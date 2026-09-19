@@ -867,13 +867,42 @@
     </div>
   </div>
 
-  <!-- Walkthrough Wizard Modal -->
+  <!-- Walkthrough Wizard Modal (3-step setup) -->
   <div id="wizardOverlay" class="fixed inset-0 bg-slate-950/85 backdrop-blur-md z-50 flex items-center justify-center p-4 hidden">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-5 space-y-4 shadow-2xl relative text-center">
-      <button onclick="dismissWizard()" class="absolute top-4 right-4 text-xs font-bold text-slate-400 hover:text-white uppercase cursor-pointer">Skip</button>
-      <h3 class="text-base font-bold text-white pt-2">Welcome to EdgeLoop</h3>
-      <p class="text-xs text-slate-400">Connect a BLE Heart Rate monitor and your toys. The engine throttles speed automatically to keep you right on the edge.</p>
-      <button onclick="dismissWizard()" class="w-full bg-purple-600 text-white font-bold py-2.5 rounded-xl text-xs cursor-pointer">Get Started</button>
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-5 space-y-4 shadow-2xl relative">
+      <button type="button" id="wizardSkipBtn" class="absolute top-4 right-4 text-xs font-bold text-slate-400 hover:text-white uppercase cursor-pointer">Skip</button>
+
+      <div class="flex items-center justify-center gap-1.5 pt-1">
+        <span data-wizard-dot="0" class="wizard-dot h-1.5 w-6 rounded-full bg-purple-500"></span>
+        <span data-wizard-dot="1" class="wizard-dot h-1.5 w-6 rounded-full bg-slate-700"></span>
+        <span data-wizard-dot="2" class="wizard-dot h-1.5 w-6 rounded-full bg-slate-700"></span>
+      </div>
+
+      <div id="wizardStep0" class="wizard-pane space-y-2 text-center">
+        <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 1 of 3</p>
+        <h3 class="text-base font-bold text-white">Connect a heart rate monitor</h3>
+        <p class="text-xs text-slate-400 leading-relaxed">Tap <strong class="text-slate-200">HR Monitor</strong> and Scan &amp; Pair a BLE strap or watch. Chest straps (Polar H10, etc.) stay more stable than optical sensors. You can also use the built-in HR simulator while testing.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">Apple Watch cannot loop back on the same iPhone. Broadcast HeartCast/Echo to EdgeLoop on a PC, Mac, or tablet, or use a chest strap.</p>
+      </div>
+
+      <div id="wizardStep1" class="wizard-pane space-y-2 text-center hidden">
+        <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 2 of 3</p>
+        <h3 class="text-base font-bold text-white">Connect your toys</h3>
+        <p class="text-xs text-slate-400 leading-relaxed">The Handy uses your Wi-Fi connection key. Everything else (vibrators, OSSM, OSR2/SR6) goes through <strong class="text-slate-200">Intiface Central</strong> at <span class="font-mono text-slate-300">ws://localhost:12345</span>.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">In the Intiface tray, assign each axis Primary, Secondary, or OFF, then tap <strong>Test</strong> so you know Linear (stroke) and Rotate (twist/roll) are mapped.</p>
+      </div>
+
+      <div id="wizardStep2" class="wizard-pane space-y-2 text-center hidden">
+        <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 3 of 3</p>
+        <h3 class="text-base font-bold text-white">Set your ceiling and start</h3>
+        <p class="text-xs text-slate-400 leading-relaxed">Enter Resting HR and Climax HR, then open <strong class="text-slate-200">Session Setup</strong> for duration, warm-up, and guards. Pick a mode (or a game) and press Start when both HR and a toy are ready.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">The engine throttles automatically. If you go over, tap <strong>Came Early</strong> so local bio-learning lowers the working ceiling next time.</p>
+      </div>
+
+      <div class="flex gap-2 pt-1">
+        <button type="button" id="wizardBackBtn" class="hidden flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 rounded-xl text-xs cursor-pointer">Back</button>
+        <button type="button" id="wizardNextBtn" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-2.5 rounded-xl text-xs cursor-pointer">Next</button>
+      </div>
     </div>
   </div>
 
@@ -921,6 +950,7 @@ python3 -m http.server 8787</pre>
 
       window.dismissWizard = function () {
         document.getElementById('wizardOverlay')?.classList.add('hidden');
+        try { localStorage.setItem('edgeloop_wizard_seen', 'true'); } catch (e) {}
       };
     })();
   </script>

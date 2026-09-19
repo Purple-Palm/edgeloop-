@@ -73,14 +73,66 @@ document.getElementById('ageDenyBtn')?.addEventListener('click', () => {
     window.location.href = 'https://www.google.com';
 });
 
-// Guide Wizard
-window.dismissWizard = () => {
-    const w = document.getElementById('wizardOverlay');
-    if (w) w.classList.add('hidden');
-};
-document.getElementById('guideBtn')?.addEventListener('click', () => {
-    const w = document.getElementById('wizardOverlay');
-    if (w) w.classList.remove('hidden');
+// Guide Wizard (3-step setup)
+let wizardStepIndex = 0;
+const wizardOverlay = document.getElementById('wizardOverlay');
+
+function markWizardSeen() {
+    try { localStorage.setItem('edgeloop_wizard_seen', 'true'); } catch (e) {}
+}
+
+function renderWizardStep() {
+    document.querySelectorAll('.wizard-pane').forEach((pane, idx) => {
+        pane.classList.toggle('hidden', idx !== wizardStepIndex);
+    });
+    document.querySelectorAll('.wizard-dot').forEach((dot, idx) => {
+        dot.className = idx === wizardStepIndex
+            ? 'wizard-dot h-1.5 w-6 rounded-full bg-purple-500'
+            : 'wizard-dot h-1.5 w-6 rounded-full bg-slate-700';
+    });
+    const backBtn = document.getElementById('wizardBackBtn');
+    const nextBtn = document.getElementById('wizardNextBtn');
+    if (backBtn) backBtn.classList.toggle('hidden', wizardStepIndex === 0);
+    if (nextBtn) nextBtn.textContent = wizardStepIndex >= 2 ? 'Get Started' : 'Next';
+}
+
+function openWizard() {
+    wizardStepIndex = 0;
+    renderWizardStep();
+    wizardOverlay?.classList.remove('hidden');
+}
+
+function closeWizard() {
+    wizardOverlay?.classList.add('hidden');
+    markWizardSeen();
+}
+
+window.dismissWizard = closeWizard;
+
+document.getElementById('guideBtn')?.addEventListener('click', openWizard);
+document.getElementById('wizardSkipBtn')?.addEventListener('click', closeWizard);
+document.getElementById('wizardBackBtn')?.addEventListener('click', () => {
+    wizardStepIndex = Math.max(0, wizardStepIndex - 1);
+    renderWizardStep();
+});
+document.getElementById('wizardNextBtn')?.addEventListener('click', () => {
+    if (wizardStepIndex >= 2) {
+        closeWizard();
+        return;
+    }
+    wizardStepIndex += 1;
+    renderWizardStep();
+});
+
+function maybeShowFirstRunWizard() {
+    const ageOk = localStorage.getItem('edgeloop_age_verified') === 'true';
+    const seen = localStorage.getItem('edgeloop_wizard_seen') === 'true';
+    if (ageOk && !seen) openWizard();
+}
+
+document.getElementById('ageConfirmBtn')?.addEventListener('click', () => {
+    if (location.protocol === 'file:') return;
+    setTimeout(maybeShowFirstRunWizard, 50);
 });
 
 // Disconnect / Watchdog Alert Banner
@@ -1614,3 +1666,4 @@ if (isRemoteController && partnerRoom) {
 }
 checkReadiness();
 updateEngine();
+if (!isRemoteController) maybeShowFirstRunWizard();
