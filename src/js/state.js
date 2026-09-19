@@ -35,11 +35,13 @@ export const state = {
     survivalSpeedFloor: 30,
     survivalTimer: 0,
     lastSpokenPrompt: '',
+    lastSpokenAt: 0,
     isTestingMic: false,
     micStream: null,
     micAudioCtx: null,
     micAnalyser: null,
-    micAnimId: null
+    micAnimId: null,
+    micBoost: 0
 };
 
 export const advancedSettings = {
@@ -59,11 +61,13 @@ export const advancedSettings = {
     decayBpm: 2,
     decayFloor: 105,
     voiceEnabled: false,
+    voiceURI: '',
     micEnabled: false,
     micSensitivityThreshold: 35,
     customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,
-        suggestedMaxHrOffset: 0
+        suggestedMaxHrOffset: 0,
+        lastBreakthroughHr: null
     }
 };

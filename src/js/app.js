@@ -1,5 +1,5 @@
 import { state, advancedSettings } from './state.js';
-import { calculateEngineOutputs } from './engine.js';
+import { calculateEngineOutputs, resolveEngineMode } from './engine.js';
 import { drawTelemetryChart } from './chart.js';
 import { connectBleHeartRate, disconnectBle, bleDeviceRef } from './hardware/ble.js';
 import { connectHandy, disconnectHandy, dispatchHandy, handyConnected } from './hardware/handy.js';
@@ -15,6 +15,7 @@ import {
     intifaceDevices
 } from './hardware/intiface.js';
 import { initHostPeer, initControllerPeer, broadcastPeerTelemetry, sendPeerCommand } from './webrtc.js';
+import { speakPrompt, setMindgamePrompt, startMicMonitor, stopMicMonitor, sampleMicLevel, listSpeechVoices } from './voice.js';
 
 // Auto-migrate legacy storage
 const storedSettings = localStorage.getItem('edgeloop_advanced_settings');
@@ -285,10 +286,24 @@ function updateEngine() {
     let max = parseInt(maxInput?.value || 140, 10);
     let hr = state.hrCurrent;
     if (!hr || hr < 35) hr = min;
+    if (advancedSettings.micEnabled && state.micBoost > 0) {
+        hr = Math.min(max, hr + state.micBoost);
+    }
 
     const hrDisplay = document.getElementById('hrDisplay');
     if (hrDisplay) hrDisplay.textContent = hr;
     if (hr > state.peakHr) state.peakHr = hr;
+
+    const learnedOffset = advancedSettings.learningProfile?.suggestedMaxHrOffset || 0;
+    const learnBadge = document.getElementById('learnBadge');
+    const learnAmount = document.getElementById('learnAmountText');
+    if (learnedOffset > 0) {
+        max = Math.max(min + 15, max - learnedOffset);
+        if (learnAmount) learnAmount.textContent = learnedOffset;
+        learnBadge?.classList.remove('hidden');
+    } else {
+        learnBadge?.classList.add('hidden');
+    }
 
     // Dual Stimulation Offset Check
     const hasSecondary = Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === 'secondary'));
@@ -327,7 +342,7 @@ function updateEngine() {
         hr,
         minHr: min,
         maxHr: max,
-        activeMode: state.activeMode,
+        activeMode: resolveEngineMode(state.activeMode),
         sessionStatus: state.sessionStatus,
         rampdownSecondsLeft: state.rampdownSecondsLeft,
         isEdged: state.isEdged,
@@ -336,7 +351,16 @@ function updateEngine() {
         intensityValue: state.intensityValue,
         edgeStrokeDepth: advancedSettings.edgeStrokeDepth,
         handyHwMin: advancedSettings.handyHwMin,
-        handyHwMax: advancedSettings.handyHwMax
+        handyHwMax: advancedSettings.handyHwMax,
+        sessionSeconds: state.sessionSeconds,
+        warmupMinutes: advancedSettings.warmupMinutes,
+        cadenceBreathing: advancedSettings.cadenceBreathing,
+        milkingWave: advancedSettings.milkingWave,
+        stallGuardEngaged: state.stallGuardEngaged,
+        stallGuardEnabled: advancedSettings.stallGuard,
+        ruinHoldSeconds: state.ruinHoldSeconds,
+        oracleState: state.oracleState,
+        survivalSpeedFloor: state.survivalSpeedFloor
     });
 
     if (result.newEdgeTriggered) {
@@ -345,6 +369,7 @@ function updateEngine() {
         if (edgeEl) edgeEl.textContent = state.edges;
         if (state.activeMode === 'ruin') state.ruinHoldSeconds = 18;
         intifaceDevices.forEach(dev => { dev.clockwise = !dev.clockwise; });
+        cueVoice('Edge. Back off.');
     }
 
     state.isEdged = result.isEdged;
@@ -367,8 +392,14 @@ function updateEngine() {
 
     const cutoffEl = document.getElementById('cutoffNotice');
     if (cutoffEl) {
-        cutoffEl.classList.toggle('hidden', !state.isEdged || state.orgasmMode || state.sessionStatus === 'RAMPDOWN');
+        cutoffEl.classList.toggle('hidden', !state.isEdged || state.orgasmMode || state.sessionStatus === 'RAMPDOWN' || state.stallGuardEngaged);
     }
+
+    const stallNotice = document.getElementById('stallGuardNotice');
+    if (stallNotice) stallNotice.classList.toggle('hidden', !state.stallGuardEngaged);
+
+    updateWarmupBadge();
+    updateGameNotice();
 
     dispatchHardware(result.primaryPercent, result.secondaryPercent, result.strokeMinPercent, result.strokeMaxPercent);
 }
@@ -391,8 +422,168 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     const effStrokeMax = state.alwaysFullStroke ? 100 : strokeMax;
 
     dispatchHandy(key, targetHandySpeed, effStrokeMin, effStrokeMax, force);
-    dispatchIntiface(primarySpeed, secondarySpeed);
+    dispatchIntiface(primarySpeed, secondarySpeed, effStrokeMin, effStrokeMax);
 }
+
+function cueVoice(text) {
+    if (!advancedSettings.voiceEnabled || !text) {
+        setMindgamePrompt(text || '', Boolean(advancedSettings.voiceEnabled && text));
+        return;
+    }
+    const now = Date.now();
+    if (text === state.lastSpokenPrompt && (now - (state.lastSpokenAt || 0) < 7000)) return;
+    state.lastSpokenPrompt = text;
+    state.lastSpokenAt = now;
+    setMindgamePrompt(text, true);
+    speakPrompt(true, text, advancedSettings.voiceURI);
+}
+
+function updateWarmupBadge() {
+    const badge = document.getElementById('warmupBadge');
+    const remainingEl = document.getElementById('warmupRemainingText');
+    const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
+    const active = state.sessionStatus === 'RUNNING' && warmupSeconds > 0 && state.sessionSeconds < warmupSeconds;
+    if (badge) badge.classList.toggle('hidden', !active);
+    if (active && remainingEl) {
+        const left = warmupSeconds - state.sessionSeconds;
+        remainingEl.textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+    }
+}
+
+function updateGameNotice() {
+    const notice = document.getElementById('gameNotice');
+    if (!notice) return;
+    let text = '';
+    if (state.activeMode === 'oracle' && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
+        if (state.oracleState === 'HOLD') text = `THE ORACLE: HOLDING ${state.oracleTimer}s — FATE PENDING`;
+        else if (state.oracleState === 'CLIMAX') text = 'THE ORACLE: CLIMAX';
+        else if (state.oracleState === 'DENIAL') text = 'THE ORACLE: DENIAL';
+        else if (state.oracleState === 'PURGATORY') text = 'THE ORACLE: PURGATORY';
+        else text = 'THE ORACLE: APPROACHING THE CEILING';
+    } else if (state.activeMode === 'survival' && state.sessionStatus === 'RUNNING') {
+        text = `SURVIVAL: FLOOR ${Math.round(state.survivalSpeedFloor)}% — STAY UNDER YOUR LIMIT`;
+    }
+    notice.textContent = text || 'GAME MODE ACTIVE';
+    notice.classList.toggle('hidden', !text);
+}
+
+function pickSessionTargetSeconds() {
+    if (state.durationMode === 'endless') return 0;
+    if (state.durationMode === 'fixed') {
+        const mins = parseInt(document.getElementById('paramFixedInput')?.value || '30', 10);
+        return Math.max(1, mins || 30) * 60;
+    }
+    const min = parseInt(document.getElementById('paramMinInput')?.value || '25', 10);
+    const max = parseInt(document.getElementById('paramMaxInput')?.value || '45', 10);
+    const lo = Math.min(min, max);
+    const hi = Math.max(min, max);
+    return (Math.floor(Math.random() * (hi - lo + 1)) + lo) * 60;
+}
+
+function resetGameState() {
+    state.oracleState = 'IDLE';
+    state.oracleTimer = 0;
+    state.survivalSpeedFloor = 30;
+    state.survivalTimer = 0;
+    state.edgeStallSeconds = 0;
+    state.stallGuardEngaged = false;
+    state.ruinHoldSeconds = 0;
+    state.lastSpokenPrompt = '';
+    document.getElementById('stallGuardNotice')?.classList.add('hidden');
+    document.getElementById('gameNotice')?.classList.add('hidden');
+}
+
+function tickSessionGuardsAndGames() {
+    if (state.sessionStatus !== 'RUNNING') return;
+
+    if (state.ruinHoldSeconds > 0) state.ruinHoldSeconds -= 1;
+
+    const maxHr = parseInt(document.getElementById('maxHr')?.value || '140', 10);
+    const nearCeiling = state.hrCurrent >= (maxHr - 2);
+
+    if (advancedSettings.stallGuard && state.isEdged && !state.orgasmMode && state.activeMode !== 'oracle' && state.activeMode !== 'survival') {
+        state.edgeStallSeconds += 1;
+        if (state.edgeStallSeconds >= (advancedSettings.stallGuardSeconds || 8)) {
+            if (!state.stallGuardEngaged) {
+                state.stallGuardEngaged = true;
+                cueVoice('Stall guard. Motors halted. Recover.');
+            }
+        }
+    } else if (!nearCeiling || !state.isEdged) {
+        if (state.stallGuardEngaged) cueVoice('Recovered. Resume.');
+        state.edgeStallSeconds = 0;
+        state.stallGuardEngaged = false;
+    }
+
+    const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
+    if (warmupSeconds > 0 && state.sessionSeconds === warmupSeconds) {
+        cueVoice('Warm up complete.');
+    }
+
+    if (advancedSettings.micEnabled && state.micAnalyser) {
+        const level = sampleMicLevel(state);
+        const threshold = advancedSettings.micSensitivityThreshold || 35;
+        state.micBoost = level >= threshold ? Math.round((level - threshold) / 8) : 0;
+        document.getElementById('micActiveBadge')?.classList.toggle('hidden', false);
+    } else {
+        state.micBoost = 0;
+        document.getElementById('micActiveBadge')?.classList.add('hidden');
+    }
+
+    if (state.activeMode === 'oracle') {
+        if (state.oracleState === 'IDLE' || state.oracleState === 'APPROACH') {
+            if (state.oracleState !== 'APPROACH') {
+                state.oracleState = 'APPROACH';
+                cueVoice('The Oracle is watching. Climb.');
+            }
+            if (state.isEdged) {
+                state.oracleState = 'HOLD';
+                state.oracleTimer = 15;
+                cueVoice('Hold. Fifteen seconds.');
+            }
+        } else if (state.oracleState === 'HOLD') {
+            state.oracleTimer = Math.max(0, state.oracleTimer - 1);
+            if (state.oracleTimer <= 0) {
+                const roll = Math.random();
+                if (roll < 0.33) {
+                    state.oracleState = 'CLIMAX';
+                    if (!state.orgasmMode) orgasmBtn?.click();
+                    cueVoice('The Oracle chooses climax.');
+                } else if (roll < 0.66) {
+                    state.oracleState = 'DENIAL';
+                    cueVoice('The Oracle chooses denial.');
+                    stopSession('Oracle Denial');
+                    return;
+                } else {
+                    state.oracleState = 'PURGATORY';
+                    cueVoice('The Oracle chooses purgatory.');
+                }
+            }
+        } else if (state.oracleState === 'PURGATORY' && state.sessionSeconds % 28 === 0 && state.sessionSeconds > 0) {
+            state.oracleState = 'APPROACH';
+            state.isEdged = false;
+            cueVoice('Purgatory resets. Climb again.');
+        }
+    } else if (state.activeMode === 'survival') {
+        state.survivalTimer += 1;
+        state.survivalSpeedFloor = Math.min(100, 28 + state.survivalTimer * 0.45);
+        if (state.hrCurrent >= maxHr && !state.orgasmMode) {
+            cueVoice('Survival failed. Limit breached.');
+            stopSession('Survival Defeat');
+            return;
+        }
+    }
+}
+
+// Keep linear OSR/OSSM ping-pong moving between 1Hz engine ticks
+setInterval(() => {
+    if (isRemoteController) return;
+    if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
+        const effStrokeMin = state.alwaysFullStroke ? 0 : state.strokeMin;
+        const effStrokeMax = state.alwaysFullStroke ? 100 : state.strokeMax;
+        dispatchIntiface(state.strokerSpeed, state.prostateSpeed, effStrokeMin, effStrokeMax);
+    }
+}, 200);
 
 // 250ms Live Funscript Sampling Loop (4Hz)
 setInterval(() => {
@@ -410,6 +601,7 @@ setInterval(() => {
     if (state.sessionStatus === 'RUNNING') {
         state.sessionSeconds += 1;
         updateTimerDisplay();
+        tickSessionGuardsAndGames();
 
         if (state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
             handleTargetTimeReached();
@@ -484,9 +676,9 @@ playPauseBtn?.addEventListener('click', () => {
             funscriptPrimary = [];
             funscriptSecondary = [];
             funscriptSessionStart = Date.now();
-            const min = parseInt(document.getElementById('paramMinInput')?.value || 25, 10);
-            const max = parseInt(document.getElementById('paramMaxInput')?.value || 45, 10);
-            state.chosenTargetSeconds = max > 0 ? (Math.floor(Math.random() * (Math.max(min, max) - Math.min(min, max) + 1)) + Math.min(min, max)) * 60 : 0;
+            resetGameState();
+            state.chosenTargetSeconds = pickSessionTargetSeconds();
+            cueVoice('Session started. Breathe.');
         }
         state.sessionStatus = 'RUNNING';
         document.getElementById('rampdownNotice')?.classList.add('hidden');
@@ -502,6 +694,7 @@ playPauseBtn?.addEventListener('click', () => {
         if (playPauseIcon) playPauseIcon.innerHTML = `<path d="M8 5v14l11-7z"/>`;
         if (playPauseBtn) playPauseBtn.className = "flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-3 rounded-xl text-xs sm:text-sm transition tracking-wide flex justify-center items-center gap-1.5 shadow-lg shadow-emerald-950/40 cursor-pointer";
         dispatchHardware(0, 0, 0, 100, true);
+        cueVoice('Paused.');
     }
     sendPeerCommand({ type: 'SESSION_STATE', status: state.sessionStatus, chosenSeconds: state.chosenTargetSeconds });
     syncTelemetry();
@@ -513,6 +706,10 @@ stopBtn?.addEventListener('click', () => stopSession("Stopped"));
 function stopSession(outcome = "Stopped") {
     if (state.sessionSeconds >= 10 && !isRemoteController) saveSessionToHistory(outcome);
     state.sessionStatus = 'IDLE';
+    resetGameState();
+    updateWarmupBadge();
+    if (outcome && outcome !== 'Stopped') cueVoice(outcome);
+    else cueVoice('Session stopped.');
     state.strokerSpeed = 0;
     state.prostateSpeed = 0;
     document.getElementById('rampdownNotice')?.classList.add('hidden');
@@ -545,6 +742,9 @@ resetBtn?.addEventListener('click', () => {
     state.peakHr = state.hrCurrent;
     state.strokerSpeed = 0;
     state.prostateSpeed = 0;
+    resetGameState();
+    updateWarmupBadge();
+    setMindgamePrompt('', false);
     document.getElementById('rampdownNotice')?.classList.add('hidden');
     updateTimerDisplay();
     const edgeEl = document.getElementById('edgeCount');
@@ -568,36 +768,50 @@ resetBtn?.addEventListener('click', () => {
 });
 
 // Came Early & Learning Profile
+function persistSettings() {
+    localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+}
+
 function renderLearningStatus() {
     const text = document.getElementById('learningStatusText');
-    if (!text) return;
-    const p = advancedSettings.learningProfile;
-    if (p.breakthroughEvents > 0) {
-        text.textContent = `Active Learning: ${p.breakthroughEvents} premature event(s) logged. Climax threshold offset by -${p.suggestedMaxHrOffset} BPM.`;
-        text.className = "p-2 bg-amber-950/40 border border-amber-800 rounded-lg text-[10px] font-mono text-amber-300";
-    } else {
-        text.textContent = "Zero breakthrough events recorded. Calibrated limits active.";
-        text.className = "p-2 bg-slate-900 rounded-lg text-[10px] font-mono text-purple-300";
+    const p = advancedSettings.learningProfile || { breakthroughEvents: 0, suggestedMaxHrOffset: 0 };
+    if (text) {
+        if (p.breakthroughEvents > 0) {
+            const last = p.lastBreakthroughHr ? ` Last event at ${p.lastBreakthroughHr} BPM.` : '';
+            text.textContent = `Active: ${p.breakthroughEvents} premature event(s). Working climax ceiling is ${p.suggestedMaxHrOffset} BPM below your typed Climax HR on every session.${last}`;
+            text.className = "p-2 bg-amber-950/40 border border-amber-800 rounded-lg text-[10px] font-mono text-amber-300";
+        } else {
+            text.textContent = "Zero breakthrough events recorded. Typed Climax HR is used as-is.";
+            text.className = "p-2 bg-slate-900 rounded-lg text-[10px] font-mono text-purple-300";
+        }
     }
+    updateEngine();
 }
 
 cameEarlyBtn?.addEventListener('click', () => {
-    if (confirm("Log an accidental release? EdgeLoop will tighten protection.")) {
-        advancedSettings.learningProfile.breakthroughEvents += 1;
-        advancedSettings.learningProfile.suggestedMaxHrOffset += 3;
-        const currentMax = parseInt(document.getElementById('maxHr')?.value || 140, 10);
-        const maxInput = document.getElementById('maxHr');
-        if (maxInput) maxInput.value = Math.max(90, currentMax - 3);
-        localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+    if (confirm("Log an accidental release? EdgeLoop will lower your working climax ceiling on this and future sessions.")) {
+        if (!advancedSettings.learningProfile) {
+            advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
+        }
+        const profile = advancedSettings.learningProfile;
+        const userMax = parseInt(document.getElementById('maxHr')?.value || '140', 10);
+        profile.breakthroughEvents += 1;
+        profile.lastBreakthroughHr = state.hrCurrent;
+        profile.suggestedMaxHrOffset = Math.min(30, (profile.suggestedMaxHrOffset || 0) + 3);
+        if (state.hrCurrent && state.hrCurrent < userMax - 8) {
+            profile.suggestedMaxHrOffset = Math.min(30, profile.suggestedMaxHrOffset + 2);
+        }
+        persistSettings();
         renderLearningStatus();
+        cueVoice('Limit tightened.');
         stopSession("Premature Release");
     }
 });
 
 document.getElementById('wipeLearningBtn')?.addEventListener('click', () => {
-    if (confirm("Reset local bio-learning memory?")) {
-        advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0 };
-        localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+    if (confirm("Reset local bio-learning memory? Your typed Climax HR will be used with no offset.")) {
+        advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
+        persistSettings();
         renderLearningStatus();
     }
 });
@@ -647,6 +861,7 @@ const modeCards = document.querySelectorAll('.mode-card');
 modeCards.forEach(card => {
     card.addEventListener('click', () => {
         state.activeMode = card.getAttribute('data-mode');
+        resetGameState();
         modeCards.forEach(c => {
             const check = c.querySelector('.mode-check');
             const title = c.querySelector('.font-bold');
@@ -814,7 +1029,49 @@ function syncParamsUI() {
 
     if (warmup) warmup.value = advancedSettings.warmupMinutes ?? 5;
     if (warmupDisp) warmupDisp.textContent = (advancedSettings.warmupMinutes === 0) ? "0 min (Instant)" : `${advancedSettings.warmupMinutes ?? 5} Minutes`;
+
+    const voiceToggle = document.getElementById('paramVoiceToggle');
+    const micToggle = document.getElementById('paramMicToggle');
+    if (voiceToggle) voiceToggle.checked = Boolean(advancedSettings.voiceEnabled);
+    if (micToggle) micToggle.checked = Boolean(advancedSettings.micEnabled);
+    populateVoiceSelect();
+    setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
 }
+
+function populateVoiceSelect() {
+    const select = document.getElementById('paramVoiceSelect');
+    if (!select || !window.speechSynthesis) return;
+    const voices = listSpeechVoices();
+    const current = advancedSettings.voiceURI || '';
+    select.innerHTML = '<option value="">Browser default</option>';
+    voices.forEach((voice) => {
+        const option = document.createElement('option');
+        option.value = voice.voiceURI;
+        option.textContent = `${voice.name} (${voice.lang})`;
+        if (voice.voiceURI === current) option.selected = true;
+        select.appendChild(option);
+    });
+    if (current && !voices.some((voice) => voice.voiceURI === current)) {
+        select.value = '';
+    } else {
+        select.value = current;
+    }
+}
+
+if (window.speechSynthesis) {
+    populateVoiceSelect();
+    window.speechSynthesis.addEventListener('voiceschanged', populateVoiceSelect);
+}
+
+document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () => {
+    const select = document.getElementById('paramVoiceSelect');
+    if (select) advancedSettings.voiceURI = select.value;
+    speakPrompt(true, 'EdgeLoop voice preview. Stay right on the edge.', advancedSettings.voiceURI);
+});
+
+document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
+    advancedSettings.voiceURI = e.target.value;
+});
 
 // Endgame selection inside Session Setup
 const paramEndgameCards = document.querySelectorAll('.param-endgame-card');
@@ -834,8 +1091,29 @@ paramEndgameCards.forEach(card => {
     });
 });
 
+async function applyMicSetting(enabled) {
+    advancedSettings.micEnabled = Boolean(enabled);
+    const badge = document.getElementById('micActiveBadge');
+    if (!enabled) {
+        stopMicMonitor(state);
+        badge?.classList.add('hidden');
+        state.micBoost = 0;
+        return;
+    }
+    try {
+        await startMicMonitor(state);
+        badge?.classList.remove('hidden');
+    } catch (e) {
+        advancedSettings.micEnabled = false;
+        const toggle = document.getElementById('paramMicToggle');
+        if (toggle) toggle.checked = false;
+        badge?.classList.add('hidden');
+        alert('Microphone permission denied or unavailable in this browser.');
+    }
+}
+
 // Apply Session Setup
-document.getElementById('applyParamsBtn')?.addEventListener('click', () => {
+document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
     advancedSettings.stallGuardSeconds = parseInt(document.getElementById('stallGuardSecondsInput')?.value, 10) || 8;
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
@@ -844,8 +1122,13 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', () => {
     advancedSettings.decayEdgeCount = parseInt(document.getElementById('decayEdgeCountInput')?.value, 10) || 2;
     advancedSettings.decayBpm = parseInt(document.getElementById('decayBpmInput')?.value, 10) || 2;
     advancedSettings.decayFloor = parseInt(document.getElementById('decayFloorInput')?.value, 10) || 105;
-    advancedSettings.warmupMinutes = parseInt(document.getElementById('warmupInput')?.value, 10) || 5;
+    const warmupParsed = parseInt(document.getElementById('warmupInput')?.value, 10);
+    advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
+    advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
+    const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
+    await applyMicSetting(micOn);
+    setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
 
     localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
     closeModal();
@@ -1243,6 +1526,36 @@ function setupPartnerHost() {
     });
 }
 
+function applyRemoteTelemetry(data) {
+    if (!data || data.type !== 'TELEMETRY') return;
+    if (typeof data.hr === 'number') state.hrCurrent = data.hr;
+    if (typeof data.seconds === 'number') state.sessionSeconds = data.seconds;
+    if (typeof data.chosenTargetSeconds === 'number') state.chosenTargetSeconds = data.chosenTargetSeconds;
+    if (data.sessionStatus) state.sessionStatus = data.sessionStatus;
+    if (typeof data.edges === 'number') state.edges = data.edges;
+    if (typeof data.pauses === 'number') state.pauses = data.pauses;
+    if (typeof data.strokerSpeed === 'number') state.strokerSpeed = data.strokerSpeed;
+    if (typeof data.prostateSpeed === 'number') state.prostateSpeed = data.prostateSpeed;
+    if (Array.isArray(data.history)) state.history = data.history;
+    if (data.activeMode) state.activeMode = data.activeMode;
+
+    const hrDisplay = document.getElementById('hrDisplay');
+    if (hrDisplay) hrDisplay.textContent = state.hrCurrent;
+    const strokerVal = document.getElementById('strokerVal');
+    const strokerBar = document.getElementById('strokerBar');
+    const prostateVal = document.getElementById('prostateVal');
+    const prostateBar = document.getElementById('prostateBar');
+    if (strokerVal) strokerVal.textContent = `${Math.round(state.strokerSpeed)}%`;
+    if (strokerBar) strokerBar.style.width = `${state.strokerSpeed}%`;
+    if (prostateVal) prostateVal.textContent = `${Math.round(state.prostateSpeed)}%`;
+    if (prostateBar) prostateBar.style.width = `${state.prostateSpeed}%`;
+    const edgeEl = document.getElementById('edgeCount');
+    const pauseEl = document.getElementById('pauseCount');
+    if (edgeEl) edgeEl.textContent = state.edges;
+    if (pauseEl) pauseEl.textContent = state.pauses;
+    updateTimerDisplay();
+}
+
 function syncTelemetry() {
     if (isRemoteController) return;
     broadcastPeerTelemetry({
@@ -1287,5 +1600,17 @@ document.getElementById('copyGroupUrlBtn')?.addEventListener('click', () => {
 // Boot Initialization
 initHandyRoleUI();
 renderLearningStatus();
+syncParamsUI();
+if (advancedSettings.micEnabled) applyMicSetting(true);
+if (advancedSettings.voiceEnabled) setMindgamePrompt('Calm and steady. Breathe.', true);
+if (isRemoteController && partnerRoom) {
+    initControllerPeer(partnerRoom, {
+        onConnected: () => {
+            const role = document.getElementById('roleIndicator');
+            if (role) role.textContent = 'Remote Controller · Live';
+        },
+        onTelemetryReceived: applyRemoteTelemetry
+    });
+}
 checkReadiness();
 updateEngine();
