@@ -28,13 +28,18 @@ export const state = {
     handyBattery: null,
     intifaceBattery: null,
     simEngaged: false,
-    handyRole: localStorage.getItem('handy_role') || 'primary', // 'primary' | 'secondary' | 'off'
+    handyRole: localStorage.getItem('handy_role') || 'primary',
     handyMaxCap: parseInt(localStorage.getItem('handy_max_cap') || '100', 10),
     oracleState: 'IDLE',
     oracleTimer: 0,
     survivalSpeedFloor: 30,
     survivalTimer: 0,
-    lastSpokenPrompt: ''
+    lastSpokenPrompt: '',
+    isTestingMic: false,
+    micStream: null,
+    micAudioCtx: null,
+    micAnalyser: null,
+    micAnimId: null
 };
 
 export const advancedSettings = {
@@ -55,6 +60,7 @@ export const advancedSettings = {
     decayFloor: 105,
     voiceEnabled: false,
     micEnabled: false,
+    micSensitivityThreshold: 35,
     customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,
