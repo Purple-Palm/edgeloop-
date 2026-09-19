@@ -200,13 +200,25 @@ fullStrokeToggleBtn?.addEventListener('click', () => {
     updateEngine();
 });
 
-// The Handy Role & Speed Cap Controls
+// Update Handy Travel Envelope Bounds Display
+function updateHwEnvelopeDisplay() {
+    const hwMin = document.getElementById('hwMinInput');
+    const hwMax = document.getElementById('hwMaxInput');
+    const hwEnv = document.getElementById('hwEnvelopeDisplay');
+    const minVal = parseInt(hwMin?.value || advancedSettings.handyHwMin || 0, 10);
+    const maxVal = parseInt(hwMax?.value || advancedSettings.handyHwMax || 100, 10);
+    if (hwEnv) hwEnv.textContent = `Bounds: ${minVal}% - ${maxVal}%`;
+}
+
+// The Handy Role, Speed Cap & Physical Travel Envelope Controls
 function initHandyRoleUI() {
     const pBtn = document.getElementById('handyRolePrimaryBtn');
     const sBtn = document.getElementById('handyRoleSecondaryBtn');
     const oBtn = document.getElementById('handyRoleOffBtn');
     const capSlider = document.getElementById('handyCapSlider');
     const capVal = document.getElementById('handyCapVal');
+    const hwMin = document.getElementById('hwMinInput');
+    const hwMax = document.getElementById('hwMaxInput');
 
     if (capSlider && capVal) {
         capSlider.value = state.handyMaxCap ?? 100;
@@ -218,6 +230,27 @@ function initHandyRoleUI() {
             updateEngine();
         });
     }
+
+    // Envelope inputs located inside Handy modal
+    if (hwMin) {
+        hwMin.value = advancedSettings.handyHwMin ?? 0;
+        hwMin.addEventListener('input', (e) => {
+            advancedSettings.handyHwMin = parseInt(e.target.value, 10) || 0;
+            localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+            updateHwEnvelopeDisplay();
+        });
+    }
+
+    if (hwMax) {
+        hwMax.value = advancedSettings.handyHwMax ?? 100;
+        hwMax.addEventListener('input', (e) => {
+            advancedSettings.handyHwMax = parseInt(e.target.value, 10) || 100;
+            localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+            updateHwEnvelopeDisplay();
+        });
+    }
+
+    updateHwEnvelopeDisplay();
 
     const applyRole = (role) => {
         state.handyRole = role;
@@ -649,7 +682,11 @@ const modals = {
 function openModal(type) {
     Object.values(modals).forEach(m => m?.classList.add('hidden'));
     if (type === 'Ble' && modalTitle) { modalTitle.textContent = "Heart Rate Monitor & Simulator"; modals.Ble?.classList.remove('hidden'); }
-    else if (type === 'Handy' && modalTitle) { modalTitle.textContent = "The Handy (Wi-Fi API)"; modals.Handy?.classList.remove('hidden'); }
+    else if (type === 'Handy' && modalTitle) {
+        modalTitle.textContent = "The Handy (Wi-Fi API)";
+        modals.Handy?.classList.remove('hidden');
+        updateHwEnvelopeDisplay();
+    }
     else if (type === 'Intiface' && modalTitle) { modalTitle.textContent = "Intiface Central & Toy Roles"; modals.Intiface?.classList.remove('hidden'); renderIntifaceDevices(); }
     else if (type === 'History' && modalTitle) { modalTitle.textContent = "Session History & Funscripts"; modals.History?.classList.remove('hidden'); renderHistory(); }
     else if (type === 'Params' && modalTitle) { modalTitle.textContent = "Session Setup"; modals.Params?.classList.remove('hidden'); renderLearningStatus(); syncParamsUI(); }
@@ -693,11 +730,10 @@ bleTabSimBtn?.addEventListener('click', () => {
     bleRealSection?.classList.add('hidden');
 });
 
-// Session Setup Sub-Tabs
+// Session Setup Sub-Tabs (4 Tabs: duration, guards, audio, backup)
 const paramsTabMap = {
     duration: { btn: document.getElementById('paramsTabDurationBtn'), sec: document.getElementById('paramsDurationSection') },
     guards: { btn: document.getElementById('paramsTabGuardsBtn'), sec: document.getElementById('paramsGuardsSection') },
-    motion: { btn: document.getElementById('paramsTabMotionBtn'), sec: document.getElementById('paramsMotionSection') },
     audio: { btn: document.getElementById('paramsTabAudioBtn'), sec: document.getElementById('paramsAudioSection') },
     backup: { btn: document.getElementById('paramsTabBackupBtn'), sec: document.getElementById('paramsBackupSection') }
 };
@@ -717,7 +753,6 @@ function setParamsTab(activeKey) {
 
 paramsTabMap.duration.btn?.addEventListener('click', () => setParamsTab('duration'));
 paramsTabMap.guards.btn?.addEventListener('click', () => setParamsTab('guards'));
-paramsTabMap.motion.btn?.addEventListener('click', () => setParamsTab('motion'));
 paramsTabMap.audio.btn?.addEventListener('click', () => setParamsTab('audio'));
 paramsTabMap.backup.btn?.addEventListener('click', () => setParamsTab('backup'));
 
@@ -745,6 +780,16 @@ durFixedBtn?.addEventListener('click', () => setDurationMode('fixed'));
 durRangeBtn?.addEventListener('click', () => setDurationMode('range'));
 durEndlessBtn?.addEventListener('click', () => setDurationMode('endless'));
 
+// Warm-up Slider Listener
+const warmupInput = document.getElementById('warmupInput');
+const warmupDisplay = document.getElementById('warmupValDisplay');
+warmupInput?.addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    if (warmupDisplay) {
+        warmupDisplay.textContent = (val === 0) ? "0 min (Instant)" : `${val} Minutes`;
+    }
+});
+
 function syncParamsUI() {
     setDurationMode(state.durationMode);
     const stallToggle = document.getElementById('stallGuardToggle');
@@ -756,10 +801,7 @@ function syncParamsUI() {
     const decayBpm = document.getElementById('decayBpmInput');
     const decayFloor = document.getElementById('decayFloorInput');
     const warmup = document.getElementById('warmupInput');
-    const warmupDisplay = document.getElementById('warmupValDisplay');
-    const hwMin = document.getElementById('hwMinInput');
-    const hwMax = document.getElementById('hwMaxInput');
-    const hwEnv = document.getElementById('hwEnvelopeDisplay');
+    const warmupDisp = document.getElementById('warmupValDisplay');
 
     if (stallToggle) stallToggle.checked = Boolean(advancedSettings.stallGuard);
     if (stallSec) stallSec.value = advancedSettings.stallGuardSeconds || 8;
@@ -771,11 +813,7 @@ function syncParamsUI() {
     if (decayFloor) decayFloor.value = advancedSettings.decayFloor || 105;
 
     if (warmup) warmup.value = advancedSettings.warmupMinutes ?? 5;
-    if (warmupDisplay) warmupDisplay.textContent = (advancedSettings.warmupMinutes === 0) ? "0 min (Instant)" : `${advancedSettings.warmupMinutes ?? 5} Minutes`;
-
-    if (hwMin) hwMin.value = advancedSettings.handyHwMin ?? 0;
-    if (hwMax) hwMax.value = advancedSettings.handyHwMax ?? 100;
-    if (hwEnv) hwEnv.textContent = `Bounds: ${advancedSettings.handyHwMin ?? 0}% - ${advancedSettings.handyHwMax ?? 100}%`;
+    if (warmupDisp) warmupDisp.textContent = (advancedSettings.warmupMinutes === 0) ? "0 min (Instant)" : `${advancedSettings.warmupMinutes ?? 5} Minutes`;
 }
 
 // Endgame selection inside Session Setup
@@ -807,8 +845,6 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', () => {
     advancedSettings.decayBpm = parseInt(document.getElementById('decayBpmInput')?.value, 10) || 2;
     advancedSettings.decayFloor = parseInt(document.getElementById('decayFloorInput')?.value, 10) || 105;
     advancedSettings.warmupMinutes = parseInt(document.getElementById('warmupInput')?.value, 10) || 5;
-    advancedSettings.handyHwMin = parseInt(document.getElementById('hwMinInput')?.value, 10) || 0;
-    advancedSettings.handyHwMax = parseInt(document.getElementById('hwMaxInput')?.value, 10) || 100;
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
 
     localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
@@ -839,6 +875,7 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             Object.assign(advancedSettings, parsed);
             localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
             syncParamsUI();
+            updateHwEnvelopeDisplay();
             updateEngine();
             alert("Settings successfully imported!");
         } catch (err) {

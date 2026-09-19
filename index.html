@@ -470,7 +470,7 @@
         </div>
       </div>
 
-      <!-- 2. The Handy Modal (With Dedicated Role Switcher & Power Cap) -->
+      <!-- 2. The Handy Modal (With Dedicated Role Switcher, Power Cap & Travel Envelope) -->
       <div id="modalBodyHandy" class="space-y-3 hidden">
         <p class="text-xs text-slate-400">Enter your Handy Connection Key from handyfeeling.com.</p>
         <div class="space-y-1">
@@ -497,6 +497,27 @@
               <span id="handyCapVal" class="font-bold font-mono text-amber-400">100%</span>
             </div>
             <input type="range" id="handyCapSlider" min="10" max="100" step="5" value="100" class="w-full accent-amber-500 h-1.5 bg-slate-800 rounded cursor-pointer">
+          </div>
+
+          <!-- Handy Physical Sleeve Travel Envelope (Moved from Motion tab) -->
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5 mt-2">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-slate-200">Hardware Travel Envelope</label>
+              <span id="hwEnvelopeDisplay" class="font-mono text-[10px] font-bold text-teal-400">Bounds: 0% - 100%</span>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              Protects against sleeve slip-out or base jamming. Strokes scale inside these physical bounds.
+            </p>
+            <div class="grid grid-cols-2 gap-2 pt-1">
+              <div class="space-y-0.5">
+                <span class="text-[9px] text-slate-400 font-semibold">Min % (Lower Guard):</span>
+                <input id="hwMinInput" type="number" min="0" max="40" value="0" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
+              </div>
+              <div class="space-y-0.5">
+                <span class="text-[9px] text-slate-400 font-semibold">Max % (Upper Guard):</span>
+                <input id="hwMaxInput" type="number" min="60" max="100" value="100" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
+              </div>
+            </div>
           </div>
         </div>
 
@@ -559,18 +580,30 @@
         </div>
       </div>
 
-      <!-- 5. UNIFIED SESSION SETUP MODAL (5 Sub-Tabs) -->
+      <!-- 5. UNIFIED SESSION SETUP MODAL (4 Sub-Tabs: Duration, Guards, Audio & Mic, Backup) -->
       <div id="modalBodyParams" class="space-y-3 hidden">
         <div class="flex bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-[10px] font-bold">
           <button id="paramsTabDurationBtn" class="flex-1 py-1.5 rounded-md bg-purple-600 text-white transition cursor-pointer">Duration</button>
           <button id="paramsTabGuardsBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Guards</button>
-          <button id="paramsTabMotionBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Motion</button>
           <button id="paramsTabAudioBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Audio & Mic</button>
           <button id="paramsTabBackupBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Backup</button>
         </div>
 
-        <!-- TAB 1: Duration -->
+        <!-- TAB 1: Duration (Includes Warm-Up, Target Mode & Endgame) -->
         <div id="paramsDurationSection" class="space-y-2.5">
+
+          <!-- Warm-Up Ramp Duration (Moved here from former Motion tab) -->
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-slate-200">Warm-Up Ramp Duration</label>
+              <span id="warmupValDisplay" class="font-mono text-xs font-bold text-amber-400">5 Minutes</span>
+            </div>
+            <input id="warmupInput" type="range" min="0" max="10" step="1" value="5" class="w-full accent-amber-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer">
+            <p class="text-[9px] text-slate-400 leading-snug">
+              Restricts strokes to lower half (0%–55%) while soft, expanding as erection builds.
+            </p>
+          </div>
+
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
             <div class="flex justify-between items-center">
               <span class="text-[10px] font-bold uppercase tracking-wider text-slate-300">Target Mode</span>
@@ -691,38 +724,7 @@
           </div>
         </div>
 
-        <!-- TAB 3: Motion -->
-        <div id="paramsMotionSection" class="space-y-2.5 hidden">
-          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-            <div class="flex justify-between items-center">
-              <label class="text-xs font-bold text-slate-200">Warm-Up Ramp Duration</label>
-              <span id="warmupValDisplay" class="font-mono text-xs font-bold text-amber-400">5 Minutes</span>
-            </div>
-            <input id="warmupInput" type="range" min="0" max="10" step="1" value="5" class="w-full accent-amber-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer">
-            <p class="text-[9px] text-slate-400 leading-snug">
-              Restricts strokes to lower half (0%–55%) while soft, expanding as erection builds.
-            </p>
-          </div>
-
-          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-            <div class="flex justify-between items-center">
-              <label class="text-xs font-bold text-slate-200">The Handy Travel Envelope</label>
-              <span id="hwEnvelopeDisplay" class="font-mono text-[10px] font-bold text-teal-400">Bounds: 0% - 100%</span>
-            </div>
-            <div class="grid grid-cols-2 gap-2 pt-1">
-              <div class="space-y-0.5">
-                <span class="text-[9px] text-slate-400 font-semibold">Min %:</span>
-                <input id="hwMinInput" type="number" min="0" max="40" value="0" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
-              </div>
-              <div class="space-y-0.5">
-                <span class="text-[9px] text-slate-400 font-semibold">Max %:</span>
-                <input id="hwMaxInput" type="number" min="60" max="100" value="100" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- TAB 4: Audio & Mic -->
+        <!-- TAB 3: Audio & Mic -->
         <div id="paramsAudioSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 flex items-center justify-between">
             <div>
@@ -749,7 +751,7 @@
           </div>
         </div>
 
-        <!-- TAB 5: Backup -->
+        <!-- TAB 4: Backup -->
         <div id="paramsBackupSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <span class="text-xs font-bold text-slate-200 block">Backup & Restore</span>
