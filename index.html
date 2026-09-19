@@ -105,6 +105,7 @@
               <span id="warmupBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-700 text-amber-300 ml-1">WARM-UP: <span id="warmupRemainingText">5:00</span></span>
               <span id="dualStimBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1">DUAL STIM (-15 BPM)</span>
               <span id="decayBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 ml-1">DECAY: -<span id="decayAmountText">0</span> BPM</span>
+              <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
             </div>
 
@@ -533,7 +534,7 @@
 
       <!-- 3. Intiface Central Modal (Natural Smooth Scrolling Tray) -->
       <div id="modalBodyIntiface" class="space-y-3 hidden">
-        <p class="text-xs text-slate-400">Bridge toys via Intiface Central WebSocket.</p>
+        <p class="text-xs text-slate-400">Bridge toys via Intiface Central. OSR2 / SR6 / OSSM: add the serial/T-code device in Intiface first, connect EdgeLoop to <span class="font-mono">ws://localhost:12345</span>, then use <strong>Test</strong> on each Linear and Rotate axis. Stroke maps to Linear; twist/roll map to Rotate. Assign leftover axes Secondary or OFF.</p>
         <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
           <div class="flex justify-between items-center">
             <span class="text-[10px] font-semibold text-slate-300">WebSocket URL</span>
@@ -726,15 +727,23 @@
 
         <!-- TAB 3: Audio & Mic -->
         <div id="paramsAudioSection" class="space-y-2.5 hidden">
-          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 flex items-center justify-between">
-            <div>
-              <label class="text-xs font-bold text-slate-200 block">Spoken Voice Guidance</label>
-              <p class="text-[9px] text-slate-400 leading-snug">Uses local browser text-to-speech to vocalize biofeedback cues.</p>
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
+            <div class="flex items-center justify-between">
+              <div>
+                <label class="text-xs font-bold text-slate-200 block">Spoken Voice Guidance</label>
+                <p class="text-[9px] text-slate-400 leading-snug">Uses local browser text-to-speech to vocalize biofeedback cues.</p>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                <input id="paramVoiceToggle" type="checkbox" class="sr-only peer">
+                <div class="w-8 h-4 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
             </div>
-            <label class="relative inline-flex items-center cursor-pointer shrink-0">
-              <input id="paramVoiceToggle" type="checkbox" class="sr-only peer">
-              <div class="w-8 h-4 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
-            </label>
+            <div class="flex items-center gap-2 pt-1 border-t border-slate-900">
+              <select id="paramVoiceSelect" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-slate-200 outline-none focus:border-purple-500">
+                <option value="">Browser default</option>
+              </select>
+              <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
+            </div>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
@@ -775,6 +784,9 @@
             <div id="learningStatusText" class="p-2 bg-slate-900 rounded-lg text-[10px] font-mono text-purple-300">
               Zero breakthrough events recorded. Calibrated limits active.
             </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              Tap <strong>Came Early</strong> after an accidental climax. EdgeLoop stores that locally and lowers the working climax ceiling on every future session (your typed Climax HR stays as the baseline). Wipe memory to restore the original ceiling.
+            </p>
           </div>
         </div>
 
@@ -806,7 +818,7 @@
         </div>
 
         <div id="partnerGroupSection" class="space-y-2.5 hidden">
-          <p class="text-xs text-slate-400">Command multiple wearers simultaneously.</p>
+          <p class="text-xs text-slate-400">v1 supports one remote controller. Extra joiners replace the previous connection.</p>
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <div class="text-[9px] text-slate-500 uppercase font-semibold">Group Join Link</div>
             <div class="flex gap-2">
@@ -870,12 +882,48 @@
     <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-6 space-y-5 text-center shadow-2xl">
       <h2 class="text-lg font-bold text-white">Age Verification</h2>
       <p class="text-xs text-slate-400">You must be at least <strong>18 years old</strong> to use EdgeLoop.</p>
+      <div id="fileProtocolNotice" class="hidden p-2.5 rounded-xl bg-amber-950/70 border border-amber-700 text-left space-y-1.5">
+        <p class="text-[11px] font-bold text-amber-200">Opened as a local file — the app cannot start</p>
+        <p class="text-[10px] text-amber-100/90 leading-snug">Chrome blocks the JavaScript modules when you double-click <span class="font-mono">index.html</span>. Serve the folder over http, then open that address:</p>
+        <pre class="text-[10px] font-mono text-amber-50 bg-slate-950 rounded-lg p-2 overflow-x-auto">cd ~/Desktop/EdgeLoop
+python3 -m http.server 8787</pre>
+        <p class="text-[10px] text-amber-100/90">Then visit <span class="font-mono">http://127.0.0.1:8787</span> (or use <span class="font-mono">npx wrangler dev</span>).</p>
+      </div>
       <div class="space-y-2">
         <button id="ageConfirmBtn" class="w-full bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 rounded-xl text-xs cursor-pointer">I am 18 or older — Enter</button>
         <button id="ageDenyBtn" class="w-full bg-slate-950 border border-slate-800 text-slate-400 font-bold py-2.5 rounded-xl text-xs cursor-pointer">Exit</button>
       </div>
     </div>
   </div>
+
+  <!-- Classic script so age gate / file:// warning work even if ES modules are blocked -->
+  <script>
+    (function () {
+      const overlay = document.getElementById('ageOverlay');
+      const fileNotice = document.getElementById('fileProtocolNotice');
+      const confirmBtn = document.getElementById('ageConfirmBtn');
+      const denyBtn = document.getElementById('ageDenyBtn');
+      const fileProtocol = location.protocol === 'file:';
+
+      if (fileProtocol && fileNotice) fileNotice.classList.remove('hidden');
+      if (!fileProtocol && localStorage.getItem('edgeloop_age_verified') === 'true' && overlay) {
+        overlay.classList.add('hidden');
+      }
+
+      confirmBtn?.addEventListener('click', function () {
+        localStorage.setItem('edgeloop_age_verified', 'true');
+        if (fileProtocol) return;
+        overlay?.classList.add('hidden');
+      });
+      denyBtn?.addEventListener('click', function () {
+        window.location.href = 'https://www.google.com';
+      });
+
+      window.dismissWizard = function () {
+        document.getElementById('wizardOverlay')?.classList.add('hidden');
+      };
+    })();
+  </script>
 
   <!-- Module Entrypoint -->
   <script type="module" src="./src/js/app.js"></script>

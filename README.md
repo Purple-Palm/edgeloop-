@@ -83,9 +83,11 @@ edgeloop/
         ├── app.js              # Main interface controller: connects on-screen controls to the engine, runs the 1-second clock loop, and manages menus
         ├── state.js            # Central memory store for settings, user preferences, and real-time session state
         ├── engine.js           # Biofeedback calculations: speed curves, recovery thresholds, and safety cutoffs
+        ├── engine.test.js      # Node tests for every cockpit mode, stall/crawl, warmup, and Oracle/Survival
         ├── chart.js            # Telemetry graph: draws the 60-second real-time heart rate canvas line
         ├── telemetry.js        # Data logger: converts session telemetry into downloadable .funscript files and local history
         ├── webrtc.js           # Peer-to-peer networking for remote partner control
+        ├── voice.js            # Local text-to-speech prompts and optional microphone monitor
         └── hardware/
             ├── ble.js          # Web Bluetooth driver for standard heart rate monitors and battery readouts
             ├── handy.js        # The Handy Wi-Fi API driver (speed commands and travel boundaries)
@@ -101,6 +103,12 @@ If you find a bug, want to add a device driver, or want to tweak the math, contr
 1. **Submit an Issue:** If you don't know how to code, click the **Issues** tab on GitHub and report a bug or request a toy integration.
 2. **Submit a Pull Request (PR):** If you are a developer, fork the repository, make your changes on a branch, and click **New Pull Request**.
 3. **Review & Automatic Deployment:** Incoming PRs allow us to compare code line-by-line before approving them. Once merged into the main branch, Cloudflare automatically compiles the update and deploys it live to `edgeloop.app` within ~30 seconds.
+
+Engine mode tests (no browser required):
+
+```bash
+node --test src/js/engine.test.js
+```
 
 **Live Web App:** [https://edgeloop.app](https://edgeloop.app)
 
