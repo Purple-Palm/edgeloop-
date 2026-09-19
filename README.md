@@ -107,16 +107,3 @@ If you find a bug, want to add a device driver, or want to tweak the math, contr
 **Feedback & Support:** support@edgeloop.app
 
 **GitHub:** [https://github.com/marshallmims/edgeloop](https://github.com/marshallmims/edgeloop)
-
----
-
-## Recommended Screenshots to Include (Widescreen PC)
-
-1. **The Active Cockpit in Mid-Session**
-   *The main widescreen view with a session running, showing the live 60-second heart rate telemetry curve, the throttled speed gauges, and the selected mode card.*
-2. **The Handy Configuration Modal**
-   *The dedicated Handy popup showing the Primary / Secondary / OFF role switcher, the Max Speed Cap slider, and the physical Travel Envelope inputs.*
-3. **Intiface Central Multi-Axis Toy Tray**
-   *The Intiface modal showing smooth, natural scrolling across connected multi-motor toys with individual power caps and role assignments.*
-4. **Session History & Funscript Download**
-   *The History log showing completed sessions alongside the `.funscript` and `.v0.funscript` export buttons.*
