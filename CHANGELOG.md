@@ -7,6 +7,11 @@ credited by username.
 ## Unreleased
 
 ### Games
+- **Edge Training** pulls you to the ceiling and treats a timed hold as the
+  goal (stall guard is off). Drop before the hold finishes and it does not
+  count; after the typed number of successful edges it Force-Orgasm finishes
+  you. Hold length (5-90 s, default 15) and edge count (1-20, default 5)
+  sit on the game card.
 - The Oracle no longer rolls climax or denial on the first edge. Mystery and
   Fixed durations keep those endings locked until the minimum; inside the
   window later holds are more likely to end you; the secret target is the

@@ -36,7 +36,7 @@ const running = {
 describe('engine modes', () => {
     it('lists every cockpit mode', () => {
         assert.deepEqual(ENGINE_MODES, [
-            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival'
+            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival', 'edgetrain'
         ]);
     });
 
@@ -222,6 +222,34 @@ describe('engine modes', () => {
     it('survival uses the accelerating floor', () => {
         const result = calculateEngineOutputs({ ...running, activeMode: 'survival', survivalSpeedFloor: 61 });
         assert.equal(result.primaryPercent, 61);
+    });
+
+    it('edge training pulls on the climb and crawls on a hold', () => {
+        const classic = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 120 });
+        const climb = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'climb',
+            hr: 120
+        });
+        assert.ok(climb.primaryPercent > classic.primaryPercent);
+        const hold = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'hold',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'stop'
+        });
+        assert.equal(hold.primaryPercent, 14);
+        const recover = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'recover',
+            isEdged: true,
+            hr: 140
+        });
+        assert.equal(recover.primaryPercent, 0);
     });
 
     it('warmup caps travel at session start', () => {

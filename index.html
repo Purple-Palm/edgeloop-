@@ -397,6 +397,29 @@
                 Speed steadily accelerates. Relax to stay under your limit. Breaching = Defeat.
               </p>
             </button>
+
+            <div class="sm:col-span-2">
+            <button type="button" data-mode="edgetrain" class="mode-card text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between w-full">
+              <div class="font-bold text-[11px] text-amber-300 flex justify-between items-center">
+                <span>Edge Training</span>
+                <span class="mode-check hidden text-amber-400">●</span>
+              </div>
+              <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
+                Pulls you to the ceiling and holds you there. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Stall guard is off so the hold is the goal, not a cutoff.
+              </p>
+              <div class="flex flex-wrap items-center gap-2 mt-1.5 pt-1.5 border-t border-slate-800 text-[9px] text-slate-400" data-train-settings>
+                <label class="flex items-center gap-1 font-mono">
+                  Hold
+                  <input id="trainHoldSecondsInput" type="number" min="5" max="90" value="15" class="w-12 bg-slate-900 border border-slate-700 rounded-md py-0.5 text-center text-amber-300 font-bold outline-none">
+                  s
+                </label>
+                <label class="flex items-center gap-1 font-mono">
+                  <input id="trainEdgesInput" type="number" min="1" max="20" value="5" class="w-10 bg-slate-900 border border-slate-700 rounded-md py-0.5 text-center text-amber-300 font-bold outline-none">
+                  edges, then finish
+                </label>
+              </div>
+            </button>
+            </div>
           </div>
         </div>
 

@@ -316,3 +316,78 @@ export function tickStallGuard(
 export function isSurvivalDefeated(breachTicks) {
     return (breachTicks || 0) >= SURVIVAL_BREACH_TICKS;
 }
+
+// Edge Training: climb to the pullback mark, hold there for holdGoal
+// seconds, repeat until edgesGoal successful holds, then finish.
+export const MIN_TRAIN_HOLD_SECONDS = 5;
+export const MAX_TRAIN_HOLD_SECONDS = 90;
+export const DEFAULT_TRAIN_HOLD_SECONDS = 15;
+export const MIN_TRAIN_EDGES = 1;
+export const MAX_TRAIN_EDGES = 20;
+export const DEFAULT_TRAIN_EDGES = 5;
+
+export function clampTrainHoldSeconds(value, fallback = DEFAULT_TRAIN_HOLD_SECONDS) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_TRAIN_HOLD_SECONDS, MAX_TRAIN_HOLD_SECONDS);
+}
+
+export function clampTrainEdges(value, fallback = DEFAULT_TRAIN_EDGES) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_TRAIN_EDGES, MAX_TRAIN_EDGES);
+}
+
+export function tickEdgeTraining(
+    { state: trainState = 'climb', holdSeconds = 0, edgesDone = 0 } = {},
+    { isEdged = false, released = false, holdGoal = DEFAULT_TRAIN_HOLD_SECONDS, edgesGoal = DEFAULT_TRAIN_EDGES, orgasmMode = false } = {}
+) {
+    const holdLimit = clampTrainHoldSeconds(holdGoal);
+    const need = clampTrainEdges(edgesGoal);
+    const done = Math.max(0, Number.isFinite(edgesDone) ? Math.round(edgesDone) : 0);
+    const held = Math.max(0, Number.isFinite(holdSeconds) ? Math.round(holdSeconds) : 0);
+    const idle = {
+        justHold: false,
+        justCounted: false,
+        justDropped: false,
+        justFinished: false,
+        justRecovered: false
+    };
+
+    if (orgasmMode || trainState === 'finish') {
+        return {
+            ...idle,
+            state: 'finish',
+            holdSeconds: 0,
+            edgesDone: Math.max(done, need),
+            justFinished: trainState !== 'finish' && !orgasmMode
+        };
+    }
+
+    if (trainState === 'hold') {
+        if (!isEdged) {
+            return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: done, justDropped: true };
+        }
+        const nextHold = held + 1;
+        if (nextHold >= holdLimit) {
+            const nextDone = done + 1;
+            if (nextDone >= need) {
+                return { ...idle, state: 'finish', holdSeconds: 0, edgesDone: nextDone, justCounted: true, justFinished: true };
+            }
+            return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: nextDone, justCounted: true };
+        }
+        return { ...idle, state: 'hold', holdSeconds: nextHold, edgesDone: done };
+    }
+
+    if (trainState === 'recover') {
+        if (released || !isEdged) {
+            return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: done, justRecovered: Boolean(isEdged) || released };
+        }
+        return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: done };
+    }
+
+    if (isEdged) {
+        return { ...idle, state: 'hold', holdSeconds: 1, edgesDone: done, justHold: true };
+    }
+    return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: done };
+}

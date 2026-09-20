@@ -13,6 +13,9 @@ import {
     parseSessionDuration,
     oracleTiming,
     rollOracleFate,
+    tickEdgeTraining,
+    clampTrainHoldSeconds,
+    clampTrainEdges,
     countSurvivalBreach,
     isSurvivalDefeated,
     clampStallGuardSeconds,
@@ -151,6 +154,8 @@ function syncGuardSettings() {
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
     advancedSettings.stallPauseSeconds = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
     advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
+    advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
+    advancedSettings.trainEdges = clampTrainEdges(advancedSettings.trainEdges);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
     advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
@@ -722,7 +727,8 @@ function updateEngine() {
         edgeHoldPercent: advancedSettings.edgeHoldPercent,
         ruinHoldSeconds: state.ruinHoldSeconds,
         oracleState: state.oracleState,
-        survivalSpeedFloor: state.survivalSpeedFloor
+        survivalSpeedFloor: state.survivalSpeedFloor,
+        trainingState: state.trainState
     });
 
     if (result.newEdgeTriggered) {
@@ -809,7 +815,10 @@ function sessionVoiceVars() {
         maxHr: Math.round(Number.isFinite(state.effectiveMaxHr) ? state.effectiveMaxHr : 0),
         minHr: Math.round(Number.isFinite(state.effectiveMinHr) ? state.effectiveMinHr : 0),
         edges: state.edges || 0,
-        minutes: Math.floor(Math.max(0, state.sessionSeconds || 0) / 60)
+        minutes: Math.floor(Math.max(0, state.sessionSeconds || 0) / 60),
+        done: state.trainEdgesDone || 0,
+        need: clampTrainEdges(advancedSettings.trainEdges),
+        hold: Math.max(0, clampTrainHoldSeconds(advancedSettings.trainHoldSeconds) - (state.trainHoldSeconds || 0))
     };
 }
 
@@ -877,6 +886,20 @@ function updateGameNotice() {
         else text = 'THE ORACLE: APPROACHING THE CEILING';
     } else if (state.activeMode === 'survival' && state.sessionStatus === 'RUNNING') {
         text = `SURVIVAL: FLOOR ${Math.round(state.survivalSpeedFloor)}% — STAY UNDER YOUR LIMIT`;
+    } else if (state.activeMode === 'edgetrain' && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
+        const need = clampTrainEdges(advancedSettings.trainEdges);
+        const done = state.trainEdgesDone || 0;
+        const holdGoal = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
+        if (state.trainState === 'hold') {
+            const left = Math.max(0, holdGoal - (state.trainHoldSeconds || 0));
+            text = `EDGE TRAINING: HOLD ${left}s — ${done}/${need} EDGES`;
+        } else if (state.trainState === 'recover') {
+            text = `EDGE TRAINING: RECOVER — ${done}/${need} EDGES`;
+        } else if (state.trainState === 'finish') {
+            text = 'EDGE TRAINING: COMPLETE — COME';
+        } else {
+            text = `EDGE TRAINING: CLIMB — ${done}/${need} EDGES`;
+        }
     }
     notice.textContent = text || 'GAME MODE ACTIVE';
     notice.classList.toggle('hidden', !text);
@@ -952,6 +975,9 @@ function resetGameState() {
     state.survivalTimer = 0;
     state.survivalBreachTicks = 0;
     state.survivalLastReadingAt = null;
+    state.trainState = 'climb';
+    state.trainHoldSeconds = 0;
+    state.trainEdgesDone = 0;
     state.edgeStallSeconds = 0;
     state.stallPauseElapsed = 0;
     state.stallGuardEngaged = false;
@@ -980,7 +1006,7 @@ function tickSessionGuardsAndGames() {
     // at the ceiling.
     const crawlAtCeiling = advancedSettings.ceilingBehaviour !== 'stop';
     const guardArmed = Boolean(advancedSettings.stallGuard) && crawlAtCeiling && !state.orgasmMode
-        && state.activeMode !== 'oracle' && state.activeMode !== 'survival';
+        && state.activeMode !== 'oracle' && state.activeMode !== 'survival' && state.activeMode !== 'edgetrain';
     const guard = tickStallGuard(
         { holdSeconds: state.edgeStallSeconds, pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged },
         {
@@ -1099,6 +1125,27 @@ function tickSessionGuardsAndGames() {
             return;
         }
         if (state.survivalBreachTicks > 0) cueVoice('survivalBreach');
+    } else if (state.activeMode === 'edgetrain') {
+        const next = tickEdgeTraining(
+            { state: state.trainState, holdSeconds: state.trainHoldSeconds, edgesDone: state.trainEdgesDone },
+            {
+                isEdged: state.isEdged,
+                released: hasReleasedEdge(hr, ceiling, state.edgeTriggerHr),
+                holdGoal: advancedSettings.trainHoldSeconds,
+                edgesGoal: advancedSettings.trainEdges,
+                orgasmMode: state.orgasmMode
+            }
+        );
+        state.trainState = next.state;
+        state.trainHoldSeconds = next.holdSeconds;
+        state.trainEdgesDone = next.edgesDone;
+        if (next.justHold) cueVoice('trainHold');
+        if (next.justCounted && !next.justFinished) cueVoice('trainHeld');
+        if (next.justDropped) cueVoice('trainDrop');
+        if (next.justFinished) {
+            if (!state.orgasmMode) setOrgasmMode(true);
+            cueVoice('trainFinish');
+        }
     }
 }
 
@@ -1308,7 +1355,9 @@ setInterval(() => {
         if (!state.endgameFired && state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
             const oracleResolving = state.activeMode === 'oracle'
                 && (state.oracleState === 'HOLD' || state.oracleState === 'CLIMAX' || state.orgasmMode);
-            if (!oracleResolving) {
+            const trainResolving = state.activeMode === 'edgetrain'
+                && (state.trainState === 'finish' || state.orgasmMode);
+            if (!oracleResolving && !trainResolving) {
                 state.endgameFired = true;
                 handleTargetTimeReached();
             }
@@ -1650,6 +1699,22 @@ modeCards.forEach(card => {
     });
 });
 
+function persistTrainSettings() {
+    advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(document.getElementById('trainHoldSecondsInput')?.value);
+    advancedSettings.trainEdges = clampTrainEdges(document.getElementById('trainEdgesInput')?.value);
+    const holdEl = document.getElementById('trainHoldSecondsInput');
+    const edgesEl = document.getElementById('trainEdgesInput');
+    if (holdEl) holdEl.value = String(advancedSettings.trainHoldSeconds);
+    if (edgesEl) edgesEl.value = String(advancedSettings.trainEdges);
+    persistSettings();
+}
+
+['trainHoldSecondsInput', 'trainEdgesInput'].forEach((id) => {
+    const el = document.getElementById(id);
+    el?.addEventListener('click', (e) => e.stopPropagation());
+    el?.addEventListener('change', persistTrainSettings);
+});
+
 // Pop-up Modals Router
 const overlay = document.getElementById('modalOverlay');
 const modalTitle = document.getElementById('modalTitle');
@@ -1822,6 +1887,10 @@ function syncParamsUI() {
     const holdInput = document.getElementById('edgeHoldPercentInput');
     if (holdInput) holdInput.value = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
     updateEdgeHoldPreview();
+    const trainHold = document.getElementById('trainHoldSecondsInput');
+    const trainEdges = document.getElementById('trainEdgesInput');
+    if (trainHold) trainHold.value = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
+    if (trainEdges) trainEdges.value = clampTrainEdges(advancedSettings.trainEdges);
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
     if (dualBpm) dualBpm.value = advancedSettings.dualDampeningBpm || 15;
     if (decayToggle) decayToggle.checked = Boolean(advancedSettings.adaptiveDecay);

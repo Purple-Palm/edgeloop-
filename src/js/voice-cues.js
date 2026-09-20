@@ -5,7 +5,7 @@
 export const MAX_CUE_LENGTH = 140;
 export const MAX_PHRASES_PER_CUE = 120;
 
-export const VOICE_CUE_VARS = ['hr', 'maxHr', 'minHr', 'edges', 'minutes'];
+export const VOICE_CUE_VARS = ['hr', 'maxHr', 'minHr', 'edges', 'minutes', 'done', 'need', 'hold'];
 
 export const MIN_ENCOURAGE_SECONDS = 0;
 export const MAX_ENCOURAGE_SECONDS = 180;
@@ -111,6 +111,46 @@ export const VOICE_CUE_CATALOG = [
     { id: 'oracleNotYet', group: 'Climax', label: 'Oracle too early to end', lines: ['Not yet. Keep climbing.', 'Too soon. The Oracle is still watching.'] },
     { id: 'oracleWithdrawn', group: 'Climax', label: 'Oracle climax cancelled', lines: ['Climax withdrawn. Climb again.'] },
     { id: 'oracleReset', group: 'Climax', label: 'Oracle purgatory reset', lines: ['Purgatory resets. Climb again.'] },
+    {
+        id: 'trainHold',
+        group: 'Training',
+        label: 'Edge training: hold',
+        lines: [
+            'Hold it. {hold} seconds.',
+            'Stay on the edge. Hold.',
+            'Don\'t come. Hold it there.'
+        ]
+    },
+    {
+        id: 'trainHeld',
+        group: 'Training',
+        label: 'Edge training: edge counted',
+        lines: [
+            'Edge held. {done} of {need}.',
+            'Good. Recover, then climb. {done} of {need}.',
+            'That one counts. {done} down, keep going.'
+        ]
+    },
+    {
+        id: 'trainDrop',
+        group: 'Training',
+        label: 'Edge training: dropped early',
+        lines: [
+            'Dropped. That one does not count.',
+            'Too soon. Climb and hold again.',
+            'Off the edge. Try a longer hold.'
+        ]
+    },
+    {
+        id: 'trainFinish',
+        group: 'Training',
+        label: 'Edge training: complete',
+        lines: [
+            'Training complete. Come.',
+            '{need} edges. You can finish.',
+            'You held them. Come now.'
+        ]
+    },
     {
         id: 'cameEarly',
         group: 'Premature',

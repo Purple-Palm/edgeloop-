@@ -37,6 +37,8 @@ describe('voice cue templates', () => {
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'edge')?.group, 'Edge');
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'forceOrgasm')?.group, 'Climax');
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'cameEarly')?.group, 'Premature');
+        assert.ok(DEFAULT_VOICE_CUES.trainFinish.length >= 2);
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'trainHold')?.group, 'Training');
     });
 
     it('interpolates known tokens and leaves unknown braces alone', () => {
@@ -45,6 +47,7 @@ describe('voice cue templates', () => {
             'Edge at 147 of 140. {nope}'
         );
         assert.equal(interpolateCue('Hello {edges}', { edges: 3 }), 'Hello 3');
+        assert.equal(interpolateCue('{done} of {need}, {hold}s', { done: 2, need: 5, hold: 9 }), '2 of 5, 9s');
         assert.equal(interpolateCue('', { hr: 1 }), '');
     });
 

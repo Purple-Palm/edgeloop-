@@ -16,7 +16,8 @@ export const ENGINE_MODES = [
     'ultimate',
     'ruin',
     'oracle',
-    'survival'
+    'survival',
+    'edgetrain'
 ];
 
 // Hysteresis: once edged, the flag only clears when HR drops MORE than this
@@ -115,7 +116,8 @@ export function calculateEngineOutputs({
     edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,
     ruinHoldSeconds = 0,
     oracleState = 'IDLE',
-    survivalSpeedFloor = 30
+    survivalSpeedFloor = 30,
+    trainingState = 'climb'
 }) {
     const mode = resolveEngineMode(activeMode);
     // The hardware envelope is normalised here so an inverted, narrow or
@@ -211,6 +213,12 @@ export function calculateEngineOutputs({
         primaryPercent = orgasmMode ? 100 : floor;
         secondaryPercent = orgasmMode ? 100 : Math.round(floor * 0.7);
         strokeMaxPercent = Math.round(100 - (progress * depthContractAmount * 0.4));
+    } else if (mode === 'edgetrain') {
+        const train = applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent);
+        primaryPercent = train.primary;
+        secondaryPercent = train.secondary;
+        strokeMinPercent = train.strokeMin;
+        strokeMaxPercent = train.strokeMax;
     } else if (mode === 'classic') {
         applyClassicTease();
     } else if (mode === 'milker') {
@@ -360,6 +368,39 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             break;
         }
         case 'APPROACH':
+        default: {
+            const pull = Math.round(48 + progress * 52);
+            out.primary = nextIsEdged ? 14 : pull;
+            out.secondary = nextIsEdged ? 40 : Math.round(30 + progress * 50);
+            out.strokeMax = 100;
+        }
+    }
+    return out;
+}
+
+function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent = CRAWL_PERCENT) {
+    const out = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
+    if (orgasmMode) {
+        out.primary = 100;
+        out.secondary = 100;
+        return out;
+    }
+    if (trainingState === 'finish') {
+        out.primary = nextIsEdged ? crawlPercent : 100;
+        out.secondary = nextIsEdged ? crawlPercent : 100;
+        return out;
+    }
+    switch (trainingState) {
+        case 'hold':
+            out.primary = 14;
+            out.secondary = 55;
+            out.strokeMax = 70;
+            break;
+        case 'recover':
+            out.primary = 0;
+            out.secondary = 35;
+            out.strokeMax = 55;
+            break;
         default: {
             const pull = Math.round(48 + progress * 52);
             out.primary = nextIsEdged ? 14 : pull;

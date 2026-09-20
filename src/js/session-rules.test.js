@@ -9,6 +9,15 @@ import {
     parseSessionDuration,
     oracleTiming,
     rollOracleFate,
+    tickEdgeTraining,
+    clampTrainHoldSeconds,
+    clampTrainEdges,
+    DEFAULT_TRAIN_HOLD_SECONDS,
+    DEFAULT_TRAIN_EDGES,
+    MIN_TRAIN_HOLD_SECONDS,
+    MAX_TRAIN_HOLD_SECONDS,
+    MIN_TRAIN_EDGES,
+    MAX_TRAIN_EDGES,
     countSurvivalBreach,
     isSurvivalDefeated,
     MIN_STALL_GUARD_SECONDS,
@@ -295,5 +304,52 @@ describe('stall guard', () => {
         assert.equal(released.justReleased, true);
         const idle = tickStallGuard({ holdSeconds: 0, engaged: false }, { armed: false, isEdged: true, holdTimeoutSeconds: 8, pauseTimeoutSeconds: 8 });
         assert.equal(idle.justReleased, false);
+    });
+});
+
+describe('edge training', () => {
+    it('clamps hold seconds and edge counts', () => {
+        assert.equal(clampTrainHoldSeconds(15), 15);
+        assert.equal(clampTrainHoldSeconds(2), MIN_TRAIN_HOLD_SECONDS);
+        assert.equal(clampTrainHoldSeconds(400), MAX_TRAIN_HOLD_SECONDS);
+        assert.equal(clampTrainHoldSeconds('nope'), DEFAULT_TRAIN_HOLD_SECONDS);
+        assert.equal(clampTrainEdges(5), 5);
+        assert.equal(clampTrainEdges(0), MIN_TRAIN_EDGES);
+        assert.equal(clampTrainEdges(99), MAX_TRAIN_EDGES);
+        assert.equal(clampTrainEdges('x'), DEFAULT_TRAIN_EDGES);
+    });
+
+    it('counts a full hold as one edge and finishes at the goal', () => {
+        let t = { state: 'climb', holdSeconds: 0, edgesDone: 0 };
+        t = tickEdgeTraining(t, { isEdged: true, holdGoal: 5, edgesGoal: 2 });
+        assert.equal(t.state, 'hold');
+        assert.equal(t.justHold, true);
+        assert.equal(t.holdSeconds, 1);
+        for (let i = 0; i < 3; i++) {
+            t = tickEdgeTraining(t, { isEdged: true, holdGoal: 5, edgesGoal: 2 });
+        }
+        assert.equal(t.state, 'hold');
+        t = tickEdgeTraining(t, { isEdged: true, holdGoal: 5, edgesGoal: 2 });
+        assert.equal(t.justCounted, true);
+        assert.equal(t.edgesDone, 1);
+        assert.equal(t.state, 'recover');
+        t = tickEdgeTraining(t, { isEdged: false, released: true, holdGoal: 5, edgesGoal: 2 });
+        assert.equal(t.state, 'climb');
+        t = tickEdgeTraining(t, { isEdged: true, holdGoal: 5, edgesGoal: 2 });
+        for (let i = 0; i < 4; i++) {
+            t = tickEdgeTraining(t, { isEdged: true, holdGoal: 5, edgesGoal: 2 });
+        }
+        assert.equal(t.state, 'finish');
+        assert.equal(t.justFinished, true);
+        assert.equal(t.edgesDone, 2);
+    });
+
+    it('a dropped hold does not count', () => {
+        let t = tickEdgeTraining({ state: 'climb' }, { isEdged: true, holdGoal: 8, edgesGoal: 3 });
+        t = tickEdgeTraining(t, { isEdged: true, holdGoal: 8, edgesGoal: 3 });
+        t = tickEdgeTraining(t, { isEdged: false, holdGoal: 8, edgesGoal: 3 });
+        assert.equal(t.justDropped, true);
+        assert.equal(t.edgesDone, 0);
+        assert.equal(t.state, 'recover');
     });
 });

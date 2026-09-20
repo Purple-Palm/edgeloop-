@@ -282,6 +282,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   await step('mode cards click', async () => {
     await page.getByText(/prostate milker/i).first().click().catch(() => {}); await sleep(200);
     await page.getByText(/classic tease/i).first().click().catch(() => {}); await sleep(200);
+    await page.locator('#expTabGameBtn').click().catch(() => {}); await sleep(150);
+    if (!(await page.locator('[data-mode="edgetrain"]').count())) throw new Error('edge training game missing');
+    await page.locator('[data-mode="edgetrain"]').click(); await sleep(150);
+    if (!(await page.locator('#trainHoldSecondsInput').count())) throw new Error('edge training hold input missing');
   });
   await step('connect the mocked Handy', async () => {
     await page.locator('#cardHandy').click(); await sleep(300);

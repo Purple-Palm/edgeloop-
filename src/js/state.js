@@ -75,6 +75,9 @@ export const state = {
     // Timestamp of the reading the last Survival tick judged, so a value held
     // across ticks by a slow source counts as one breach reading.
     survivalLastReadingAt: null,
+    trainState: 'climb',
+    trainHoldSeconds: 0,
+    trainEdgesDone: 0,
     lastSpokenPrompt: '',
     lastCueTemplateById: {},
     lastSpokenAt: 0,
@@ -105,6 +108,8 @@ export const advancedSettings = {
     ceilingBehaviour: 'crawl',
     // Pullback as a percent of typed Climax HR (90-115, default 100).
     edgeHoldPercent: 100,
+    trainHoldSeconds: 15,
+    trainEdges: 5,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,
