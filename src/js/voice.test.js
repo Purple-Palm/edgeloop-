@@ -3,12 +3,17 @@ import assert from 'node:assert/strict';
 import {
     voiceBandLevel,
     clampMicGate,
-    MIC_VOICE_BAND_LO_HZ,
-    MIC_VOICE_BAND_HI_HZ,
+    clampMicBoostBpm,
+    micBoostFromLevel,
     MIN_MIC_GATE,
     MAX_MIC_GATE,
     DEFAULT_MIC_GATE,
-    sampleMicLevel
+    MIN_MIC_BOOST_BPM,
+    MAX_MIC_BOOST_BPM,
+    DEFAULT_MIC_BOOST_BPM,
+    sampleMicLevel,
+    MIC_VOICE_BAND_LO_HZ,
+    MIC_VOICE_BAND_HI_HZ
 } from './voice.js';
 
 const SAMPLE_RATE = 44100;
@@ -62,5 +67,24 @@ describe('microphone voice-band gate', () => {
         assert.equal(voiceBandLevel(null, SAMPLE_RATE, FFT_SIZE), 0);
         assert.equal(sampleMicLevel({}), 0);
         assert.equal(sampleMicLevel({ micAnalyser: null }), 0);
+    });
+});
+
+describe('microphone loudness boost', () => {
+    it('clamps the extra-BPM cap', () => {
+        assert.equal(clampMicBoostBpm(-3), MIN_MIC_BOOST_BPM);
+        assert.equal(clampMicBoostBpm(99), MAX_MIC_BOOST_BPM);
+        assert.equal(clampMicBoostBpm('8'), DEFAULT_MIC_BOOST_BPM);
+        assert.equal(clampMicBoostBpm('nope'), DEFAULT_MIC_BOOST_BPM);
+        assert.equal(clampMicBoostBpm(0), 0);
+    });
+
+    it('is silent at or under the gate and scales up to the cap', () => {
+        assert.equal(micBoostFromLevel(40, 40, 8), 0);
+        assert.equal(micBoostFromLevel(20, 40, 8), 0);
+        assert.equal(micBoostFromLevel(100, 40, 8), 8);
+        assert.equal(micBoostFromLevel(70, 40, 8), 4);
+        assert.equal(micBoostFromLevel(100, 40, 0), 0);
+        assert.ok(micBoostFromLevel(90, 40, 8) > micBoostFromLevel(50, 40, 8));
     });
 });

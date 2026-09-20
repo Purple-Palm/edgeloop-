@@ -186,8 +186,11 @@ credited by username.
 - The microphone monitor starts from a user gesture (a "tap to re-enable"
   button appears when the browser withholds the permission) and its boost
   is clamped to the effective ceiling. Session Setup has a live meter, a
-  Test button and a noise-gate slider; the sampler uses the 250-4000 Hz
-  voice band so toy motors do not trip it.
+  Test button, a noise-gate slider, and a **louder → closer** cap (0-20
+  extra BPM, default 8, 0 = listen only). Louder voice/panting above the
+  gate raises the working heart rate so the loop treats you as nearer the
+  edge; the cockpit shows MIC +N while it is boosting. The sampler uses
+  the 250-4000 Hz voice band so toy motors do not trip it.
 - Spoken Voice Guidance shows the current cue on the dashboard and speaks
   it. Each event is a list of phrases (one per line, randomly rotated).
   Phrase files can be imported/exported on the Audio tab and are included

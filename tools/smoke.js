@@ -245,6 +245,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     await page.locator('#paramsTabAudioBtn').click(); await sleep(150);
     if (!(await page.locator('#paramMicTestBtn').count())) throw new Error('mic test button missing');
     if (!(await page.locator('#micGateInput').count())) throw new Error('mic noise gate missing');
+    if (!(await page.locator('#micBoostBpmInput').count())) throw new Error('mic extra BPM slider missing');
     if (!(await page.locator('#voiceCuesList [data-voice-cue]').count())) throw new Error('voice cue editor missing');
     if (!(await page.locator('#voiceCuesExportBtn').count())) throw new Error('voice phrase export missing');
     for (const id of ['edge', 'encourage', 'forceOrgasm', 'cameEarly']) {
