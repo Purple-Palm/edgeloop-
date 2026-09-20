@@ -30,7 +30,7 @@ EdgeLoop runs 100% locally in your web browser with zero accounts, zero subscrip
 * **Session Guards:**
   * *Dual Stimulation Dampening:* Automatically offsets your climax ceiling down (default: -15 BPM) when internal/prostate toys are active alongside a stroker to balance out nerve summation.
   * *Adaptive Ceiling Decay:* Automatically steps down your climax ceiling as edges accumulate over long sessions to counteract physical fatigue.
-  * *Stall Guard & Safety Watchdog:* Halts motor outputs if your heart rate signal disconnects or stays clamped at peak levels for too long during Crawl Mode.
+  * *Stall Guard & Safety Watchdog:* Halts motor outputs if your heart rate signal is lost or stays clamped at peak levels for too long during Crawl Mode. The signal watchdog holds the last valid reading through short gaps (watches and relay apps often update only every 2-5 s), pauses the session after a configurable signal-loss timeout (3-20 s, default 8), flags poor electrode contact, and can resume automatically once readings return. A dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost.
 * **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate) and *Survival Mode*.
 * **Session Telemetry & Funscript Export:** Automatically logs session metrics and exports dual-channel `.funscript` (primary stroker) and `.v0.funscript` (secondary vibrator) files directly to your machine for replay in external players like ScriptPlayer or HereSphere.
 * **Remote & Group Partner Control:** Peer-to-peer WebRTC room links allow a partner (or group host) anywhere in the world to view live heart rate telemetry and manage the session remotely.
@@ -83,13 +83,22 @@ edgeloop/
         ├── app.js              # Main interface controller: connects on-screen controls to the engine, runs the 1-second clock loop, and manages menus
         ├── state.js            # Central memory store for settings, user preferences, and real-time session state
         ├── engine.js           # Biofeedback calculations: speed curves, recovery thresholds, and safety cutoffs
-        ├── engine.test.js      # Node tests for every cockpit mode, stall/crawl, warmup, and Oracle/Survival
+        ├── engine.test.js      # Node tests for every cockpit mode, stall/crawl, warmup, hysteresis, and Oracle/Survival
+        ├── session-rules.js    # Pure session rules: effective ceiling (offsets, decay floor, overdrive boost), HR-limit and duration validation, Survival breach counter
+        ├── session-rules.test.js
+        ├── funscript.js        # Pure funscript builder: turns the 4 Hz speed/zone timeline into .funscript stroke actions and .v0.funscript vibration levels
+        ├── funscript.test.js
+        ├── storage.js          # Robust localStorage helpers: corrupt-JSON-safe reads, quota-safe writes, oldest-first history trimming
+        ├── storage.test.js
+        ├── hr-watchdog.js      # Pure heart-rate signal watchdog: ok / holding / stale verdicts, no-contact flag, one-shot trip and recovery
+        ├── hr-watchdog.test.js
         ├── chart.js            # Telemetry graph: draws the 60-second real-time heart rate canvas line
-        ├── telemetry.js        # Data logger: converts session telemetry into downloadable .funscript files and local history
         ├── webrtc.js           # Peer-to-peer networking for remote partner control
         ├── voice.js            # Local text-to-speech prompts and optional microphone monitor
         └── hardware/
-            ├── ble.js          # Web Bluetooth driver for standard heart rate monitors and battery readouts
+            ├── ble.js          # Web Bluetooth driver for standard heart rate monitors: notifications, battery, automatic reconnect
+            ├── ble-protocol.js # Pure GATT Heart Rate Measurement parser (BPM, sensor-contact bits, RR intervals), reconnect schedule, browser-support and error messages
+            ├── ble-protocol.test.js
             ├── handy.js        # The Handy Wi-Fi API driver (speed commands and travel boundaries)
             └── intiface.js     # Intiface / Buttplug.io WebSocket driver for multi-motor vibrators, strokers, and rotators
 ```

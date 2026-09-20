@@ -157,6 +157,9 @@ function markOffline(reason) {
     handyStartInFlight = false;
     commandGeneration += 1;
     stopOfflinePolling();
+    // Best-effort single stop with the old key: if the device is merely slow
+    // rather than gone, this is what brings it to rest.
+    if (handyKey) handyRequest('/hamp/stop', { method: 'PUT', key: handyKey, countFailure: false }).catch(() => {});
     if (typeof handlers.onOffline === 'function') {
         try { handlers.onOffline(reason); } catch (e) {}
     }
@@ -323,8 +326,15 @@ async function startHamp(velocity) {
         if (generation !== commandGeneration) {
             // A stop or disconnect happened while start was in flight. The
             // device may now be moving even though we asked it to stop, so
-            // send another verified stop rather than trusting the earlier one.
-            if (handyConnected) stopWithRetry(handyKey).catch(() => {});
+            // wait for any stop that is still in flight (it may have reached
+            // the device before this start did) and then send a fresh
+            // verified stop rather than trusting the earlier one.
+            if (handyConnected) {
+                const pending = handyStopInFlight || Promise.resolve();
+                pending.catch(() => {}).then(() => {
+                    if (handyConnected) return stopWithRetry(handyKey);
+                }).catch(() => {});
+            }
             return;
         }
         handyIsHampRunning = true;

@@ -102,10 +102,14 @@
               <span class="text-xs text-slate-400 font-mono">BPM</span>
               <span id="hrWarningTag" class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/60 border border-rose-800 text-rose-300 ml-1">BLE REQUIRED</span>
               <span id="simActiveTag" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1">SIMULATOR ACTIVE</span>
+              <span id="hrContactHint" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1" title="The sensor is transmitting but reports no pulse. Wet the electrodes or tighten the strap / watch band.">NO SKIN CONTACT</span>
+              <span id="hrHoldHint" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-800 border border-slate-600 text-slate-300 ml-1" title="No fresh reading yet; the last valid pulse is kept until the signal-loss timeout.">HOLDING LAST READING</span>
+              <span id="hrSignalBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">SIGNAL RESTORED</span>
               <span id="warmupBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-700 text-amber-300 ml-1">WARM-UP: <span id="warmupRemainingText">5:00</span></span>
               <span id="dualStimBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1">DUAL STIM (-15 BPM)</span>
               <span id="decayBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 ml-1">DECAY: -<span id="decayAmountText">0</span> BPM</span>
               <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
+              <span id="effectiveCeilingBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1" title="The climax ceiling the engine is using right now, after every offset"><span id="effectiveCeilingLabel">CEILING</span> <span id="effectiveCeilingText">140</span> BPM</span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
             </div>
 
@@ -125,8 +129,8 @@
           <!-- 60-Second Real-Time Canvas -->
           <div class="relative">
             <canvas id="hrChart" width="800" height="110" class="w-full h-20 sm:h-24 bg-slate-950 rounded-xl border border-slate-800/80"></canvas>
-            <div id="staleAlert" class="absolute inset-0 bg-slate-950/85 backdrop-blur-[1px] rounded-xl flex items-center justify-center text-xs font-bold text-rose-400 hidden">
-              WATCHDOG: SIGNAL LOST, MOTORS HALTED
+            <div id="staleAlert" class="absolute inset-0 bg-slate-950/85 backdrop-blur-[1px] rounded-xl flex items-center justify-center text-center px-3 text-xs font-bold text-rose-400 hidden">
+              <span id="staleAlertText">WATCHDOG: NO HEART-RATE READING, MOTORS HALTED</span>
             </div>
           </div>
 
@@ -175,7 +179,7 @@
             CLIMAX LIMIT REACHED: PRIMARY CUT — SECONDARY MILKING ACTIVE
           </div>
           <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse">
-            PROLONGED CEILING LOCK: MOTORS HALTED UNTIL PULSE RECOVERS
+            PROLONGED CEILING LOCK: PRIMARY HALTED UNTIL PULSE RECOVERS
           </div>
           <div id="gameNotice" class="hidden text-center text-[11px] font-bold text-purple-300 bg-purple-950/50 border border-purple-800/80 rounded-lg py-1 animate-pulse">
             GAME MODE ACTIVE
@@ -451,6 +455,7 @@
               Disconnect
             </button>
           </div>
+          <div id="modalBleMsg" class="text-xs leading-snug text-slate-500">Status: Not connected</div>
           <button id="bleQuickHelpBtn" class="text-[10px] text-purple-400 hover:underline block text-center w-full pt-0.5 cursor-pointer">
             Apple Watch / Pixel Watch Pairing Guide &rarr;
           </button>
@@ -478,7 +483,7 @@
           <label class="text-[10px] text-slate-300 font-semibold block uppercase tracking-wider">Connection Key</label>
           <input id="modalHandyInput" type="text" placeholder="e.g. 12345678" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 font-mono text-xs outline-none focus:border-rose-500 text-slate-200">
         </div>
-        <div id="modalHandyMsg" class="text-xs text-slate-500">Status: Disconnected</div>
+        <div id="modalHandyMsg" class="text-xs text-slate-500">Status: Offline</div>
 
         <!-- Handy Stimulation Role & Speed Cap -->
         <div class="pt-3 border-t border-slate-800 space-y-2.5">
@@ -669,7 +674,7 @@
               </label>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Cuts primary motors to 0% if trapped near ceiling too long during crawl mode.
+              Cuts the primary stroker to 0% if trapped near the ceiling too long during crawl mode. The secondary channel keeps running.
             </p>
             <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
               <span class="text-[9px] text-slate-400 font-semibold">Timeout:</span>
@@ -677,6 +682,33 @@
                 <input id="stallGuardSecondsInput" type="number" min="3" max="25" value="8" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
                 <span class="text-slate-500 text-[10px]">sec</span>
               </div>
+            </div>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-slate-200">Heart-Rate Signal Watchdog</label>
+              <span class="text-[9px] font-mono text-rose-400 font-bold">ALWAYS ON</span>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              Stops every motor and pauses the session when no usable pulse has arrived for the timeout. A short gap keeps the last reading instead of dropping to 0. Watches and relay apps often update only every 2-5 s, so keep this at 8 s or more for them.
+            </p>
+            <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
+              <span class="text-[9px] text-slate-400 font-semibold">Signal-loss timeout:</span>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="hrStaleSecondsInput" type="number" min="3" max="20" value="8" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec</span>
+              </div>
+            </div>
+            <div class="flex items-center justify-between pt-1 border-t border-slate-900">
+              <div>
+                <span class="text-[9px] text-slate-400 font-semibold block">Auto-resume when signal returns</span>
+                <span class="text-[8px] text-slate-500 block">Off: the session stays paused until you press RESUME.</span>
+              </div>
+              <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                <input id="hrAutoResumeToggle" type="checkbox" checked class="sr-only peer">
+                <div class="w-8 h-4 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
             </div>
           </div>
 
