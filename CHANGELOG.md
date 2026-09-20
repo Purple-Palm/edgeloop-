@@ -21,6 +21,21 @@ credited by username.
 - Full Length Strokes respects the hardware travel envelope; envelope inputs
   are validated and the upper bound is no longer locked at 60% (SDuna).
 
+### TCode Serial (OSR2 / SR6 / OSSM)
+- New "TCode Serial" device card: OSR2, SR6, OSSM and other T-Code v0.3
+  strokers connect straight over their USB serial port (Web Serial, 115200
+  8N1) without Intiface Central, which exposes an OSR2 as a single linear
+  axis (requested by dapo, NikolaiX and Redbird). The device is identified
+  with D0 / D1 / D2; a silent device falls back to the L0 / R0 / R1 / R2 / V0
+  set. Every axis has a Primary / Secondary / OFF role, a cap, a Test button
+  and (linear axes) an invert switch; settings are remembered per device
+  name. L0 is Primary and V0 Secondary by default, everything else OFF.
+- Linear and rotation axes use the shared stroke planner (one command per
+  leg, nothing re-sent mid-leg); rotation axes swing around centre by the
+  engine speed. STOP, pause, Reset and every disconnect alert bring all axes
+  to rest on one line; an unplugged device or a failed write pauses the
+  session. Browsers without Web Serial get a clear message.
+
 ### Session engine and lifecycle
 - Force Orgasm is a boost on the working ceiling and is always cleared by
   STOP and Reset; the typed Climax HR is never rewritten.

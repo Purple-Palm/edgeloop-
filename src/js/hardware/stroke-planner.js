@@ -1,0 +1,110 @@
+// Per-axis stroke scheduler for Buttplug LinearCmd actuators (OSR2 / SR6 /
+// OSSM through Intiface). Pure: no timers, no sockets. The driver feeds it
+// the engine's inputs and asks "what should be sent now?"; the planner
+// answers with at most ONE leg at a time and never re-issues a leg that is
+// still in flight, which is what keeps the motion smooth.
+//
+// Rules:
+//   - A stroke alternates between zone min and zone max; each leg is one
+//     LinearCmd carrying the FULL leg duration.
+//   - Speed, cap and zone changes apply to the NEXT leg only.
+//   - Speed 0, role OFF, pause or stop -> a single move to the rest position
+//     (zone min) over REST_MOVE_MS, then silence until speed > 0 again.
+
+export const FAST_LEG_MS = 180;
+export const SLOW_LEG_MS = 2200;
+export const MIN_LEG_MS = 120;
+export const MIN_TRAVEL = 0.08;
+export const REST_MOVE_MS = 400;
+
+function clamp01(v, fallback = 0) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(1, n));
+}
+
+function clampPercent(v, fallback = 0) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(0, Math.min(100, n));
+}
+
+// One leg's duration: 100 % speed ~ 180 ms per leg, 0 % ~ 2200 ms, scaled by
+// the travel (a 40 % zone takes 40 % of the time), never below MIN_LEG_MS.
+export function legDurationMs(speedPercent, travel) {
+    const speed = clampPercent(speedPercent);
+    const span = Math.max(MIN_TRAVEL, clamp01(travel));
+    const duration = FAST_LEG_MS + ((100 - speed) / 100) * (SLOW_LEG_MS - FAST_LEG_MS);
+    return Math.max(MIN_LEG_MS, Math.round(duration * span));
+}
+
+// Normalise the planner inputs: percentages clamped, zone ordered.
+export function normalizePlannerInput({ speed = 0, zoneMin = 0, zoneMax = 1, cap = 100, enabled = true } = {}) {
+    const min = clamp01(zoneMin, 0);
+    const max = Math.max(min, clamp01(zoneMax, 1));
+    const capPct = clampPercent(cap, 100);
+    const effectiveSpeed = clampPercent(speed) * (capPct / 100);
+    return { speed: clampPercent(speed), cap: capPct, effectiveSpeed, zoneMin: min, zoneMax: max, enabled: enabled !== false };
+}
+
+export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
+    let input = normalizePlannerInput({});
+    let legEndsAt = 0;
+    let lastPosition = null;      // null: position unknown (fresh axis)
+    let atRest = false;           // a rest move has been issued and nothing since
+    let goingUp = true;           // direction of the next stroke leg
+
+    function isInFlight(now) {
+        return now < legEndsAt;
+    }
+
+    return {
+        // Update the inputs. Takes effect on the next leg; never interrupts one.
+        setInput(next) {
+            input = normalizePlannerInput({ ...input, ...next });
+        },
+        getInput() {
+            return { ...input };
+        },
+        isInFlight,
+        legEndsAt() {
+            return legEndsAt;
+        },
+        isResting() {
+            return atRest;
+        },
+        lastPosition() {
+            return lastPosition;
+        },
+        // The leg to send right now, or null when nothing should be sent
+        // (a leg is in flight, or the axis is already resting).
+        next(now) {
+            if (isInFlight(now)) return null;
+            const active = input.enabled && input.effectiveSpeed > 0;
+            if (!active) {
+                if (atRest) return null;
+                atRest = true;
+                goingUp = true;
+                lastPosition = input.zoneMin;
+                legEndsAt = now + restMs;
+                return { position: input.zoneMin, durationMs: restMs, kind: 'rest' };
+            }
+            atRest = false;
+            const travel = input.zoneMax - input.zoneMin;
+            const position = goingUp ? input.zoneMax : input.zoneMin;
+            const durationMs = legDurationMs(input.effectiveSpeed, travel);
+            goingUp = !goingUp;
+            lastPosition = position;
+            legEndsAt = now + durationMs;
+            return { position, durationMs, kind: 'stroke' };
+        },
+        // Forget the in-flight leg (device removed, socket closed). The next
+        // call to next() with speed 0 issues a fresh rest move.
+        reset() {
+            legEndsAt = 0;
+            lastPosition = null;
+            atRest = false;
+            goingUp = true;
+        }
+    };
+}

@@ -10,7 +10,7 @@ import {
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
-import { drawTelemetryChart } from './chart.js';
+import { drawTelemetryChart, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
@@ -21,14 +21,60 @@ import {
     disconnectIntiface,
     rescanIntiface,
     dispatchIntiface,
+    stopAllIntiface,
     setAxisRole,
     setAxisMaxCap,
+    setAxisInvert,
+    setDeviceRotation,
+    reverseIntifaceRotation,
+    saveIntifaceConfig,
     testSingleAxis,
-    intifaceSocket,
-    intifaceDevices
+    isIntifaceConnected,
+    isIntifaceScanning,
+    getIntifaceStatus,
+    countAssignedIntifaceDevices,
+    intifaceDevices,
+    DEFAULT_INTIFACE_URL,
+    ALTERNATE_SECONDS_MIN,
+    ALTERNATE_SECONDS_MAX
 } from './hardware/intiface.js';
-import { initHostPeer, initControllerPeer, broadcastPeerTelemetry, sendPeerCommand } from './webrtc.js';
-import { speakPrompt, setMindgamePrompt, startMicMonitor, stopMicMonitor, sampleMicLevel, listSpeechVoices } from './voice.js';
+import {
+    connectTCode,
+    disconnectTCode,
+    dispatchTCode,
+    stopTCode,
+    setTCodeHandlers,
+    setAxisRole as setTCodeAxisRole,
+    setAxisCap as setTCodeAxisCap,
+    setAxisInvert as setTCodeAxisInvert,
+    testAxis as testTCodeAxis,
+    isTCodeConnected,
+    isSerialSupported,
+    getTCodeStatus,
+    getTCodeDevice,
+    countAssignedTCodeAxes,
+    tcodeHasRole
+} from './hardware/tcode.js';
+import { describeSerialSupport } from './hardware/tcode-protocol.js';
+import {
+    initHostPeer,
+    initRemotePeer,
+    broadcastPeerTelemetry,
+    sendPeerCommand,
+    pruneStalePeers,
+    getPeerCounts,
+    peerLibraryAvailable
+} from './webrtc.js';
+import {
+    speakPrompt,
+    speakNow,
+    cancelSpeech,
+    setMindgamePrompt,
+    startMicMonitor,
+    stopMicMonitor,
+    sampleMicLevel,
+    listSpeechVoices
+} from './voice.js';
 
 // Load persisted settings. The old 15/85 default envelope is migrated to
 // 0/100 exactly once (flagged), so a user who deliberately types 15/85 later
@@ -43,6 +89,12 @@ if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(store
             parsed.handyHwMax = 100;
         }
         parsed.envelopeMigrated = true;
+        migrated = true;
+    }
+    // Before the explicit "At the ceiling" control, crawl was implied by the
+    // stall guard toggle: keep whatever behaviour the user effectively had.
+    if (parsed.ceilingBehaviour !== 'stop' && parsed.ceilingBehaviour !== 'crawl') {
+        parsed.ceilingBehaviour = parsed.stallGuard === false ? 'stop' : 'crawl';
         migrated = true;
     }
     Object.assign(advancedSettings, parsed);
@@ -72,14 +124,34 @@ let funscriptSessionStart = 0;
 // Query string check for remote controller
 const urlParams = new URLSearchParams(window.location.search);
 const partnerRoom = urlParams.get('partner');
+const viewerRoom = urlParams.get('group_sub');
+// ?partner= opens a remote CONTROLLER (transport, orgasm and mode commands);
+// ?group_sub= opens a read-only VIEWER. Both render the host's telemetry and
+// run no engine, watchdog or hardware of their own.
 export const isRemoteController = Boolean(partnerRoom);
+export const isRemoteViewer = !isRemoteController && Boolean(viewerRoom);
+const isRemotePage = isRemoteController || isRemoteViewer;
+const remoteRoom = isRemoteController ? partnerRoom : viewerRoom;
+const remoteRoleLabel = isRemoteViewer ? 'Viewer' : 'Remote Controller';
+// Set when the host link died (peer close / error / silent telemetry).
+let remoteLinkLost = false;
 
-if (isRemoteController) {
+// Header badge on a remote page: "Viewer · Live", "Remote Controller · Disconnected"...
+let remoteRoleSuffix = '';
+function setRemoteRoleStatus(suffix) {
+    remoteRoleSuffix = suffix || '';
+    const role = document.getElementById('roleIndicator');
+    if (role) role.textContent = suffix ? `${remoteRoleLabel} · ${suffix}` : remoteRoleLabel;
+}
+
+if (isRemotePage) {
     const role = document.getElementById('roleIndicator');
     if (role) {
-        role.textContent = "Remote Controller";
-        role.className = "text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-200 uppercase";
+        role.className = isRemoteViewer
+            ? "text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-900 text-sky-200 uppercase"
+            : "text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-900 text-purple-200 uppercase";
     }
+    setRemoteRoleStatus('Connecting');
     const hrTag = document.getElementById('hrWarningTag');
     if (hrTag) hrTag.textContent = "WEARER TELEMETRY";
 }
@@ -112,7 +184,7 @@ let wizardStepIndex = 0;
 const wizardOverlay = document.getElementById('wizardOverlay');
 
 function markWizardSeen() {
-    try { localStorage.setItem('edgeloop_wizard_seen', 'true'); } catch (e) {}
+    safeSet('edgeloop_wizard_seen', 'true');
 }
 
 function renderWizardStep() {
@@ -159,8 +231,8 @@ document.getElementById('wizardNextBtn')?.addEventListener('click', () => {
 });
 
 function maybeShowFirstRunWizard() {
-    const ageOk = localStorage.getItem('edgeloop_age_verified') === 'true';
-    const seen = localStorage.getItem('edgeloop_wizard_seen') === 'true';
+    const ageOk = safeGet('edgeloop_age_verified') === 'true';
+    const seen = safeGet('edgeloop_wizard_seen') === 'true';
     if (ageOk && !seen) openWizard();
 }
 
@@ -293,7 +365,11 @@ function setBadgeState(type, status, nameLabel, batteryLabel = null) {
 // controller so its transport can mirror the host's readiness.
 function hardwareReadiness() {
     const hrReady = isBleConnected() || state.simEngaged;
-    const toyReady = Boolean(handyConnected || (intifaceSocket && intifaceSocket.readyState === WebSocket.OPEN && intifaceDevices.size > 0));
+    const toyReady = Boolean(
+        handyConnected
+        || (isIntifaceConnected() && intifaceDevices.size > 0)
+        || (isTCodeConnected() && countAssignedTCodeAxes() > 0)
+    );
     return { hrReady, toyReady };
 }
 
@@ -302,11 +378,17 @@ function checkReadiness() {
 
     const active = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'PAUSED' || state.sessionStatus === 'RAMPDOWN';
 
-    if (isRemoteController) {
-        // The partner page has no hardware of its own: it mirrors the host's
-        // state and only sends commands.
-        if (active || state.remoteHostReady) renderTransport(state.sessionStatus);
+    if (isRemotePage) {
+        // A remote page has no hardware of its own: it mirrors the host's
+        // state; a controller sends commands, a viewer can only watch.
+        if (remoteLinkLost) renderTransportWaiting("HOST LINK LOST");
+        else if (active || state.remoteHostReady) renderTransport(state.sessionStatus);
         else renderTransportWaiting("WAITING FOR HOST HARDWARE");
+        if (isRemoteViewer) {
+            playPauseBtn.disabled = true;
+            playPauseBtn.classList.remove('cursor-pointer');
+            playPauseBtn.classList.add('cursor-not-allowed', 'opacity-70');
+        }
         return;
     }
 
@@ -452,26 +534,21 @@ function initHandyRoleUI() {
 
 // Engine Calculation Loop
 function updateEngine() {
-    if (isRemoteController) return;
+    if (isRemotePage) return;
 
     const limits = readHrLimits();
     const min = limits.minHr;
     const typedMax = limits.maxHr;
     let hr = state.hrCurrent;
     if (!Number.isFinite(hr) || hr < 35) hr = min;
-    if (advancedSettings.micEnabled && state.micBoost > 0) {
-        hr = Math.min(typedMax, hr + state.micBoost);
-    }
-
-    const hrDisplay = document.getElementById('hrDisplay');
-    if (hrDisplay) hrDisplay.textContent = hr;
-    if (!Number.isFinite(state.peakHr) || hr > state.peakHr) state.peakHr = hr;
 
     // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
-    // (secondary) are both live. The Handy counts for whichever role it holds.
+    // (secondary) are both live. The Handy counts for whichever role it holds;
+    // Intiface and TCode axes count for the role they are assigned.
     const intifaceHasRole = (role) => Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === role));
-    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary');
-    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary');
+    const serialHasRole = (role) => isTCodeConnected() && tcodeHasRole(role);
+    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary') || serialHasRole('primary');
+    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
     const isDualStimActive = hasPrimary && hasSecondary;
 
     // The working ceiling: typed Climax HR minus learned / dual-stim / decay
@@ -492,9 +569,18 @@ function updateEngine() {
         orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0
     });
     const max = ceiling.maxHr;
+    // The microphone boost may push the working HR up to the EFFECTIVE
+    // ceiling (after every offset), never past it and never downward.
+    if (advancedSettings.micEnabled && state.micBoost > 0 && hr < max) {
+        hr = Math.min(max, hr + state.micBoost);
+    }
     state.effectiveMinHr = min;
     state.effectiveMaxHr = max;
     state.effectiveHr = hr;
+
+    const hrDisplay = document.getElementById('hrDisplay');
+    if (hrDisplay) hrDisplay.textContent = hr;
+    if (!Number.isFinite(state.peakHr) || hr > state.peakHr) state.peakHr = hr;
 
     const learnBadge = document.getElementById('learnBadge');
     const learnAmount = document.getElementById('learnAmountText');
@@ -539,7 +625,7 @@ function updateEngine() {
         cadenceBreathing: advancedSettings.cadenceBreathing,
         milkingWave: advancedSettings.milkingWave,
         stallGuardEngaged: state.stallGuardEngaged,
-        stallGuardEnabled: advancedSettings.stallGuard,
+        ceilingBehaviour: advancedSettings.ceilingBehaviour,
         ruinHoldSeconds: state.ruinHoldSeconds,
         oracleState: state.oracleState,
         survivalSpeedFloor: state.survivalSpeedFloor
@@ -550,7 +636,7 @@ function updateEngine() {
         const edgeEl = document.getElementById('edgeCount');
         if (edgeEl) edgeEl.textContent = state.edges;
         if (state.activeMode === 'ruin') state.ruinHoldSeconds = 18;
-        intifaceDevices.forEach(dev => { dev.clockwise = !dev.clockwise; });
+        reverseIntifaceRotation('edge');
         cueVoice('Edge. Back off.');
     }
 
@@ -597,7 +683,7 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
 }
 
 function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false) {
-    if (isRemoteController) return;
+    if (isRemotePage) return;
 
     let targetHandySpeed = 0;
     const handyCap = (state.handyMaxCap ?? 100) / 100;
@@ -612,20 +698,29 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     const range = effectiveStrokeRange(strokeMin, strokeMax);
 
     dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max);
-    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max);
+    // Intiface linear axes run on their own per-leg timers; this call only
+    // updates the planner inputs (and, with force, issues StopAllDevices).
+    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force);
+    // Same for the direct T-Code serial device: a forced zero dispatch is an
+    // immediate stop (every axis to rest on one line).
+    dispatchTCode(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force);
 }
 
-function cueVoice(text) {
+// Queue a spoken cue (voice.js keeps a short queue, so back-to-back cues are
+// all heard instead of cutting each other off). An `urgent` cue (signal
+// lost, stop) jumps the queue and silences whatever was waiting.
+function cueVoice(text, urgent = false) {
     if (!advancedSettings.voiceEnabled || !text) {
         setMindgamePrompt(text || '', Boolean(advancedSettings.voiceEnabled && text));
         return;
     }
     const now = Date.now();
-    if (text === state.lastSpokenPrompt && (now - (state.lastSpokenAt || 0) < 7000)) return;
+    if (!urgent && text === state.lastSpokenPrompt && (now - (state.lastSpokenAt || 0) < 7000)) return;
     state.lastSpokenPrompt = text;
     state.lastSpokenAt = now;
     setMindgamePrompt(text, true);
-    speakPrompt(true, text, advancedSettings.voiceURI);
+    if (urgent) speakNow(text, advancedSettings.voiceURI);
+    else speakPrompt(true, text, advancedSettings.voiceURI);
 }
 
 function updateWarmupBadge() {
@@ -741,7 +836,10 @@ function tickSessionGuardsAndGames() {
     const hr = Number.isFinite(state.effectiveHr) ? state.effectiveHr : state.hrCurrent;
     const nearCeiling = hr >= (ceiling - 2);
 
-    if (advancedSettings.stallGuard && state.isEdged && !state.orgasmMode && state.activeMode !== 'oracle' && state.activeMode !== 'survival') {
+    // The stall guard only has something to cut in Crawl mode: with Full
+    // Stop the primary is already parked at 0% at the ceiling.
+    const crawlAtCeiling = advancedSettings.ceilingBehaviour !== 'stop';
+    if (advancedSettings.stallGuard && crawlAtCeiling && state.isEdged && !state.orgasmMode && state.activeMode !== 'oracle' && state.activeMode !== 'survival') {
         state.edgeStallSeconds += 1;
         if (state.edgeStallSeconds >= (advancedSettings.stallGuardSeconds || 8)) {
             if (!state.stallGuardEngaged) {
@@ -791,8 +889,7 @@ function tickSessionGuardsAndGames() {
                     cueVoice('The Oracle chooses climax.');
                 } else if (roll < 0.66) {
                     state.oracleState = 'DENIAL';
-                    cueVoice('The Oracle chooses denial.');
-                    stopSession('Oracle Denial');
+                    stopSession('Oracle Denial', 'The Oracle chooses denial.');
                     return;
                 } else {
                     state.oracleState = 'PURGATORY';
@@ -819,28 +916,18 @@ function tickSessionGuardsAndGames() {
         // consecutive ticks (SURVIVAL_BREACH_TICKS) before the game ends.
         state.survivalBreachTicks = state.orgasmMode ? 0 : countSurvivalBreach(state.survivalBreachTicks, hr, ceiling);
         if (isSurvivalDefeated(state.survivalBreachTicks)) {
-            cueVoice('Survival failed. Limit breached.');
-            stopSession('Survival Defeat');
+            stopSession('Survival Defeat', 'Survival failed. Limit breached.');
             return;
         }
         if (state.survivalBreachTicks > 0) cueVoice('Over the limit. Drop it.');
     }
 }
 
-// Keep linear OSR/OSSM ping-pong moving between 1Hz engine ticks
-setInterval(() => {
-    if (isRemoteController) return;
-    if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
-        const range = effectiveStrokeRange(state.strokeMin, state.strokeMax);
-        dispatchIntiface(state.strokerSpeed, state.prostateSpeed, range.min, range.max);
-    }
-}, 200);
-
 // 250ms Live Funscript Sampling Loop (4Hz). Records what was really sent to
 // the toys (speed plus the physical stroke zone, honouring "Full Length
 // Strokes Only"); the buffer is capped at four hours, oldest dropped first.
 setInterval(() => {
-    if (isRemoteController) return;
+    if (isRemotePage) return;
     const active = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
     // A pause is part of the timeline too: the motors are stopped, so record
     // explicit zero-speed samples rather than leaving a hole the export
@@ -963,7 +1050,6 @@ function resumeAfterSignalReturn() {
     document.getElementById('disconnectBanner')?.classList.add('hidden');
     cueVoice('Signal restored. Resuming.');
     showHrSignalBadge('SIGNAL RESTORED, RESUMED', 6000);
-    sendPeerCommand({ type: 'SESSION_STATE', status: state.sessionStatus, chosenSeconds: state.chosenTargetSeconds });
     syncTelemetry();
     updateEngine();
 }
@@ -995,7 +1081,7 @@ function evaluateHrWatchdog(now = Date.now()) {
         state.hrSignalPaused = true;
         dispatchHardware(0, 0, 0, 100, true);
         triggerDisconnectAlert(describeHrLoss(verdict));
-        cueVoice('Heart rate signal lost. Motors stopped.');
+        cueVoice('Heart rate signal lost. Motors stopped.', true);
     }
 }
 
@@ -1003,16 +1089,21 @@ function evaluateHrWatchdog(now = Date.now()) {
 // games, no endgame, no ceiling inflation.
 function renderRemoteClock() {
     updateTimerDisplay();
+    checkRemoteLinkHealth();
+    redrawChart();
+}
+
+// Draw the guide lines where edges really trigger: the host's WORKING
+// limits after every offset (on a remote page these arrive in telemetry).
+function redrawChart() {
     const chartEl = document.getElementById('hrChart');
-    if (chartEl) {
-        const limits = readHrLimits();
-        drawTelemetryChart(chartEl, state.history, limits.minHr, limits.maxHr);
-    }
+    if (!chartEl) return;
+    drawTelemetryChart(chartEl, state.history, state.effectiveMinHr, state.effectiveMaxHr);
 }
 
 // 1-Second Master Clock
 setInterval(() => {
-    if (isRemoteController) {
+    if (isRemotePage) {
         renderRemoteClock();
         return;
     }
@@ -1050,14 +1141,10 @@ setInterval(() => {
         clearHrSignalPause();
     }
 
+    pruneStalePeers(Date.now());
     syncTelemetry();
     updateEngine();
-    const chartEl = document.getElementById('hrChart');
-    if (chartEl) {
-        // Draw the ceiling the engine is actually using, so the line on the
-        // chart is where edges really trigger.
-        drawTelemetryChart(chartEl, state.history, state.effectiveMinHr, state.effectiveMaxHr);
-    }
+    redrawChart();
 }, 1000);
 
 function handleTargetTimeReached() {
@@ -1128,6 +1215,7 @@ function startOrResumeSession() {
 
 // Session Controls Handlers
 playPauseBtn?.addEventListener('click', () => {
+    if (isRemoteViewer) return;
     if (isRemoteController) {
         // Ask the host; the button re-renders from the telemetry it sends back.
         const wants = (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') ? 'RUNNING' : 'PAUSED';
@@ -1139,12 +1227,12 @@ playPauseBtn?.addEventListener('click', () => {
     } else if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         pauseSession('Paused.');
     }
-    sendPeerCommand({ type: 'SESSION_STATE', status: state.sessionStatus, chosenSeconds: state.chosenTargetSeconds });
     syncTelemetry();
     updateEngine();
 });
 
 stopBtn?.addEventListener('click', () => {
+    if (isRemoteViewer) return;
     if (isRemoteController) {
         sendPeerCommand({ type: 'SESSION_STATE', status: 'IDLE' });
         return;
@@ -1158,7 +1246,9 @@ function showIdleTransport() {
     renderTransport('IDLE');
 }
 
-function stopSession(outcome = "Stopped") {
+// `voiceText` overrides the spoken outcome when a game or guard wants to say
+// more than the history label (one cue, never two back-to-back).
+function stopSession(outcome = "Stopped", voiceText = null) {
     const wasActive = state.sessionStatus !== 'IDLE';
     // Status and motors FIRST: nothing below (history, storage, voice) may
     // leave the session running if it throws.
@@ -1170,7 +1260,7 @@ function stopSession(outcome = "Stopped") {
     setOrgasmMode(false);
     clearHrSignalPause();
     try {
-        if (wasActive && state.sessionSeconds >= 10 && !isRemoteController) saveSessionToHistory(outcome);
+        if (wasActive && state.sessionSeconds >= 10 && !isRemotePage) saveSessionToHistory(outcome);
     } catch (e) {
         console.warn('Session history could not be saved', e);
     } finally {
@@ -1178,16 +1268,17 @@ function stopSession(outcome = "Stopped") {
         resetGameState();
         updateWarmupBadge();
         showIdleTransport();
-        if (outcome && outcome !== 'Stopped') cueVoice(outcome);
-        else cueVoice('Session stopped.');
-        sendPeerCommand({ type: 'SESSION_STATE', status: state.sessionStatus, chosenSeconds: 0 });
+        // STOP silences every queued cue; the outcome is the one thing said.
+        cancelSpeech();
+        cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'Session stopped.'), true);
         syncTelemetry();
         checkReadiness();
-        if (!isRemoteController) updateEngine();
+        if (!isRemotePage) updateEngine();
     }
 }
 
 resetBtn?.addEventListener('click', () => {
+    if (isRemoteViewer) return;
     if (isRemoteController) {
         sendPeerCommand({ type: 'SESSION_RESET' });
         return;
@@ -1200,12 +1291,12 @@ resetBtn?.addEventListener('click', () => {
     resetSessionCounters();
     resetGameState();
     updateWarmupBadge();
+    cancelSpeech();
     setMindgamePrompt('', false);
     showIdleTransport();
-    sendPeerCommand({ type: 'SESSION_RESET' });
     syncTelemetry();
     checkReadiness();
-    if (!isRemoteController) updateEngine();
+    if (!isRemotePage) updateEngine();
 });
 
 // Came Early & Learning Profile
@@ -1232,6 +1323,8 @@ function renderLearningStatus() {
 }
 
 cameEarlyBtn?.addEventListener('click', () => {
+    // The learning profile belongs to the host; a remote page never logs one.
+    if (isRemotePage) return;
     if (confirm("Log an accidental release? EdgeLoop will lower your working climax ceiling on this and future sessions.")) {
         if (!advancedSettings.learningProfile) {
             advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
@@ -1246,8 +1339,7 @@ cameEarlyBtn?.addEventListener('click', () => {
         }
         persistSettings();
         renderLearningStatus();
-        cueVoice('Limit tightened.');
-        stopSession("Premature Release");
+        stopSession("Premature Release", "Premature release. Limit tightened.");
     }
 });
 
@@ -1275,13 +1367,13 @@ function setOrgasmMode(on) {
 }
 
 orgasmBtn?.addEventListener('click', () => {
+    if (isRemoteViewer) return;
     if (isRemoteController) {
         // The host toggles and reports back through telemetry.
         sendPeerCommand({ type: 'ORGASM_TOGGLE' });
         return;
     }
     setOrgasmMode(!state.orgasmMode);
-    sendPeerCommand({ type: 'ORGASM_TOGGLE' });
     syncTelemetry();
     updateEngine();
 });
@@ -1316,24 +1408,30 @@ expTabGameBtn?.addEventListener('click', () => {
 
 // Experience Mode Selection
 const modeCards = document.querySelectorAll('.mode-card');
+function highlightModeCard(mode) {
+    modeCards.forEach(c => {
+        const check = c.querySelector('.mode-check');
+        const title = c.querySelector('.font-bold');
+        if (c.getAttribute('data-mode') === mode) {
+            c.className = "mode-card text-left p-2 rounded-xl bg-purple-950/20 border border-purple-800 hover:border-purple-600 transition cursor-pointer flex flex-col justify-between";
+            if (title) title.className = "font-bold text-[11px] text-purple-300 flex justify-between items-center";
+            check?.classList.remove('hidden');
+        } else {
+            c.className = "mode-card text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between";
+            if (title) title.className = "font-bold text-[11px] text-slate-200 flex justify-between items-center";
+            check?.classList.add('hidden');
+        }
+    });
+}
 modeCards.forEach(card => {
     card.addEventListener('click', () => {
+        if (isRemoteViewer) return;
         state.activeMode = card.getAttribute('data-mode');
         resetGameState();
-        modeCards.forEach(c => {
-            const check = c.querySelector('.mode-check');
-            const title = c.querySelector('.font-bold');
-            if (c === card) {
-                c.className = "mode-card text-left p-2 rounded-xl bg-purple-950/20 border border-purple-800 hover:border-purple-600 transition cursor-pointer flex flex-col justify-between";
-                if (title) title.className = "font-bold text-[11px] text-purple-300 flex justify-between items-center";
-                check?.classList.remove('hidden');
-            } else {
-                c.className = "mode-card text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between";
-                if (title) title.className = "font-bold text-[11px] text-slate-200 flex justify-between items-center";
-                check?.classList.add('hidden');
-            }
-        });
-        sendPeerCommand({ type: 'MODE_CHANGE', mode: state.activeMode });
+        highlightModeCard(state.activeMode);
+        // A controller asks the host; the host tells every remote via telemetry.
+        if (isRemoteController) sendPeerCommand({ type: 'MODE_CHANGE', mode: state.activeMode });
+        else syncTelemetry();
         updateEngine();
     });
 });
@@ -1345,6 +1443,7 @@ const modals = {
     Ble: document.getElementById('modalBodyBle'),
     Handy: document.getElementById('modalBodyHandy'),
     Intiface: document.getElementById('modalBodyIntiface'),
+    TCode: document.getElementById('modalBodyTCode'),
     History: document.getElementById('modalBodyHistory'),
     Params: document.getElementById('modalBodyParams'),
     Partner: document.getElementById('modalBodyPartner'),
@@ -1365,6 +1464,13 @@ function openModal(type) {
         updateHwEnvelopeDisplay();
     }
     else if (type === 'Intiface' && modalTitle) { modalTitle.textContent = "Intiface Central & Toy Roles"; modals.Intiface?.classList.remove('hidden'); renderIntifaceDevices(); }
+    else if (type === 'TCode' && modalTitle) {
+        modalTitle.textContent = "TCode Serial (OSR2 / SR6 / OSSM)";
+        modals.TCode?.classList.remove('hidden');
+        renderTCodeStatus(getTCodeStatus());
+        renderTCodeDevice();
+        warnSerialUnsupported();
+    }
     else if (type === 'History' && modalTitle) { modalTitle.textContent = "Session History & Funscripts"; modals.History?.classList.remove('hidden'); renderHistory(); }
     else if (type === 'Params' && modalTitle) { modalTitle.textContent = "Session Setup"; modals.Params?.classList.remove('hidden'); renderLearningStatus(); syncParamsUI(); }
     else if (type === 'Partner' && modalTitle) { modalTitle.textContent = "Share Control Hub"; modals.Partner?.classList.remove('hidden'); setupPartnerHost(); }
@@ -1375,13 +1481,14 @@ function openModal(type) {
 
 function closeModal() { overlay?.classList.add('hidden'); }
 
-document.getElementById('cardBle')?.addEventListener('click', () => { if (!isRemoteController) openModal('Ble'); });
-document.getElementById('cardHandy')?.addEventListener('click', () => { if (!isRemoteController) openModal('Handy'); });
-document.getElementById('cardIntiface')?.addEventListener('click', () => { if (!isRemoteController) openModal('Intiface'); });
+document.getElementById('cardBle')?.addEventListener('click', () => { if (!isRemotePage) openModal('Ble'); });
+document.getElementById('cardHandy')?.addEventListener('click', () => { if (!isRemotePage) openModal('Handy'); });
+document.getElementById('cardIntiface')?.addEventListener('click', () => { if (!isRemotePage) openModal('Intiface'); });
+document.getElementById('cardTCode')?.addEventListener('click', () => { if (!isRemotePage) openModal('TCode'); });
 document.getElementById('historyBtn')?.addEventListener('click', () => openModal('History'));
 document.getElementById('sessionParamsHeaderBtn')?.addEventListener('click', () => openModal('Params'));
 document.getElementById('openParamsBtn')?.addEventListener('click', () => openModal('Params'));
-document.getElementById('partnerShareBtn')?.addEventListener('click', () => openModal('Partner'));
+document.getElementById('partnerShareBtn')?.addEventListener('click', () => { if (!isRemotePage) openModal('Partner'); });
 document.getElementById('bleQuickHelpBtn')?.addEventListener('click', () => openModal('HrGuide'));
 document.getElementById('footerLegalBtn')?.addEventListener('click', () => openModal('Legal'));
 document.getElementById('modalCloseBtn')?.addEventListener('click', closeModal);
@@ -1487,6 +1594,8 @@ function syncParamsUI() {
 
     if (stallToggle) stallToggle.checked = Boolean(advancedSettings.stallGuard);
     if (stallSec) stallSec.value = advancedSettings.stallGuardSeconds || 8;
+    const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
+    if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
     if (dualBpm) dualBpm.value = advancedSettings.dualDampeningBpm || 15;
     if (decayToggle) decayToggle.checked = Boolean(advancedSettings.adaptiveDecay);
@@ -1538,7 +1647,7 @@ if (window.speechSynthesis) {
 document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () => {
     const select = document.getElementById('paramVoiceSelect');
     if (select) advancedSettings.voiceURI = select.value;
-    speakPrompt(true, 'EdgeLoop voice preview. Stay right on the edge.', advancedSettings.voiceURI);
+    speakNow('EdgeLoop voice preview. Stay right on the edge.', advancedSettings.voiceURI);
 });
 
 document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
@@ -1563,9 +1672,20 @@ paramEndgameCards.forEach(card => {
     });
 });
 
+// Browsers only grant the microphone (and an unmuted AudioContext) inside a
+// user gesture, so a persisted mic setting is never started on load: the
+// cockpit shows a "Tap to re-enable microphone" control instead.
+const micReenableBtn = document.getElementById('micReenableBtn');
+function showMicReenable(visible) {
+    micReenableBtn?.classList.toggle('hidden', !visible);
+}
+micReenableBtn?.addEventListener('click', () => { applyMicSetting(true); });
+
+// Must run from a click handler (see startMicMonitor).
 async function applyMicSetting(enabled) {
     advancedSettings.micEnabled = Boolean(enabled);
     const badge = document.getElementById('micActiveBadge');
+    showMicReenable(false);
     if (!enabled) {
         stopMicMonitor(state);
         badge?.classList.add('hidden');
@@ -1588,6 +1708,7 @@ async function applyMicSetting(enabled) {
 document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
     advancedSettings.stallGuardSeconds = parseInt(document.getElementById('stallGuardSecondsInput')?.value, 10) || 8;
+    advancedSettings.ceilingBehaviour = document.getElementById('ceilingBehaviourSelect')?.value === 'stop' ? 'stop' : 'crawl';
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
     advancedSettings.dualDampeningBpm = parseInt(document.getElementById('dualDampeningOffsetInput')?.value, 10) || 15;
     advancedSettings.adaptiveDecay = document.getElementById('adaptiveDecayToggle')?.checked ?? true;
@@ -1601,8 +1722,17 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
+    if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
-    await applyMicSetting(micOn);
+    const micWasOn = Boolean(state.micAnalyser);
+    // Only (re)start the monitor when the setting changed: the button click
+    // that submits the form is the user gesture the microphone needs.
+    if (micOn !== micWasOn) {
+        await applyMicSetting(micOn);
+    } else {
+        advancedSettings.micEnabled = micOn;
+        if (!micOn) showMicReenable(false);
+    }
     setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
 
     persistSettings();
@@ -1901,39 +2031,81 @@ document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', ()
     triggerDisconnectAlert("The Handy disconnected.");
 });
 
-// Intiface Central WebSocket
+// Intiface Central WebSocket. The driver reports its state through
+// onStatus; the modal label, the summary badge and the buttons follow it.
+const intifaceStatusColors = {
+    offline: 'text-rose-400',
+    connecting: 'text-amber-400',
+    handshake: 'text-amber-400',
+    connected: 'text-emerald-400',
+    error: 'text-rose-400'
+};
+
+function renderIntifaceStatus(status) {
+    const label = document.getElementById('modalIntifaceStatusText');
+    if (label) {
+        label.textContent = status.text;
+        label.className = `text-[10px] font-mono text-right max-w-[60%] break-words ${intifaceStatusColors[status.state] || 'text-slate-400'}`;
+    }
+    const connectBtn = document.getElementById('modalIntifaceConnectBtn');
+    const disconnectBtn = document.getElementById('modalIntifaceDisconnectBtn');
+    const rescanBtn = document.getElementById('modalIntifaceRescanBtn');
+    const busy = status.state === 'connecting' || status.state === 'handshake';
+    const connected = status.state === 'connected';
+    if (connectBtn) {
+        connectBtn.disabled = busy;
+        connectBtn.classList.toggle('opacity-50', busy);
+        connectBtn.classList.toggle('cursor-not-allowed', busy);
+        connectBtn.classList.toggle('hidden', connected);
+        connectBtn.textContent = busy ? 'Connecting...' : 'Connect';
+    }
+    disconnectBtn?.classList.toggle('hidden', !(connected || busy));
+    rescanBtn?.classList.toggle('hidden', !connected);
+    renderIntifaceSummaryBadge();
+}
+
 document.getElementById('modalIntifaceConnectBtn')?.addEventListener('click', () => {
-    const url = document.getElementById('modalIntifaceUrl')?.value.trim() || 'ws://localhost:12345';
-    setBadgeState('Intiface', 'connecting', 'Connecting...');
+    const url = document.getElementById('modalIntifaceUrl')?.value.trim() || DEFAULT_INTIFACE_URL;
     connectIntifaceServer(url, {
-        onOpen: () => {
-            document.getElementById('modalIntifaceConnectBtn')?.classList.add('hidden');
-            document.getElementById('modalIntifaceDisconnectBtn')?.classList.remove('hidden');
-            document.getElementById('modalIntifaceRescanBtn')?.classList.remove('hidden');
-        },
+        onStatus: renderIntifaceStatus,
         onDevicesChanged: () => {
             renderIntifaceDevices();
             syncTelemetry();
         },
         onError: () => {
-            setBadgeState('Intiface', 'disconnected', 'WS Error');
-            triggerDisconnectAlert("Intiface Central (toy server) connection error: toys unreachable. Motors paused for safety.");
+            // The status label already carries the text; a failed connect
+            // attempt must not pause a session running on other hardware.
         },
-        onClose: () => {
+        onClose: ({ wasConnected, assignedDevices, intentional }) => {
             renderIntifaceDevices();
-            setBadgeState('Intiface', 'disconnected', 'Disconnected');
-            document.getElementById('modalIntifaceConnectBtn')?.classList.remove('hidden');
-            document.getElementById('modalIntifaceDisconnectBtn')?.classList.add('hidden');
-            document.getElementById('modalIntifaceRescanBtn')?.classList.add('hidden');
+            syncTelemetry();
+            if (!wasConnected || assignedDevices === 0) return;
+            const toys = `${assignedDevices} assigned toy${assignedDevices === 1 ? '' : 's'}`;
+            triggerDisconnectAlert(intentional
+                ? `Intiface Central disconnected with ${toys} in use. Motors paused for safety.`
+                : `Intiface Central connection lost: ${toys} unreachable. Motors paused for safety.`);
         }
     });
 });
-document.getElementById('modalIntifaceDisconnectBtn')?.addEventListener('click', disconnectIntiface);
-document.getElementById('modalIntifaceRescanBtn')?.addEventListener('click', rescanIntiface);
-document.getElementById('modalIntifaceSaveBtn')?.addEventListener('click', () => {
-    renderIntifaceSummaryBadge();
-    closeModal();
+document.getElementById('modalIntifaceDisconnectBtn')?.addEventListener('click', () => disconnectIntiface());
+document.getElementById('modalIntifaceRescanBtn')?.addEventListener('click', () => {
+    rescanIntiface();
+    renderIntifaceDevices();
 });
+document.getElementById('modalIntifaceSaveBtn')?.addEventListener('click', () => {
+    const btn = document.getElementById('modalIntifaceSaveBtn');
+    const saved = saveIntifaceConfig();
+    if (btn) {
+        btn.textContent = saved ? 'Saved' : 'Could not save (storage full or blocked)';
+        setTimeout(() => { btn.textContent = 'Save & Apply Configuration'; }, 1500);
+    }
+    renderIntifaceSummaryBadge();
+    syncTelemetry();
+    if (saved) setTimeout(closeModal, 600);
+});
+
+// Best effort: stop every Intiface toy when the page goes away.
+window.addEventListener('pagehide', () => { stopAllIntiface(); });
 
 window.setDeviceRole = (devIdx, axisIdx, role) => {
     setAxisRole(devIdx, axisIdx, role);
@@ -1948,15 +2120,36 @@ window.setDeviceCap = (devIdx, axisIdx, val) => {
     syncTelemetry();
 };
 
+window.setDeviceInvert = (devIdx, axisIdx, checked) => {
+    setAxisInvert(devIdx, axisIdx, Boolean(checked));
+};
+
+window.setDeviceReverseOnEdge = (devIdx, checked) => {
+    setDeviceRotation(devIdx, { reverseOnEdge: Boolean(checked) });
+};
+
+window.setDeviceAlternate = (devIdx, val) => {
+    setDeviceRotation(devIdx, { alternateSeconds: parseInt(val, 10) || 0 });
+};
+
 window.testAxis = (devIdx, axisIdx) => testSingleAxis(devIdx, axisIdx);
+
+function escapeHtml(text) {
+    return String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 function renderIntifaceDevices() {
     const list = document.getElementById('modalIntifaceList');
     if (!list) return;
     if (intifaceDevices.size === 0) {
-        list.innerHTML = `<div class="p-3 bg-slate-950 rounded-xl border border-slate-800 text-slate-500 text-xs italic">
-        ${intifaceSocket && intifaceSocket.readyState === WebSocket.OPEN ? 'Scanning... Power on your toys.' : 'Connect to Intiface server to detect your toys.'}
-        </div>`;
+        let hint = 'Connect to Intiface server to detect your toys.';
+        if (isIntifaceConnected()) {
+            hint = isIntifaceScanning()
+                ? 'Scanning... Power on your toys.'
+                : 'No toys found. Power them on and tap Re-Scan Toys.';
+        }
+        list.innerHTML = `<div class="p-3 bg-slate-950 rounded-xl border border-slate-800 text-slate-500 text-xs italic text-center">${hint}</div>`;
+        renderIntifaceSummaryBadge();
         return;
     }
     list.innerHTML = '';
@@ -1967,11 +2160,21 @@ function renderIntifaceDevices() {
 
         let axisRows = '';
         dev.axes.forEach((axis, aIdx) => {
+            const label = axis.descriptor ? `${escapeHtml(axis.type)} - ${escapeHtml(axis.descriptor)}` : escapeHtml(axis.type);
+            const failing = axis.failing
+                ? `<span class="text-[9px] font-bold text-rose-400 bg-rose-950/60 border border-rose-800 px-1 rounded" title="Intiface rejected the last 3 commands to this axis">Not responding</span>`
+                : '';
+            const invertRow = axis.kind === 'linear' ? `
+            <label class="flex items-center justify-between text-[9px] text-slate-400 pt-1 border-t border-slate-800/60 cursor-pointer">
+            <span>Invert direction (sleeve mounted upside down)</span>
+            <input type="checkbox" ${axis.invert ? 'checked' : ''} onchange="setDeviceInvert(${devIdx}, ${aIdx}, this.checked)" class="accent-amber-500 cursor-pointer">
+            </label>` : '';
             axisRows += `
-            <div class="bg-slate-900 p-2 rounded-lg border border-slate-800 space-y-1.5 text-[10px]">
-            <div class="flex justify-between items-center">
-            <span class="font-bold text-slate-300">Axis ${axis.index} (${axis.type})</span>
-            <button onclick="testAxis(${devIdx}, ${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer">Test</button>
+            <div class="bg-slate-900 p-2 rounded-lg border ${axis.failing ? 'border-rose-800' : 'border-slate-800'} space-y-1.5 text-[10px]">
+            <div class="flex justify-between items-center gap-1">
+            <span class="font-bold text-slate-300 truncate">Axis ${axis.index} (${label})</span>
+            <span class="flex items-center gap-1 shrink-0">${failing}
+            <button onclick="testAxis(${devIdx}, ${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer">Test</button></span>
             </div>
             <div class="flex gap-1">
             <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'primary')" class="flex-1 py-1 rounded ${axis.role === 'primary' ? 'bg-rose-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Primary</button>
@@ -1985,16 +2188,38 @@ function renderIntifaceDevices() {
             </div>
             <input type="range" min="10" max="100" step="5" value="${axis.maxCap ?? 100}" oninput="setDeviceCap(${devIdx}, ${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">
             </div>
+            ${invertRow}
             </div>
             `;
         });
 
+        let rotationRow = '';
+        if (dev.axes.some((a) => a.kind === 'rotate')) {
+            let options = `<option value="0" ${!dev.alternateSeconds ? 'selected' : ''}>Off</option>`;
+            for (let sec = ALTERNATE_SECONDS_MIN; sec <= ALTERNATE_SECONDS_MAX; sec += 5) {
+                options += `<option value="${sec}" ${dev.alternateSeconds === sec ? 'selected' : ''}>${sec} s</option>`;
+            }
+            rotationRow = `
+            <div class="bg-slate-900 p-2 rounded-lg border border-slate-800 space-y-1.5 text-[10px]">
+            <div class="font-bold text-slate-300">Rotation</div>
+            <label class="flex items-center justify-between text-[9px] text-slate-400 cursor-pointer">
+            <span>Reverse direction on every edge</span>
+            <input type="checkbox" ${dev.reverseOnEdge !== false ? 'checked' : ''} onchange="setDeviceReverseOnEdge(${devIdx}, this.checked)" class="accent-purple-500 cursor-pointer">
+            </label>
+            <label class="flex items-center justify-between text-[9px] text-slate-400">
+            <span>Alternate direction every</span>
+            <select onchange="setDeviceAlternate(${devIdx}, this.value)" class="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-200 cursor-pointer">${options}</select>
+            </label>
+            <p class="text-[9px] text-slate-500">Direction never changes more than once per second.</p>
+            </div>`;
+        }
+
         item.innerHTML = `
         <div class="flex justify-between items-center font-bold text-slate-200">
-        <span>${dev.name}</span>
-        <span class="text-[9px] font-mono text-emerald-400">${batText}</span>
+        <span class="truncate">${escapeHtml(dev.displayName || dev.name)}</span>
+        <span class="text-[9px] font-mono text-emerald-400 shrink-0">${batText}</span>
         </div>
-        <div class="space-y-1">${axisRows}</div>
+        <div class="space-y-1">${axisRows}${rotationRow}</div>
         `;
         list.appendChild(item);
     });
@@ -2002,15 +2227,178 @@ function renderIntifaceDevices() {
 }
 
 function renderIntifaceSummaryBadge() {
+    const status = getIntifaceStatus();
+    if (!isIntifaceConnected()) {
+        const busy = status.state === 'connecting' || status.state === 'handshake';
+        let label = 'Disconnected';
+        if (busy) label = status.state === 'handshake' ? 'Handshake...' : 'Connecting...';
+        else if (status.state === 'error') label = 'Error';
+        setBadgeState('Intiface', busy ? 'connecting' : 'disconnected', label, null);
+        return;
+    }
     if (intifaceDevices.size === 0) {
-        const isConn = intifaceSocket && intifaceSocket.readyState === WebSocket.OPEN;
-        setBadgeState('Intiface', isConn ? 'connected' : 'disconnected', isConn ? '0 Toys Ready' : 'Disconnected', null);
+        setBadgeState('Intiface', 'connected', isIntifaceScanning() ? 'Scanning...' : '0 Toys Ready', null);
         return;
     }
     const firstToy = Array.from(intifaceDevices.values())[0];
-    let nameLabel = firstToy.name.split(' ')[0];
+    let nameLabel = (firstToy.displayName || firstToy.name).split(' ')[0];
     if (intifaceDevices.size > 1) nameLabel += ` +${intifaceDevices.size - 1}`;
-    setBadgeState('Intiface', 'connected', nameLabel, firstToy.battery !== null ? `🔋 ${firstToy.battery}%` : null);
+    const assigned = countAssignedIntifaceDevices();
+    if (assigned === 0) nameLabel += ' (all OFF)';
+    const failing = Array.from(intifaceDevices.values()).some((d) => d.axes.some((a) => a.failing));
+    setBadgeState('Intiface', failing ? 'warning' : 'connected', failing ? `${nameLabel} - errors` : nameLabel, firstToy.battery !== null ? `🔋 ${firstToy.battery}%` : null);
+}
+
+// TCode Serial (Web Serial). The driver reports its state through onStatus;
+// the modal label, the summary badge and the buttons follow it.
+function warnSerialUnsupported() {
+    if (isSerialSupported()) return false;
+    renderTCodeStatus({ state: 'error', text: describeSerialSupport(navigator.userAgent) });
+    setBadgeState('TCode', 'disconnected', 'Unsupported');
+    return true;
+}
+
+function renderTCodeStatus(status) {
+    const label = document.getElementById('modalTCodeStatusText');
+    if (label) {
+        label.textContent = status.text;
+        label.className = `text-[10px] font-mono text-right max-w-[70%] break-words ${intifaceStatusColors[status.state] || 'text-slate-400'}`;
+    }
+    const connectBtn = document.getElementById('modalTCodeConnectBtn');
+    const disconnectBtn = document.getElementById('modalTCodeDisconnectBtn');
+    const busy = status.state === 'connecting' || status.state === 'handshake';
+    const connected = status.state === 'connected';
+    if (connectBtn) {
+        connectBtn.disabled = busy;
+        connectBtn.classList.toggle('opacity-50', busy);
+        connectBtn.classList.toggle('cursor-not-allowed', busy);
+        connectBtn.classList.toggle('hidden', connected);
+        connectBtn.textContent = busy ? 'Connecting...' : 'Connect';
+    }
+    disconnectBtn?.classList.toggle('hidden', !(connected || busy));
+    renderTCodeSummaryBadge();
+}
+
+setTCodeHandlers({
+    onStatus: renderTCodeStatus,
+    onDevicesChanged: () => {
+        renderTCodeDevice();
+        syncTelemetry();
+    },
+    onError: () => {
+        // The status label carries the text; the driver closes the port
+        // itself and onClose decides whether the session must pause.
+    },
+    onClose: ({ wasConnected, assignedAxes, intentional }) => {
+        renderTCodeDevice();
+        syncTelemetry();
+        if (!wasConnected || assignedAxes === 0) return;
+        const axes = `${assignedAxes} assigned ax${assignedAxes === 1 ? 'is' : 'es'}`;
+        triggerDisconnectAlert(intentional
+            ? `TCode Serial device disconnected with ${axes} in use. Motors paused for safety.`
+            : `TCode Serial device lost: ${axes} unreachable. Motors paused for safety.`);
+    }
+});
+
+document.getElementById('modalTCodeConnectBtn')?.addEventListener('click', () => {
+    if (warnSerialUnsupported()) return;
+    // requestPort needs the click's user activation: call straight away.
+    // The modal stays open so the identified axes can be checked with Test.
+    connectTCode().then(() => syncTelemetry()).catch(() => {});
+});
+document.getElementById('modalTCodeDisconnectBtn')?.addEventListener('click', () => {
+    disconnectTCode().catch(() => {});
+});
+
+// Best effort: rest every axis when the page goes away.
+window.addEventListener('pagehide', () => { stopTCode(); });
+
+window.setTCodeRole = (axisIdx, role) => {
+    setTCodeAxisRole(axisIdx, role);
+    renderTCodeDevice();
+    syncTelemetry();
+};
+
+window.setTCodeCap = (axisIdx, val) => {
+    setTCodeAxisCap(axisIdx, parseInt(val, 10));
+    const el = document.getElementById(`tcodeCapVal_${axisIdx}`);
+    if (el) el.textContent = `${val}%`;
+};
+
+window.setTCodeInvert = (axisIdx, checked) => {
+    setTCodeAxisInvert(axisIdx, Boolean(checked));
+};
+
+window.testTCodeAxis = (axisIdx) => testTCodeAxis(axisIdx);
+
+function renderTCodeDevice() {
+    const list = document.getElementById('modalTCodeList');
+    const info = document.getElementById('modalTCodeInfo');
+    if (!list) return;
+    const dev = isTCodeConnected() ? getTCodeDevice() : null;
+    if (info) {
+        if (dev) {
+            info.textContent = `${dev.name}${dev.version ? ` - ${dev.version}` : ''}${dev.identified ? '' : ' (no reply to D0/D1/D2: assuming the OSR2 axis set)'}`;
+            info.classList.remove('hidden');
+        } else {
+            info.textContent = 'No device';
+            info.classList.add('hidden');
+        }
+    }
+    if (!dev) {
+        list.innerHTML = `<div class="p-3 bg-slate-950 rounded-xl border border-slate-800 text-slate-500 text-xs italic text-center">Connect to list the device axes.</div>`;
+        renderTCodeSummaryBadge();
+        return;
+    }
+    list.innerHTML = '';
+    dev.axes.forEach((axis, aIdx) => {
+        const kindLabel = axis.kind === 'linear' ? 'Linear' : axis.kind === 'rotate' ? 'Rotate' : axis.kind === 'vibe' ? 'Vibe' : 'Aux';
+        const invertRow = axis.kind === 'linear' ? `
+        <label class="flex items-center justify-between text-[9px] text-slate-400 pt-1 border-t border-slate-800/60 cursor-pointer">
+        <span>Invert direction (sleeve mounted upside down)</span>
+        <input type="checkbox" ${axis.invert ? 'checked' : ''} onchange="setTCodeInvert(${aIdx}, this.checked)" class="accent-amber-500 cursor-pointer">
+        </label>` : '';
+        const item = document.createElement('div');
+        item.className = 'bg-slate-900 p-2 rounded-lg border border-slate-800 space-y-1.5 text-[10px]';
+        item.innerHTML = `
+        <div class="flex justify-between items-center gap-1">
+        <span class="font-bold text-slate-300 truncate">${escapeHtml(axis.id)} - ${escapeHtml(axis.description)} <span class="font-normal text-slate-500">(${kindLabel})</span></span>
+        <button onclick="testTCodeAxis(${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer shrink-0">Test</button>
+        </div>
+        <div class="flex gap-1">
+        <button onclick="setTCodeRole(${aIdx}, 'primary')" class="flex-1 py-1 rounded ${axis.role === 'primary' ? 'bg-rose-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Primary</button>
+        <button onclick="setTCodeRole(${aIdx}, 'secondary')" class="flex-1 py-1 rounded ${axis.role === 'secondary' ? 'bg-purple-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Secondary</button>
+        <button onclick="setTCodeRole(${aIdx}, 'off')" class="flex-1 py-1 rounded ${axis.role === 'off' ? 'bg-slate-700 text-amber-300 font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">OFF</button>
+        </div>
+        <div class="space-y-0.5 pt-1 border-t border-slate-800/60">
+        <div class="flex justify-between text-[9px] text-slate-400">
+        <span>Max cap:</span>
+        <span id="tcodeCapVal_${aIdx}" class="font-bold font-mono text-amber-400">${axis.maxCap ?? 100}%</span>
+        </div>
+        <input type="range" min="10" max="100" step="5" value="${axis.maxCap ?? 100}" oninput="setTCodeCap(${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">
+        </div>
+        ${invertRow}
+        `;
+        list.appendChild(item);
+    });
+    renderTCodeSummaryBadge();
+}
+
+function renderTCodeSummaryBadge() {
+    const status = getTCodeStatus();
+    if (!isTCodeConnected()) {
+        const busy = status.state === 'connecting' || status.state === 'handshake';
+        let label = 'Disconnected';
+        if (busy) label = status.state === 'handshake' ? 'Identifying...' : 'Connecting...';
+        else if (status.state === 'error') label = isSerialSupported() ? 'Error' : 'Unsupported';
+        setBadgeState('TCode', busy ? 'connecting' : 'disconnected', label, null);
+        return;
+    }
+    const dev = getTCodeDevice();
+    let nameLabel = dev ? dev.name.split(' ')[0] : 'TCode';
+    const assigned = countAssignedTCodeAxes();
+    if (assigned === 0) nameLabel += ' (all OFF)';
+    setBadgeState('TCode', 'connected', nameLabel, null);
 }
 
 // Session History & Funscript Downloader Hook
@@ -2107,30 +2495,87 @@ document.getElementById('clearHistoryBtn')?.addEventListener('click', () => {
     renderHistory();
 });
 
-// Partner WebRTC Sync
+// Partner WebRTC Sync (host side): one controller plus any number of
+// read-only viewers. Commands arrive already validated by peer-messages.js.
+function setPartnerStatus(text, tone = 'wait') {
+    const status = document.getElementById('partnerStatusText');
+    if (!status) return;
+    status.textContent = text;
+    status.className = tone === 'ok' ? 'font-bold text-emerald-400'
+        : tone === 'error' ? 'font-bold text-rose-400'
+        : 'font-bold text-amber-400';
+}
+
+// Header badge ("1C+2V") and the Share modal's viewer list, counted apart.
+function renderPeerCounts() {
+    const counts = getPeerCounts();
+    const badge = document.getElementById('shareControlBadge');
+    if (badge) {
+        const parts = [];
+        if (counts.controllers > 0) parts.push(`${counts.controllers}C`);
+        if (counts.viewers > 0) parts.push(`${counts.viewers}V`);
+        badge.textContent = parts.join('+');
+        badge.title = `${counts.controllers} controller, ${counts.viewers} viewer(s) connected`;
+        badge.classList.toggle('hidden', parts.length === 0);
+    }
+    const viewerBadge = document.getElementById('groupViewerCountBadge');
+    if (viewerBadge) viewerBadge.textContent = `${counts.viewers} Watching`;
+    const viewerList = document.getElementById('groupViewersList');
+    if (viewerList) {
+        viewerList.textContent = counts.viewers > 0
+            ? `${counts.viewers} read-only viewer(s) receiving live telemetry.`
+            : 'No viewers currently connected.';
+    }
+}
+
 function setupPartnerHost() {
+    if (!peerLibraryAvailable()) {
+        setPartnerStatus('Signalling library not loaded (CDN blocked or offline). Remote control is unavailable.', 'error');
+        ['partnerShareUrl', 'groupShareUrl'].forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.value = 'Unavailable: the PeerJS library could not be loaded';
+        });
+        return;
+    }
     initHostPeer({
         onPeerReady: (id) => {
             const share = document.getElementById('partnerShareUrl');
             const group = document.getElementById('groupShareUrl');
             if (share) share.value = `${window.location.origin}${window.location.pathname}?partner=${id}`;
             if (group) group.value = `${window.location.origin}${window.location.pathname}?group_sub=${id}`;
-            const status = document.getElementById('partnerStatusText');
-            if (status) status.textContent = "Ready (Awaiting Controller)";
+            // Also fires after a signalling reconnect: keep a live controller shown as such.
+            if (getPeerCounts().controllers > 0) setPartnerStatus('Controller Connected', 'ok');
+            else setPartnerStatus('Ready (Awaiting Controller)');
+            renderPeerCounts();
         },
         onPartnerConnected: () => {
-            const status = document.getElementById('partnerStatusText');
-            if (status) {
-                status.textContent = "Controller Connected";
-                status.className = "font-bold text-emerald-400";
-            }
+            setPartnerStatus('Controller Connected', 'ok');
+            renderPeerCounts();
             syncTelemetry();
+        },
+        onControllerDisconnected: (reason) => {
+            setPartnerStatus(reason === 'timeout' ? 'Partner disconnected (no response)' : 'Partner disconnected', 'error');
+            renderPeerCounts();
+        },
+        onViewerConnected: () => {
+            renderPeerCounts();
+            syncTelemetry();
+        },
+        onViewerDisconnected: () => renderPeerCounts(),
+        onCountsChanged: () => renderPeerCounts(),
+        onSignallingLost: () => setPartnerStatus('Signalling lost, reconnecting...', 'error'),
+        onPeerClosed: () => {
+            setPartnerStatus('Signalling closed. Reopen Share Control to create a new room.', 'error');
+            renderPeerCounts();
+        },
+        onPeerError: (message) => {
+            setPartnerStatus(`Signalling error: ${message}`, 'error');
+            renderPeerCounts();
         },
         onCommandReceived: (cmd) => {
             if (cmd.type === 'SESSION_STATE') {
-                const wantsActive = cmd.status === 'RUNNING' || cmd.status === 'RAMPDOWN';
                 const hostActive = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
-                if (wantsActive && !hostActive) playPauseBtn?.click();
+                if (cmd.status === 'RUNNING' && !hostActive) playPauseBtn?.click();
                 else if (cmd.status === 'PAUSED' && hostActive) playPauseBtn?.click();
                 else if (cmd.status === 'IDLE') stopBtn?.click();
             } else if (cmd.type === 'SESSION_RESET') resetBtn?.click();
@@ -2143,34 +2588,114 @@ function setupPartnerHost() {
     });
 }
 
+// ---- Remote page (controller or viewer) ----------------------------------
+
+// A viewer page renders everything but can change nothing. Re-applied after
+// every telemetry frame because some renderers reset element classes.
+const VIEWER_LOCKED_IDS = [
+    'sessionPlayPauseBtn', 'sessionStopBtn', 'sessionResetBtn', 'cameEarlyBtn', 'orgasmBtn',
+    'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
+    'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode'
+];
+function lockElement(el) {
+    if (!el) return;
+    el.disabled = true;
+    el.setAttribute('aria-disabled', 'true');
+    el.classList.remove('cursor-pointer');
+    el.classList.add('opacity-60', 'cursor-not-allowed');
+}
+function lockViewerControls() {
+    VIEWER_LOCKED_IDS.forEach((id) => lockElement(document.getElementById(id)));
+    modeCards.forEach(lockElement);
+}
+
+// The typed limits belong to the host: on a remote page the inputs only
+// mirror what the host reports.
+function lockRemoteLimitInputs() {
+    ['minHr', 'maxHr'].forEach((id) => {
+        const input = document.getElementById(id);
+        if (!input) return;
+        input.disabled = true;
+        input.title = 'Set by the host';
+        input.classList.add('opacity-70');
+    });
+}
+
+let lastTelemetryAt = 0;
+let remoteLinkUp = false;
+
+function showRemoteBanner(message) {
+    const banner = document.getElementById('disconnectBanner');
+    const msg = document.getElementById('disconnectMsg');
+    if (msg) msg.textContent = message;
+    banner?.classList.remove('hidden');
+}
+
+// Telemetry arrives every second; a long silence with the channel still
+// nominally open means the host is gone.
+const REMOTE_TELEMETRY_STALE_MS = 10000;
+function checkRemoteLinkHealth(now = Date.now()) {
+    if (!remoteLinkUp || remoteLinkLost || !lastTelemetryAt) return;
+    if (now - lastTelemetryAt > REMOTE_TELEMETRY_STALE_MS) {
+        markRemoteLinkLost(`No telemetry from the host for ${Math.round((now - lastTelemetryAt) / 1000)} s. The host may have closed the page or lost its connection.`);
+    }
+}
+
+function markRemoteLinkLost(message) {
+    remoteLinkLost = true;
+    state.remoteHostReady = false;
+    setRemoteRoleStatus('Disconnected');
+    showRemoteBanner(message);
+    checkReadiness();
+}
+
 function applyRemoteTelemetry(data) {
     if (!data || data.type !== 'TELEMETRY') return;
-    if (typeof data.hr === 'number') state.hrCurrent = data.hr;
-    if (typeof data.seconds === 'number') state.sessionSeconds = data.seconds;
-    if (typeof data.chosenTargetSeconds === 'number') state.chosenTargetSeconds = data.chosenTargetSeconds;
-    if (data.sessionStatus) state.sessionStatus = data.sessionStatus;
-    if (typeof data.edges === 'number') state.edges = data.edges;
-    if (typeof data.pauses === 'number') state.pauses = data.pauses;
-    if (typeof data.strokerSpeed === 'number') state.strokerSpeed = data.strokerSpeed;
-    if (typeof data.prostateSpeed === 'number') state.prostateSpeed = data.prostateSpeed;
-    if (Array.isArray(data.history)) state.history = data.history;
-    if (data.activeMode) state.activeMode = data.activeMode;
-    if (typeof data.orgasmMode === 'boolean' && data.orgasmMode !== state.orgasmMode) setOrgasmMode(data.orgasmMode);
-    if (typeof data.ready === 'boolean') state.remoteHostReady = data.ready;
-    // Watchdog state is rendered, never evaluated, on the partner page.
-    if (data.hrSignal && typeof data.hrSignal === 'object') {
-        state.hrSignalState = data.hrSignal.status || 'ok';
-        state.hrNoContact = Boolean(data.hrSignal.noContact);
+    lastTelemetryAt = Date.now();
+    // Telemetry proves the data channel is alive even after a signalling
+    // error, so the stale check stays armed.
+    remoteLinkUp = true;
+    if (remoteLinkLost || remoteRoleSuffix !== 'Live') {
+        // Also clears a transient "Signalling lost" once frames keep coming.
+        remoteLinkLost = false;
+        setRemoteRoleStatus('Live');
+        document.getElementById('disconnectBanner')?.classList.add('hidden');
+    }
+    if (data.hr !== undefined) state.hrCurrent = data.hr;
+    if (data.seconds !== undefined) state.sessionSeconds = data.seconds;
+    if (data.chosenTargetSeconds !== undefined) state.chosenTargetSeconds = data.chosenTargetSeconds;
+    if (data.sessionStatus !== undefined) state.sessionStatus = data.sessionStatus;
+    if (data.edges !== undefined) state.edges = data.edges;
+    if (data.pauses !== undefined) state.pauses = data.pauses;
+    if (data.strokerSpeed !== undefined) state.strokerSpeed = data.strokerSpeed;
+    if (data.prostateSpeed !== undefined) state.prostateSpeed = data.prostateSpeed;
+    if (data.history !== undefined) state.history = data.history;
+    if (data.minHr !== undefined) state.effectiveMinHr = data.minHr;
+    if (data.maxHr !== undefined) state.effectiveMaxHr = data.maxHr;
+    if (data.activeMode !== undefined && data.activeMode !== state.activeMode) {
+        state.activeMode = data.activeMode;
+        highlightModeCard(state.activeMode);
+    }
+    if (data.orgasmMode !== undefined && data.orgasmMode !== state.orgasmMode) setOrgasmMode(data.orgasmMode);
+    if (data.ready !== undefined) state.remoteHostReady = data.ready;
+    // Watchdog state is rendered, never evaluated, on a remote page.
+    if (data.hrSignal) {
+        state.hrSignalState = data.hrSignal.status;
+        state.hrNoContact = data.hrSignal.noContact;
         renderHrSignal({
             status: state.hrSignalState,
             noContact: state.hrNoContact,
-            sinceValidMs: Number(data.hrSignal.silentMs) || 0
+            sinceValidMs: data.hrSignal.silentMs
         });
     }
     checkReadiness();
 
     const hrDisplay = document.getElementById('hrDisplay');
     if (hrDisplay) hrDisplay.textContent = state.hrCurrent;
+    const minInput = document.getElementById('minHr');
+    const maxInput = document.getElementById('maxHr');
+    if (minInput) minInput.value = state.effectiveMinHr;
+    if (maxInput) maxInput.value = state.effectiveMaxHr;
     const strokerVal = document.getElementById('strokerVal');
     const strokerBar = document.getElementById('strokerBar');
     const prostateVal = document.getElementById('prostateVal');
@@ -2184,10 +2709,12 @@ function applyRemoteTelemetry(data) {
     if (edgeEl) edgeEl.textContent = state.edges;
     if (pauseEl) pauseEl.textContent = state.pauses;
     updateTimerDisplay();
+    redrawChart();
+    if (isRemoteViewer) lockViewerControls();
 }
 
 function syncTelemetry() {
-    if (isRemoteController) return;
+    if (isRemotePage) return;
     const readiness = hardwareReadiness();
     broadcastPeerTelemetry({
         type: 'TELEMETRY',
@@ -2200,6 +2727,10 @@ function syncTelemetry() {
         strokerSpeed: state.strokerSpeed,
         prostateSpeed: state.prostateSpeed,
         history: state.history,
+        // The WORKING limits after every offset, so remote charts draw the
+        // guide lines where edges really trigger.
+        minHr: state.effectiveMinHr,
+        maxHr: state.effectiveMaxHr,
         activeMode: state.activeMode,
         orgasmMode: state.orgasmMode,
         ready: readiness.hrReady && readiness.toyReady,
@@ -2211,45 +2742,94 @@ function syncTelemetry() {
     });
 }
 
-document.getElementById('copyShareUrlBtn')?.addEventListener('click', () => {
-    const copyInput = document.getElementById('partnerShareUrl');
-    if (!copyInput) return;
-    copyInput.select();
-    navigator.clipboard.writeText(copyInput.value);
-    const btn = document.getElementById('copyShareUrlBtn');
-    if (btn) {
-        btn.textContent = "Copied!";
-        setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+// Copy a share link. navigator.clipboard only exists in secure contexts
+// (https / localhost): on plain http over a LAN fall back to selecting the
+// field and execCommand('copy'). Never throws; when even that fails the
+// text is left selected so the user can copy it by hand.
+async function copyLinkFrom(inputId, btnId) {
+    const input = document.getElementById(inputId);
+    const btn = document.getElementById(btnId);
+    if (!input || !input.value) return false;
+    let copied = false;
+    try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(input.value);
+            copied = true;
+        }
+    } catch (e) {
+        copied = false;
     }
+    if (!copied) {
+        try {
+            input.focus();
+            input.select();
+            input.setSelectionRange(0, input.value.length);
+            copied = typeof document.execCommand === 'function' && document.execCommand('copy');
+        } catch (e) {
+            copied = false;
+        }
+    }
+    if (btn) {
+        btn.textContent = copied ? 'Copied!' : 'Select & copy';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+    }
+    if (!copied) {
+        try {
+            input.focus();
+            input.select();
+        } catch (e) { /* nothing more to do */ }
+    }
+    return copied;
+}
+
+document.getElementById('copyShareUrlBtn')?.addEventListener('click', () => {
+    copyLinkFrom('partnerShareUrl', 'copyShareUrlBtn').catch(() => {});
 });
 
 document.getElementById('copyGroupUrlBtn')?.addEventListener('click', () => {
-    const copyInput = document.getElementById('groupShareUrl');
-    if (!copyInput) return;
-    copyInput.select();
-    navigator.clipboard.writeText(copyInput.value);
-    const btn = document.getElementById('copyGroupUrlBtn');
-    if (btn) {
-        btn.textContent = "Copied!";
-        setTimeout(() => { btn.textContent = "Copy"; }, 2000);
-    }
+    copyLinkFrom('groupShareUrl', 'copyGroupUrlBtn').catch(() => {});
 });
 
 // Boot Initialization
 initHandyRoleUI();
 renderLearningStatus();
 syncParamsUI();
-if (advancedSettings.micEnabled) applyMicSetting(true);
+// A persisted mic setting waits for a tap (browser gesture rule).
+if (advancedSettings.micEnabled && !isRemotePage) showMicReenable(true);
 if (advancedSettings.voiceEnabled) setMindgamePrompt('Calm and steady. Breathe.', true);
-if (isRemoteController && partnerRoom) {
-    initControllerPeer(partnerRoom, {
+watchChartResize(document.getElementById('hrChart'), redrawChart);
+if (isRemotePage && remoteRoom) {
+    lockRemoteLimitInputs();
+    if (isRemoteViewer) lockViewerControls();
+    const started = initRemotePeer(remoteRoom, isRemoteViewer ? 'viewer' : 'controller', {
         onConnected: () => {
-            const role = document.getElementById('roleIndicator');
-            if (role) role.textContent = 'Remote Controller · Live';
+            remoteLinkUp = true;
+            remoteLinkLost = false;
+            lastTelemetryAt = Date.now();
+            setRemoteRoleStatus('Live');
+            document.getElementById('disconnectBanner')?.classList.add('hidden');
         },
-        onTelemetryReceived: applyRemoteTelemetry
+        onTelemetryReceived: applyRemoteTelemetry,
+        onDisconnected: () => {
+            remoteLinkUp = false;
+            markRemoteLinkLost('Host disconnected. Reload this link once the host has reopened Share Control.');
+        },
+        onSignallingLost: () => setRemoteRoleStatus(remoteLinkLost ? 'Disconnected' : 'Signalling lost'),
+        onPeerClosed: () => {
+            remoteLinkUp = false;
+            markRemoteLinkLost('The signalling connection closed. Reload this link to reconnect.');
+        },
+        onPeerError: (message) => {
+            remoteLinkUp = false;
+            markRemoteLinkLost(`Signalling error: ${message}.`);
+        }
     });
+    if (!started) {
+        markRemoteLinkLost('This remote link cannot start: the PeerJS signalling library could not be loaded (CDN blocked or offline).');
+        setRemoteRoleStatus('Unavailable');
+    }
 }
 checkReadiness();
 updateEngine();
-if (!isRemoteController) maybeShowFirstRunWizard();
+redrawChart();
+if (!isRemotePage) maybeShowFirstRunWizard();

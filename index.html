@@ -111,6 +111,7 @@
               <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
               <span id="effectiveCeilingBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1" title="The climax ceiling the engine is using right now, after every offset"><span id="effectiveCeilingLabel">CEILING</span> <span id="effectiveCeilingText">140</span> BPM</span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
+              <button id="micReenableBtn" type="button" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 hover:bg-amber-900 ml-1 cursor-pointer" title="Browsers only grant the microphone after a tap">Tap to re-enable microphone</button>
             </div>
 
             <!-- BPM Limits -->
@@ -128,7 +129,7 @@
 
           <!-- 60-Second Real-Time Canvas -->
           <div class="relative">
-            <canvas id="hrChart" width="800" height="110" class="w-full h-20 sm:h-24 bg-slate-950 rounded-xl border border-slate-800/80"></canvas>
+            <canvas id="hrChart" class="block w-full h-20 sm:h-24 bg-slate-950 rounded-xl border border-slate-800/80"></canvas>
             <div id="staleAlert" class="absolute inset-0 bg-slate-950/85 backdrop-blur-[1px] rounded-xl flex items-center justify-center text-center px-3 text-xs font-bold text-rose-400 hidden">
               <span id="staleAlertText">WATCHDOG: NO HEART-RATE READING, MOTORS HALTED</span>
             </div>
@@ -234,7 +235,7 @@
       <div class="lg:col-span-5 space-y-3 flex flex-col justify-between">
 
         <!-- Hardware Status Badges -->
-        <div class="grid grid-cols-3 gap-1.5">
+        <div class="grid grid-cols-2 xl:grid-cols-4 gap-1.5">
           <button id="cardBle" class="text-left p-2 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 transition flex items-start gap-2 cursor-pointer min-w-0">
             <span id="dotBle" class="h-2 w-2 rounded-full bg-rose-500/30 border border-rose-500 shrink-0 mt-1"></span>
             <div class="flex flex-col min-w-0 flex-1">
@@ -259,6 +260,15 @@
               <span class="text-[8px] font-bold uppercase tracking-wider text-slate-400 leading-tight">Intiface Toys</span>
               <span id="badgeIntifaceText" class="text-[11px] text-slate-200 font-medium truncate block mt-0.5">Disconnected</span>
               <span id="badgeIntifaceBattery" class="text-[9px] font-mono text-emerald-400 hidden mt-0.5">🔋 --%</span>
+            </div>
+          </button>
+
+          <button id="cardTCode" class="text-left p-2 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 transition flex items-start gap-2 cursor-pointer min-w-0">
+            <span id="dotTCode" class="h-2 w-2 rounded-full bg-rose-500/30 border border-rose-500 shrink-0 mt-1"></span>
+            <div class="flex flex-col min-w-0 flex-1">
+              <span class="text-[8px] font-bold uppercase tracking-wider text-slate-400 leading-tight">TCode Serial</span>
+              <span id="badgeTCodeText" class="text-[11px] text-slate-200 font-medium truncate block mt-0.5">Disconnected</span>
+              <span id="badgeTCodeBattery" class="text-[9px] font-mono text-emerald-400 hidden mt-0.5">🔋 --%</span>
             </div>
           </button>
         </div>
@@ -330,7 +340,7 @@
                 <span class="mode-check hidden text-rose-500">●</span>
               </div>
               <p class="text-[9px] text-slate-400 mt-0.5 leading-snug">
-                Pulls stroke envelope away from glans into base micro-strokes (0–35%).
+                Pulls the stroke zone away from the glans as your pulse climbs: full length at rest, base micro-strokes (0–35%) at the ceiling.
               </p>
             </button>
 
@@ -539,7 +549,7 @@
 
       <!-- 3. Intiface Central Modal (Natural Smooth Scrolling Tray) -->
       <div id="modalBodyIntiface" class="space-y-3 hidden">
-        <p class="text-xs text-slate-400">Bridge toys via Intiface Central. OSR2 / SR6 / OSSM: add the serial/T-code device in Intiface first, connect EdgeLoop to <span class="font-mono">ws://localhost:12345</span>, then use <strong>Test</strong> on each Linear and Rotate axis. Stroke maps to Linear; twist/roll map to Rotate. Assign leftover axes Secondary or OFF.</p>
+        <p class="text-xs text-slate-400">Bridge toys via Intiface Central (server started, URL <span class="font-mono">ws://</span> not <span class="font-mono">wss://</span> for localhost). OSR2 / SR6 / OSSM: add the serial/T-code device in Intiface first, connect EdgeLoop to <span class="font-mono">ws://localhost:12345</span>, then use <strong>Test</strong> on each Linear and Rotate axis. Stroke maps to Linear; twist/roll map to Rotate. Assign leftover axes Secondary or OFF. Roles, caps and rotation settings are remembered per toy.</p>
         <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
           <div class="flex justify-between items-center">
             <span class="text-[10px] font-semibold text-slate-300">WebSocket URL</span>
@@ -571,6 +581,36 @@
         <button id="modalIntifaceSaveBtn" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 px-3 rounded-xl text-xs transition shadow-lg shadow-emerald-950/30 cursor-pointer">
           Save & Apply Configuration
         </button>
+      </div>
+
+      <!-- 3b. TCode Serial Modal (OSR2 / SR6 / OSSM over Web Serial, no Intiface) -->
+      <div id="modalBodyTCode" class="space-y-3 hidden">
+        <p class="text-xs text-slate-400">Drive an OSR2, SR6, OSSM or any other T-Code v0.3 stroker straight over its USB serial port (115200 baud), without Intiface Central. Close Intiface Central, MultiFunPlayer or any other app that holds the COM port first, then press <strong>Connect</strong> and pick the port in the browser dialog. On Linux your user must be in the <span class="font-mono">dialout</span> group.</p>
+        <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+          <div class="flex justify-between items-center gap-2">
+            <span class="text-[10px] font-semibold text-slate-300 shrink-0">Serial port</span>
+            <span id="modalTCodeStatusText" class="text-[10px] font-mono text-rose-400 text-right max-w-[70%] break-words">Offline</span>
+          </div>
+          <div id="modalTCodeInfo" class="text-[10px] font-mono text-slate-400 hidden">No device</div>
+          <div class="flex gap-2">
+            <button id="modalTCodeConnectBtn" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-3 py-1 rounded-lg text-xs transition cursor-pointer">
+              Connect
+            </button>
+            <button id="modalTCodeDisconnectBtn" class="bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 font-bold px-3 py-1 rounded-lg text-xs transition hidden cursor-pointer">
+              Disconnect
+            </button>
+          </div>
+        </div>
+
+        <div class="space-y-1.5">
+          <label class="text-[10px] text-slate-300 font-semibold">Axes & Roles</label>
+          <div id="modalTCodeList" class="space-y-2 max-h-56 overflow-y-auto no-scrollbar scroll-smooth pr-0.5">
+            <div class="p-3 bg-slate-950 rounded-xl border border-slate-800 text-slate-500 text-xs italic text-center">
+              Connect to list the device axes.
+            </div>
+          </div>
+        </div>
+        <p class="text-[9px] text-slate-500 leading-snug">L0 (stroke) is Primary by default and follows the stroke zone and the Handy travel envelope; V0 is Secondary; every other axis is OFF until you assign it. Rotation axes swing around centre by the engine speed. Tap <strong>Test</strong> to see which motor an axis is. Roles, caps and invert are remembered per device name.</p>
       </div>
 
       <!-- 4. Session History & Funscript Download Modal -->
@@ -666,6 +706,19 @@
         <!-- TAB 2: Guards -->
         <div id="paramsGuardsSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="ceilingBehaviourSelect" class="text-xs font-bold text-slate-200">At the ceiling</label>
+              <select id="ceilingBehaviourSelect" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-purple-300 font-bold outline-none focus:border-purple-500">
+                <option value="stop">Full Stop (0%)</option>
+                <option value="crawl">Crawl (10%)</option>
+              </select>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              What the strokers do while your pulse sits at the climax ceiling. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+            </p>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <div class="flex justify-between items-center">
               <label class="text-xs font-bold text-slate-200">Prolonged Edge Auto-Cutoff (Stall Guard)</label>
               <label class="relative inline-flex items-center cursor-pointer">
@@ -674,7 +727,7 @@
               </label>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Cuts the primary stroker to 0% if trapped near the ceiling too long during crawl mode. The secondary channel keeps running.
+              Cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout. The secondary channel keeps running. Only relevant with Crawl selected above.
             </p>
             <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
               <span class="text-[9px] text-slate-400 font-semibold">Timeout:</span>
@@ -835,7 +888,7 @@
         </div>
 
         <div id="partner1on1Section" class="space-y-2.5">
-          <p class="text-xs text-slate-400">Share this direct WebRTC link with a single controller.</p>
+          <p class="text-xs text-slate-400">Share this direct WebRTC link with a single controller. A second controller replaces the first.</p>
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <div class="text-[9px] text-slate-500 uppercase font-semibold">1-on-1 Session URL</div>
             <div class="flex gap-2">
@@ -850,9 +903,9 @@
         </div>
 
         <div id="partnerGroupSection" class="space-y-2.5 hidden">
-          <p class="text-xs text-slate-400">v1 supports one remote controller. Extra joiners replace the previous connection.</p>
+          <p class="text-xs text-slate-400">Share this link with any number of read-only viewers. They see the live telemetry exactly as the controller does, but every control is disabled. Only the 1-on-1 link can control the session.</p>
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-            <div class="text-[9px] text-slate-500 uppercase font-semibold">Group Join Link</div>
+            <div class="text-[9px] text-slate-500 uppercase font-semibold">Viewer Join Link</div>
             <div class="flex gap-2">
               <input id="groupShareUrl" type="text" readonly class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 font-mono text-[10px] text-slate-300 select-all outline-none">
               <button id="copyGroupUrlBtn" class="bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold px-3 py-1 rounded-lg transition cursor-pointer">Copy</button>
@@ -860,10 +913,10 @@
           </div>
           <div class="p-2 bg-slate-950 rounded-xl border border-slate-800 space-y-1">
             <div class="flex justify-between items-center text-xs">
-              <span class="font-bold text-slate-300">Connected Wearers</span>
-              <span id="groupWearerCountBadge" class="font-mono text-purple-400 font-bold">0 Attached</span>
+              <span class="font-bold text-slate-300">Connected Viewers</span>
+              <span id="groupViewerCountBadge" class="font-mono text-purple-400 font-bold">0 Watching</span>
             </div>
-            <div id="groupWearersList" class="space-y-1 text-[10px] text-slate-500 italic">No wearers currently attached.</div>
+            <div id="groupViewersList" class="space-y-1 text-[10px] text-slate-500 italic">No viewers currently connected.</div>
           </div>
         </div>
       </div>
@@ -920,8 +973,8 @@
       <div id="wizardStep1" class="wizard-pane space-y-2 text-center hidden">
         <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 2 of 3</p>
         <h3 class="text-base font-bold text-white">Connect your toys</h3>
-        <p class="text-xs text-slate-400 leading-relaxed">The Handy uses your Wi-Fi connection key. Everything else (vibrators, OSSM, OSR2/SR6) goes through <strong class="text-slate-200">Intiface Central</strong> at <span class="font-mono text-slate-300">ws://localhost:12345</span>.</p>
-        <p class="text-[10px] text-slate-500 leading-relaxed">In the Intiface tray, assign each axis Primary, Secondary, or OFF, then tap <strong>Test</strong> so you know Linear (stroke) and Rotate (twist/roll) are mapped.</p>
+        <p class="text-xs text-slate-400 leading-relaxed">The Handy uses your Wi-Fi connection key. OSR2, SR6 and OSSM strokers plug in over USB through <strong class="text-slate-200">TCode Serial</strong> (Chrome or Edge on a desktop). Everything else (vibrators, Bluetooth toys) goes through <strong class="text-slate-200">Intiface Central</strong> at <span class="font-mono text-slate-300">ws://localhost:12345</span>.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">In the TCode or Intiface tray, assign each axis Primary, Secondary, or OFF, then tap <strong>Test</strong> so you know Linear (stroke) and Rotate (twist/roll) are mapped.</p>
       </div>
 
       <div id="wizardStep2" class="wizard-pane space-y-2 text-center hidden">
@@ -966,13 +1019,23 @@ python3 -m http.server 8787</pre>
       const denyBtn = document.getElementById('ageDenyBtn');
       const fileProtocol = location.protocol === 'file:';
 
+      // This classic script cannot import storage.js, so it carries the same
+      // guards inline: localStorage can throw on ACCESS (blocked cookies,
+      // private mode) and that must never break the age gate.
+      function safeGet(key) {
+        try { return window.localStorage.getItem(key); } catch (e) { return null; }
+      }
+      function safeSet(key, value) {
+        try { window.localStorage.setItem(key, value); return true; } catch (e) { return false; }
+      }
+
       if (fileProtocol && fileNotice) fileNotice.classList.remove('hidden');
-      if (!fileProtocol && localStorage.getItem('edgeloop_age_verified') === 'true' && overlay) {
+      if (!fileProtocol && safeGet('edgeloop_age_verified') === 'true' && overlay) {
         overlay.classList.add('hidden');
       }
 
       confirmBtn?.addEventListener('click', function () {
-        localStorage.setItem('edgeloop_age_verified', 'true');
+        safeSet('edgeloop_age_verified', 'true');
         if (fileProtocol) return;
         overlay?.classList.add('hidden');
       });
@@ -982,7 +1045,7 @@ python3 -m http.server 8787</pre>
 
       window.dismissWizard = function () {
         document.getElementById('wizardOverlay')?.classList.add('hidden');
-        try { localStorage.setItem('edgeloop_wizard_seen', 'true'); } catch (e) {}
+        safeSet('edgeloop_wizard_seen', 'true');
       };
     })();
   </script>

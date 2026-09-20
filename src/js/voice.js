@@ -1,15 +1,42 @@
 /**
  * Local TTS prompts and optional microphone arousal monitor.
+ *
+ * Cues go through a short queue (voice-queue.js) instead of cancelling
+ * whatever is being said: back-to-back cues are all heard, duplicates are
+ * dropped and at most three wait. Only speakNow() (safety-critical cues)
+ * and cancelSpeech() (STOP / Reset / voice turned off) interrupt speech.
  */
+import { createCueQueue } from './voice-queue.js';
 
-export function listSpeechVoices() {
-    if (!window.speechSynthesis) return [];
-    return window.speechSynthesis.getVoices() || [];
+const queue = createCueQueue({ maxQueued: 3 });
+let activeToken = 0;
+let fallbackTimer = null;
+
+function synth() {
+    return typeof window !== 'undefined' ? window.speechSynthesis : null;
 }
 
-export function speakPrompt(enabled, text, voiceURI = '') {
-    if (!enabled || !text || !window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
+export function listSpeechVoices() {
+    const s = synth();
+    if (!s) return [];
+    return s.getVoices() || [];
+}
+
+function clearFallbackTimer() {
+    if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+    }
+}
+
+// Speak one utterance and advance the queue when it ends. A token guards
+// the callbacks so a cancelled utterance can never pop the NEXT cue, and a
+// fallback timer keeps the queue moving on browsers that never fire `end`.
+function utter(text, voiceURI) {
+    const s = synth();
+    if (!s) return;
+    const token = ++activeToken;
+    clearFallbackTimer();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 0.95;
     utterance.pitch = 0.92;
@@ -17,7 +44,62 @@ export function speakPrompt(enabled, text, voiceURI = '') {
         const match = listSpeechVoices().find((voice) => voice.voiceURI === voiceURI);
         if (match) utterance.voice = match;
     }
-    window.speechSynthesis.speak(utterance);
+    const done = () => {
+        if (token !== activeToken) return;
+        clearFallbackTimer();
+        const next = queue.next();
+        if (next) utter(next, voiceURI);
+    };
+    utterance.onend = done;
+    utterance.onerror = done;
+    fallbackTimer = setTimeout(done, 3000 + text.length * 120);
+    try {
+        s.speak(utterance);
+    } catch (e) {
+        done();
+    }
+}
+
+// Enqueue a cue. Nothing already speaking is interrupted.
+export function speakPrompt(enabled, text, voiceURI = '') {
+    if (!enabled || !text || !synth()) return;
+    if (!queue.enqueue(text)) return;
+    if (queue.isIdle()) {
+        const next = queue.next();
+        if (next) utter(next, voiceURI);
+    }
+}
+
+// Safety-critical cue: drops everything waiting, cuts the current cue and
+// speaks `text` immediately.
+export function speakNow(text, voiceURI = '') {
+    const s = synth();
+    if (!text || !s) return;
+    activeToken += 1;
+    const mine = activeToken;
+    clearFallbackTimer();
+    queue.jump(text);
+    try {
+        s.cancel();
+    } catch (e) { /* nothing to cancel */ }
+    // Chrome drops an utterance queued in the same tick as cancel(); a short
+    // delay makes the urgent cue reliable. Skipped if silenced meanwhile.
+    setTimeout(() => {
+        if (activeToken === mine) utter(text, voiceURI);
+    }, 50);
+}
+
+// Silence everything: current cue and queue. Used on STOP, Reset and when
+// voice guidance is switched off.
+export function cancelSpeech() {
+    activeToken += 1;
+    clearFallbackTimer();
+    queue.clear();
+    const s = synth();
+    if (!s) return;
+    try {
+        s.cancel();
+    } catch (e) { /* nothing to cancel */ }
 }
 
 export function setMindgamePrompt(text, visible) {
@@ -27,13 +109,29 @@ export function setMindgamePrompt(text, visible) {
     if (box) box.classList.toggle('hidden', !visible);
 }
 
+// Must be called from inside a user gesture (a click): the AudioContext is
+// created and resumed BEFORE the permission prompt awaits, because a context
+// created after the gesture has ended starts suspended on most browsers.
 export async function startMicMonitor(state) {
     stopMicMonitor(state);
     if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error('Microphone not supported in this browser');
     }
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtor) {
+        throw new Error('Web Audio not supported in this browser');
+    }
+    const audioCtx = new AudioCtor();
+    try {
+        if (audioCtx.state !== 'running') await audioCtx.resume();
+    } catch (e) { /* resume is best effort; getUserMedia may still unlock it */ }
+    let stream;
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch (e) {
+        audioCtx.close().catch(() => {});
+        throw e;
+    }
     const source = audioCtx.createMediaStreamSource(stream);
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
@@ -41,6 +139,11 @@ export async function startMicMonitor(state) {
     state.micStream = stream;
     state.micAudioCtx = audioCtx;
     state.micAnalyser = analyser;
+    if (audioCtx.state !== 'running') {
+        try {
+            await audioCtx.resume();
+        } catch (e) { /* the level sampler simply reads silence until it runs */ }
+    }
 }
 
 export function stopMicMonitor(state) {

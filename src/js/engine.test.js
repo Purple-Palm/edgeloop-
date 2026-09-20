@@ -1,6 +1,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateEngineOutputs, ENGINE_MODES, resolveEngineMode, hasReleasedEdge, EDGE_RELEASE_BPM, MIN_ZONE_WIDTH } from './engine.js';
+import {
+    calculateEngineOutputs,
+    ENGINE_MODES,
+    resolveEngineMode,
+    resolveCeilingBehaviour,
+    hasReleasedEdge,
+    EDGE_RELEASE_BPM,
+    MIN_ZONE_WIDTH,
+    CRAWL_PERCENT,
+    SHORTENER_TOP_PERCENT
+} from './engine.js';
 
 const running = {
     hr: 95,
@@ -12,7 +22,7 @@ const running = {
     orgasmMode: false,
     sessionSeconds: 20,
     warmupMinutes: 0,
-    stallGuardEnabled: false,
+    ceilingBehaviour: 'stop',
     stallGuardEngaged: false,
     oracleState: 'APPROACH',
     survivalSpeedFloor: 42
@@ -49,39 +59,54 @@ describe('engine modes', () => {
         });
     }
 
-    it('classic full-stops at ceiling without stall guard', () => {
+    it('classic full-stops at the ceiling with Full Stop selected', () => {
         const result = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             hr: 140,
             isEdged: true,
-            stallGuardEnabled: false
+            ceilingBehaviour: 'stop'
         });
         assert.equal(result.primaryPercent, 0);
+        assert.equal(result.secondaryPercent, 0);
         assert.equal(result.isEdged, true);
     });
 
-    it('classic crawls then stall-halts', () => {
+    it('classic crawls at the ceiling with Crawl selected, then stall-halts', () => {
         const crawl = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             hr: 140,
             isEdged: true,
-            stallGuardEnabled: true
+            ceilingBehaviour: 'crawl'
         });
         const halt = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             hr: 140,
             isEdged: true,
-            stallGuardEnabled: true,
+            ceilingBehaviour: 'crawl',
             stallGuardEngaged: true
         });
-        assert.equal(crawl.primaryPercent, 12);
-        assert.equal(crawl.secondaryPercent, 12);
+        assert.equal(CRAWL_PERCENT, 10);
+        assert.equal(crawl.primaryPercent, CRAWL_PERCENT);
+        assert.equal(crawl.secondaryPercent, CRAWL_PERCENT);
         assert.equal(halt.primaryPercent, 0);
         // Stall guard cuts the PRIMARY stroker only; the secondary keeps crawling.
-        assert.equal(halt.secondaryPercent, 12);
+        assert.equal(halt.secondaryPercent, CRAWL_PERCENT);
+    });
+
+    it('an unknown ceiling behaviour falls back to crawl, "stop" is honoured', () => {
+        assert.equal(resolveCeilingBehaviour(undefined), 'crawl');
+        assert.equal(resolveCeilingBehaviour('garbage'), 'crawl');
+        assert.equal(resolveCeilingBehaviour('stop'), 'stop');
+        for (const mode of ['milker', 'ultimate']) {
+            const stop = calculateEngineOutputs({ ...running, activeMode: mode, hr: 140, isEdged: true, ceilingBehaviour: 'stop' });
+            const crawl = calculateEngineOutputs({ ...running, activeMode: mode, hr: 140, isEdged: true, ceilingBehaviour: 'crawl' });
+            assert.equal(stop.primaryPercent, 0, `${mode} primary must full-stop`);
+            assert.equal(crawl.primaryPercent, CRAWL_PERCENT, `${mode} primary must crawl`);
+            assert.ok(stop.secondaryPercent > 0, `${mode} secondary keeps milking either way`);
+        }
     });
 
     it('stall guard cuts primary but the secondary milker survives', () => {
@@ -91,7 +116,7 @@ describe('engine modes', () => {
                 activeMode: mode,
                 hr: 140,
                 isEdged: true,
-                stallGuardEnabled: true,
+                ceilingBehaviour: 'crawl',
                 stallGuardEngaged: true
             });
             assert.equal(halt.primaryPercent, 0, `${mode} primary must be cut`);
@@ -101,7 +126,7 @@ describe('engine modes', () => {
             ...running,
             activeMode: 'classic',
             hr: 100,
-            stallGuardEnabled: true,
+            ceilingBehaviour: 'crawl',
             stallGuardEngaged: true
         });
         assert.equal(classicNoCrawl.primaryPercent, 0);
@@ -112,6 +137,21 @@ describe('engine modes', () => {
         const result = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 120 });
         assert.ok(result.strokeMaxPercent < 100);
         assert.equal(result.strokeMinPercent, 0);
+    });
+
+    it('shortener runs full length at rest and lands on base micro-strokes 0-35% at the ceiling', () => {
+        assert.equal(SHORTENER_TOP_PERCENT, 35);
+        const rest = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 70 });
+        assert.equal(rest.strokeMinPercent, 0);
+        assert.equal(rest.strokeMaxPercent, 100);
+        const mid = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 125 });
+        assert.ok(mid.strokeMaxPercent < 100 && mid.strokeMaxPercent > SHORTENER_TOP_PERCENT);
+        const ceiling = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 140, isEdged: true, ceilingBehaviour: 'crawl' });
+        assert.equal(ceiling.strokeMinPercent, 0);
+        assert.equal(ceiling.strokeMaxPercent, SHORTENER_TOP_PERCENT);
+        // Never narrower than promised, even past the ceiling.
+        const over = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 170, isEdged: true, ceilingBehaviour: 'crawl' });
+        assert.equal(over.strokeMaxPercent, SHORTENER_TOP_PERCENT);
     });
 
     it('headplay contracts the envelope toward the glans', () => {

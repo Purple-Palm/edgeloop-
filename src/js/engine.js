@@ -28,6 +28,19 @@ export const EDGE_RELEASE_BPM = 5;
 // will ever emit. Anything tighter jams the sleeve in place.
 export const MIN_ZONE_WIDTH = 10;
 
+// Primary / secondary speed while parked at the ceiling in Crawl mode
+// (ceilingBehaviour 'crawl'); Full Stop ('stop') parks at 0%.
+export const CRAWL_PERCENT = 10;
+export const CEILING_BEHAVIOURS = ['stop', 'crawl'];
+
+// Glans Protector: the stroke zone contracts from the full range at rest
+// toward 0-SHORTENER_TOP_PERCENT (base micro-strokes) at the ceiling.
+export const SHORTENER_TOP_PERCENT = 35;
+
+export function resolveCeilingBehaviour(value) {
+    return value === 'stop' ? 'stop' : 'crawl';
+}
+
 export function resolveEngineMode(mode) {
     return ENGINE_MODES.includes(mode) ? mode : 'classic';
 }
@@ -73,7 +86,7 @@ export function calculateEngineOutputs({
     cadenceBreathing = false,
     milkingWave = false,
     stallGuardEngaged = false,
-    stallGuardEnabled = false,
+    ceilingBehaviour = 'crawl',
     ruinHoldSeconds = 0,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30
@@ -130,13 +143,15 @@ export function calculateEngineOutputs({
     let strokeMaxPercent = 100;
 
     const depthContractAmount = 100 - depthSafe;
-    const crawlPercent = 12;
+    // At the ceiling the user chooses Full Stop (0%) or Crawl (CRAWL_PERCENT).
+    const crawl = resolveCeilingBehaviour(ceilingBehaviour) === 'crawl';
+    const crawlPercent = crawl ? CRAWL_PERCENT : 0;
 
     // Stall guard only ever cuts the PRIMARY stroker: the secondary (milker)
     // channel keeps whatever the mode gives it at the ceiling.
     const applyClassicTease = () => {
         const atPeak = nextIsEdged && !orgasmMode;
-        if (atPeak && stallGuardEnabled) {
+        if (atPeak && crawl) {
             primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
             secondaryPercent = crawlPercent;
         } else if (atPeak) {
@@ -170,7 +185,7 @@ export function calculateEngineOutputs({
         applyClassicTease();
     } else if (mode === 'milker') {
         if (nextIsEdged && !orgasmMode) {
-            primaryPercent = stallGuardEngaged ? 0 : (stallGuardEnabled ? crawlPercent : 0);
+            primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
             secondaryPercent = 100;
         } else {
             primaryPercent = Math.round((1.0 - progress) * 100);
@@ -178,16 +193,18 @@ export function calculateEngineOutputs({
         }
         strokeMaxPercent = Math.round(100 - (progress * depthContractAmount));
     } else if (mode === 'shortener') {
+        // Full length at rest, base micro-strokes (0-35%) at the ceiling.
         applyClassicTease();
         strokeMinPercent = 0;
-        strokeMaxPercent = Math.max(25, Math.round(100 - (progress * 75)));
+        const shortenerSpan = 100 - SHORTENER_TOP_PERCENT;
+        strokeMaxPercent = Math.max(SHORTENER_TOP_PERCENT, Math.round(100 - (progress * shortenerSpan)));
     } else if (mode === 'headplay') {
         applyClassicTease();
         strokeMinPercent = Math.min(75, Math.round(progress * 75));
         strokeMaxPercent = 100;
     } else if (mode === 'ultimate') {
         if (nextIsEdged && !orgasmMode) {
-            primaryPercent = stallGuardEngaged ? 0 : (stallGuardEnabled ? crawlPercent : 0);
+            primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
             secondaryPercent = 100;
             strokeMaxPercent = Math.max(25, depthSafe);
         } else {

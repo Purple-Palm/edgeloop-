@@ -33,8 +33,8 @@ EdgeLoop runs 100% locally in your web browser with zero accounts, zero subscrip
   * *Stall Guard & Safety Watchdog:* Halts motor outputs if your heart rate signal is lost or stays clamped at peak levels for too long during Crawl Mode. The signal watchdog holds the last valid reading through short gaps (watches and relay apps often update only every 2-5 s), pauses the session after a configurable signal-loss timeout (3-20 s, default 8), flags poor electrode contact, and can resume automatically once readings return. A dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost.
 * **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate) and *Survival Mode*.
 * **Session Telemetry & Funscript Export:** Automatically logs session metrics and exports dual-channel `.funscript` (primary stroker) and `.v0.funscript` (secondary vibrator) files directly to your machine for replay in external players like ScriptPlayer or HereSphere.
-* **Remote & Group Partner Control:** Peer-to-peer WebRTC room links allow a partner (or group host) anywhere in the world to view live heart rate telemetry and manage the session remotely.
-* **Broad Protocol Support:** Direct connection to BLE heart rate monitors (standard 0x180D GATT service), The Handy (Wi-Fi HAMP API), and Buttplug.io / Intiface Central for vibrators, reciprocating sex machines (OSSM), and rotational devices.
+* **Remote Partner Control & Viewers:** Peer-to-peer WebRTC room links let one partner anywhere in the world manage the session remotely (transport, Force Orgasm, mode), while any number of read-only viewers watch the live heart-rate telemetry. Every inbound message is validated; a dropped link is shown as disconnected, never as connected.
+* **Broad Protocol Support:** Direct connection to BLE heart rate monitors (standard 0x180D GATT service), The Handy (Wi-Fi HAMP API), T-Code strokers (OSR2, SR6, OSSM) straight over their USB serial port via Web Serial (Chrome or Edge on a desktop, no Intiface needed), and Buttplug.io / Intiface Central for vibrators, reciprocating sex machines, and rotational devices.
 
 ---
 
@@ -100,7 +100,11 @@ edgeloop/
             ├── ble-protocol.js # Pure GATT Heart Rate Measurement parser (BPM, sensor-contact bits, RR intervals), reconnect schedule, browser-support and error messages
             ├── ble-protocol.test.js
             ├── handy.js        # The Handy Wi-Fi API driver (speed commands and travel boundaries)
-            └── intiface.js     # Intiface / Buttplug.io WebSocket driver for multi-motor vibrators, strokers, and rotators
+            ├── intiface.js     # Intiface / Buttplug.io WebSocket driver for multi-motor vibrators, strokers, and rotators
+            ├── buttplug-protocol.js  # Pure Buttplug v3 message builders / parsers (handshake, device attributes, errors)
+            ├── tcode.js        # Direct T-Code driver over Web Serial (OSR2 / SR6 / OSSM): identification, per-axis roles, caps, stop
+            ├── tcode-protocol.js     # Pure T-Code v0.3 helpers: axis commands, D0/D1/D2 parsing, default roles, browser-support text
+            └── stroke-planner.js     # Pure per-axis stroke scheduler: one command per leg, rest move on stop
 ```
 
 ---

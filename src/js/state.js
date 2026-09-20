@@ -1,12 +1,7 @@
 // localStorage can throw on access itself (blocked cookies / private mode);
-// boot must survive that with defaults rather than a blank page.
-function readStored(key) {
-    try {
-        return localStorage.getItem(key);
-    } catch (e) {
-        return null;
-    }
-}
+// boot must survive that with defaults rather than a blank page, so every
+// read goes through storage.js.
+import { safeGet } from './storage.js';
 
 export const state = {
     sessionStatus: 'IDLE',
@@ -62,9 +57,9 @@ export const state = {
     handyBattery: null,
     intifaceBattery: null,
     simEngaged: false,
-    handyRole: readStored('handy_role') || 'primary',
+    handyRole: safeGet('handy_role', 'primary') || 'primary',
     handyMaxCap: (() => {
-        const cap = parseInt(readStored('handy_max_cap') || '100', 10);
+        const cap = parseInt(safeGet('handy_max_cap', '100') || '100', 10);
         return Number.isFinite(cap) ? Math.max(0, Math.min(100, cap)) : 100;
     })(),
     oracleState: 'IDLE',
@@ -94,6 +89,9 @@ export const advancedSettings = {
     envelopeMigrated: true,
     stallGuard: true,
     stallGuardSeconds: 8,
+    // What the primary does while parked at the climax ceiling: 'stop'
+    // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
+    ceilingBehaviour: 'crawl',
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,
