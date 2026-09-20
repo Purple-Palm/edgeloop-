@@ -73,6 +73,7 @@ let msgId = 1;
 let scanning = false;
 let status = { state: 'offline', text: 'Offline' };
 let lastZone = { min: 0.2, max: 0.8 };
+let lastEnvelope = { min: 0, max: 1 };
 let lastSpeeds = { primary: 0, secondary: 0 };
 
 const handlers = {
@@ -585,13 +586,22 @@ function sendRotate(dev, axis, value) {
     return true;
 }
 
+// Invert mirrors a linear axis INSIDE the hardware envelope (min + max -
+// position), not around 0.5: a 20-100 % envelope must never produce a
+// physical 0-80 % move just because the sleeve is mounted upside down. The
+// rest move mirrors the same way, so a stop stays inside the envelope too.
+function physicalPosition(axis, position) {
+    if (axis.kind !== 'linear' || !axis.invert) return position;
+    return lastEnvelope.min + lastEnvelope.max - position;
+}
+
 // Ask the planner for the next leg and, when it yields one, send it and
 // arm a timer for its end. Never sends while a leg is in flight.
 function pumpLinear(dev, axis, now = Date.now()) {
     if (!axis.planner || !isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
     const leg = axis.planner.next(now);
     if (!leg) return;
-    const position = axis.invert ? 1 - leg.position : leg.position;
+    const position = physicalPosition(axis, leg.position);
     sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position, durationMs: leg.durationMs }]));
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
@@ -655,15 +665,18 @@ function zoneFromPercent(strokeMin, strokeMax, envMin, envMax) {
     const eMax = Math.max(eMin, pct(envMax, 100) / 100);
     const min = Math.max(eMin, Math.min(eMax, pct(strokeMin, 0) / 100));
     const max = Math.max(min, Math.min(eMax, pct(strokeMax, 100) / 100));
-    return { min, max };
+    return { zone: { min, max }, envelope: { min: eMin, max: eMax } };
 }
 
 // Main dispatch entry point, called on every engine tick and on every
 // stop / pause (force = true). strokeMin/strokeMax are physical percents
 // already mapped into the hardware envelope by engine.js; the envelope is
-// used only to clamp so the rest position can never leave the user's bounds.
+// used only to clamp (and to mirror inverted axes) so no position can ever
+// leave the user's bounds.
 export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, strokeMax = 100, envMin = 0, envMax = 100, force = false) {
-    lastZone = zoneFromPercent(strokeMin, strokeMax, envMin, envMax);
+    const mapped = zoneFromPercent(strokeMin, strokeMax, envMin, envMax);
+    lastZone = mapped.zone;
+    lastEnvelope = mapped.envelope;
     lastSpeeds = {
         primary: Math.max(0, Math.min(100, Number(primarySpeed) || 0)),
         secondary: Math.max(0, Math.min(100, Number(secondarySpeed) || 0))
@@ -755,8 +768,8 @@ export function testSingleAxis(devIdx, axisIdx) {
 
     if (axis.kind === 'linear') {
         if (axis.planner.isInFlight(Date.now()) || axis.testTimer) return false;
-        const up = axis.invert ? 1 - lastZone.max : lastZone.max;
-        const down = axis.invert ? 1 - lastZone.min : lastZone.min;
+        const up = physicalPosition(axis, lastZone.max);
+        const down = physicalPosition(axis, lastZone.min);
         const moveMs = INTIFACE_TIMINGS.testMoveMs;
         sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position: up, durationMs: moveMs }]));
         axis.testTimer = setTimeout(() => {
@@ -805,6 +818,7 @@ export function resetIntifaceForTests() {
     msgId = 1;
     status = { state: 'offline', text: 'Offline' };
     lastZone = { min: 0.2, max: 0.8 };
+    lastEnvelope = { min: 0, max: 1 };
     lastSpeeds = { primary: 0, secondary: 0 };
     Object.keys(handlers).forEach((k) => { handlers[k] = null; });
 }

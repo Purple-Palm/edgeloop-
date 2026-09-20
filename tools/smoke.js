@@ -1,0 +1,273 @@
+// EdgeLoop browser smoke test.
+//
+// Drives the real app in headless Chromium: serves the repository over a local
+// python http.server, walks the age gate, the setup wizard, every device modal,
+// Session Setup, Guide / History / Share, the simulator HR sweep, the transport
+// buttons and the remote viewer / controller pages, and fails on any page
+// error, console.error, failed request or broken assertion. Screenshots and a
+// JSON report land in the output directory.
+//
+// It is the twin of the script used while developing the app, so a contributor
+// can run the same checks before opening a pull request. It is NOT part of
+// `npm test` because it needs a browser.
+//
+// One-time setup (Playwright is deliberately not a project dependency; the
+// app itself has none). Install it next to the repository without touching
+// package.json, then let it download its bundled Chromium:
+//
+//     npm install --no-save playwright
+//     npx playwright install chromium
+//
+// Run:
+//
+//     npm run smoke                    # same as: node tools/smoke.js
+//     node tools/smoke.js [repoDir] [outDir]
+//
+// repoDir defaults to the repository root, outDir to tools/smoke-out (ignored
+// by git only if you add it to .gitignore; it holds PNG screenshots,
+// snapshot.json and report.json). python3 must be on PATH. The browser fetches
+// the CDN scripts (Tailwind, PeerJS) itself, so an internet connection is
+// needed; the PeerJS cloud is contacted by the Share modal but its
+// availability is not asserted.
+//
+// Exit code: 0 when every step passed and no errors were captured, 1 when a
+// step failed or an error was captured, 2 when the script itself crashed.
+import { chromium } from 'playwright';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+// package.json declares "type": "module", so this file is an ES module.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO = process.argv[2] || path.resolve(__dirname, '..');
+const OUT = process.argv[3] || path.join(__dirname, 'smoke-out');
+const PORT = 8123 + Math.floor(Math.random() * 500);
+fs.mkdirSync(OUT, { recursive: true });
+const errors = [], warnings = [];
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+(async () => {
+  const server = spawn('python3', ['-m', 'http.server', String(PORT), '--bind', '127.0.0.1'], { cwd: REPO, stdio: 'ignore' });
+  await sleep(800);
+  const browser = await chromium.launch();
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page = await ctx.newPage();
+  page.setDefaultTimeout(6000);
+  page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+  page.on('console', m => {
+    if (m.type() === 'error') errors.push('console.error: ' + m.text());
+    else if (m.type() === 'warning') warnings.push(m.text());
+  });
+  page.on('requestfailed', r => { if (!r.url().includes('favicon')) errors.push('requestfailed: ' + r.url() + ' ' + (r.failure() || {}).errorText); });
+  page.on('response', r => { if (r.status() >= 400 && !r.url().includes('favicon')) errors.push(`http ${r.status()}: ${r.url()}`); });
+
+  const steps = [];
+  const step = async (name, fn) => {
+    try { await fn(); steps.push({ name, ok: true }); }
+    catch (e) {
+      let overlays = null;
+      try {
+        overlays = await page.evaluate(() => Array.from(document.querySelectorAll('div')).filter(d => {
+          const cs = getComputedStyle(d); return cs.position === 'fixed' && cs.display !== 'none' && cs.visibility !== 'hidden' && d.getBoundingClientRect().width > 300;
+        }).map(d => (d.id || '') + '.' + d.className.split(' ').slice(0, 4).join('.')));
+        await page.screenshot({ path: path.join(OUT, 'fail-' + name.replace(/[^a-z0-9]+/gi, '_') + '.png') });
+      } catch (e2) {}
+      steps.push({ name, ok: false, error: e.message.split('\n')[0], overlays });
+    }
+  };
+  const shot = (n) => page.screenshot({ path: path.join(OUT, n + '.png') });
+  const setRange = (sel, v) => page.locator(sel).evaluate((el, val) => { el.value = val; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }, v);
+  const closeModal = async () => {
+    // The setup wizard is its own overlay (#wizardSkipBtn; older markup uses an inline Skip button).
+    const wiz = page.locator('#wizardOverlay');
+    if (await wiz.isVisible().catch(() => false)) {
+      const skip = page.locator('#wizardSkipBtn');
+      if (await skip.count()) await skip.click().catch(() => {});
+      else await wiz.getByRole('button', { name: /skip|get started/i }).first().click().catch(() => {});
+      await sleep(150);
+    }
+    const btn = page.locator('#modalCloseBtn');
+    if (await btn.isVisible().catch(() => false)) await btn.click();
+    else await page.keyboard.press('Escape');
+    await sleep(200);
+  };
+
+  await step('load', async () => {
+    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load', timeout: 60000 });
+    await page.locator('#ageConfirmBtn').waitFor({ state: 'visible', timeout: 15000 });
+    await sleep(800);
+  });
+  await step('age gate', async () => {
+    await page.locator('#ageConfirmBtn').click(); await sleep(400);
+    // First run: the 3-step wizard opens on top of the cockpit. Walk it once, then dismiss.
+    const wiz = page.locator('#wizardOverlay');
+    if (await wiz.isVisible().catch(() => false)) {
+      await shot('01a-wizard');
+      const next = page.locator('#wizardNextBtn');
+      if (await next.count()) { for (let i = 0; i < 3; i++) { await next.click().catch(() => {}); await sleep(120); } }
+      await closeModal();
+    }
+    await shot('01-main');
+  });
+  await step('open BLE modal + engage simulator', async () => {
+    await page.locator('#cardBle').click(); await sleep(300); await shot('02-ble-modal');
+    await page.getByRole('button', { name: /manual simulator/i }).click(); await sleep(200);
+    await setRange('#modalSimHrSlider', '95');
+    await page.locator('#modalEngageSimBtn').click(); await sleep(400);
+  });
+  await step('open Handy modal', async () => { await page.locator('#cardHandy').click(); await sleep(300); await shot('03-handy-modal'); await closeModal(); });
+  await step('open Intiface modal', async () => { await page.locator('#cardIntiface').click(); await sleep(300); await shot('04-intiface-modal'); await closeModal(); });
+  await step('intiface connect with a scheme-less URL shows the invalid-URL status', async () => {
+    await page.locator('#cardIntiface').click(); await sleep(300);
+    try {
+      // Browsers resolve "localhost:12345" relative to the page; the driver must refuse it itself.
+      await page.locator('#modalIntifaceUrl').fill('localhost:12345');
+      await page.locator('#modalIntifaceConnectBtn').click(); await sleep(300);
+      const txt = (await page.locator('#modalIntifaceStatusText').textContent() || '').trim();
+      if (!/invalid websocket url/i.test(txt)) throw new Error('expected an invalid-URL status, got: ' + txt);
+      if (await page.locator('#modalIntifaceConnectBtn').isDisabled()) throw new Error('Connect stayed disabled after a failed attempt');
+      if (await page.locator('#modalIntifaceDisconnectBtn').isVisible()) throw new Error('Disconnect visible while offline');
+      await page.locator('#modalIntifaceUrl').fill('ws://localhost:12345');
+      await shot('04b-intiface-invalid-url');
+    } finally { await closeModal(); }
+  });
+  await step('open TCode Serial modal', async () => {
+    // Headless Chromium has navigator.serial but no ports: the modal must open, and Connect must end in a
+    // readable status (no port selected / not supported), never a page error, and never mark the toy ready.
+    await page.locator('#cardTCode').click(); await sleep(300); await shot('04c-tcode-modal');
+    try {
+      const body = page.locator('#modalBodyTCode');
+      if (!(await body.isVisible())) throw new Error('TCode modal did not open');
+      const title = (await page.locator('#modalTitle').textContent() || '').trim();
+      if (!/tcode serial/i.test(title)) throw new Error('unexpected modal title: ' + title);
+      let txt = (await page.locator('#modalTCodeStatusText').textContent() || '').trim();
+      const supported = await page.evaluate(() => Boolean(navigator.serial && navigator.serial.requestPort));
+      if (!supported && !/web serial is not available|does not implement web serial|not available on/i.test(txt)) throw new Error('expected a not-supported status, got: ' + txt);
+      await page.locator('#modalTCodeConnectBtn').click().catch(() => {}); await sleep(1200);
+      txt = (await page.locator('#modalTCodeStatusText').textContent() || '').trim();
+      if (!/no port selected|not available|does not implement|blocked|could not open|serial error|pick the device port/i.test(txt)) throw new Error('unexpected status after Connect: ' + txt);
+      const badge = (await page.locator('#badgeTCodeText').textContent() || '').trim();
+      if (!/unsupported|disconnected|error|connecting/i.test(badge)) throw new Error('unexpected badge: ' + badge);
+      if (await page.locator('#modalTCodeDisconnectBtn').isVisible()) {
+        // A chooser that stays open in headless mode leaves the driver in 'connecting': Disconnect must be harmless.
+        await page.locator('#modalTCodeDisconnectBtn').click().catch(() => {});
+      }
+      const playText = (await page.locator('#playPauseText').textContent() || '').trim();
+      if (!/WAITING FOR TOY/i.test(playText)) throw new Error('TCode card must not make the toy ready: ' + playText);
+      await shot('04d-tcode-after-connect');
+    } finally { await closeModal(); }
+  });
+  await step('TCode modal envelope input is shared with the Handy modal', async () => {
+    // The Hardware Travel Envelope is one persisted setting edited from both modals: typing a
+    // lower guard in the TCode modal must show up in the Handy modal (and vice versa).
+    await page.locator('#cardTCode').click(); await sleep(300);
+    try {
+      const tcodeMin = page.locator('#tcodeHwMinInput');
+      if (!(await tcodeMin.isVisible())) throw new Error('TCode modal has no envelope min input');
+      await tcodeMin.fill('25'); await tcodeMin.dispatchEvent('change'); await sleep(150);
+      const disp = (await page.locator('#tcodeHwEnvelopeDisplay').textContent() || '').trim();
+      if (!/25%\s*-\s*100%/.test(disp)) throw new Error('TCode envelope display did not update: ' + disp);
+      await shot('04e-tcode-envelope');
+    } finally { await closeModal(); }
+    await page.locator('#cardHandy').click(); await sleep(300);
+    try {
+      const handyMin = await page.locator('#hwMinInput').inputValue();
+      if (handyMin !== '25') throw new Error('Handy min input expected 25, got: ' + handyMin);
+      const disp = (await page.locator('#hwEnvelopeDisplay').textContent() || '').trim();
+      if (!/25%\s*-\s*100%/.test(disp)) throw new Error('Handy envelope display did not update: ' + disp);
+      // Put it back through the Handy input so later steps run with the default envelope.
+      const handyInput = page.locator('#hwMinInput');
+      await handyInput.fill('0'); await handyInput.dispatchEvent('change'); await sleep(150);
+      await shot('04f-handy-envelope-synced');
+    } finally { await closeModal(); }
+    await page.locator('#cardTCode').click(); await sleep(200);
+    try {
+      const back = await page.locator('#tcodeHwMinInput').inputValue();
+      if (back !== '0') throw new Error('TCode min input expected 0 after the Handy edit, got: ' + back);
+    } finally { await closeModal(); }
+  });
+  await step('open Session Setup', async () => {
+    await page.locator('#sessionParamsHeaderBtn').click(); await sleep(300); await shot('05-session-setup');
+    // walk tabs inside the modal if present
+    const tabs = page.locator('#modalOverlay button');
+    const n = await tabs.count();
+    for (let i = 0; i < Math.min(n, 12); i++) { const t = tabs.nth(i); const txt = (await t.textContent() || '').trim(); if (/guards|duration|motion|audio|profiles|tuning|general/i.test(txt)) { await t.click().catch(() => {}); await sleep(150); } }
+    await closeModal();
+  });
+  await step('open Guide / History / Share', async () => {
+    await page.locator('#guideBtn').click(); await sleep(250); await shot('06-guide'); await closeModal();
+    await page.locator('#historyBtn').click(); await sleep(250); await shot('07-history'); await closeModal();
+    await page.getByText(/share control/i).first().click(); await sleep(400); await shot('08-share');
+    // Copy-link buttons must never throw (clipboard may be denied; execCommand fallback).
+    await page.locator('#copyShareUrlBtn').click().catch(() => {}); await sleep(150);
+    const groupTab = page.locator('#partnerTabGroupBtn, button:has-text("Group"), button:has-text("Viewer")').first();
+    if (await groupTab.count()) await groupTab.click().catch(() => {});
+    await page.locator('#copyGroupUrlBtn').click().catch(() => {}); await sleep(150);
+    await closeModal();
+  });
+  await step('drive HR above ceiling via simulator', async () => {
+    await page.locator('#cardBle').click(); await sleep(200);
+    await page.getByRole('button', { name: /manual simulator/i }).click(); await sleep(200);
+    for (const v of ['120', '139', '141', '150', '130', '100']) { await setRange('#modalSimHrSlider', v); await sleep(250); }
+    await closeModal(); await sleep(1200); await shot('09-after-hr-sweep');
+  });
+  await step('mode cards click', async () => {
+    await page.getByText(/prostate milker/i).first().click().catch(() => {}); await sleep(200);
+    await page.getByText(/classic tease/i).first().click().catch(() => {}); await sleep(200);
+  });
+  await step('start/stop/reset buttons do not throw', async () => {
+    const play = page.locator('#playPauseBtn'); if (await play.count()) await play.click({ force: true }).catch(() => {});
+    await sleep(1500);
+    const stop = page.locator('#stopBtn'); if (await stop.count()) await stop.click({ force: true }).catch(() => {});
+    const reset = page.locator('#resetBtn'); if (await reset.count()) await reset.click({ force: true }).catch(() => {});
+    await sleep(300); await shot('10-after-controls');
+  });
+  await step('viewer page (?group_sub=) locks every control', async () => {
+    await page.goto(`http://127.0.0.1:${PORT}/?group_sub=smokeroom`, { waitUntil: 'load', timeout: 60000 });
+    await sleep(1500);
+    const v = await page.evaluate(() => ({
+      role: document.querySelector('#roleIndicator')?.textContent?.trim() || '',
+      playDisabled: document.querySelector('#sessionPlayPauseBtn')?.disabled,
+      stopDisabled: document.querySelector('#sessionStopBtn')?.disabled,
+      orgasmDisabled: document.querySelector('#orgasmBtn')?.disabled,
+      maxHrDisabled: document.querySelector('#maxHr')?.disabled
+    }));
+    if (!/viewer/i.test(v.role)) throw new Error('viewer badge missing: ' + v.role);
+    if (!v.playDisabled || !v.stopDisabled || !v.orgasmDisabled || !v.maxHrDisabled) throw new Error('viewer controls not locked: ' + JSON.stringify(v));
+    await page.locator('#sessionStopBtn').click({ force: true }).catch(() => {});
+    await page.locator('#orgasmBtn').click({ force: true }).catch(() => {});
+    await shot('11-viewer');
+  });
+  await step('controller page (?partner=) loads', async () => {
+    await page.goto(`http://127.0.0.1:${PORT}/?partner=smokeroom`, { waitUntil: 'load', timeout: 60000 });
+    await sleep(1500);
+    const role = await page.evaluate(() => document.querySelector('#roleIndicator')?.textContent?.trim() || '');
+    if (!/remote controller/i.test(role)) throw new Error('controller badge missing: ' + role);
+    await page.locator('#stopBtn, #sessionStopBtn').first().click({ force: true }).catch(() => {});
+    await page.locator('#resetBtn, #sessionResetBtn').first().click({ force: true }).catch(() => {});
+    await shot('12-controller');
+    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load', timeout: 60000 }); await sleep(800);
+  });
+  await step('state snapshot', async () => {
+    const snap = await page.evaluate(() => ({
+      title: document.title,
+      bpm: document.querySelector('#hrDisplay, #bpmDisplay, .bpm')?.textContent?.trim() || null,
+      playText: document.querySelector('#playPauseText')?.textContent?.trim() || null,
+      stroker: document.querySelector('#strokerVal')?.textContent?.trim() || null,
+      prostate: document.querySelector('#prostateVal')?.textContent?.trim() || null,
+      maxHr: document.querySelector('#maxHr')?.value || null,
+      edges: document.querySelector('#edgeCount')?.textContent?.trim() || null,
+    }));
+    fs.writeFileSync(path.join(OUT, 'snapshot.json'), JSON.stringify(snap, null, 2));
+  });
+
+  await browser.close();
+  server.kill();
+  const report = { steps, errors, warnings: warnings.slice(0, 10) };
+  fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2));
+  const failed = steps.filter(s => !s.ok);
+  console.log(JSON.stringify({ stepsOk: steps.length - failed.length, stepsFailed: failed, errors }, null, 2));
+  process.exit(errors.length || failed.length ? 1 : 0);
+})().catch(e => { console.error('SMOKE CRASHED:', e.message); process.exit(2); });

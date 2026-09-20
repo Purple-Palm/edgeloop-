@@ -15,6 +15,7 @@ import {
     splitLines,
     parseAxisLine,
     parseIdentification,
+    fallbackDeviceName,
     fallbackAxes,
     defaultAxisRoles,
     rotationAmplitude,
@@ -126,6 +127,22 @@ describe('reply parsing', () => {
         assert.deepEqual(ident.axes, fallbackAxes());
         assert.deepEqual(parseIdentification(), ident);
         assert.deepEqual(parseIdentification({ name: 'OSSM', version: 'v0.3', axisLines: 'L0 stroke' }).axes, [{ id: 'L0', description: 'stroke' }]);
+    });
+    it('names a silent device after its USB ids so two rigs do not share one config', () => {
+        assert.equal(fallbackDeviceName({ usbVendorId: 0x1a86, usbProductId: 0x7523 }), 'TCode device 1a86:7523');
+        assert.equal(fallbackDeviceName({ usbVendorId: 0x10c4, usbProductId: 0xea60 }), 'TCode device 10c4:ea60');
+        assert.equal(fallbackDeviceName({ usbVendorId: 0x1a86 }), 'TCode device 1a86');
+        assert.equal(fallbackDeviceName({}), DEFAULT_DEVICE_NAME);
+        assert.equal(fallbackDeviceName(null), DEFAULT_DEVICE_NAME);
+        assert.equal(fallbackDeviceName(undefined), DEFAULT_DEVICE_NAME);
+        assert.equal(fallbackDeviceName({ usbVendorId: 'abc', usbProductId: -1 }), DEFAULT_DEVICE_NAME);
+        assert.equal(fallbackDeviceName({ usbVendorId: 0x1a86, usbProductId: 0x10000 }), 'TCode device 1a86');
+        const silent = parseIdentification({ name: [], version: [], axisLines: [], portInfo: { usbVendorId: 0x1a86, usbProductId: 0x7523 } });
+        assert.equal(silent.name, 'TCode device 1a86:7523');
+        assert.equal(silent.identified, false);
+        // A D0 reply always wins over the USB ids.
+        const named = parseIdentification({ name: ['OSSM'], portInfo: { usbVendorId: 0x1a86, usbProductId: 0x7523 } });
+        assert.equal(named.name, 'OSSM');
     });
     it('truncates absurd names', () => {
         const ident = parseIdentification({ name: ['x'.repeat(200)] });

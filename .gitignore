@@ -1,0 +1,5 @@
+# Playwright, if installed locally for the smoke test (never a project dependency)
+node_modules/
+package-lock.json
+# Screenshots and reports written by tools/smoke.js
+tools/smoke-out/

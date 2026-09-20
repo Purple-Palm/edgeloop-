@@ -7,6 +7,7 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "test": "node --test \"src/js/**/*.test.js\"",
+    "smoke": "node tools/smoke.js",
     "start": "python3 -m http.server 8000"
   }
 }

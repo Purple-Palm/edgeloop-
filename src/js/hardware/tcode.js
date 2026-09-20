@@ -365,6 +365,16 @@ export async function connectTCode(newHandlers) {
     }
 }
 
+// SerialPort.getInfo() ({ usbVendorId, usbProductId } for USB ports) names
+// a rig that does not answer D0. Never throws; null when unavailable.
+function readPortInfo(port) {
+    try {
+        return port && typeof port.getInfo === 'function' ? (port.getInfo() || null) : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function openAndIdentify(serial) {
     if (session) await finishSession(session, 'user');
     const generation = connectGeneration;
@@ -432,7 +442,7 @@ async function openAndIdentify(serial) {
     const axisLines = await query(s, 'D2', timing);
     if (s.finished) return false;
 
-    const ident = parseIdentification({ name, version, axisLines });
+    const ident = parseIdentification({ name, version, axisLines, portInfo: readPortInfo(port) });
     device = buildDevice(ident);
     s.identified = true;
     setStatus('connected', describeConnected());

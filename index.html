@@ -467,7 +467,7 @@
           </div>
           <div id="modalBleMsg" class="text-xs leading-snug text-slate-500">Status: Not connected</div>
           <button id="bleQuickHelpBtn" class="text-[10px] text-purple-400 hover:underline block text-center w-full pt-0.5 cursor-pointer">
-            Apple Watch / Pixel Watch Pairing Guide &rarr;
+            Watch, strap &amp; browser pairing guide &rarr;
           </button>
         </div>
 
@@ -610,7 +610,28 @@
             </div>
           </div>
         </div>
-        <p class="text-[9px] text-slate-500 leading-snug">L0 (stroke) is Primary by default and follows the stroke zone and the Handy travel envelope; V0 is Secondary; every other axis is OFF until you assign it. Rotation axes swing around centre by the engine speed. Tap <strong>Test</strong> to see which motor an axis is. Roles, caps and invert are remembered per device name.</p>
+
+        <!-- Hardware Travel Envelope: the SAME setting as in the Handy modal (bounds every linear axis) -->
+        <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+          <div class="flex justify-between items-center">
+            <label class="text-xs font-bold text-slate-200">Hardware Travel Envelope</label>
+            <span id="tcodeHwEnvelopeDisplay" class="font-mono text-[10px] font-bold text-teal-400">Bounds: 0% - 100%</span>
+          </div>
+          <p class="text-[9px] text-slate-400 leading-snug">
+            Protects against sleeve slip-out or base jamming. Linear (L) axes scale inside these physical bounds; STOP rests at the lower guard. Shared with The Handy modal.
+          </p>
+          <div class="grid grid-cols-2 gap-2 pt-1">
+            <div class="space-y-0.5">
+              <span class="text-[9px] text-slate-400 font-semibold">Min % (Lower Guard):</span>
+              <input id="tcodeHwMinInput" type="number" min="0" max="90" value="0" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
+            </div>
+            <div class="space-y-0.5">
+              <span class="text-[9px] text-slate-400 font-semibold">Max % (Upper Guard):</span>
+              <input id="tcodeHwMaxInput" type="number" min="10" max="100" value="100" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
+            </div>
+          </div>
+        </div>
+        <p class="text-[9px] text-slate-500 leading-snug">L0 (stroke) is Primary by default and follows the stroke zone and the hardware travel envelope; V0 is Secondary; every other axis is OFF until you assign it. Rotation axes swing around centre by the engine speed. Tap <strong>Test</strong> to see which motor an axis is. Roles, caps and invert are remembered per device name.</p>
       </div>
 
       <!-- 4. Session History & Funscript Download Modal -->
@@ -934,18 +955,30 @@
 
       <!-- 8. Smartwatch Guide Modal -->
       <div id="modalBodyHrGuide" class="space-y-3 max-h-[75vh] overflow-y-auto pr-1 hidden text-xs text-slate-300">
+        <p class="text-slate-400 leading-relaxed">EdgeLoop reads any sensor that broadcasts the standard Bluetooth <strong>Heart Rate</strong> service. Then click <strong>HR Monitor</strong> &rarr; <strong>Scan &amp; Pair</strong>.</p>
         <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-          <div class="font-bold text-rose-400 text-sm">Google Pixel Watch & Wear OS</div>
-          <ol class="list-decimal list-inside space-y-0.5 text-slate-400 leading-relaxed">
-            <li>Open Quick Settings on watch & tap <strong>Heart Rate Sharing</strong>.</li>
-            <li>In EdgeLoop, click <strong>HR Monitor</strong> &rarr; <strong>Scan & Pair</strong>.</li>
-          </ol>
+          <div class="font-bold text-rose-400 text-sm">Watches</div>
+          <ul class="list-disc list-inside space-y-0.5 text-slate-400 leading-relaxed">
+            <li><strong>Pixel Watch / Wear OS:</strong> native broadcast. Quick Settings &rarr; <strong>Heart Rate Sharing</strong>, then Scan &amp; Pair.</li>
+            <li><strong>Galaxy Watch:</strong> install the <strong>"Heart for Bluetooth"</strong> app on the watch and start its broadcast.</li>
+            <li><strong>Apple Watch:</strong> broadcast with <strong>HeartCast</strong> or <strong>Echo</strong> to EdgeLoop on a <em>second</em> device (PC, Mac, tablet). iOS cannot loop back on the same iPhone; in Bluefy on the iPhone, pair a chest strap instead.</li>
+            <li><strong>Budget GloryFit / Da Fit watches</strong> do not broadcast the Heart Rate service and cannot work.</li>
+          </ul>
         </div>
         <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-          <div class="font-bold text-sky-400 text-sm">Apple Watch (watchOS) & Bluefy</div>
-          <p class="text-slate-400 leading-relaxed">
-            iOS prevents Bluefy from connecting to an app broadcasting BLE on the <em>same phone</em>. To use HeartCast/Echo, run EdgeLoop on your PC/tablet, or pair a chest strap directly.
-          </p>
+          <div class="font-bold text-sky-400 text-sm">Chest straps</div>
+          <ul class="list-disc list-inside space-y-0.5 text-slate-400 leading-relaxed">
+            <li><strong>Polar H10, Coospo H6M, Cycplus H2 Pro, Garmin, Wahoo:</strong> pair directly; the most stable option.</li>
+            <li><strong>Wet the electrodes</strong> before wearing, or the strap reports nothing or poor contact.</li>
+          </ul>
+        </div>
+        <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+          <div class="font-bold text-teal-400 text-sm">Browsers</div>
+          <ul class="list-disc list-inside space-y-0.5 text-slate-400 leading-relaxed">
+            <li><strong>Chrome / Edge</strong> on Windows, macOS, Android and ChromeOS: works out of the box. iPhone / iPad: use <strong>Bluefy</strong>.</li>
+            <li><strong>Linux Chrome:</strong> enable <span class="font-mono text-slate-300">chrome://flags/#enable-experimental-web-platform-features</span> and use a native (non-Flatpak / non-Snap) browser, or Bluetooth stays hidden.</li>
+            <li><strong>Firefox and Safari</strong> do not support Web Bluetooth.</li>
+          </ul>
         </div>
       </div>
 
@@ -973,15 +1006,15 @@
       <div id="wizardStep1" class="wizard-pane space-y-2 text-center hidden">
         <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 2 of 3</p>
         <h3 class="text-base font-bold text-white">Connect your toys</h3>
-        <p class="text-xs text-slate-400 leading-relaxed">The Handy uses your Wi-Fi connection key. OSR2, SR6 and OSSM strokers plug in over USB through <strong class="text-slate-200">TCode Serial</strong> (Chrome or Edge on a desktop). Everything else (vibrators, Bluetooth toys) goes through <strong class="text-slate-200">Intiface Central</strong> at <span class="font-mono text-slate-300">ws://localhost:12345</span>.</p>
-        <p class="text-[10px] text-slate-500 leading-relaxed">In the TCode or Intiface tray, assign each axis Primary, Secondary, or OFF, then tap <strong>Test</strong> so you know Linear (stroke) and Rotate (twist/roll) are mapped.</p>
+        <p class="text-xs text-slate-400 leading-relaxed">Three ways in: <strong class="text-slate-200">The Handy</strong> with its Wi-Fi connection key; <strong class="text-slate-200">Intiface Central</strong> at <span class="font-mono text-slate-300">ws://localhost:12345</span> for vibrators and Bluetooth toys; or <strong class="text-slate-200">TCode Serial</strong> for OSR2, SR6 and OSSM strokers straight over USB (Chrome or Edge on a desktop, no Intiface needed). The heart-rate simulator in the HR Monitor modal stands in for a sensor, not for a toy.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">In the TCode or Intiface tray, assign each axis Primary, Secondary, or OFF, then tap <strong>Test</strong> so you know Linear (stroke) and Rotate (twist/roll) are mapped. The Hardware Travel Envelope (Handy or TCode modal) bounds every stroke.</p>
       </div>
 
       <div id="wizardStep2" class="wizard-pane space-y-2 text-center hidden">
         <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 3 of 3</p>
         <h3 class="text-base font-bold text-white">Set your ceiling and start</h3>
         <p class="text-xs text-slate-400 leading-relaxed">Enter Resting HR and Climax HR, then open <strong class="text-slate-200">Session Setup</strong> for duration, warm-up, and guards. Pick a mode (or a game) and press Start when both HR and a toy are ready.</p>
-        <p class="text-[10px] text-slate-500 leading-relaxed">The engine throttles automatically. If you go over, tap <strong>Came Early</strong> so local bio-learning lowers the working ceiling next time.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">The engine throttles automatically. If you go over, tap <strong>Came Early</strong> so local bio-learning lowers the working ceiling next time. Two guards watch the sensor: the <strong>signal-loss timeout</strong> (3-20 s) pauses the motors when readings stop, and <strong>auto-resume</strong> picks the session back up when they return.</p>
       </div>
 
       <div class="flex gap-2 pt-1">

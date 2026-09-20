@@ -137,10 +137,28 @@ export function fallbackAxes() {
     return FALLBACK_AXIS_IDS.map((id) => ({ id, description: KNOWN_AXES[id] }));
 }
 
+function hex4(value) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 0 || n > 0xffff) return '';
+    return n.toString(16).padStart(4, '0');
+}
+
+// The name a device that does not answer D0 is saved under. Settings are
+// remembered per name, so two silent rigs must not share one config: the USB
+// vendor:product ids from SerialPort.getInfo() tell them apart ("TCode device
+// 1a86:7523"). Only a port with no ids at all gets the plain default.
+export function fallbackDeviceName(portInfo) {
+    const info = portInfo && typeof portInfo === 'object' ? portInfo : {};
+    const ids = [hex4(info.usbVendorId), hex4(info.usbProductId)].filter(Boolean);
+    if (ids.length === 0) return DEFAULT_DEVICE_NAME;
+    return `${DEFAULT_DEVICE_NAME} ${ids.join(':')}`;
+}
+
 // Build { name, version, axes, identified } from the raw reply lines. A
-// device that answered nothing gets the default name, an empty version and
-// the fallback axis set; `identified` says whether D2 produced any axis.
-export function parseIdentification({ name = [], version = [], axisLines = [] } = {}) {
+// device that answered nothing gets the fallback name (see
+// fallbackDeviceName), an empty version and the fallback axis set;
+// `identified` says whether D2 produced any axis.
+export function parseIdentification({ name = [], version = [], axisLines = [], portInfo = null } = {}) {
     const nameLines = (Array.isArray(name) ? name : [name]).map((l) => cleanReply(l, 'D0')).filter(Boolean);
     const versionLines = (Array.isArray(version) ? version : [version]).map((l) => cleanReply(l, 'D1')).filter(Boolean);
     const seen = new Set();
@@ -153,7 +171,7 @@ export function parseIdentification({ name = [], version = [], axisLines = [] } 
     });
     const identified = axes.length > 0;
     return {
-        name: nameLines[0] ? nameLines[0].slice(0, 60) : DEFAULT_DEVICE_NAME,
+        name: nameLines[0] ? nameLines[0].slice(0, 60) : fallbackDeviceName(portInfo),
         version: versionLines[0] ? versionLines[0].slice(0, 30) : '',
         axes: identified ? axes : fallbackAxes(),
         identified

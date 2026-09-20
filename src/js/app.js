@@ -436,42 +436,62 @@ fullStrokeToggleBtn?.addEventListener('click', () => {
     updateEngine();
 });
 
-// Update Handy Travel Envelope Bounds Display
-function updateHwEnvelopeDisplay() {
-    const hwEnv = document.getElementById('hwEnvelopeDisplay');
-    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
-    if (hwEnv) hwEnv.textContent = `Bounds: ${env.min}% - ${env.max}%`;
+// The hardware travel envelope is ONE persisted setting (advancedSettings
+// handyHwMin / handyHwMax) that bounds The Handy and every TCode linear axis,
+// so it is edited from both the Handy and the TCode modal. Every input and
+// display on the page is listed here and kept in sync.
+const HW_ENVELOPE_INPUT_IDS = {
+    min: ['hwMinInput', 'tcodeHwMinInput'],
+    max: ['hwMaxInput', 'tcodeHwMaxInput']
+};
+const HW_ENVELOPE_DISPLAY_IDS = ['hwEnvelopeDisplay', 'tcodeHwEnvelopeDisplay'];
+
+function hwEnvelopeInputs(bound) {
+    return HW_ENVELOPE_INPUT_IDS[bound].map((id) => document.getElementById(id)).filter(Boolean);
 }
 
-// Normalise the persisted envelope and push it into the modal inputs. Used on
-// boot and after a settings import, so a hand-edited or imported file can
+// Update every Travel Envelope Bounds display (Handy and TCode modals)
+function updateHwEnvelopeDisplay() {
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    HW_ENVELOPE_DISPLAY_IDS.forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = `Bounds: ${env.min}% - ${env.max}%`;
+    });
+}
+
+// Normalise the persisted envelope and push it into every modal input. Used
+// on boot and after a settings import, so a hand-edited or imported file can
 // never produce an inverted or zero-width envelope.
 function syncHwEnvelopeInputs() {
     const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
     advancedSettings.handyHwMin = env.min;
     advancedSettings.handyHwMax = env.max;
-    const hwMin = document.getElementById('hwMinInput');
-    const hwMax = document.getElementById('hwMaxInput');
-    if (hwMin) hwMin.value = env.min;
-    if (hwMax) hwMax.value = env.max;
+    hwEnvelopeInputs('min').forEach((el) => { el.value = env.min; });
+    hwEnvelopeInputs('max').forEach((el) => { el.value = env.max; });
     updateHwEnvelopeDisplay();
 }
 
 // Validate the typed envelope: clamp to 0-100, keep at least a 10% stroke by
 // moving the bound the user did NOT just edit, then write the corrected values
-// back into the inputs and persisted settings. `changed` is 'min' or 'max'.
-function applyHwEnvelopeInput(changed, commit = false) {
-    const hwMin = document.getElementById('hwMinInput');
-    const hwMax = document.getElementById('hwMaxInput');
-    const rawMin = hwMin && hwMin.value !== '' ? hwMin.value : advancedSettings.handyHwMin;
-    const rawMax = hwMax && hwMax.value !== '' ? hwMax.value : advancedSettings.handyHwMax;
+// back into every input (both modals) and the persisted settings. `changed`
+// is 'min' or 'max'; `source` is the input being edited (defaults to the
+// first input of that bound).
+function applyHwEnvelopeInput(changed, commit = false, source = null) {
+    const edited = source || hwEnvelopeInputs(changed)[0] || null;
+    const typed = edited && edited.value !== '' ? edited.value : null;
+    const rawMin = changed === 'min' && typed !== null ? typed : advancedSettings.handyHwMin;
+    const rawMax = changed === 'max' && typed !== null ? typed : advancedSettings.handyHwMax;
     const env = normalizeEnvelope(rawMin, rawMax, changed);
     advancedSettings.handyHwMin = env.min;
     advancedSettings.handyHwMax = env.max;
-    // While typing, only rewrite the input the user is NOT focused on so a
-    // half-typed number is not yanked away; on commit, rewrite both.
-    if (hwMin && (commit || changed !== 'min') && String(hwMin.value) !== String(env.min)) hwMin.value = env.min;
-    if (hwMax && (commit || changed !== 'max') && String(hwMax.value) !== String(env.max)) hwMax.value = env.max;
+    // While typing, only rewrite the inputs the user is NOT focused on so a
+    // half-typed number is not yanked away; on commit, rewrite all of them.
+    hwEnvelopeInputs('min').forEach((el) => {
+        if ((commit || el !== edited) && String(el.value) !== String(env.min)) el.value = env.min;
+    });
+    hwEnvelopeInputs('max').forEach((el) => {
+        if ((commit || el !== edited) && String(el.value) !== String(env.max)) el.value = env.max;
+    });
     persistSettings();
     updateHwEnvelopeDisplay();
     updateEngine();
@@ -484,8 +504,6 @@ function initHandyRoleUI() {
     const oBtn = document.getElementById('handyRoleOffBtn');
     const capSlider = document.getElementById('handyCapSlider');
     const capVal = document.getElementById('handyCapVal');
-    const hwMin = document.getElementById('hwMinInput');
-    const hwMax = document.getElementById('hwMaxInput');
 
     if (capSlider && capVal) {
         capSlider.value = state.handyMaxCap ?? 100;
@@ -498,16 +516,15 @@ function initHandyRoleUI() {
         });
     }
 
-    // Envelope inputs located inside Handy modal
+    // Envelope inputs live in the Handy AND the TCode modal, all bound to the
+    // same persisted setting; editing either keeps the others in sync.
     syncHwEnvelopeInputs();
-    if (hwMin) {
-        hwMin.addEventListener('input', () => applyHwEnvelopeInput('min', false));
-        hwMin.addEventListener('change', () => applyHwEnvelopeInput('min', true));
-    }
-    if (hwMax) {
-        hwMax.addEventListener('input', () => applyHwEnvelopeInput('max', false));
-        hwMax.addEventListener('change', () => applyHwEnvelopeInput('max', true));
-    }
+    ['min', 'max'].forEach((bound) => {
+        hwEnvelopeInputs(bound).forEach((el) => {
+            el.addEventListener('input', () => applyHwEnvelopeInput(bound, false, el));
+            el.addEventListener('change', () => applyHwEnvelopeInput(bound, true, el));
+        });
+    });
 
     const applyRole = (role) => {
         state.handyRole = role;

@@ -380,6 +380,23 @@ describe('dispatch', () => {
         await sleep(leg.Vectors[0].Duration + REST_MOVE_MS + 60);
     });
 
+    it('invert mirrors inside the hardware envelope, never below its lower guard', async () => {
+        const ws = connectWith([OSR2]);
+        setAxisInvert(1, 0, true);
+        dispatchIntiface(100, 0, 20, 90, 20, 90);
+        const leg = ws.messages('LinearCmd')[0];
+        // zone max 0.9 mirrored inside 0.2..0.9 -> 0.2, never 0.1
+        assert.equal(leg.Vectors[0].Position, 0.2);
+        // STOP: the rest move (envelope min 0.2) mirrors to 0.9, still inside.
+        dispatchIntiface(0, 0, 0, 100, 20, 90, true);
+        await sleep(leg.Vectors[0].Duration + 30);
+        const legs = ws.messages('LinearCmd');
+        assert.equal(legs.length, 2);
+        assert.equal(legs[1].Vectors[0].Duration, REST_MOVE_MS);
+        assert.equal(legs[1].Vectors[0].Position, 0.9);
+        assert.ok(legs.every((m) => m.Vectors[0].Position >= 0.2 && m.Vectors[0].Position <= 0.9));
+    });
+
     it('stopAllIntiface is a best-effort StopAllDevices', () => {
         const ws = connectWith([EDGE]);
         assert.equal(stopAllIntiface(), true);

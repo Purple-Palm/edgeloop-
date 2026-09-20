@@ -233,6 +233,28 @@ describe('connect and identify', () => {
         assert.deepEqual(dev.axes.map((a) => a.id), ['L0', 'R0', 'R1', 'R2', 'V0']);
         assert.equal(isTCodeConnected(), true);
     });
+    it('names a silent device after its USB ids and keeps its settings apart', async () => {
+        port = makeFakePort({});
+        port.getInfo = () => ({ usbVendorId: 0x1a86, usbProductId: 0x7523 });
+        requestPortImpl = async () => port;
+        assert.equal(await connectTCode(handlers()), true);
+        await sleep(TCODE_TIMINGS.restMs + 5);
+        const dev = getTCodeDevice();
+        assert.equal(dev.name, 'TCode device 1a86:7523');
+        assert.equal(dev.identified, false);
+        assert.match(getTCodeStatus().text, /TCode device 1a86:7523/);
+        setAxisCap(0, 40);
+        const saved = JSON.parse(store[TCODE_STORAGE_KEY]);
+        assert.equal(saved['TCode device 1a86:7523'].axes.L0.maxCap, 40);
+        assert.equal(saved['TCode device'], undefined);
+        // A port whose getInfo() throws still connects under the plain name.
+        await disconnectTCode();
+        port = makeFakePort({});
+        port.getInfo = () => { throw new Error('no info'); };
+        assert.equal(await connectTCode(handlers()), true);
+        await sleep(TCODE_TIMINGS.restMs + 5);
+        assert.equal(getTCodeDevice().name, 'TCode device');
+    });
     it('ignores a command echo and unsolicited chatter', async () => {
         assert.equal(await connect({ D0: ['D0', 'SR6'], D1: ['D1', 'v0.3'], D2: ['D2', 'L0 stroke', 'L1 surge', 'OK'] }), true);
         const dev = getTCodeDevice();

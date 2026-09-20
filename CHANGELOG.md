@@ -21,6 +21,28 @@ credited by username.
 - Full Length Strokes respects the hardware travel envelope; envelope inputs
   are validated and the upper bound is no longer locked at 60% (SDuna).
 
+### Intiface Central / Buttplug.io
+- Linear axes (OSR2, SR6, OSSM and other strokers exposed by Intiface) are
+  driven by a per-axis stroke planner: one `LinearCmd` per stroke leg
+  carrying the full leg duration, nothing re-sent while a leg is in flight,
+  speed and zone changes applied to the next leg. The 200 ms polling loop
+  that re-sent hold commands, and produced the jerky bursts klozzie0
+  recorded on his TCode stroker, is gone.
+- Connection state is real: the modal label walks Offline, Connecting,
+  Handshake, Connected (server name, N devices) or the error text instead of
+  staying on "Offline" while connected (klozzie0). A second Connect closes
+  and detaches the previous socket; a 5 s handshake timeout and URL
+  validation (`ws://` or `wss://` only) replace silent hangs.
+- Ping honours the server's `MaxPingTime`; `Error` replies are shown and an
+  axis that fails three commands in a row is flagged; `ScanningFinished`
+  ends the scanning hint; the battery sensor is read at its real index.
+- OFF axes get a single rest move (or zero) and then nothing. `StopAllDevices`
+  is sent on STOP, pause, disconnect and page unload.
+- Roles, caps, linear invert and the rotation settings are remembered per
+  toy (Save & Apply now really saves). Rotators can alternate direction
+  every N seconds (5-60) in addition to reversing on an edge (SDuna).
+- A failed connect no longer pauses a session running on other hardware.
+
 ### TCode Serial (OSR2 / SR6 / OSSM)
 - New "TCode Serial" device card: OSR2, SR6, OSSM and other T-Code v0.3
   strokers connect straight over their USB serial port (Web Serial, 115200
@@ -30,6 +52,10 @@ credited by username.
   set. Every axis has a Primary / Secondary / OFF role, a cap, a Test button
   and (linear axes) an invert switch; settings are remembered per device
   name. L0 is Primary and V0 Secondary by default, everything else OFF.
+  A device that does not answer D0 is named after its USB vendor and
+  product id (for example "TCode device 1a86:7523") so two silent rigs do
+  not share one saved mapping; a mapping saved under the old plain name
+  must be assigned once more.
 - Linear and rotation axes use the shared stroke planner (one command per
   leg, nothing re-sent mid-leg); rotation axes swing around centre by the
   engine speed. STOP, pause, Reset and every disconnect alert bring all axes
@@ -48,9 +74,16 @@ credited by username.
 - Stall guard stops only the primary channel, as the UI states.
 - Stroke zones keep a minimum width; Head Play during warm-up can no longer
   collapse the stroke.
+- Glans Protector now does what its card promises: full-length strokes at
+  rest contracting toward base micro-strokes (0-35%) at the ceiling.
+- Full Stop vs Crawl (10%) at the ceiling is an explicit setting on the
+  Guards tab instead of an implicit mode behaviour; Force Orgasm overrides
+  both.
 - Funscript export produces real stroke actions from the recorded speed and
   zone instead of writing the speed percentage as a position.
-- Storage is corruption-safe and trims the oldest history on quota errors.
+- Storage is corruption-safe and trims the oldest history on quota errors;
+  every remaining `localStorage` access in the app goes through the same
+  helpers.
 
 ### Heart-rate monitor and watchdog
 - Short signal gaps hold the last valid reading instead of pausing; the
@@ -61,11 +94,43 @@ credited by username.
 - A dropped Bluetooth link is retried three times before it is reported.
 - Clear guidance when Web Bluetooth is unavailable, including the Chrome
   flag needed on Linux (Jalex).
+
+### Remote control
+- PeerJS error, close and disconnected events are handled on both sides: a
+  dropped link is shown as disconnected, never as connected; a replaced
+  controller is closed; a missing PeerJS script is reported instead of
+  failing silently.
+- Every inbound message is validated and clamped (`peer-messages.js`). A
+  controller may only send transport, Force Orgasm and mode commands, never
+  limits or raw speeds; a viewer may only ping; host telemetry is coerced
+  before it touches the remote page.
 - The remote-controller page only renders telemetry and sends transport
-  commands to the host.
+  commands to the host. The group link (`?group_sub=`) opens a read-only
+  viewer page with every control locked.
+
+### Voice, microphone, chart and sharing
+- Voice cues are queued instead of cancelling each other; safety cues jump
+  the queue; identical back-to-back cues are dropped.
+- The microphone monitor starts from a user gesture (a "tap to re-enable"
+  button appears when the browser withholds the permission) and its boost
+  is clamped to the effective ceiling.
+- The telemetry chart sizes itself from its box and the device pixel ratio,
+  so it is crisp on phones and never wider than the layout, and its scale
+  always includes the Climax HR line.
+- Copy-link buttons fall back to a hidden field and `execCommand('copy')`
+  when the Clipboard API is unavailable (plain `http://` hosting) and never
+  throw.
 
 ### Project
-- `npm test` runs the unit tests (169 at the time of writing) and a GitHub
-  Actions workflow runs them on every push and pull request.
+- `npm test` runs the unit tests (about 290 at the time of writing) and a GitHub
+  Actions workflow runs them, plus `node --check` on every module, on every
+  push and pull request.
+- `npm run smoke` (`tools/smoke.js`) drives the real app in headless
+  Chromium through every modal and page and reports console errors, failed
+  requests and broken assertions as JSON.
+- The service worker is now network-first with a cache fallback, so a
+  deployed update is picked up on the next load while the cockpit still
+  opens offline, and it is actually registered on secure origins (https or
+  localhost).
 - Manifest and service-worker paths are relative so the app also works
   when hosted under a sub-path such as GitHub Pages.
