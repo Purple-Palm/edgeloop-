@@ -177,6 +177,9 @@ credited by username.
   is clamped to the effective ceiling. Session Setup has a live meter, a
   Test button and a noise-gate slider; the sampler uses the 250-4000 Hz
   voice band so toy motors do not trip it.
+- Spoken Voice Guidance shows the current cue on the dashboard and speaks
+  it. The phrases are editable on the Audio tab, with `{hr}`, `{maxHr}`,
+  `{minHr}`, `{edges}` and `{minutes}` filled from the live session.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.

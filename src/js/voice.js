@@ -12,8 +12,19 @@ const queue = createCueQueue({ maxQueued: 3 });
 let activeToken = 0;
 let fallbackTimer = null;
 
+// Tests replace these hooks to assert that speak() is actually called.
+export const speechHooks = {
+    getSynth() {
+        return typeof window !== 'undefined' ? window.speechSynthesis : null;
+    },
+    UtteranceCtor() {
+        if (typeof SpeechSynthesisUtterance === 'function') return SpeechSynthesisUtterance;
+        return typeof window !== 'undefined' ? window.SpeechSynthesisUtterance : null;
+    }
+};
+
 function synth() {
-    return typeof window !== 'undefined' ? window.speechSynthesis : null;
+    return speechHooks.getSynth();
 }
 
 export function listSpeechVoices() {
@@ -34,10 +45,11 @@ function clearFallbackTimer() {
 // fallback timer keeps the queue moving on browsers that never fire `end`.
 function utter(text, voiceURI) {
     const s = synth();
-    if (!s) return;
+    const Utterance = speechHooks.UtteranceCtor();
+    if (!s || !Utterance) return;
     const token = ++activeToken;
     clearFallbackTimer();
-    const utterance = new SpeechSynthesisUtterance(text);
+    const utterance = new Utterance(text);
     utterance.rate = 0.95;
     utterance.pitch = 0.92;
     if (voiceURI) {

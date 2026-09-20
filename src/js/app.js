@@ -85,6 +85,12 @@ import {
     listSpeechVoices,
     clampMicGate
 } from './voice.js';
+import {
+    VOICE_CUE_CATALOG,
+    DEFAULT_VOICE_CUES,
+    mergeVoiceCues,
+    resolveVoiceCue
+} from './voice-cues.js';
 
 // Load persisted settings. The old 15/85 default envelope is migrated to
 // 0/100 exactly once (flagged), so a user who deliberately types 15/85 later
@@ -140,6 +146,7 @@ function syncGuardSettings() {
     advancedSettings.stallPauseSeconds = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
     advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
+    advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
 }
 syncWatchdogSettings();
 syncGuardSettings();
@@ -300,7 +307,7 @@ function pauseSession(voiceText = 'Paused.') {
     if (pauseEl) pauseEl.textContent = state.pauses;
     renderTransport('PAUSED');
     dispatchHardware(0, 0, 0, 100, true);
-    if (voiceText) cueVoice(voiceText);
+    if (voiceText) cueVoice('paused');
     return true;
 }
 
@@ -717,7 +724,7 @@ function updateEngine() {
         if (edgeEl) edgeEl.textContent = state.edges;
         if (state.activeMode === 'ruin') state.ruinHoldSeconds = 18;
         reverseIntifaceRotation('edge');
-        cueVoice('Edge. Back off.');
+        cueVoice('edge');
     }
 
     state.isEdged = result.isEdged;
@@ -789,7 +796,24 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
 // Queue a spoken cue (voice.js keeps a short queue, so back-to-back cues are
 // all heard instead of cutting each other off). An `urgent` cue (signal
 // lost, stop) jumps the queue and silences whatever was waiting.
-function cueVoice(text, urgent = false) {
+function sessionVoiceVars() {
+    return {
+        hr: Math.round(Number.isFinite(state.effectiveHr) ? state.effectiveHr : (state.hrCurrent || 0)),
+        maxHr: Math.round(Number.isFinite(state.effectiveMaxHr) ? state.effectiveMaxHr : 0),
+        minHr: Math.round(Number.isFinite(state.effectiveMinHr) ? state.effectiveMinHr : 0),
+        edges: state.edges || 0,
+        minutes: Math.floor(Math.max(0, state.sessionSeconds || 0) / 60)
+    };
+}
+
+function dashboardIdlePrompt() {
+    return resolveVoiceCue(advancedSettings.voiceCues, 'idle', sessionVoiceVars()) || DEFAULT_VOICE_CUES.idle;
+}
+
+// Queue a spoken cue. Voice guidance ON both paints the dashboard line and
+// speaks it. An `urgent` cue (signal lost, stop) jumps the TTS queue.
+function cueVoice(key, urgent = false) {
+    const text = resolveVoiceCue(advancedSettings.voiceCues, key, sessionVoiceVars());
     if (!advancedSettings.voiceEnabled || !text) {
         setMindgamePrompt(text || '', Boolean(advancedSettings.voiceEnabled && text));
         return;
@@ -939,13 +963,13 @@ function tickSessionGuardsAndGames() {
     state.edgeStallSeconds = guard.holdSeconds;
     state.stallPauseElapsed = guard.pauseSeconds;
     state.stallGuardEngaged = guard.engaged;
-    if (guard.justEngaged) cueVoice('Stall guard. Primary halted. Recover.');
-    if (guard.justResumed) cueVoice('Hold window reset. Crawl.');
-    if (guard.justReleased) cueVoice('Recovered. Resume.');
+    if (guard.justEngaged) cueVoice('stallHalt');
+    if (guard.justResumed) cueVoice('stallResume');
+    if (guard.justReleased) cueVoice('stallRecover');
 
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
     if (warmupSeconds > 0 && state.sessionSeconds === warmupSeconds) {
-        cueVoice('Warm up complete.');
+        cueVoice('warmupDone');
     }
 
     if (advancedSettings.micEnabled && state.micAnalyser) {
@@ -962,12 +986,12 @@ function tickSessionGuardsAndGames() {
         if (state.oracleState === 'IDLE' || state.oracleState === 'APPROACH') {
             if (state.oracleState !== 'APPROACH') {
                 state.oracleState = 'APPROACH';
-                cueVoice('The Oracle is watching. Climb.');
+                cueVoice('oracleWatching');
             }
             if (state.isEdged) {
                 state.oracleState = 'HOLD';
                 state.oracleTimer = 15;
-                cueVoice('Hold. Fifteen seconds.');
+                cueVoice('oracleHold');
             }
         } else if (state.oracleState === 'HOLD') {
             state.oracleTimer = Math.max(0, state.oracleTimer - 1);
@@ -976,7 +1000,7 @@ function tickSessionGuardsAndGames() {
                 if (roll < 0.33) {
                     state.oracleState = 'CLIMAX';
                     if (!state.orgasmMode) orgasmBtn?.click();
-                    cueVoice('The Oracle chooses climax.');
+                    cueVoice('oracleClimax');
                 } else if (roll < 0.66) {
                     state.oracleState = 'DENIAL';
                     stopSession('Oracle Denial', 'The Oracle chooses denial.');
@@ -984,7 +1008,7 @@ function tickSessionGuardsAndGames() {
                 } else {
                     state.oracleState = 'PURGATORY';
                     state.oracleTimer = 0;
-                    cueVoice('The Oracle chooses purgatory.');
+                    cueVoice('oraclePurgatory');
                 }
             }
         } else if (state.oracleState === 'CLIMAX') {
@@ -994,7 +1018,7 @@ function tickSessionGuardsAndGames() {
             // ceiling too, this keeps the game state honest).
             if (!state.orgasmMode) {
                 state.oracleState = 'APPROACH';
-                cueVoice('Climax withdrawn. Climb again.');
+                cueVoice('oracleWithdrawn');
             }
         } else if (state.oracleState === 'PURGATORY') {
             // Purgatory lasts 28 s, but the edge flag is only cleared once the
@@ -1005,7 +1029,7 @@ function tickSessionGuardsAndGames() {
                 state.oracleState = 'APPROACH';
                 state.oracleTimer = 0;
                 state.isEdged = false;
-                cueVoice('Purgatory resets. Climb again.');
+                cueVoice('oracleReset');
             }
         }
     } else if (state.activeMode === 'survival') {
@@ -1024,7 +1048,7 @@ function tickSessionGuardsAndGames() {
             stopSession('Survival Defeat', 'Survival failed. Limit breached.');
             return;
         }
-        if (state.survivalBreachTicks > 0) cueVoice('Over the limit. Drop it.');
+        if (state.survivalBreachTicks > 0) cueVoice('survivalBreach');
     }
 }
 
@@ -1160,7 +1184,7 @@ function resumeAfterSignalReturn() {
     state.hrSignalPaused = false;
     if (!startOrResumeSession()) return;
     document.getElementById('disconnectBanner')?.classList.add('hidden');
-    cueVoice('Signal restored. Resuming.');
+    cueVoice('signalRestored');
     showHrSignalBadge('SIGNAL RESTORED, RESUMED', 6000);
     syncTelemetry();
     updateEngine();
@@ -1193,7 +1217,7 @@ function evaluateHrWatchdog(now = Date.now()) {
         state.hrSignalPaused = true;
         dispatchHardware(0, 0, 0, 100, true);
         triggerDisconnectAlert(describeHrLoss(verdict));
-        cueVoice('Heart rate signal lost. Motors stopped.', true);
+        cueVoice('signalLost', true);
     }
 }
 
@@ -1325,7 +1349,7 @@ function startOrResumeSession() {
         resetGameState();
         state.chosenTargetSeconds = pickSessionTargetSeconds();
         updateTimerDisplay();
-        cueVoice('Session started. Breathe.');
+        cueVoice('sessionStart');
     } else {
         // Resume into the rampdown where it left off, not back to RUNNING.
         resumingRampdown = state.resumeStatus === 'RAMPDOWN' && state.rampdownSecondsLeft > 0;
@@ -1396,7 +1420,7 @@ function stopSession(outcome = "Stopped", voiceText = null) {
         showIdleTransport();
         // STOP silences every queued cue; the outcome is the one thing said.
         cancelSpeech();
-        cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'Session stopped.'), true);
+        cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'sessionStop'), true);
         syncTelemetry();
         checkReadiness();
         if (!isRemotePage) updateEngine();
@@ -1759,7 +1783,8 @@ function syncParamsUI() {
     if (gateInput) gateInput.value = gate;
     if (gateValue) gateValue.textContent = String(gate);
     populateVoiceSelect();
-    setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
+    renderVoiceCueEditor();
+    setMindgamePrompt(state.lastSpokenPrompt || dashboardIdlePrompt(), advancedSettings.voiceEnabled);
 }
 
 function populateVoiceSelect() {
@@ -1790,7 +1815,53 @@ if (window.speechSynthesis) {
 document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () => {
     const select = document.getElementById('paramVoiceSelect');
     if (select) advancedSettings.voiceURI = select.value;
-    speakNow('EdgeLoop voice preview. Stay right on the edge.', advancedSettings.voiceURI);
+    readVoiceCuesFromForm();
+    const text = resolveVoiceCue(advancedSettings.voiceCues, 'preview', sessionVoiceVars());
+    if (text) speakNow(text, advancedSettings.voiceURI);
+});
+
+function escapeAttr(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function renderVoiceCueEditor() {
+    const root = document.getElementById('voiceCuesList');
+    if (!root) return;
+    const merged = mergeVoiceCues(advancedSettings.voiceCues);
+    root.innerHTML = VOICE_CUE_CATALOG.map((cue) => (
+        `<div class="space-y-0.5">
+            <div class="flex justify-between items-center gap-2">
+              <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)}</label>
+              <button type="button" data-voice-preview="${cue.id}" class="text-[9px] text-purple-300 hover:underline cursor-pointer">Speak</button>
+            </div>
+            <input id="voiceCue-${cue.id}" data-voice-cue="${cue.id}" value="${escapeAttr(merged[cue.id])}" maxlength="140" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-[10px] text-slate-200 outline-none focus:border-purple-500">
+        </div>`
+    )).join('');
+}
+
+function readVoiceCuesFromForm() {
+    const raw = {};
+    document.querySelectorAll('[data-voice-cue]').forEach((el) => {
+        raw[el.getAttribute('data-voice-cue')] = el.value;
+    });
+    if (Object.keys(raw).length > 0) advancedSettings.voiceCues = mergeVoiceCues(raw);
+}
+
+document.getElementById('voiceCuesList')?.addEventListener('click', (e) => {
+    const btn = e.target?.closest?.('[data-voice-preview]');
+    if (!btn) return;
+    readVoiceCuesFromForm();
+    const text = resolveVoiceCue(advancedSettings.voiceCues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
+    if (text) speakNow(text, advancedSettings.voiceURI);
+});
+
+document.getElementById('voiceCuesResetBtn')?.addEventListener('click', () => {
+    advancedSettings.voiceCues = mergeVoiceCues({});
+    renderVoiceCueEditor();
 });
 
 document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
@@ -1953,6 +2024,7 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
+    readVoiceCuesFromForm();
     if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
     advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);
@@ -1966,7 +2038,7 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
         advancedSettings.micEnabled = micOn;
         if (!micOn) showMicReenable(false);
     }
-    setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
+    setMindgamePrompt(state.lastSpokenPrompt || dashboardIdlePrompt(), advancedSettings.voiceEnabled);
 
     persistSettings();
     closeModal();
@@ -3102,7 +3174,7 @@ renderLearningStatus();
 syncParamsUI();
 // A persisted mic setting waits for a tap (browser gesture rule).
 if (advancedSettings.micEnabled && !isRemotePage) showMicReenable(true);
-if (advancedSettings.voiceEnabled) setMindgamePrompt('Calm and steady. Breathe.', true);
+if (advancedSettings.voiceEnabled) setMindgamePrompt(dashboardIdlePrompt(), true);
 watchChartResize(document.getElementById('hrChart'), redrawChart);
 if (isRemotePage && remoteRoom) {
     lockRemoteLimitInputs();

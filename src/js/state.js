@@ -114,6 +114,7 @@ export const advancedSettings = {
     decayFloor: 105,
     voiceEnabled: false,
     voiceURI: '',
+    voiceCues: {},
     micEnabled: false,
     micSensitivityThreshold: 40,
     customProfiles: {},

@@ -859,7 +859,7 @@
             <div class="flex items-center justify-between">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Spoken Voice Guidance</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Uses local browser text-to-speech to vocalize biofeedback cues.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Shows each cue on the dashboard and speaks it with the browser's local voice.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramVoiceToggle" type="checkbox" class="sr-only peer">
@@ -872,6 +872,11 @@
               </select>
               <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
             </div>
+            <p class="text-[9px] text-slate-400 leading-snug pt-1 border-t border-slate-900">
+              When this is on, each cue is shown on the dashboard <em>and</em> spoken. Tokens you can drop into a phrase: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
+            </p>
+            <div id="voiceCuesList" class="space-y-1.5 max-h-56 overflow-y-auto pr-0.5"></div>
+            <button id="voiceCuesResetBtn" type="button" class="text-[10px] text-slate-400 hover:text-purple-300 font-bold cursor-pointer">Reset phrases to defaults</button>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">

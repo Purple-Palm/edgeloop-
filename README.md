@@ -128,7 +128,7 @@ The **Guards** tab of Session Setup holds every safety rule. They are independen
 * **Adaptive Ceiling Decay.** Every X edges (1-10, default 2) the ceiling drops by Y BPM (1-5, default 2) to counteract fatigue over a long session, down to a **floor** (80-130, default 105). The floor can *stop* the decay but can never *raise* the ceiling: if you typed a Climax HR below the floor, your value wins. No offset can push the working ceiling below Resting HR + 15 BPM or above the Climax HR you typed. The DECAY badge shows the amount currently applied.
 * **Force Orgasm** is a temporary boost on the working ceiling; STOP and Reset always clear it and the typed Climax HR is never rewritten.
 
-The **Audio & Mic** tab has spoken voice guidance (local browser TTS, with a voice picker and Preview) and an optional **Microphone Monitor**. The monitor uses a voice-band noise gate so stroker and vibrator rumble does not count as arousal: Test microphone in Session Setup, run the toys, and raise the gate until the meter stays dark, then speak or pant to confirm it lights. Only levels above the gate add a small boost toward the working ceiling.
+The **Audio & Mic** tab has spoken voice guidance (local browser TTS, with a voice picker and Preview). When it is on, each cue is shown on the dashboard **and** spoken. The phrases are editable there (`{hr}`, `{maxHr}`, `{minHr}`, `{edges}`, `{minutes}` fill in live session values). There is also an optional **Microphone Monitor**. The monitor uses a voice-band noise gate so stroker and vibrator rumble does not count as arousal: Test microphone in Session Setup, run the toys, and raise the gate until the meter stays dark, then speak or pant to confirm it lights. Only levels above the gate add a small boost toward the working ceiling.
 
 ---
 
@@ -201,6 +201,9 @@ edgeloop/
         ├── peer-messages.test.js
         ├── voice.js            # Local text-to-speech prompts and optional microphone monitor (voice-band gate)
         ├── voice.test.js
+        ├── voice-cues.js       # Editable cue templates and {hr}/{edges} interpolation
+        ├── voice-cues.test.js
+        ├── voice-speak.test.js
         ├── voice-queue.js      # Pure cue queue: dedupe, bounded backlog, safety cues jump the queue
         ├── voice-queue.test.js
         └── hardware/
