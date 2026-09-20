@@ -28,7 +28,7 @@ EdgeLoop runs 100% locally in your web browser with zero accounts, zero subscrip
 
 * **Adaptive Biofeedback Core:** Uses a convex power curve that keeps speeds active and engaging during mid-arousal, only backing off sharply in the final heart rate window before your climax ceiling. Includes a 5 BPM recovery buffer (hysteresis) and a selectable peak behavior (Full Stop or a gentle Crawl).
 * **Session Guards:** Signal watchdog, stall guard, dual-stimulation dampening and adaptive ceiling decay. They are described one by one in [Session guards](#session-guards) below.
-* **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate) and *Survival Mode*.
+* **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate) and *Survival Mode*. The Oracle uses your Duration tab: with Mystery (e.g. 30–60 min) it will not climax or deny before the minimum; after that each 15 s hold can end you, more often as you near the secret target; Endless has no minimum.
 * **Session Telemetry & Funscript Export:** Automatically logs session metrics and exports dual-channel `.funscript` (primary stroker) and `.v0.funscript` (secondary vibrator) files directly to your machine for replay in external players like ScriptPlayer or HereSphere.
 * **Remote Partner Control & Viewers:** Peer-to-peer WebRTC room links let one partner anywhere in the world manage the session remotely (transport, Force Orgasm, mode), while any number of read-only viewers watch the live heart-rate telemetry. Every inbound message is validated; a dropped link is shown as disconnected, never as connected.
 * **Broad Protocol Support:** Direct connection to BLE heart rate monitors (standard 0x180D GATT service), The Handy (Wi-Fi HAMP API), T-Code strokers (OSR2, SR6, OSSM) straight over their USB serial port via Web Serial, and Buttplug.io / Intiface Central for vibrators, reciprocating sex machines, and rotational devices.
@@ -186,7 +186,7 @@ edgeloop/
         ├── state.js            # Central memory store for settings, user preferences, and real-time session state
         ├── engine.js           # Biofeedback calculations: speed curves, recovery thresholds, and safety cutoffs
         ├── engine.test.js      # Node tests for every cockpit mode, stall/crawl, warmup, hysteresis, and Oracle/Survival
-        ├── session-rules.js    # Pure session rules: effective ceiling (offsets, decay floor, overdrive boost), HR-limit and duration validation, Survival breach counter
+        ├── session-rules.js    # Pure session rules: effective ceiling, duration window, Oracle fate vs mystery min, Survival breach, stall timers
         ├── session-rules.test.js
         ├── funscript.js        # Pure funscript builder: turns the 4 Hz speed/zone timeline into .funscript stroke actions and .v0.funscript vibration levels
         ├── funscript.test.js

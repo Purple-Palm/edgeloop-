@@ -7,6 +7,8 @@ import {
     sanitizeHrLimits,
     computeEffectiveCeiling,
     parseSessionDuration,
+    oracleTiming,
+    rollOracleFate,
     countSurvivalBreach,
     isSurvivalDefeated,
     MIN_STALL_GUARD_SECONDS,
@@ -129,11 +131,16 @@ describe('computeEffectiveCeiling', () => {
 
 describe('parseSessionDuration', () => {
     it('endless is always zero', () => {
-        assert.deepEqual(parseSessionDuration({ mode: 'endless' }), { targetSeconds: 0, valid: true, invalid: [] });
+        assert.deepEqual(parseSessionDuration({ mode: 'endless' }), {
+            targetSeconds: 0, minSeconds: 0, maxSeconds: 0, valid: true, invalid: []
+        });
     });
 
-    it('fixed uses the typed minutes', () => {
-        assert.equal(parseSessionDuration({ mode: 'fixed', fixedMinutes: '30' }).targetSeconds, 1800);
+    it('fixed uses the typed minutes as both ends of the window', () => {
+        const out = parseSessionDuration({ mode: 'fixed', fixedMinutes: '30' });
+        assert.equal(out.targetSeconds, 1800);
+        assert.equal(out.minSeconds, 1800);
+        assert.equal(out.maxSeconds, 1800);
     });
 
     it('fixed rejects zero, negative and non-numeric values', () => {
@@ -152,6 +159,8 @@ describe('parseSessionDuration', () => {
         assert.equal(hi.targetSeconds, 45 * 60);
         const same = parseSessionDuration({ mode: 'range', minMinutes: 10, maxMinutes: 10, random: () => 0.5 });
         assert.equal(same.targetSeconds, 600);
+        assert.equal(lo.minSeconds, 25 * 60);
+        assert.equal(hi.maxSeconds, 45 * 60);
     });
 
     it('range flags an inverted window and falls back to endless', () => {
@@ -165,6 +174,37 @@ describe('parseSessionDuration', () => {
         const out = parseSessionDuration({ mode: 'range', minMinutes: 'x', maxMinutes: 40 });
         assert.deepEqual(out.invalid, ['min']);
         assert.equal(out.targetSeconds, 0);
+    });
+});
+
+describe('oracle timing and fate', () => {
+    it('blocks climax and denial before the mystery minimum', () => {
+        const early = oracleTiming({ sessionSeconds: 5 * 60, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 42 * 60 });
+        assert.equal(early.canEnd, false);
+        assert.equal(early.mustEnd, false);
+        assert.equal(rollOracleFate(early, { random: () => 0 }), 'PURGATORY');
+        assert.equal(rollOracleFate(early, { random: () => 0.99 }), 'PURGATORY');
+    });
+
+    it('opens the window at min and forces an ending at max', () => {
+        const open = oracleTiming({ sessionSeconds: 30 * 60, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 42 * 60 });
+        assert.equal(open.canEnd, true);
+        assert.equal(open.mustEnd, false);
+        assert.equal(rollOracleFate(open, { random: () => 0 }), 'PURGATORY');
+        const late = oracleTiming({ sessionSeconds: 42 * 60, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 42 * 60 });
+        assert.equal(late.mustEnd, true);
+        const stillOpen = oracleTiming({ sessionSeconds: 40 * 60, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 42 * 60 });
+        assert.equal(stillOpen.mustEnd, false);
+        assert.equal(stillOpen.canEnd, true);
+        assert.equal(rollOracleFate(late, { random: () => 0.9, endgameType: 'orgasm' }), 'CLIMAX');
+        assert.equal(rollOracleFate(late, { random: () => 0.1, endgameType: 'denial' }), 'DENIAL');
+    });
+
+    it('endless has no clock so any hold may end', () => {
+        const open = oracleTiming({ sessionSeconds: 12, minSeconds: 0, maxSeconds: 0, targetSeconds: 0 });
+        assert.equal(open.canEnd, true);
+        assert.equal(open.mustEnd, false);
+        assert.equal(rollOracleFate(open, { random: () => 0.5 }), 'CLIMAX');
     });
 });
 

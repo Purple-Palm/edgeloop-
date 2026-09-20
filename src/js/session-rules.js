@@ -141,8 +141,12 @@ export function computeEffectiveCeiling({
 // `invalid` (field names 'fixed', 'min', 'max') and the session falls back to
 // endless (targetSeconds 0) so the caller can flag the field instead of
 // silently running forever.
+function emptyDuration(invalid = []) {
+    return { targetSeconds: 0, minSeconds: 0, maxSeconds: 0, valid: invalid.length === 0, invalid };
+}
+
 export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinutes, random = Math.random }) {
-    if (mode === 'endless') return { targetSeconds: 0, valid: true, invalid: [] };
+    if (mode === 'endless') return emptyDuration();
 
     const toMinutes = (value) => {
         const n = toInt(value);
@@ -151,8 +155,9 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
 
     if (mode === 'fixed') {
         const mins = toMinutes(fixedMinutes);
-        if (mins === null) return { targetSeconds: 0, valid: false, invalid: ['fixed'] };
-        return { targetSeconds: mins * 60, valid: true, invalid: [] };
+        if (mins === null) return { ...emptyDuration(['fixed']), valid: false };
+        const seconds = mins * 60;
+        return { targetSeconds: seconds, minSeconds: seconds, maxSeconds: seconds, valid: true, invalid: [] };
     }
 
     const lo = toMinutes(minMinutes);
@@ -161,11 +166,68 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
     if (lo === null) invalid.push('min');
     if (hi === null) invalid.push('max');
     if (lo !== null && hi !== null && lo > hi) invalid.push('min', 'max');
-    if (invalid.length > 0) return { targetSeconds: 0, valid: false, invalid };
+    if (invalid.length > 0) return { ...emptyDuration(invalid), valid: false };
 
     const roll = clamp(Number(random()) || 0, 0, 0.999999);
     const mins = Math.min(hi, Math.floor(roll * (hi - lo + 1)) + lo);
-    return { targetSeconds: mins * 60, valid: true, invalid: [] };
+    return {
+        targetSeconds: mins * 60,
+        minSeconds: lo * 60,
+        maxSeconds: hi * 60,
+        valid: true,
+        invalid: []
+    };
+}
+
+// When the Oracle may climax or deny. Endless (all zeros) has no clock, so
+// any hold may end the session. Mystery/Fixed keep climax and denial closed
+// until minSeconds, then open them through the window; past maxSeconds the
+// next hold must end (no more purgatory).
+export function oracleTiming({
+    sessionSeconds = 0,
+    minSeconds = 0,
+    maxSeconds = 0,
+    targetSeconds = 0
+} = {}) {
+    const t = Math.max(0, Number(sessionSeconds) || 0);
+    const min = Math.max(0, Number(minSeconds) || 0);
+    const max = Math.max(0, Number(maxSeconds) || 0);
+    const target = Math.max(0, Number(targetSeconds) || 0);
+    const openAt = min;
+    const closeAt = target > 0 ? target : max;
+    const endless = openAt === 0 && closeAt === 0;
+    if (endless) {
+        return { canEnd: true, mustEnd: false, openAt: 0, closeAt: 0, progress: 1 };
+    }
+    const span = Math.max(1, closeAt - openAt);
+    const progress = clamp((t - openAt) / span, 0, 1);
+    return {
+        canEnd: t >= openAt,
+        mustEnd: closeAt > 0 && t >= closeAt,
+        openAt,
+        closeAt,
+        progress
+    };
+}
+
+export function rollOracleFate(timing, { random = Math.random, endgameType = 'orgasm' } = {}) {
+    const gate = timing && typeof timing === 'object'
+        ? timing
+        : { canEnd: true, mustEnd: false, progress: 1 };
+    if (!gate.canEnd) return 'PURGATORY';
+    const roll = clamp(Number(random()) || 0, 0, 0.999999);
+    if (gate.mustEnd) {
+        if (endgameType === 'denial') return 'DENIAL';
+        if (endgameType === 'orgasm') return 'CLIMAX';
+        return roll < 0.5 ? 'CLIMAX' : 'DENIAL';
+    }
+    // Early in the window most holds continue; near the close, climax and
+    // denial take most of the rolls. Equal split between those two.
+    const p = clamp(Number(gate.progress) || 0, 0, 1);
+    const purgP = 0.72 * (1 - p) + 0.18 * p;
+    if (roll < purgP) return 'PURGATORY';
+    const mid = purgP + (1 - purgP) / 2;
+    return roll < mid ? 'CLIMAX' : 'DENIAL';
 }
 
 // Survival breach counter: consecutive readings at or above the ceiling. A

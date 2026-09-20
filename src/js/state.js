@@ -7,6 +7,8 @@ export const state = {
     sessionStatus: 'IDLE',
     sessionSeconds: 0,
     chosenTargetSeconds: 0,
+    durationMinSeconds: 0,
+    durationMaxSeconds: 0,
     durationMode: 'range',
     endgameType: 'orgasm',
     rampdownSecondsLeft: 45,

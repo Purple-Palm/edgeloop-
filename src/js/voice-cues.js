@@ -108,6 +108,7 @@ export const VOICE_CUE_CATALOG = [
         ]
     },
     { id: 'oraclePurgatory', group: 'Climax', label: 'Oracle purgatory', lines: ['The Oracle chooses purgatory.'] },
+    { id: 'oracleNotYet', group: 'Climax', label: 'Oracle too early to end', lines: ['Not yet. Keep climbing.', 'Too soon. The Oracle is still watching.'] },
     { id: 'oracleWithdrawn', group: 'Climax', label: 'Oracle climax cancelled', lines: ['Climax withdrawn. Climb again.'] },
     { id: 'oracleReset', group: 'Climax', label: 'Oracle purgatory reset', lines: ['Purgatory resets. Climb again.'] },
     {

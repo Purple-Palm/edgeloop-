@@ -6,6 +6,12 @@ credited by username.
 
 ## Unreleased
 
+### Games
+- The Oracle no longer rolls climax or denial on the first edge. Mystery and
+  Fixed durations keep those endings locked until the minimum; inside the
+  window later holds are more likely to end you; the secret target is the
+  latest it will wait. Endless still has no minimum.
+
 ### The Handy
 - Connect now selects HAMP mode (mode 0). The driver previously selected
   HSSP (mode 1), which the Handy API v2 spec documents as script streaming.

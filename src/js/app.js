@@ -11,6 +11,8 @@ import {
     computeEffectiveCeiling,
     sanitizeHrLimits,
     parseSessionDuration,
+    oracleTiming,
+    rollOracleFate,
     countSurvivalBreach,
     isSurvivalDefeated,
     clampStallGuardSeconds,
@@ -863,7 +865,15 @@ function updateGameNotice() {
         if (state.oracleState === 'HOLD') text = `THE ORACLE: HOLDING ${state.oracleTimer}s — FATE PENDING`;
         else if (state.oracleState === 'CLIMAX') text = 'THE ORACLE: CLIMAX';
         else if (state.oracleState === 'DENIAL') text = 'THE ORACLE: DENIAL';
-        else if (state.oracleState === 'PURGATORY') text = 'THE ORACLE: PURGATORY';
+        else if (state.oracleState === 'PURGATORY') {
+            const timing = oracleTiming({
+                sessionSeconds: state.sessionSeconds,
+                minSeconds: state.durationMinSeconds,
+                maxSeconds: state.durationMaxSeconds,
+                targetSeconds: state.chosenTargetSeconds
+            });
+            text = timing.canEnd ? 'THE ORACLE: PURGATORY' : 'THE ORACLE: NOT YET — KEEP CLIMBING';
+        }
         else text = 'THE ORACLE: APPROACHING THE CEILING';
     } else if (state.activeMode === 'survival' && state.sessionStatus === 'RUNNING') {
         text = `SURVIVAL: FLOOR ${Math.round(state.survivalSpeedFloor)}% — STAY UNDER YOUR LIMIT`;
@@ -893,6 +903,8 @@ function validateDurationInputs() {
 function pickSessionTargetSeconds() {
     const parsed = validateDurationInputs();
     state.durationFallback = !parsed.valid;
+    state.durationMinSeconds = parsed.minSeconds || 0;
+    state.durationMaxSeconds = parsed.maxSeconds || 0;
     return parsed.targetSeconds;
 }
 
@@ -902,6 +914,8 @@ function pickSessionTargetSeconds() {
 function resetSessionCounters() {
     state.sessionSeconds = 0;
     state.chosenTargetSeconds = 0;
+    state.durationMinSeconds = 0;
+    state.durationMaxSeconds = 0;
     state.edges = 0;
     state.pauses = 0;
     state.peakHr = Number.isFinite(state.hrCurrent) ? state.hrCurrent : 70;
@@ -1024,21 +1038,27 @@ function tickSessionGuardsAndGames() {
         } else if (state.oracleState === 'HOLD') {
             state.oracleTimer = Math.max(0, state.oracleTimer - 1);
             if (state.oracleTimer <= 0) {
-                const roll = Math.random();
-                if (roll < 0.33) {
+                const timing = oracleTiming({
+                    sessionSeconds: state.sessionSeconds,
+                    minSeconds: state.durationMinSeconds,
+                    maxSeconds: state.durationMaxSeconds,
+                    targetSeconds: state.chosenTargetSeconds
+                });
+                const fate = rollOracleFate(timing, { endgameType: state.endgameType });
+                if (fate === 'CLIMAX') {
                     state.oracleState = 'CLIMAX';
                     // Arm Force Orgasm without its own bank so Oracle climax
                     // is the one phrase the wearer hears.
                     if (!state.orgasmMode) setOrgasmMode(true);
                     cueVoice('oracleClimax');
-                } else if (roll < 0.66) {
+                } else if (fate === 'DENIAL') {
                     state.oracleState = 'DENIAL';
                     stopSession('Oracle Denial', 'The Oracle chooses denial.');
                     return;
                 } else {
                     state.oracleState = 'PURGATORY';
                     state.oracleTimer = 0;
-                    cueVoice('oraclePurgatory');
+                    cueVoice(timing.canEnd ? 'oraclePurgatory' : 'oracleNotYet');
                 }
             }
         } else if (state.oracleState === 'CLIMAX') {
@@ -1286,8 +1306,12 @@ setInterval(() => {
         // The endgame fires exactly once per session: the Orgasm endgame
         // arms Force Orgasm, which stays a toggle the wearer can cancel.
         if (!state.endgameFired && state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
-            state.endgameFired = true;
-            handleTargetTimeReached();
+            const oracleResolving = state.activeMode === 'oracle'
+                && (state.oracleState === 'HOLD' || state.oracleState === 'CLIMAX' || state.orgasmMode);
+            if (!oracleResolving) {
+                state.endgameFired = true;
+                handleTargetTimeReached();
+            }
         }
         if (state.orgasmMode) {
             // Raise the WORKING ceiling 1 BPM/s (capped) so the edge detector
