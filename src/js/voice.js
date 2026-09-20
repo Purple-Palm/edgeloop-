@@ -134,7 +134,8 @@ export async function startMicMonitor(state) {
     }
     const source = audioCtx.createMediaStreamSource(stream);
     const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 512;
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.65;
     source.connect(analyser);
     state.micStream = stream;
     state.micAudioCtx = audioCtx;
@@ -162,15 +163,46 @@ export function stopMicMonitor(state) {
     state.micAnalyser = null;
 }
 
+// Voice-band gate: ignore rumble from strokers / vibrators (mostly <250 Hz)
+// and keep panting, speech and other user noise (roughly 250-4000 Hz).
+export const MIC_VOICE_BAND_LO_HZ = 250;
+export const MIC_VOICE_BAND_HI_HZ = 4000;
+export const MIN_MIC_GATE = 8;
+export const MAX_MIC_GATE = 90;
+export const DEFAULT_MIC_GATE = 40;
+
+export function clampMicGate(value, fallback = DEFAULT_MIC_GATE) {
+    const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(MIN_MIC_GATE, Math.min(MAX_MIC_GATE, n));
+}
+
+// Pure: average magnitude of analyser frequency bins inside the voice band,
+// scaled 0-100. Low-frequency motor noise is dropped on purpose.
+export function voiceBandLevel(freqBytes, sampleRate, fftSize) {
+    if (!freqBytes || !freqBytes.length) return 0;
+    const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 44100;
+    const size = Number.isFinite(fftSize) && fftSize > 0 ? fftSize : (freqBytes.length * 2);
+    const binHz = rate / size;
+    let sum = 0;
+    let n = 0;
+    for (let i = 0; i < freqBytes.length; i++) {
+        const hz = i * binHz;
+        if (hz < MIC_VOICE_BAND_LO_HZ || hz > MIC_VOICE_BAND_HI_HZ) continue;
+        const mag = freqBytes[i];
+        if (!Number.isFinite(mag)) continue;
+        sum += mag;
+        n += 1;
+    }
+    if (!n) return 0;
+    return Math.min(100, Math.round((sum / n) / 2.55));
+}
+
 export function sampleMicLevel(state) {
     const analyser = state.micAnalyser;
     if (!analyser) return 0;
-    const data = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-        const centered = (data[i] - 128) / 128;
-        sum += centered * centered;
-    }
-    return Math.min(100, Math.round(Math.sqrt(sum / data.length) * 140));
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(data);
+    const sampleRate = state.micAudioCtx?.sampleRate || 44100;
+    return voiceBandLevel(data, sampleRate, analyser.fftSize);
 }

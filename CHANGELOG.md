@@ -111,7 +111,12 @@ credited by username.
   the ceiling rule applies again; pausing during Soft Landing resumes it.
 - Stall guard stops only the primary channel, as the UI states; it is
   released at once when it is switched off, Full Stop is selected or Force
-  Orgasm starts, and its timeout is clamped to 3-25 s wherever it enters.
+  Orgasm starts, and its timeout is clamped to 3-120 s (default 20) wherever
+  it enters. The Guards toggle turns the auto-cutoff off entirely.
+- Edge hold overshoot (0-15%, default 5%) stretches the tease up to
+  Climax HR plus that percent before crawl / Full Stop / stall engage, so
+  the typed max is a hold rather than an immediate pullback. The edge still
+  releases 5 BPM below the typed Climax HR.
 - The endgame (Orgasm / Soft Landing / Denied) fires once per session, so
   Force Orgasm stays a toggle the wearer can cancel after the target time.
 - Importing the same settings file twice works (the file input is cleared
@@ -168,7 +173,9 @@ credited by username.
   the queue; identical back-to-back cues are dropped.
 - The microphone monitor starts from a user gesture (a "tap to re-enable"
   button appears when the browser withholds the permission) and its boost
-  is clamped to the effective ceiling.
+  is clamped to the effective ceiling. Session Setup has a live meter, a
+  Test button and a noise-gate slider; the sampler uses the 250-4000 Hz
+  voice band so toy motors do not trip it.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.

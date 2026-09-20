@@ -1,5 +1,11 @@
 import { state, advancedSettings } from './state.js';
-import { calculateEngineOutputs, resolveEngineMode, hasReleasedEdge } from './engine.js';
+import {
+    calculateEngineOutputs,
+    resolveEngineMode,
+    hasReleasedEdge,
+    clampEdgeOvershootPercent,
+    resolveEdgeTriggerHr
+} from './engine.js';
 import {
     ORGASM_BOOST_CAP,
     computeEffectiveCeiling,
@@ -75,7 +81,8 @@ import {
     startMicMonitor,
     stopMicMonitor,
     sampleMicLevel,
-    listSpeechVoices
+    listSpeechVoices,
+    clampMicGate
 } from './voice.js';
 
 // Load persisted settings. The old 15/85 default envelope is migrated to
@@ -117,11 +124,13 @@ function syncWatchdogSettings() {
         autoResume: advancedSettings.hrAutoResume
     });
 }
-// The stall-guard timeout is clamped to its supported range (3-25 s) wherever
-// it enters: load, Apply and import. A negative or garbage value would fire
-// the guard on the first tick at the ceiling.
+// Stall timeout (3-120 s), edge overshoot (0-15 %) and the mic gate are
+// clamped wherever they enter: load, Apply and import. A negative stall
+// timeout would fire the guard on the first tick at the ceiling.
 function syncGuardSettings() {
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
+    advancedSettings.edgeOvershootPercent = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
+    advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
 }
 syncWatchdogSettings();
 syncGuardSettings();
@@ -659,6 +668,14 @@ function updateEngine() {
     if (ceilingText) ceilingText.textContent = max;
     ceilingBadge?.classList.toggle('hidden', max === typedMax);
 
+    const overshoot = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
+    const triggerHr = resolveEdgeTriggerHr(max, overshoot);
+    const holdBadge = document.getElementById('edgeHoldBadge');
+    const holdText = document.getElementById('edgeHoldText');
+    if (holdText) holdText.textContent = `${triggerHr}`;
+    holdBadge?.classList.toggle('hidden', overshoot <= 0 || triggerHr <= max);
+    state.edgeTriggerHr = triggerHr;
+
     const result = calculateEngineOutputs({
         hr,
         minHr: min,
@@ -679,6 +696,7 @@ function updateEngine() {
         milkingWave: advancedSettings.milkingWave,
         stallGuardEngaged: state.stallGuardEngaged,
         ceilingBehaviour: advancedSettings.ceilingBehaviour,
+        edgeOvershootPercent: advancedSettings.edgeOvershootPercent,
         ruinHoldSeconds: state.ruinHoldSeconds,
         oracleState: state.oracleState,
         survivalSpeedFloor: state.survivalSpeedFloor
@@ -915,10 +933,10 @@ function tickSessionGuardsAndGames() {
 
     if (advancedSettings.micEnabled && state.micAnalyser) {
         const level = sampleMicLevel(state);
-        const threshold = advancedSettings.micSensitivityThreshold || 35;
+        const threshold = clampMicGate(advancedSettings.micSensitivityThreshold);
         state.micBoost = level >= threshold ? Math.round((level - threshold) / 8) : 0;
-        document.getElementById('micActiveBadge')?.classList.toggle('hidden', false);
-    } else {
+        paintMicMeter(level);
+    } else if (!state.isTestingMic) {
         state.micBoost = 0;
         document.getElementById('micActiveBadge')?.classList.add('hidden');
     }
@@ -1175,7 +1193,8 @@ function renderRemoteClock() {
 function redrawChart() {
     const chartEl = document.getElementById('hrChart');
     if (!chartEl) return;
-    drawTelemetryChart(chartEl, state.history, state.effectiveMinHr, state.effectiveMaxHr);
+    const triggerHr = Number.isFinite(state.edgeTriggerHr) ? state.edgeTriggerHr : undefined;
+    drawTelemetryChart(chartEl, state.history, state.effectiveMinHr, state.effectiveMaxHr, triggerHr);
 }
 
 // 1-Second Master Clock
@@ -1472,8 +1491,8 @@ orgasmBtn?.addEventListener('click', () => {
 // the next clock tick.
 ['minHr', 'maxHr'].forEach((id) => {
     const input = document.getElementById(id);
-    input?.addEventListener('input', () => { updateEngine(); syncTelemetry(); });
-    input?.addEventListener('change', () => { updateEngine(); syncTelemetry(); });
+    input?.addEventListener('input', () => { updateEngine(); syncTelemetry(); updateEdgeOvershootPreview(); });
+    input?.addEventListener('change', () => { updateEngine(); syncTelemetry(); updateEdgeOvershootPreview(); });
 });
 
 // Experience Modes vs Games Tab Switching
@@ -1569,7 +1588,14 @@ function openModal(type) {
     overlay?.classList.remove('hidden');
 }
 
-function closeModal() { overlay?.classList.add('hidden'); }
+function closeModal() {
+    overlay?.classList.add('hidden');
+    if (state.isTestingMic && !advancedSettings.micEnabled) {
+        stopMicMonitor(state);
+        paintMicMeter(0);
+    }
+    state.isTestingMic = false;
+}
 
 document.getElementById('cardBle')?.addEventListener('click', () => { if (!isRemotePage) openModal('Ble'); });
 document.getElementById('cardHandy')?.addEventListener('click', () => { if (!isRemotePage) openModal('Handy'); });
@@ -1686,6 +1712,9 @@ function syncParamsUI() {
     if (stallSec) stallSec.value = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
     const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
     if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
+    const overshootInput = document.getElementById('edgeOvershootInput');
+    if (overshootInput) overshootInput.value = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
+    updateEdgeOvershootPreview();
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
     if (dualBpm) dualBpm.value = advancedSettings.dualDampeningBpm || 15;
     if (decayToggle) decayToggle.checked = Boolean(advancedSettings.adaptiveDecay);
@@ -1705,6 +1734,11 @@ function syncParamsUI() {
     const micToggle = document.getElementById('paramMicToggle');
     if (voiceToggle) voiceToggle.checked = Boolean(advancedSettings.voiceEnabled);
     if (micToggle) micToggle.checked = Boolean(advancedSettings.micEnabled);
+    const gateInput = document.getElementById('micGateInput');
+    const gateValue = document.getElementById('micGateValue');
+    const gate = clampMicGate(advancedSettings.micSensitivityThreshold);
+    if (gateInput) gateInput.value = gate;
+    if (gateValue) gateValue.textContent = String(gate);
     populateVoiceSelect();
     setMindgamePrompt(state.lastSpokenPrompt || 'Calm and steady. Breathe.', advancedSettings.voiceEnabled);
 }
@@ -1778,13 +1812,16 @@ async function applyMicSetting(enabled) {
     showMicReenable(false);
     if (!enabled) {
         stopMicMonitor(state);
+        state.isTestingMic = false;
         badge?.classList.add('hidden');
         state.micBoost = 0;
+        paintMicMeter(0);
         return;
     }
     try {
         await startMicMonitor(state);
         badge?.classList.remove('hidden');
+        startMicMeterLoop();
     } catch (e) {
         advancedSettings.micEnabled = false;
         const toggle = document.getElementById('paramMicToggle');
@@ -1794,11 +1831,95 @@ async function applyMicSetting(enabled) {
     }
 }
 
+function liveMicGate() {
+    const fromSlider = document.getElementById('micGateInput')?.value;
+    if (fromSlider !== undefined && fromSlider !== null && fromSlider !== '') {
+        return clampMicGate(fromSlider);
+    }
+    return clampMicGate(advancedSettings.micSensitivityThreshold);
+}
+
+function paintMicMeter(level) {
+    const bar = document.getElementById('micLevelBar');
+    const label = document.getElementById('micLevelLabel');
+    const badge = document.getElementById('micActiveBadge');
+    const gate = liveMicGate();
+    const value = Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0;
+    const gated = value >= gate;
+    if (bar) {
+        bar.style.width = `${value}%`;
+        bar.className = `h-full transition-[width] duration-75 ${gated ? 'bg-emerald-400' : 'bg-slate-600'}`;
+    }
+    if (label) {
+        if (!state.micAnalyser) {
+            label.textContent = 'Tap Test, then make noise. Toys should stay below the gate.';
+            label.className = 'text-[9px] font-mono text-slate-500';
+        } else if (gated) {
+            label.textContent = `Voice ${value} — above gate ${gate}. Monitor would boost.`;
+            label.className = 'text-[9px] font-mono text-emerald-300';
+        } else {
+            label.textContent = `Level ${value} — below gate ${gate}. Toys/noise ignored.`;
+            label.className = 'text-[9px] font-mono text-slate-400';
+        }
+    }
+    if (badge && (advancedSettings.micEnabled || state.isTestingMic) && state.micAnalyser) {
+        badge.textContent = gated ? 'MIC VOICE' : 'MIC LISTEN';
+        badge.classList.remove('hidden');
+        badge.classList.toggle('border-emerald-700', !gated);
+        badge.classList.toggle('text-emerald-300', !gated);
+        badge.classList.toggle('bg-emerald-950/80', !gated);
+        badge.classList.toggle('border-rose-700', gated);
+        badge.classList.toggle('text-rose-300', gated);
+        badge.classList.toggle('bg-rose-950/80', gated);
+    }
+}
+
+function startMicMeterLoop() {
+    if (state.micAnimId) cancelAnimationFrame(state.micAnimId);
+    const tick = () => {
+        paintMicMeter(sampleMicLevel(state));
+        state.micAnimId = requestAnimationFrame(tick);
+    };
+    tick();
+}
+
+function updateEdgeOvershootPreview() {
+    const preview = document.getElementById('edgeOvershootPreview');
+    if (!preview) return;
+    const typedMax = readHrLimits().maxHr;
+    const pct = clampEdgeOvershootPercent(document.getElementById('edgeOvershootInput')?.value);
+    const trigger = resolveEdgeTriggerHr(typedMax, pct);
+    preview.textContent = `Pullback at ${trigger} BPM (${100 + pct}% of ${typedMax})`;
+}
+
+document.getElementById('edgeOvershootInput')?.addEventListener('input', updateEdgeOvershootPreview);
+
+document.getElementById('paramMicTestBtn')?.addEventListener('click', async () => {
+    try {
+        state.isTestingMic = true;
+        await startMicMonitor(state);
+        document.getElementById('micActiveBadge')?.classList.remove('hidden');
+        startMicMeterLoop();
+    } catch (e) {
+        state.isTestingMic = false;
+        paintMicMeter(0);
+        alert('Microphone permission denied or unavailable in this browser.');
+    }
+});
+
+document.getElementById('micGateInput')?.addEventListener('input', (e) => {
+    const gate = clampMicGate(e.target.value);
+    const disp = document.getElementById('micGateValue');
+    if (disp) disp.textContent = String(gate);
+    paintMicMeter(sampleMicLevel(state));
+});
+
 // Apply Session Setup
 document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(document.getElementById('stallGuardSecondsInput')?.value);
     advancedSettings.ceilingBehaviour = document.getElementById('ceilingBehaviourSelect')?.value === 'stop' ? 'stop' : 'crawl';
+    advancedSettings.edgeOvershootPercent = clampEdgeOvershootPercent(document.getElementById('edgeOvershootInput')?.value);
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
     advancedSettings.dualDampeningBpm = parseInt(document.getElementById('dualDampeningOffsetInput')?.value, 10) || 15;
     advancedSettings.adaptiveDecay = document.getElementById('adaptiveDecayToggle')?.checked ?? true;
@@ -1814,6 +1935,8 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
     if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
+    advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);
+    syncGuardSettings();
     const micWasOn = Boolean(state.micAnalyser);
     // Only (re)start the monitor when the setting changed: the button click
     // that submits the form is the user gesture the microphone needs.

@@ -79,7 +79,8 @@ export const state = {
     micAudioCtx: null,
     micAnalyser: null,
     micAnimId: null,
-    micBoost: 0
+    micBoost: 0,
+    edgeTriggerHr: 140
 };
 
 export const advancedSettings = {
@@ -93,10 +94,12 @@ export const advancedSettings = {
     // Fresh installs need no legacy 15/85 envelope migration (see app.js).
     envelopeMigrated: true,
     stallGuard: true,
-    stallGuardSeconds: 8,
-    // What the primary does while parked at the climax ceiling: 'stop'
+    stallGuardSeconds: 20,
+    // What the primary does while parked at the pullback trigger: 'stop'
     // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
     ceilingBehaviour: 'crawl',
+    // Extra % of Climax HR allowed before crawl / Full Stop / stall engage.
+    edgeOvershootPercent: 5,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,
@@ -110,7 +113,7 @@ export const advancedSettings = {
     voiceEnabled: false,
     voiceURI: '',
     micEnabled: false,
-    micSensitivityThreshold: 35,
+    micSensitivityThreshold: 40,
     customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,

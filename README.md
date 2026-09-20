@@ -119,13 +119,16 @@ The TCode Serial card drives any T-Code v0.3 stroker straight over its USB seria
 
 The **Guards** tab of Session Setup holds every safety rule. They are independent of the selected mode.
 
-* **At the ceiling: Full Stop vs Crawl.** What the strokers do while your pulse sits at the climax ceiling. *Full Stop* parks the primary at 0%; *Crawl* keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
-* **Prolonged Edge Auto-Cutoff (Stall Guard).** With Crawl selected, cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout (3-25 s, default 8). The secondary channel keeps running.
+* **At the ceiling: Full Stop vs Crawl.** What the strokers do once your pulse crosses the pullback trigger. *Full Stop* parks the primary at 0%; *Crawl* keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+* **Edge hold overshoot (0-15%, default 5%).** The tease keeps running at your typed Climax HR. Crawl / Full Stop and the stall timer only start after pulse reaches Climax HR plus this percent (5% of 140 BPM is 147). 0% is the old “pull back at the typed max” behaviour. The edge releases when pulse drops more than 5 BPM below the typed Climax HR, so you can sit in the hold band. The cockpit shows a HOLD TO badge and a purple chart line for the trigger.
+* **Prolonged Edge Auto-Cutoff (Stall Guard).** Optional. With Crawl selected, cuts the primary stroker from Crawl to 0% when your pulse stays parked at the pullback trigger longer than the timeout (3-120 s, default 20). Turn it off to stay on the crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running.
 * **Heart-Rate Signal Watchdog (always on).** A short gap holds the last valid reading instead of dropping to 0, because watches and relay apps often update only every 2-5 s. When no usable pulse has arrived for the **signal-loss timeout** (3-20 s, default 8 s) every motor stops and the session pauses. Readings below 35 BPM are ignored rather than treated as silence, poor electrode contact is flagged, and a dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost. START and RESUME (from the cockpit or a remote controller) need a usable reading younger than the timeout, so the transport reads WAITING FOR PULSE instead of driving the toys on a frozen heart rate; engaging the simulator during a watchdog pause keeps the session paused until you press RESUME.
 * **Auto-resume when signal returns.** On by default: the session resumes by itself once readings are back. Off: it stays paused until you press RESUME.
 * **Dual Stimulation Dampening.** When a secondary (prostate) toy is active alongside a stroker, the climax ceiling is offset down (5-30 BPM, default 15) to balance nerve summation. The cockpit shows a DUAL STIM badge while it applies.
 * **Adaptive Ceiling Decay.** Every X edges (1-10, default 2) the ceiling drops by Y BPM (1-5, default 2) to counteract fatigue over a long session, down to a **floor** (80-130, default 105). The floor can *stop* the decay but can never *raise* the ceiling: if you typed a Climax HR below the floor, your value wins. No offset can push the working ceiling below Resting HR + 15 BPM or above the Climax HR you typed. The DECAY badge shows the amount currently applied.
 * **Force Orgasm** is a temporary boost on the working ceiling; STOP and Reset always clear it and the typed Climax HR is never rewritten.
+
+The **Audio & Mic** tab has spoken voice guidance (local browser TTS, with a voice picker and Preview) and an optional **Microphone Monitor**. The monitor uses a voice-band noise gate so stroker and vibrator rumble does not count as arousal: Test microphone in Session Setup, run the toys, and raise the gate until the meter stays dark, then speak or pant to confirm it lights. Only levels above the gate add a small boost toward the working ceiling.
 
 ---
 
@@ -196,7 +199,8 @@ edgeloop/
         ├── webrtc.js           # Peer-to-peer networking for remote partner control (?partner=) and read-only viewers (?group_sub=)
         ├── peer-messages.js    # Pure validation of every message that crosses the WebRTC data channel, in both directions
         ├── peer-messages.test.js
-        ├── voice.js            # Local text-to-speech prompts and optional microphone monitor
+        ├── voice.js            # Local text-to-speech prompts and optional microphone monitor (voice-band gate)
+        ├── voice.test.js
         ├── voice-queue.js      # Pure cue queue: dedupe, bounded backlog, safety cues jump the queue
         ├── voice-queue.test.js
         └── hardware/

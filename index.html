@@ -110,6 +110,7 @@
               <span id="decayBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 ml-1">DECAY: -<span id="decayAmountText">0</span> BPM</span>
               <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
               <span id="effectiveCeilingBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1" title="The climax ceiling the engine is using right now, after every offset"><span id="effectiveCeilingLabel">CEILING</span> <span id="effectiveCeilingText">140</span> BPM</span>
+              <span id="edgeHoldBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1" title="Pulse may climb this far past Climax HR before crawl / Full Stop">HOLD TO <span id="edgeHoldText">147</span></span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
               <button id="micReenableBtn" type="button" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 hover:bg-amber-900 ml-1 cursor-pointer" title="Browsers only grant the microphone after a tap">Tap to re-enable microphone</button>
             </div>
@@ -735,8 +736,22 @@
               </select>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              What the strokers do while your pulse sits at the climax ceiling. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+              What the strokers do once your pulse crosses the pullback trigger (Climax HR plus the overshoot below). <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
             </p>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="edgeOvershootInput" class="text-xs font-bold text-slate-200">Edge hold overshoot</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="edgeOvershootInput" type="number" min="0" max="15" value="5" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">%</span>
+              </div>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              Stay on the tease at your typed Climax HR. Crawl / Full Stop (and the stall timer) only start after pulse reaches this extra percent — 5% of 140 BPM is 147. 0% pulls back at the typed max; 10% holds through 110%. Dropping back below Climax HR − 5 BPM releases the edge.
+            </p>
+            <p id="edgeOvershootPreview" class="text-[10px] font-mono text-purple-300">Pullback at 147 BPM (105% of 140)</p>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
@@ -748,12 +763,12 @@
               </label>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout. The secondary channel keeps running. Only relevant with Crawl selected above.
+              Optional. When on, and Crawl is selected, cuts the primary stroker from Crawl to 0% after the pulse has sat at the pullback trigger longer than the timeout. Turn it off to stay on the crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running either way.
             </p>
             <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
               <span class="text-[9px] text-slate-400 font-semibold">Timeout:</span>
               <div class="flex items-center gap-1 font-mono">
-                <input id="stallGuardSecondsInput" type="number" min="3" max="25" value="8" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <input id="stallGuardSecondsInput" type="number" min="3" max="120" value="20" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
                 <span class="text-slate-500 text-[10px]">sec</span>
               </div>
             </div>
@@ -856,12 +871,29 @@
             <div class="flex justify-between items-center">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Microphone Monitor (Experimental)</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Correlates panting with cardiac spikes.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramMicToggle" type="checkbox" class="sr-only peer">
                 <div class="w-8 h-4 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
               </label>
+            </div>
+            <div class="space-y-1.5 pt-1 border-t border-slate-900">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[9px] text-slate-400 font-semibold">Live level</span>
+                <button id="paramMicTestBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Test microphone</button>
+              </div>
+              <div class="h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                <div id="micLevelBar" class="h-full w-0 bg-slate-600 transition-[width] duration-75"></div>
+              </div>
+              <p id="micLevelLabel" class="text-[9px] font-mono text-slate-500">Tap Test, then make noise. Toys should stay below the gate.</p>
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-[9px] text-slate-400 font-semibold">Noise gate</span>
+                <div class="flex items-center gap-2">
+                  <input id="micGateInput" type="range" min="8" max="90" value="40" class="w-28 accent-purple-500">
+                  <span id="micGateValue" class="font-mono text-[10px] text-purple-300 w-8 text-right">40</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>

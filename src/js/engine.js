@@ -20,9 +20,27 @@ export const ENGINE_MODES = [
 ];
 
 // Hysteresis: once edged, the flag only clears when HR drops MORE than this
-// many BPM below the ceiling, so a reading hovering at the limit cannot
-// flap the motors on and off or count phantom edges.
+// many BPM below the typed climax ceiling, so a reading hovering at the
+// limit cannot flap the motors on and off or count phantom edges.
 export const EDGE_RELEASE_BPM = 5;
+
+// Extra headroom above the typed Climax HR before crawl / Full Stop / stall
+// engage. 0% pulls back at the typed max; 5% holds through 105% of it.
+export const MIN_EDGE_OVERSHOOT_PERCENT = 0;
+export const MAX_EDGE_OVERSHOOT_PERCENT = 15;
+export const DEFAULT_EDGE_OVERSHOOT_PERCENT = 5;
+
+export function clampEdgeOvershootPercent(value, fallback = DEFAULT_EDGE_OVERSHOOT_PERCENT) {
+    const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return clamp(n, MIN_EDGE_OVERSHOOT_PERCENT, MAX_EDGE_OVERSHOOT_PERCENT);
+}
+
+export function resolveEdgeTriggerHr(maxHr, overshootPercent = 0) {
+    if (!Number.isFinite(maxHr)) return maxHr;
+    const pct = clampEdgeOvershootPercent(overshootPercent, 0);
+    return Math.max(maxHr, Math.round(maxHr * (1 + pct / 100)));
+}
 
 // The narrowest stroke zone (percent of the hardware envelope) the engine
 // will ever emit. Anything tighter jams the sleeve in place.
@@ -87,6 +105,9 @@ export function calculateEngineOutputs({
     milkingWave = false,
     stallGuardEngaged = false,
     ceilingBehaviour = 'crawl',
+    // 0 keeps the historical "edged at typed max" behaviour so tests that
+    // omit the field stay on the old curve. The cockpit default is 5%.
+    edgeOvershootPercent = 0,
     ruinHoldSeconds = 0,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30
@@ -124,7 +145,9 @@ export function calculateEngineOutputs({
     let nextIsEdged = Boolean(isEdged);
     let newEdgeTriggered = false;
 
-    if (hr >= maxHr) {
+    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeOvershootPercent);
+
+    if (hr >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
             newEdgeTriggered = true;
             nextIsEdged = true;
@@ -133,7 +156,9 @@ export function calculateEngineOutputs({
         nextIsEdged = false;
     }
 
-    const span = Math.max(1, maxHr - minHr);
+    // Stretch the tease band up to the overshoot trigger so typed max is a
+    // hold, not an automatic 0%. Crawl / Full Stop only apply once edged.
+    const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);
 

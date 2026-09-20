@@ -18,8 +18,8 @@ export const SURVIVAL_BREACH_TICKS = 3;
 
 // Stall guard timeout (seconds at the ceiling before the primary is cut).
 export const MIN_STALL_GUARD_SECONDS = 3;
-export const MAX_STALL_GUARD_SECONDS = 25;
-export const DEFAULT_STALL_GUARD_SECONDS = 8;
+export const MAX_STALL_GUARD_SECONDS = 120;
+export const DEFAULT_STALL_GUARD_SECONDS = 20;
 
 export const DEFAULT_MIN_HR = 70;
 export const DEFAULT_MAX_HR = 140;

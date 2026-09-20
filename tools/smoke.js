@@ -206,11 +206,17 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   });
   await step('open Session Setup', async () => {
     await page.locator('#sessionParamsHeaderBtn').click(); await sleep(300); await shot('05-session-setup');
-    // walk tabs inside the modal if present
     const tabs = page.locator('#modalOverlay button');
     const n = await tabs.count();
     for (let i = 0; i < Math.min(n, 12); i++) { const t = tabs.nth(i); const txt = (await t.textContent() || '').trim(); if (/guards|duration|motion|audio|profiles|tuning|general|backup/i.test(txt)) { await t.click().catch(() => {}); await sleep(150); } }
-    // Apply persists the form and closes the modal; it must not throw.
+    await page.locator('#paramsTabGuardsBtn').click(); await sleep(150);
+    if (!(await page.locator('#stallGuardToggle').count())) throw new Error('stall guard toggle missing');
+    const stallMax = await page.locator('#stallGuardSecondsInput').getAttribute('max');
+    if (stallMax !== '120') throw new Error('stall timeout max expected 120, got ' + stallMax);
+    if (!(await page.locator('#edgeOvershootInput').count())) throw new Error('edge overshoot input missing');
+    await page.locator('#paramsTabAudioBtn').click(); await sleep(150);
+    if (!(await page.locator('#paramMicTestBtn').count())) throw new Error('mic test button missing');
+    if (!(await page.locator('#micGateInput').count())) throw new Error('mic noise gate missing');
     const apply = page.locator('#applyParamsBtn');
     if (await apply.isVisible().catch(() => false)) { await apply.click(); await sleep(300); }
     await closeModal();

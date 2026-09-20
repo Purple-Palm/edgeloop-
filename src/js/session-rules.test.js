@@ -202,11 +202,14 @@ describe('survival breach counter', () => {
 describe('stall guard', () => {
     it('clamps the typed timeout to its range and falls back on garbage', () => {
         assert.equal(clampStallGuardSeconds(-5), MIN_STALL_GUARD_SECONDS);
-        assert.equal(clampStallGuardSeconds('99'), MAX_STALL_GUARD_SECONDS);
+        assert.equal(clampStallGuardSeconds('200'), MAX_STALL_GUARD_SECONDS);
         assert.equal(clampStallGuardSeconds('12'), 12);
+        assert.equal(clampStallGuardSeconds('99'), 99);
         assert.equal(clampStallGuardSeconds('abc'), DEFAULT_STALL_GUARD_SECONDS);
         assert.equal(clampStallGuardSeconds(undefined), DEFAULT_STALL_GUARD_SECONDS);
         assert.equal(clampStallGuardSeconds(NaN), DEFAULT_STALL_GUARD_SECONDS);
+        assert.equal(MAX_STALL_GUARD_SECONDS, 120);
+        assert.equal(DEFAULT_STALL_GUARD_SECONDS, 20);
     });
 
     it('counts up while armed and edged and engages at the timeout', () => {
