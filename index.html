@@ -1047,6 +1047,15 @@ python3 -m http.server 8787</pre>
         document.getElementById('wizardOverlay')?.classList.add('hidden');
         safeSet('edgeloop_wizard_seen', 'true');
       };
+
+      // Offline support: register the service worker on secure origins only
+      // (https or localhost); it is network-first, so updates are never stale.
+      const secureOrigin = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      if ('serviceWorker' in navigator && secureOrigin) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js').catch(() => {});
+        });
+      }
     })();
   </script>
 
