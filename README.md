@@ -28,7 +28,7 @@ EdgeLoop runs 100% locally in your web browser with zero accounts, zero subscrip
 
 * **Adaptive Biofeedback Core:** Uses a convex power curve that keeps speeds active and engaging during mid-arousal, only backing off sharply in the final heart rate window before your climax ceiling. Includes a 5 BPM recovery buffer (hysteresis) and a selectable peak behavior (Full Stop or a gentle Crawl).
 * **Session Guards:** Signal watchdog, stall guard, dual-stimulation dampening and adaptive ceiling decay. They are described one by one in [Session guards](#session-guards) below.
-* **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate) and *Survival Mode*.
+* **Experience Modes & Games:** Selectable profiles like Classic Tease, Prostate Milker (cross-fader), Glans Protector, and Ultimate Milker, alongside interactive challenges like *The Oracle* (decision gate), *Survival Mode*, and *Edge Training* (hold at the ceiling for a set time, N times, then finish). The Oracle uses your Duration tab: with Mystery (e.g. 30–60 min) it will not climax or deny before the minimum; after that each 15 s hold can end you, more often as you near the secret target; Endless has no minimum.
 * **Session Telemetry & Funscript Export:** Automatically logs session metrics and exports dual-channel `.funscript` (primary stroker) and `.v0.funscript` (secondary vibrator) files directly to your machine for replay in external players like ScriptPlayer or HereSphere.
 * **Remote Partner Control & Viewers:** Peer-to-peer WebRTC room links let one partner anywhere in the world manage the session remotely (transport, Force Orgasm, mode), while any number of read-only viewers watch the live heart-rate telemetry. Every inbound message is validated; a dropped link is shown as disconnected, never as connected.
 * **Broad Protocol Support:** Direct connection to BLE heart rate monitors (standard 0x180D GATT service), The Handy (Wi-Fi HAMP API), T-Code strokers (OSR2, SR6, OSSM) straight over their USB serial port via Web Serial, and Buttplug.io / Intiface Central for vibrators, reciprocating sex machines, and rotational devices.
@@ -119,13 +119,16 @@ The TCode Serial card drives any T-Code v0.3 stroker straight over its USB seria
 
 The **Guards** tab of Session Setup holds every safety rule. They are independent of the selected mode.
 
-* **At the ceiling: Full Stop vs Crawl.** What the strokers do while your pulse sits at the climax ceiling. *Full Stop* parks the primary at 0%; *Crawl* keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
-* **Prolonged Edge Auto-Cutoff (Stall Guard).** With Crawl selected, cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout (3-25 s, default 8). The secondary channel keeps running.
+* **At the ceiling: Full Stop vs Crawl.** What the strokers do once your pulse crosses the pullback trigger. *Full Stop* parks the primary at 0%; *Crawl* keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+* **Pullback at % of Climax HR (90-115, default 100).** 100% is the number you typed. 95% pulls back early; 105% lets pulse sit a little past it. Crawl / Full Stop and the stall timers start at this mark. The edge releases 5 BPM below the lower of Climax HR and that trigger. The cockpit shows a HOLD TO badge and a purple chart line when this is not 100%.
+* **Prolonged Edge Auto-Cutoff (Stall Guard).** Optional, Crawl only. Two timers: **Allow on the edge** (3-120 s, default 20) is how long pulse may sit at the pullback mark before the primary is cut. **Pause the primary** (2-60 s, default 8) is how long that halt lasts; then crawl resumes and the allow window starts again. Turn it off to stay on crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running.
 * **Heart-Rate Signal Watchdog (always on).** A short gap holds the last valid reading instead of dropping to 0, because watches and relay apps often update only every 2-5 s. When no usable pulse has arrived for the **signal-loss timeout** (3-20 s, default 8 s) every motor stops and the session pauses. Readings below 35 BPM are ignored rather than treated as silence, poor electrode contact is flagged, and a dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost. START and RESUME (from the cockpit or a remote controller) need a usable reading younger than the timeout, so the transport reads WAITING FOR PULSE instead of driving the toys on a frozen heart rate; engaging the simulator during a watchdog pause keeps the session paused until you press RESUME.
 * **Auto-resume when signal returns.** On by default: the session resumes by itself once readings are back. Off: it stays paused until you press RESUME.
 * **Dual Stimulation Dampening.** When a secondary (prostate) toy is active alongside a stroker, the climax ceiling is offset down (5-30 BPM, default 15) to balance nerve summation. The cockpit shows a DUAL STIM badge while it applies.
 * **Adaptive Ceiling Decay.** Every X edges (1-10, default 2) the ceiling drops by Y BPM (1-5, default 2) to counteract fatigue over a long session, down to a **floor** (80-130, default 105). The floor can *stop* the decay but can never *raise* the ceiling: if you typed a Climax HR below the floor, your value wins. No offset can push the working ceiling below Resting HR + 15 BPM or above the Climax HR you typed. The DECAY badge shows the amount currently applied.
 * **Force Orgasm** is a temporary boost on the working ceiling; STOP and Reset always clear it and the typed Climax HR is never rewritten.
+
+The **Audio & Mic** tab has spoken voice guidance (local browser TTS, with a voice picker and Preview). When it is on, each cue is shown on the dashboard **and** spoken. Phrase banks are grouped: **Build-up** encouragement on a timer (default every 45 s, 0 = off), **Edge** when pulse hits the pullback mark, **Climax** when you tap Force Orgasm (or the orgasm endgame arms it; Oracle climax uses its own lines), and **Premature** when you tap Came Early. Every event can hold many phrases (one per line; a random line is picked each time). Tokens `{hr}`, `{maxHr}`, `{minHr}`, `{edges}`, `{minutes}` fill in live session values. **Export phrases** / **Import phrases** save or load a JSON (or a `# edge` / `# encourage` / `# forceOrgasm` / `# cameEarly` text file); the full Backup export includes the same lists.
 
 ---
 
@@ -183,7 +186,7 @@ edgeloop/
         ├── state.js            # Central memory store for settings, user preferences, and real-time session state
         ├── engine.js           # Biofeedback calculations: speed curves, recovery thresholds, and safety cutoffs
         ├── engine.test.js      # Node tests for every cockpit mode, stall/crawl, warmup, hysteresis, and Oracle/Survival
-        ├── session-rules.js    # Pure session rules: effective ceiling (offsets, decay floor, overdrive boost), HR-limit and duration validation, Survival breach counter
+        ├── session-rules.js    # Pure session rules: effective ceiling, duration window, Oracle fate vs mystery min, Survival breach, stall timers
         ├── session-rules.test.js
         ├── funscript.js        # Pure funscript builder: turns the 4 Hz speed/zone timeline into .funscript stroke actions and .v0.funscript vibration levels
         ├── funscript.test.js
@@ -196,7 +199,11 @@ edgeloop/
         ├── webrtc.js           # Peer-to-peer networking for remote partner control (?partner=) and read-only viewers (?group_sub=)
         ├── peer-messages.js    # Pure validation of every message that crosses the WebRTC data channel, in both directions
         ├── peer-messages.test.js
-        ├── voice.js            # Local text-to-speech prompts and optional microphone monitor
+        ├── voice.js            # Local text-to-speech prompts and optional microphone monitor (voice-band gate)
+        ├── voice.test.js
+        ├── voice-cues.js       # Editable cue templates and {hr}/{edges} interpolation
+        ├── voice-cues.test.js
+        ├── voice-speak.test.js
         ├── voice-queue.js      # Pure cue queue: dedupe, bounded backlog, safety cues jump the queue
         ├── voice-queue.test.js
         └── hardware/

@@ -110,6 +110,7 @@
               <span id="decayBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 ml-1">DECAY: -<span id="decayAmountText">0</span> BPM</span>
               <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
               <span id="effectiveCeilingBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1" title="The climax ceiling the engine is using right now, after every offset"><span id="effectiveCeilingLabel">CEILING</span> <span id="effectiveCeilingText">140</span> BPM</span>
+              <span id="edgeHoldBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1" title="Pulse relative to this percent of Climax HR is the pullback trigger">HOLD TO <span id="edgeHoldText">140</span></span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
               <button id="micReenableBtn" type="button" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 hover:bg-amber-900 ml-1 cursor-pointer" title="Browsers only grant the microphone after a tap">Tap to re-enable microphone</button>
             </div>
@@ -180,7 +181,7 @@
             CLIMAX LIMIT REACHED: PRIMARY CUT — SECONDARY MILKING ACTIVE
           </div>
           <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse">
-            PROLONGED CEILING LOCK: PRIMARY HALTED UNTIL PULSE RECOVERS
+            STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE
           </div>
           <div id="gameNotice" class="hidden text-center text-[11px] font-bold text-purple-300 bg-purple-950/50 border border-purple-800/80 rounded-lg py-1 animate-pulse">
             GAME MODE ACTIVE
@@ -383,7 +384,7 @@
                 <span class="mode-check hidden text-fuchsia-400">●</span>
               </div>
               <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
-                Pulls you to ceiling, holds for 15s, then secretly rolls Climax, Denial, or Purgatory.
+                Pulls you to the ceiling and holds 15s. Climax and Denial stay locked until the Duration minimum (Mystery window or Fixed length); then it rolls how you end. Endless has no minimum.
               </p>
             </button>
 
@@ -396,6 +397,29 @@
                 Speed steadily accelerates. Relax to stay under your limit. Breaching = Defeat.
               </p>
             </button>
+
+            <div class="sm:col-span-2">
+            <button type="button" data-mode="edgetrain" class="mode-card text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between w-full">
+              <div class="font-bold text-[11px] text-amber-300 flex justify-between items-center">
+                <span>Edge Training</span>
+                <span class="mode-check hidden text-amber-400">●</span>
+              </div>
+              <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
+                Pulls you to the ceiling and holds you there. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Stall guard is off so the hold is the goal, not a cutoff.
+              </p>
+              <div class="flex flex-wrap items-center gap-2 mt-1.5 pt-1.5 border-t border-slate-800 text-[9px] text-slate-400" data-train-settings>
+                <label class="flex items-center gap-1 font-mono">
+                  Hold
+                  <input id="trainHoldSecondsInput" type="number" min="5" max="90" value="15" class="w-12 bg-slate-900 border border-slate-700 rounded-md py-0.5 text-center text-amber-300 font-bold outline-none">
+                  s
+                </label>
+                <label class="flex items-center gap-1 font-mono">
+                  <input id="trainEdgesInput" type="number" min="1" max="20" value="5" class="w-10 bg-slate-900 border border-slate-700 rounded-md py-0.5 text-center text-amber-300 font-bold outline-none">
+                  edges, then finish
+                </label>
+              </div>
+            </button>
+            </div>
           </div>
         </div>
 
@@ -703,6 +727,9 @@
               <span class="text-slate-400 text-[10px]">Endless Mode:</span>
               <span class="text-purple-400 font-mono text-[10px] font-semibold">Runs indefinitely until manually stopped</span>
             </div>
+            <p class="text-[9px] text-slate-400 leading-snug pt-1">
+              With <strong>The Oracle</strong>, climax and denial stay locked until the Mystery minimum (or the Fixed length). Endless has no minimum.
+            </p>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
@@ -735,8 +762,22 @@
               </select>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              What the strokers do while your pulse sits at the climax ceiling. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
             </p>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="edgeHoldPercentInput" class="text-xs font-bold text-slate-200">Pullback at</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="edgeHoldPercentInput" type="number" min="90" max="115" value="100" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">% of Climax HR</span>
+              </div>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              100% is the Climax HR you typed. 95% pulls back early; 105% lets you sit a little past it. Crawl / Full Stop and the stall timers start at this mark. The edge releases 5 BPM below the lower of Climax HR and this trigger.
+            </p>
+            <p id="edgeHoldPreview" class="text-[10px] font-mono text-purple-300">Pullback at 140 BPM (100% of 140)</p>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
@@ -748,12 +789,19 @@
               </label>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout. The secondary channel keeps running. Only relevant with Crawl selected above.
+              Two timers, only used with Crawl. <strong>Allow on the edge</strong> is how long pulse may sit at the pullback mark before the primary is cut. <strong>Pause the primary</strong> is how long that halt lasts (then crawl resumes and the allow window starts again). Turn the guard off to stay on crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running either way.
             </p>
             <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
-              <span class="text-[9px] text-slate-400 font-semibold">Timeout:</span>
+              <span class="text-[9px] text-slate-400 font-semibold">Allow on the edge:</span>
               <div class="flex items-center gap-1 font-mono">
-                <input id="stallGuardSecondsInput" type="number" min="3" max="25" value="8" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <input id="stallGuardSecondsInput" type="number" min="3" max="120" value="20" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec</span>
+              </div>
+            </div>
+            <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
+              <span class="text-[9px] text-slate-400 font-semibold">Pause the primary:</span>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="stallPauseSecondsInput" type="number" min="2" max="60" value="8" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
                 <span class="text-slate-500 text-[10px]">sec</span>
               </div>
             </div>
@@ -837,7 +885,7 @@
             <div class="flex items-center justify-between">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Spoken Voice Guidance</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Uses local browser text-to-speech to vocalize biofeedback cues.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Shows each cue on the dashboard and speaks it with the browser's local voice.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramVoiceToggle" type="checkbox" class="sr-only peer">
@@ -850,18 +898,54 @@
               </select>
               <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
             </div>
+            <p class="text-[9px] text-slate-400 leading-snug pt-1 border-t border-slate-900">
+              One phrase per line. As many lines as you want for each event — a random unused line is picked each time. Tokens: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
+            </p>
+            <div class="flex items-center justify-between gap-2 pt-1">
+              <span class="text-[9px] text-slate-400 font-semibold">Encouragement every</span>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="voiceEncourageSecondsInput" type="number" min="0" max="180" value="45" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec (0 = off)</span>
+              </div>
+            </div>
+            <div id="voiceCuesList" class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5"></div>
+            <div class="flex flex-wrap gap-2 pt-1">
+              <button id="voiceCuesExportBtn" type="button" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer">Export phrases</button>
+              <label class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer text-center">
+                Import phrases
+                <input id="voiceCuesImportFile" type="file" accept=".json,.txt,text/plain,application/json" class="hidden">
+              </label>
+              <button id="voiceCuesResetBtn" type="button" class="text-[10px] text-slate-400 hover:text-purple-300 font-bold cursor-pointer px-1">Reset defaults</button>
+            </div>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
             <div class="flex justify-between items-center">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Microphone Monitor (Experimental)</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Correlates panting with cardiac spikes.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramMicToggle" type="checkbox" class="sr-only peer">
                 <div class="w-8 h-4 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
               </label>
+            </div>
+            <div class="space-y-1.5 pt-1 border-t border-slate-900">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[9px] text-slate-400 font-semibold">Live level</span>
+                <button id="paramMicTestBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Test microphone</button>
+              </div>
+              <div class="h-2 rounded-full bg-slate-900 border border-slate-800 overflow-hidden">
+                <div id="micLevelBar" class="h-full w-0 bg-slate-600 transition-[width] duration-75"></div>
+              </div>
+              <p id="micLevelLabel" class="text-[9px] font-mono text-slate-500">Tap Test, then make noise. Toys should stay below the gate.</p>
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-[9px] text-slate-400 font-semibold">Noise gate</span>
+                <div class="flex items-center gap-2">
+                  <input id="micGateInput" type="range" min="8" max="90" value="40" class="w-28 accent-purple-500">
+                  <span id="micGateValue" class="font-mono text-[10px] text-purple-300 w-8 text-right">40</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -870,6 +954,7 @@
         <div id="paramsBackupSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <span class="text-xs font-bold text-slate-200 block">Backup & Restore</span>
+            <p class="text-[9px] text-slate-400 leading-snug">Exports every Session Setup value, including your voice-phrase lists. Import restores them. Phrase files can also be exported on their own from the Audio &amp; Mic tab.</p>
             <div class="flex gap-2 pt-1">
               <button id="exportSettingsBtn" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer">
                 Export (.json)

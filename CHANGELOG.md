@@ -6,6 +6,17 @@ credited by username.
 
 ## Unreleased
 
+### Games
+- **Edge Training** pulls you to the ceiling and treats a timed hold as the
+  goal (stall guard is off). Drop before the hold finishes and it does not
+  count; after the typed number of successful edges it Force-Orgasm finishes
+  you. Hold length (5-90 s, default 15) and edge count (1-20, default 5)
+  sit on the game card.
+- The Oracle no longer rolls climax or denial on the first edge. Mystery and
+  Fixed durations keep those endings locked until the minimum; inside the
+  window later holds are more likely to end you; the secret target is the
+  latest it will wait. Endless still has no minimum.
+
 ### The Handy
 - Connect now selects HAMP mode (mode 0). The driver previously selected
   HSSP (mode 1), which the Handy API v2 spec documents as script streaming.
@@ -111,7 +122,13 @@ credited by username.
   the ceiling rule applies again; pausing during Soft Landing resumes it.
 - Stall guard stops only the primary channel, as the UI states; it is
   released at once when it is switched off, Full Stop is selected or Force
-  Orgasm starts, and its timeout is clamped to 3-25 s wherever it enters.
+  Orgasm starts. Two timers: how long you may stay at the pullback mark
+  (3-120 s, default 20) before the primary is cut, and how long that halt
+  lasts (2-60 s, default 8) before crawl resumes and the hold window
+  restarts. The Guards toggle turns the auto-cutoff off entirely.
+- Pullback is a percent of typed Climax HR (90-115, default 100): 95%
+  pulls back early, 105% holds a little past the typed max. A saved 0-15
+  offset from the previous build is migrated to 100-115.
 - The endgame (Orgasm / Soft Landing / Denied) fires once per session, so
   Force Orgasm stays a toggle the wearer can cancel after the target time.
 - Importing the same settings file twice works (the file input is cleared
@@ -168,7 +185,18 @@ credited by username.
   the queue; identical back-to-back cues are dropped.
 - The microphone monitor starts from a user gesture (a "tap to re-enable"
   button appears when the browser withholds the permission) and its boost
-  is clamped to the effective ceiling.
+  is clamped to the effective ceiling. Session Setup has a live meter, a
+  Test button and a noise-gate slider; the sampler uses the 250-4000 Hz
+  voice band so toy motors do not trip it.
+- Spoken Voice Guidance shows the current cue on the dashboard and speaks
+  it. Each event is a list of phrases (one per line, randomly rotated).
+  Phrase files can be imported/exported on the Audio tab and are included
+  in the full settings backup. Banks are grouped: build-up encouragement
+  on a timer, hitting the edge, Force Orgasm / make you come, and Came
+  Early / premature ejaculation. Tapping Force Orgasm (or the orgasm
+  endgame) speaks the climax bank; Came Early speaks the premature bank
+  as the session stops. Oracle climax keeps its own lines so two cues do
+  not stack.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.

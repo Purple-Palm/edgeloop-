@@ -7,6 +7,8 @@ export const state = {
     sessionStatus: 'IDLE',
     sessionSeconds: 0,
     chosenTargetSeconds: 0,
+    durationMinSeconds: 0,
+    durationMaxSeconds: 0,
     durationMode: 'range',
     endgameType: 'orgasm',
     rampdownSecondsLeft: 45,
@@ -52,6 +54,7 @@ export const state = {
     strokeMax: 100,
     ruinHoldSeconds: 0,
     edgeStallSeconds: 0,
+    stallPauseElapsed: 0,
     stallGuardEngaged: false,
     intensityValue: 50,
     history: [70],
@@ -72,14 +75,19 @@ export const state = {
     // Timestamp of the reading the last Survival tick judged, so a value held
     // across ticks by a slow source counts as one breach reading.
     survivalLastReadingAt: null,
+    trainState: 'climb',
+    trainHoldSeconds: 0,
+    trainEdgesDone: 0,
     lastSpokenPrompt: '',
+    lastCueTemplateById: {},
     lastSpokenAt: 0,
     isTestingMic: false,
     micStream: null,
     micAudioCtx: null,
     micAnalyser: null,
     micAnimId: null,
-    micBoost: 0
+    micBoost: 0,
+    edgeTriggerHr: 140
 };
 
 export const advancedSettings = {
@@ -93,10 +101,15 @@ export const advancedSettings = {
     // Fresh installs need no legacy 15/85 envelope migration (see app.js).
     envelopeMigrated: true,
     stallGuard: true,
-    stallGuardSeconds: 8,
-    // What the primary does while parked at the climax ceiling: 'stop'
+    stallGuardSeconds: 20,
+    stallPauseSeconds: 8,
+    // What the primary does while parked at the pullback trigger: 'stop'
     // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
     ceilingBehaviour: 'crawl',
+    // Pullback as a percent of typed Climax HR (90-115, default 100).
+    edgeHoldPercent: 100,
+    trainHoldSeconds: 15,
+    trainEdges: 5,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,
@@ -109,8 +122,10 @@ export const advancedSettings = {
     decayFloor: 105,
     voiceEnabled: false,
     voiceURI: '',
+    voiceCues: {},
+    voiceEncourageSeconds: 45,
     micEnabled: false,
-    micSensitivityThreshold: 35,
+    micSensitivityThreshold: 40,
     customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,

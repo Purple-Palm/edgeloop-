@@ -9,7 +9,12 @@ import {
     EDGE_RELEASE_BPM,
     MIN_ZONE_WIDTH,
     CRAWL_PERCENT,
-    SHORTENER_TOP_PERCENT
+    SHORTENER_TOP_PERCENT,
+    clampEdgeHoldPercent,
+    resolveEdgeTriggerHr,
+    DEFAULT_EDGE_HOLD_PERCENT,
+    MIN_EDGE_HOLD_PERCENT,
+    MAX_EDGE_HOLD_PERCENT
 } from './engine.js';
 
 const running = {
@@ -31,7 +36,7 @@ const running = {
 describe('engine modes', () => {
     it('lists every cockpit mode', () => {
         assert.deepEqual(ENGINE_MODES, [
-            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival'
+            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival', 'edgetrain'
         ]);
     });
 
@@ -219,6 +224,34 @@ describe('engine modes', () => {
         assert.equal(result.primaryPercent, 61);
     });
 
+    it('edge training pulls on the climb and crawls on a hold', () => {
+        const classic = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 120 });
+        const climb = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'climb',
+            hr: 120
+        });
+        assert.ok(climb.primaryPercent > classic.primaryPercent);
+        const hold = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'hold',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'stop'
+        });
+        assert.equal(hold.primaryPercent, 14);
+        const recover = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'recover',
+            isEdged: true,
+            hr: 140
+        });
+        assert.equal(recover.primaryPercent, 0);
+    });
+
     it('warmup caps travel at session start', () => {
         const result = calculateEngineOutputs({
             ...running,
@@ -296,6 +329,102 @@ describe('engine safety guards', () => {
         assert.equal(back.isEdged, false);
         const again = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, isEdged: back.isEdged });
         assert.equal(again.newEdgeTriggered, true);
+    });
+
+    it('clamps hold percent and maps it onto a trigger HR', () => {
+        assert.equal(DEFAULT_EDGE_HOLD_PERCENT, 100);
+        assert.equal(MIN_EDGE_HOLD_PERCENT, 90);
+        assert.equal(MAX_EDGE_HOLD_PERCENT, 115);
+        assert.equal(clampEdgeHoldPercent(80), 90);
+        assert.equal(clampEdgeHoldPercent(140), 115);
+        assert.equal(clampEdgeHoldPercent('abc'), DEFAULT_EDGE_HOLD_PERCENT);
+        assert.equal(resolveEdgeTriggerHr(140, 100), 140);
+        assert.equal(resolveEdgeTriggerHr(140, 105), 147);
+        assert.equal(resolveEdgeTriggerHr(140, 95), 133);
+        assert.ok(Number.isNaN(resolveEdgeTriggerHr(NaN, 105)));
+    });
+
+    it('105% hold sits through typed max and only pulls back at the trigger', () => {
+        const atMax = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            isEdged: false,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 105
+        });
+        assert.equal(atMax.isEdged, false);
+        assert.equal(atMax.newEdgeTriggered, false);
+        assert.ok(atMax.primaryPercent > CRAWL_PERCENT, 'typed max is still a tease, not crawl');
+
+        const trigger = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 147,
+            isEdged: false,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 105
+        });
+        assert.equal(trigger.newEdgeTriggered, true);
+        assert.equal(trigger.isEdged, true);
+        assert.equal(trigger.primaryPercent, CRAWL_PERCENT);
+
+        const holding = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            isEdged: true,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 105
+        });
+        assert.equal(holding.isEdged, true);
+        assert.equal(holding.primaryPercent, CRAWL_PERCENT);
+
+        const released = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 134,
+            isEdged: true,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 105
+        });
+        assert.equal(released.isEdged, false);
+        assert.ok(released.primaryPercent > CRAWL_PERCENT);
+    });
+
+    it('100% hold still edges at the typed climax', () => {
+        const hit = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            isEdged: false,
+            ceilingBehaviour: 'stop',
+            edgeHoldPercent: 100
+        });
+        assert.equal(hit.newEdgeTriggered, true);
+        assert.equal(hit.primaryPercent, 0);
+    });
+
+    it('95% hold pulls back before the typed climax', () => {
+        const early = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 133,
+            isEdged: false,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 95
+        });
+        assert.equal(early.newEdgeTriggered, true);
+        assert.equal(early.primaryPercent, CRAWL_PERCENT);
+        const below = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 132,
+            isEdged: false,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 95
+        });
+        assert.equal(below.isEdged, false);
     });
 
     it('does not count edges during orgasm mode or rampdown', () => {

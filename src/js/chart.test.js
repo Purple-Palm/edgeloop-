@@ -13,6 +13,11 @@ describe('computeChartScale', () => {
         assert.equal(scale.lo, 50);
     });
 
+    it('extends the top for an overshoot trigger above the typed climax', () => {
+        const scale = computeChartScale(70, 140, 210);
+        assert.ok(scale.hi >= 210 + 5);
+    });
+
     it('extends the bottom for a very low resting HR', () => {
         const scale = computeChartScale(40, 140);
         assert.ok(scale.lo < 40);

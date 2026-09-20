@@ -12,11 +12,12 @@ const BASE_MAX = 180;
 const MARGIN = 10;
 
 // Pure: the BPM range the y-axis covers for the given guide lines.
-export function computeChartScale(minHr, maxHr) {
+export function computeChartScale(minHr, maxHr, triggerHr) {
     let lo = BASE_MIN;
     let hi = BASE_MAX;
     if (Number.isFinite(minHr)) lo = Math.min(lo, minHr - MARGIN);
     if (Number.isFinite(maxHr)) hi = Math.max(hi, maxHr + MARGIN);
+    if (Number.isFinite(triggerHr)) hi = Math.max(hi, triggerHr + MARGIN);
     lo = Math.max(0, Math.floor(lo));
     hi = Math.ceil(hi);
     if (hi - lo < 20) hi = lo + 20;
@@ -54,7 +55,7 @@ export function watchChartResize(canvas, redraw) {
     return () => {};
 }
 
-export function drawTelemetryChart(canvas, history, minHr, maxHr) {
+export function drawTelemetryChart(canvas, history, minHr, maxHr, triggerHr) {
     if (!canvas) return;
     const box = fitCanvas(canvas);
     if (!box) return;
@@ -64,7 +65,7 @@ export function drawTelemetryChart(canvas, history, minHr, maxHr) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const { lo, hi } = computeChartScale(minHr, maxHr);
+    const { lo, hi } = computeChartScale(minHr, maxHr, triggerHr);
     const scaleY = (val) => height - ((val - lo) / (hi - lo)) * height;
 
     ctx.lineWidth = 1;
@@ -85,6 +86,15 @@ export function drawTelemetryChart(canvas, history, minHr, maxHr) {
         ctx.beginPath();
         ctx.moveTo(0, scaleY(maxHr));
         ctx.lineTo(width, scaleY(maxHr));
+        ctx.stroke();
+    }
+
+    // Overshoot pullback line (only when it sits above the typed climax)
+    if (Number.isFinite(triggerHr) && (!Number.isFinite(maxHr) || triggerHr > maxHr)) {
+        ctx.strokeStyle = '#c084fc';
+        ctx.beginPath();
+        ctx.moveTo(0, scaleY(triggerHr));
+        ctx.lineTo(width, scaleY(triggerHr));
         ctx.stroke();
     }
 

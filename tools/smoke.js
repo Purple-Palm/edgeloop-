@@ -57,6 +57,33 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await ctx.newPage();
   page.setDefaultTimeout(6000);
+  await page.addInitScript(() => {
+    window.__edgeloopSpoken = [];
+    const record = (u) => {
+      window.__edgeloopSpoken.push((u && typeof u.text === 'string') ? u.text : String(u || ''));
+    };
+    if (window.speechSynthesis && typeof window.speechSynthesis.speak === 'function') {
+      const origSpeak = window.speechSynthesis.speak.bind(window.speechSynthesis);
+      window.speechSynthesis.speak = function (u) {
+        record(u);
+        try { origSpeak(u); } catch (e) { /* headless often has no voice backend */ }
+        queueMicrotask(() => { if (u && typeof u.onend === 'function') u.onend(); });
+      };
+    } else {
+      class FakeUtterance { constructor(text) { this.text = text; } }
+      window.SpeechSynthesisUtterance = FakeUtterance;
+      window.speechSynthesis = {
+        getVoices() { return []; },
+        speak(u) {
+          record(u);
+          queueMicrotask(() => { if (u && typeof u.onend === 'function') u.onend(); });
+        },
+        cancel() {},
+        addEventListener() {},
+        removeEventListener() {}
+      };
+    }
+  });
   page.on('pageerror', e => errors.push('pageerror: ' + e.message));
   page.on('console', m => {
     if (m.type() === 'error') errors.push('console.error: ' + m.text());
@@ -206,11 +233,31 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   });
   await step('open Session Setup', async () => {
     await page.locator('#sessionParamsHeaderBtn').click(); await sleep(300); await shot('05-session-setup');
-    // walk tabs inside the modal if present
     const tabs = page.locator('#modalOverlay button');
     const n = await tabs.count();
     for (let i = 0; i < Math.min(n, 12); i++) { const t = tabs.nth(i); const txt = (await t.textContent() || '').trim(); if (/guards|duration|motion|audio|profiles|tuning|general|backup/i.test(txt)) { await t.click().catch(() => {}); await sleep(150); } }
-    // Apply persists the form and closes the modal; it must not throw.
+    await page.locator('#paramsTabGuardsBtn').click(); await sleep(150);
+    if (!(await page.locator('#stallGuardToggle').count())) throw new Error('stall guard toggle missing');
+    const stallMax = await page.locator('#stallGuardSecondsInput').getAttribute('max');
+    if (stallMax !== '120') throw new Error('stall timeout max expected 120, got ' + stallMax);
+    if (!(await page.locator('#edgeHoldPercentInput').count())) throw new Error('edge hold percent input missing');
+    if (!(await page.locator('#stallPauseSecondsInput').count())) throw new Error('stall pause input missing');
+    await page.locator('#paramsTabAudioBtn').click(); await sleep(150);
+    if (!(await page.locator('#paramMicTestBtn').count())) throw new Error('mic test button missing');
+    if (!(await page.locator('#micGateInput').count())) throw new Error('mic noise gate missing');
+    if (!(await page.locator('#voiceCuesList [data-voice-cue]').count())) throw new Error('voice cue editor missing');
+    if (!(await page.locator('#voiceCuesExportBtn').count())) throw new Error('voice phrase export missing');
+    for (const id of ['edge', 'encourage', 'forceOrgasm', 'cameEarly']) {
+      if (!(await page.locator(`[data-voice-cue="${id}"]`).count())) throw new Error('missing phrase bank ' + id);
+    }
+    await page.locator('#paramVoiceToggle').evaluate((el) => { el.checked = true; });
+    const edgeCue = page.locator('[data-voice-cue="edge"]');
+    if (await edgeCue.count()) await edgeCue.fill('Edge at {hr}. Back off.');
+    await page.locator('#paramVoicePreviewBtn').click(); await sleep(200);
+    const previewSpoken = await page.evaluate(() => window.__edgeloopSpoken || []);
+    if (!previewSpoken.some((t) => /voice preview|Stay right on the edge/i.test(t))) {
+      throw new Error('Preview did not speak: ' + JSON.stringify(previewSpoken));
+    }
     const apply = page.locator('#applyParamsBtn');
     if (await apply.isVisible().catch(() => false)) { await apply.click(); await sleep(300); }
     await closeModal();
@@ -235,6 +282,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   await step('mode cards click', async () => {
     await page.getByText(/prostate milker/i).first().click().catch(() => {}); await sleep(200);
     await page.getByText(/classic tease/i).first().click().catch(() => {}); await sleep(200);
+    await page.locator('#expTabGameBtn').click().catch(() => {}); await sleep(150);
+    if (!(await page.locator('[data-mode="edgetrain"]').count())) throw new Error('edge training game missing');
+    await page.locator('[data-mode="edgetrain"]').click(); await sleep(150);
+    if (!(await page.locator('#trainHoldSecondsInput').count())) throw new Error('edge training hold input missing');
   });
   await step('connect the mocked Handy', async () => {
     await page.locator('#cardHandy').click(); await sleep(300);
@@ -257,6 +308,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     handyCalls.length = 0;
     await play.click(); await sleep(1500);
     if ((await playText()) !== 'PAUSE') throw new Error('expected PAUSE after START, got: ' + await playText());
+    const spoken = await page.evaluate(() => window.__edgeloopSpoken || []);
+    if (!spoken.some((t) => /Session started/i.test(t))) throw new Error('spoken voice did not say session start: ' + JSON.stringify(spoken));
+    if (!(await page.locator('#mindgameContainer').isVisible())) throw new Error('dashboard cue text hidden while spoken guidance is on');
     const seq = handyCalls.map(c => c.method + ' ' + c.path);
     const slideAt = seq.indexOf('PUT /slide'), startAt = seq.indexOf('PUT /hamp/start');
     if (startAt < 0) throw new Error('no PUT /hamp/start after START: ' + JSON.stringify(seq));
@@ -270,6 +324,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     handyCalls.length = 0;
     await play.click(); await sleep(700);
     if ((await playText()) !== 'RESUME') throw new Error('expected RESUME after PAUSE, got: ' + await playText());
+    const spokenPause = await page.evaluate(() => window.__edgeloopSpoken || []);
+    if (!spokenPause.some((t) => /^Paused/i.test(t))) throw new Error('spoken voice did not say paused: ' + JSON.stringify(spokenPause));
     if (!handyCalls.some(c => c.path === '/hamp/stop')) throw new Error('PAUSE sent no PUT /hamp/stop: ' + JSON.stringify(handyCalls));
     await play.click(); await sleep(1200);
     if ((await playText()) !== 'PAUSE') throw new Error('expected PAUSE after RESUME, got: ' + await playText());

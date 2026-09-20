@@ -16,10 +16,16 @@ export const ORGASM_BOOST_CAP = 60;
 // the ceiling, so a single HR-sensor spike cannot end the game.
 export const SURVIVAL_BREACH_TICKS = 3;
 
-// Stall guard timeout (seconds at the ceiling before the primary is cut).
+// How long pulse may sit at the pullback trigger before the primary is cut.
 export const MIN_STALL_GUARD_SECONDS = 3;
-export const MAX_STALL_GUARD_SECONDS = 25;
-export const DEFAULT_STALL_GUARD_SECONDS = 8;
+export const MAX_STALL_GUARD_SECONDS = 120;
+export const DEFAULT_STALL_GUARD_SECONDS = 20;
+
+// How long the primary stays halted after that cut, then crawl resumes
+// (still edged) and the hold window starts again.
+export const MIN_STALL_PAUSE_SECONDS = 2;
+export const MAX_STALL_PAUSE_SECONDS = 60;
+export const DEFAULT_STALL_PAUSE_SECONDS = 8;
 
 export const DEFAULT_MIN_HR = 70;
 export const DEFAULT_MAX_HR = 140;
@@ -135,8 +141,12 @@ export function computeEffectiveCeiling({
 // `invalid` (field names 'fixed', 'min', 'max') and the session falls back to
 // endless (targetSeconds 0) so the caller can flag the field instead of
 // silently running forever.
+function emptyDuration(invalid = []) {
+    return { targetSeconds: 0, minSeconds: 0, maxSeconds: 0, valid: invalid.length === 0, invalid };
+}
+
 export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinutes, random = Math.random }) {
-    if (mode === 'endless') return { targetSeconds: 0, valid: true, invalid: [] };
+    if (mode === 'endless') return emptyDuration();
 
     const toMinutes = (value) => {
         const n = toInt(value);
@@ -145,8 +155,9 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
 
     if (mode === 'fixed') {
         const mins = toMinutes(fixedMinutes);
-        if (mins === null) return { targetSeconds: 0, valid: false, invalid: ['fixed'] };
-        return { targetSeconds: mins * 60, valid: true, invalid: [] };
+        if (mins === null) return { ...emptyDuration(['fixed']), valid: false };
+        const seconds = mins * 60;
+        return { targetSeconds: seconds, minSeconds: seconds, maxSeconds: seconds, valid: true, invalid: [] };
     }
 
     const lo = toMinutes(minMinutes);
@@ -155,11 +166,68 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
     if (lo === null) invalid.push('min');
     if (hi === null) invalid.push('max');
     if (lo !== null && hi !== null && lo > hi) invalid.push('min', 'max');
-    if (invalid.length > 0) return { targetSeconds: 0, valid: false, invalid };
+    if (invalid.length > 0) return { ...emptyDuration(invalid), valid: false };
 
     const roll = clamp(Number(random()) || 0, 0, 0.999999);
     const mins = Math.min(hi, Math.floor(roll * (hi - lo + 1)) + lo);
-    return { targetSeconds: mins * 60, valid: true, invalid: [] };
+    return {
+        targetSeconds: mins * 60,
+        minSeconds: lo * 60,
+        maxSeconds: hi * 60,
+        valid: true,
+        invalid: []
+    };
+}
+
+// When the Oracle may climax or deny. Endless (all zeros) has no clock, so
+// any hold may end the session. Mystery/Fixed keep climax and denial closed
+// until minSeconds, then open them through the window; past maxSeconds the
+// next hold must end (no more purgatory).
+export function oracleTiming({
+    sessionSeconds = 0,
+    minSeconds = 0,
+    maxSeconds = 0,
+    targetSeconds = 0
+} = {}) {
+    const t = Math.max(0, Number(sessionSeconds) || 0);
+    const min = Math.max(0, Number(minSeconds) || 0);
+    const max = Math.max(0, Number(maxSeconds) || 0);
+    const target = Math.max(0, Number(targetSeconds) || 0);
+    const openAt = min;
+    const closeAt = target > 0 ? target : max;
+    const endless = openAt === 0 && closeAt === 0;
+    if (endless) {
+        return { canEnd: true, mustEnd: false, openAt: 0, closeAt: 0, progress: 1 };
+    }
+    const span = Math.max(1, closeAt - openAt);
+    const progress = clamp((t - openAt) / span, 0, 1);
+    return {
+        canEnd: t >= openAt,
+        mustEnd: closeAt > 0 && t >= closeAt,
+        openAt,
+        closeAt,
+        progress
+    };
+}
+
+export function rollOracleFate(timing, { random = Math.random, endgameType = 'orgasm' } = {}) {
+    const gate = timing && typeof timing === 'object'
+        ? timing
+        : { canEnd: true, mustEnd: false, progress: 1 };
+    if (!gate.canEnd) return 'PURGATORY';
+    const roll = clamp(Number(random()) || 0, 0, 0.999999);
+    if (gate.mustEnd) {
+        if (endgameType === 'denial') return 'DENIAL';
+        if (endgameType === 'orgasm') return 'CLIMAX';
+        return roll < 0.5 ? 'CLIMAX' : 'DENIAL';
+    }
+    // Early in the window most holds continue; near the close, climax and
+    // denial take most of the rolls. Equal split between those two.
+    const p = clamp(Number(gate.progress) || 0, 0, 1);
+    const purgP = 0.72 * (1 - p) + 0.18 * p;
+    if (roll < purgP) return 'PURGATORY';
+    const mid = purgP + (1 - purgP) / 2;
+    return roll < mid ? 'CLIMAX' : 'DENIAL';
 }
 
 // Survival breach counter: consecutive readings at or above the ceiling. A
@@ -172,27 +240,154 @@ export function countSurvivalBreach(previousTicks, hr, ceiling, newReading = tru
     return hr >= ceiling ? (previousTicks || 0) + 1 : 0;
 }
 
-// Clamp the typed stall-guard timeout to its supported range (seconds).
 export function clampStallGuardSeconds(value, fallback = DEFAULT_STALL_GUARD_SECONDS) {
     const n = toInt(value);
     if (n === null) return fallback;
     return clamp(n, MIN_STALL_GUARD_SECONDS, MAX_STALL_GUARD_SECONDS);
 }
 
-// One 1 s tick of the stall guard. `armed` is whether the guard may act at
-// all (setting on, Crawl selected, no Force Orgasm, no game mode); while
-// armed and edged the seconds count up and the guard engages at the
-// timeout. Whenever the guard is not armed or the edge has released, it is
-// released at once, even if the pulse is still parked at the ceiling.
-export function tickStallGuard({ seconds = 0, engaged = false } = {}, { armed = false, isEdged = false, timeoutSeconds } = {}) {
+export function clampStallPauseSeconds(value, fallback = DEFAULT_STALL_PAUSE_SECONDS) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_STALL_PAUSE_SECONDS, MAX_STALL_PAUSE_SECONDS);
+}
+
+// One 1 s tick of the stall guard.
+// holdTimeoutSeconds: how long you may stay edged before the primary is cut.
+// pauseTimeoutSeconds: how long that halt lasts, then crawl resumes and the
+// hold window starts over. Disarm or leaving the edge clears both clocks.
+export function tickStallGuard(
+    { holdSeconds = 0, pauseSeconds = 0, engaged = false, seconds } = {},
+    { armed = false, isEdged = false, holdTimeoutSeconds, pauseTimeoutSeconds, timeoutSeconds } = {}
+) {
+    const hold = Number.isFinite(holdSeconds) ? holdSeconds : (Number.isFinite(seconds) ? seconds : 0);
+    const pause = Number.isFinite(pauseSeconds) ? pauseSeconds : 0;
     if (!armed || !isEdged) {
-        return { seconds: 0, engaged: false, justEngaged: false, justReleased: Boolean(engaged) };
+        return {
+            holdSeconds: 0,
+            pauseSeconds: 0,
+            seconds: 0,
+            engaged: false,
+            justEngaged: false,
+            justReleased: Boolean(engaged),
+            justResumed: false
+        };
     }
-    const next = (Number.isFinite(seconds) ? seconds : 0) + 1;
-    const engagedNow = Boolean(engaged) || next >= clampStallGuardSeconds(timeoutSeconds);
-    return { seconds: next, engaged: engagedNow, justEngaged: engagedNow && !engaged, justReleased: false };
+    const holdLimit = clampStallGuardSeconds(holdTimeoutSeconds ?? timeoutSeconds);
+    const pauseLimit = clampStallPauseSeconds(pauseTimeoutSeconds);
+
+    if (engaged) {
+        const nextPause = pause + 1;
+        if (nextPause >= pauseLimit) {
+            return {
+                holdSeconds: 0,
+                pauseSeconds: 0,
+                seconds: 0,
+                engaged: false,
+                justEngaged: false,
+                justReleased: false,
+                justResumed: true
+            };
+        }
+        return {
+            holdSeconds: hold,
+            pauseSeconds: nextPause,
+            seconds: hold,
+            engaged: true,
+            justEngaged: false,
+            justReleased: false,
+            justResumed: false
+        };
+    }
+
+    const nextHold = hold + 1;
+    const engagedNow = nextHold >= holdLimit;
+    return {
+        holdSeconds: nextHold,
+        pauseSeconds: 0,
+        seconds: nextHold,
+        engaged: engagedNow,
+        justEngaged: engagedNow,
+        justReleased: false,
+        justResumed: false
+    };
 }
 
 export function isSurvivalDefeated(breachTicks) {
     return (breachTicks || 0) >= SURVIVAL_BREACH_TICKS;
+}
+
+// Edge Training: climb to the pullback mark, hold there for holdGoal
+// seconds, repeat until edgesGoal successful holds, then finish.
+export const MIN_TRAIN_HOLD_SECONDS = 5;
+export const MAX_TRAIN_HOLD_SECONDS = 90;
+export const DEFAULT_TRAIN_HOLD_SECONDS = 15;
+export const MIN_TRAIN_EDGES = 1;
+export const MAX_TRAIN_EDGES = 20;
+export const DEFAULT_TRAIN_EDGES = 5;
+
+export function clampTrainHoldSeconds(value, fallback = DEFAULT_TRAIN_HOLD_SECONDS) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_TRAIN_HOLD_SECONDS, MAX_TRAIN_HOLD_SECONDS);
+}
+
+export function clampTrainEdges(value, fallback = DEFAULT_TRAIN_EDGES) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_TRAIN_EDGES, MAX_TRAIN_EDGES);
+}
+
+export function tickEdgeTraining(
+    { state: trainState = 'climb', holdSeconds = 0, edgesDone = 0 } = {},
+    { isEdged = false, released = false, holdGoal = DEFAULT_TRAIN_HOLD_SECONDS, edgesGoal = DEFAULT_TRAIN_EDGES, orgasmMode = false } = {}
+) {
+    const holdLimit = clampTrainHoldSeconds(holdGoal);
+    const need = clampTrainEdges(edgesGoal);
+    const done = Math.max(0, Number.isFinite(edgesDone) ? Math.round(edgesDone) : 0);
+    const held = Math.max(0, Number.isFinite(holdSeconds) ? Math.round(holdSeconds) : 0);
+    const idle = {
+        justHold: false,
+        justCounted: false,
+        justDropped: false,
+        justFinished: false,
+        justRecovered: false
+    };
+
+    if (orgasmMode || trainState === 'finish') {
+        return {
+            ...idle,
+            state: 'finish',
+            holdSeconds: 0,
+            edgesDone: Math.max(done, need),
+            justFinished: trainState !== 'finish' && !orgasmMode
+        };
+    }
+
+    if (trainState === 'hold') {
+        if (!isEdged) {
+            return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: done, justDropped: true };
+        }
+        const nextHold = held + 1;
+        if (nextHold >= holdLimit) {
+            const nextDone = done + 1;
+            if (nextDone >= need) {
+                return { ...idle, state: 'finish', holdSeconds: 0, edgesDone: nextDone, justCounted: true, justFinished: true };
+            }
+            return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: nextDone, justCounted: true };
+        }
+        return { ...idle, state: 'hold', holdSeconds: nextHold, edgesDone: done };
+    }
+
+    if (trainState === 'recover') {
+        if (released || !isEdged) {
+            return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: done, justRecovered: Boolean(isEdged) || released };
+        }
+        return { ...idle, state: 'recover', holdSeconds: 0, edgesDone: done };
+    }
+
+    if (isEdged) {
+        return { ...idle, state: 'hold', holdSeconds: 1, edgesDone: done, justHold: true };
+    }
+    return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: done };
 }

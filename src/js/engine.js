@@ -16,13 +16,38 @@ export const ENGINE_MODES = [
     'ultimate',
     'ruin',
     'oracle',
-    'survival'
+    'survival',
+    'edgetrain'
 ];
 
 // Hysteresis: once edged, the flag only clears when HR drops MORE than this
-// many BPM below the ceiling, so a reading hovering at the limit cannot
-// flap the motors on and off or count phantom edges.
+// many BPM below the typed climax ceiling, so a reading hovering at the
+// limit cannot flap the motors on and off or count phantom edges.
 export const EDGE_RELEASE_BPM = 5;
+
+// Pullback as a percent of typed Climax HR. 100% is the typed max; 95%
+// pulls back early; 105% lets pulse sit 5% past the typed max.
+export const MIN_EDGE_HOLD_PERCENT = 90;
+export const MAX_EDGE_HOLD_PERCENT = 115;
+export const DEFAULT_EDGE_HOLD_PERCENT = 100;
+
+export function clampEdgeHoldPercent(value, fallback = DEFAULT_EDGE_HOLD_PERCENT) {
+    const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return clamp(n, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT);
+}
+
+export function resolveEdgeTriggerHr(maxHr, holdPercent = DEFAULT_EDGE_HOLD_PERCENT) {
+    if (!Number.isFinite(maxHr)) return maxHr;
+    const pct = clampEdgeHoldPercent(holdPercent, DEFAULT_EDGE_HOLD_PERCENT);
+    return Math.max(1, Math.round(maxHr * (pct / 100)));
+}
+
+export function edgeReleaseHr(maxHr, triggerHr) {
+    if (!Number.isFinite(maxHr)) return maxHr;
+    const top = Number.isFinite(triggerHr) ? Math.min(maxHr, triggerHr) : maxHr;
+    return top - EDGE_RELEASE_BPM;
+}
 
 // The narrowest stroke zone (percent of the hardware envelope) the engine
 // will ever emit. Anything tighter jams the sleeve in place.
@@ -45,8 +70,9 @@ export function resolveEngineMode(mode) {
     return ENGINE_MODES.includes(mode) ? mode : 'classic';
 }
 
-export function hasReleasedEdge(hr, maxHr) {
-    return Number.isFinite(hr) && Number.isFinite(maxHr) && hr < (maxHr - EDGE_RELEASE_BPM);
+export function hasReleasedEdge(hr, maxHr, triggerHr) {
+    const release = edgeReleaseHr(maxHr, triggerHr);
+    return Number.isFinite(hr) && Number.isFinite(release) && hr < release;
 }
 
 function finiteOr(value, fallback) {
@@ -87,9 +113,11 @@ export function calculateEngineOutputs({
     milkingWave = false,
     stallGuardEngaged = false,
     ceilingBehaviour = 'crawl',
+    edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,
     ruinHoldSeconds = 0,
     oracleState = 'IDLE',
-    survivalSpeedFloor = 30
+    survivalSpeedFloor = 30,
+    trainingState = 'climb'
 }) {
     const mode = resolveEngineMode(activeMode);
     // The hardware envelope is normalised here so an inverted, narrow or
@@ -124,16 +152,20 @@ export function calculateEngineOutputs({
     let nextIsEdged = Boolean(isEdged);
     let newEdgeTriggered = false;
 
-    if (hr >= maxHr) {
+    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent);
+
+    if (hr >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
             newEdgeTriggered = true;
             nextIsEdged = true;
         }
-    } else if (hasReleasedEdge(hr, maxHr)) {
+    } else if (hasReleasedEdge(hr, maxHr, triggerHr)) {
         nextIsEdged = false;
     }
 
-    const span = Math.max(1, maxHr - minHr);
+    // Stretch the tease band up to the pullback trigger so a hold above
+    // 100% does not already sit at 0% at the typed max.
+    const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);
 
@@ -181,6 +213,12 @@ export function calculateEngineOutputs({
         primaryPercent = orgasmMode ? 100 : floor;
         secondaryPercent = orgasmMode ? 100 : Math.round(floor * 0.7);
         strokeMaxPercent = Math.round(100 - (progress * depthContractAmount * 0.4));
+    } else if (mode === 'edgetrain') {
+        const train = applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent);
+        primaryPercent = train.primary;
+        secondaryPercent = train.secondary;
+        strokeMinPercent = train.strokeMin;
+        strokeMaxPercent = train.strokeMax;
     } else if (mode === 'classic') {
         applyClassicTease();
     } else if (mode === 'milker') {
@@ -330,6 +368,39 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             break;
         }
         case 'APPROACH':
+        default: {
+            const pull = Math.round(48 + progress * 52);
+            out.primary = nextIsEdged ? 14 : pull;
+            out.secondary = nextIsEdged ? 40 : Math.round(30 + progress * 50);
+            out.strokeMax = 100;
+        }
+    }
+    return out;
+}
+
+function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent = CRAWL_PERCENT) {
+    const out = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
+    if (orgasmMode) {
+        out.primary = 100;
+        out.secondary = 100;
+        return out;
+    }
+    if (trainingState === 'finish') {
+        out.primary = nextIsEdged ? crawlPercent : 100;
+        out.secondary = nextIsEdged ? crawlPercent : 100;
+        return out;
+    }
+    switch (trainingState) {
+        case 'hold':
+            out.primary = 14;
+            out.secondary = 55;
+            out.strokeMax = 70;
+            break;
+        case 'recover':
+            out.primary = 0;
+            out.secondary = 35;
+            out.strokeMax = 55;
+            break;
         default: {
             const pull = Math.round(48 + progress * 52);
             out.primary = nextIsEdged ? 14 : pull;
