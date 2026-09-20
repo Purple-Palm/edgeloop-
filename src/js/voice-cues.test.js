@@ -28,7 +28,15 @@ describe('voice cue templates', () => {
             assert.equal(isVoiceCueId(cue.id), true);
         }
         assert.equal(isVoiceCueId('not-a-cue'), false);
-        assert.ok(DEFAULT_VOICE_CUES.encourage.length >= 2);
+        assert.ok(DEFAULT_VOICE_CUES.encourage.length >= 8);
+        assert.ok(DEFAULT_VOICE_CUES.edge.length >= 8);
+        assert.ok(DEFAULT_VOICE_CUES.forceOrgasm.length >= 8);
+        assert.ok(DEFAULT_VOICE_CUES.cameEarly.length >= 6);
+        assert.ok(DEFAULT_VOICE_CUES.forceOrgasmOff.length >= 2);
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'encourage')?.group, 'Build-up');
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'edge')?.group, 'Edge');
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'forceOrgasm')?.group, 'Climax');
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'cameEarly')?.group, 'Premature');
     });
 
     it('interpolates known tokens and leaves unknown braces alone', () => {
@@ -99,6 +107,9 @@ describe('voice cue templates', () => {
         assert.deepEqual(text.cues.encourage, ['You can do this.']);
         const bare = parseVoiceCuesText('Keep going.\nStay there.\n');
         assert.deepEqual(bare.cues.encourage, ['Keep going.', 'Stay there.']);
+        const climax = parseVoiceCuesText('# forceOrgasm\nCome now.\n\n# cameEarly\nToo soon.\n');
+        assert.deepEqual(climax.cues.forceOrgasm, ['Come now.']);
+        assert.deepEqual(climax.cues.cameEarly, ['Too soon.']);
     });
 
     it('imports a partial file without wiping other cues', () => {

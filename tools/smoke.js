@@ -247,6 +247,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     if (!(await page.locator('#micGateInput').count())) throw new Error('mic noise gate missing');
     if (!(await page.locator('#voiceCuesList [data-voice-cue]').count())) throw new Error('voice cue editor missing');
     if (!(await page.locator('#voiceCuesExportBtn').count())) throw new Error('voice phrase export missing');
+    for (const id of ['edge', 'encourage', 'forceOrgasm', 'cameEarly']) {
+      if (!(await page.locator(`[data-voice-cue="${id}"]`).count())) throw new Error('missing phrase bank ' + id);
+    }
     await page.locator('#paramVoiceToggle').evaluate((el) => { el.checked = true; });
     const edgeCue = page.locator('[data-voice-cue="edge"]');
     if (await edgeCue.count()) await edgeCue.fill('Edge at {hr}. Back off.');

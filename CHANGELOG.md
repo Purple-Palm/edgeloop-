@@ -180,7 +180,12 @@ credited by username.
 - Spoken Voice Guidance shows the current cue on the dashboard and speaks
   it. Each event is a list of phrases (one per line, randomly rotated).
   Phrase files can be imported/exported on the Audio tab and are included
-  in the full settings backup. Encouragement lines play on a timer.
+  in the full settings backup. Banks are grouped: build-up encouragement
+  on a timer, hitting the edge, Force Orgasm / make you come, and Came
+  Early / premature ejaculation. Tapping Force Orgasm (or the orgasm
+  endgame) speaks the climax bank; Came Early speaks the premature bank
+  as the session stops. Oracle climax keeps its own lines so two cues do
+  not stack.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.

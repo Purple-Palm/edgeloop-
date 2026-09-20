@@ -12,34 +12,127 @@ export const MAX_ENCOURAGE_SECONDS = 180;
 export const DEFAULT_ENCOURAGE_SECONDS = 45;
 
 export const VOICE_CUE_CATALOG = [
-    { id: 'idle', label: 'Resting prompt', lines: ['Calm and steady. Breathe.'] },
-    { id: 'preview', label: 'Voice preview', lines: ['EdgeLoop voice preview. Stay right on the edge.'] },
-    { id: 'sessionStart', label: 'Session start', lines: ['Session started. Breathe.'] },
-    { id: 'paused', label: 'Paused', lines: ['Paused.'] },
-    { id: 'sessionStop', label: 'Session stop', lines: ['Session stopped.'] },
-    { id: 'edge', label: 'Edge detected', lines: ['Edge. Back off. {hr} BPM.'] },
-    { id: 'stallHalt', label: 'Stall pause starts', lines: ['Stall guard. Primary halted. Recover.'] },
-    { id: 'stallResume', label: 'Stall pause ends', lines: ['Hold window reset. Crawl.'] },
-    { id: 'stallRecover', label: 'Left the edge', lines: ['Recovered. Resume.'] },
-    { id: 'warmupDone', label: 'Warm-up complete', lines: ['Warm up complete.'] },
-    { id: 'oracleWatching', label: 'Oracle approach', lines: ['The Oracle is watching. Climb.'] },
-    { id: 'oracleHold', label: 'Oracle hold', lines: ['Hold. Fifteen seconds.'] },
-    { id: 'oracleClimax', label: 'Oracle climax', lines: ['The Oracle chooses climax.'] },
-    { id: 'oraclePurgatory', label: 'Oracle purgatory', lines: ['The Oracle chooses purgatory.'] },
-    { id: 'oracleWithdrawn', label: 'Oracle climax cancelled', lines: ['Climax withdrawn. Climb again.'] },
-    { id: 'oracleReset', label: 'Oracle purgatory reset', lines: ['Purgatory resets. Climb again.'] },
-    { id: 'survivalBreach', label: 'Survival over the limit', lines: ['Over the limit. Drop it.'] },
-    { id: 'signalLost', label: 'Heart-rate signal lost', lines: ['Heart rate signal lost. Motors stopped.'] },
-    { id: 'signalRestored', label: 'Heart-rate restored', lines: ['Signal restored. Resuming.'] },
     {
         id: 'encourage',
-        label: 'Encouragement (during the session)',
+        group: 'Build-up',
+        label: 'Build-up encouragement',
         lines: [
             'Stay right on the edge.',
             'Breathe. You can hold this.',
-            'Not yet. Keep it there.'
+            'Not yet. Keep it there.',
+            'Good. Keep building.',
+            'Slow and mean. Don\'t rush.',
+            'You\'re doing well. Stay hungry.',
+            'Climb. Don\'t finish.',
+            'That\'s it. Let it stack.',
+            'Still denied. Keep going.',
+            '{minutes} minutes in. Hold.',
+            'Edge {edges} so far. Keep it.',
+            'Warm and tight. Don\'t spill.',
+            'Take the pleasure. Not the finish.',
+            'Steady. You are not done yet.'
         ]
-    }
+    },
+    {
+        id: 'warmupDone',
+        group: 'Build-up',
+        label: 'Warm-up complete',
+        lines: [
+            'Warm up complete.',
+            'Warm-up over. Now we climb.',
+            'The easy part is done. Hold.'
+        ]
+    },
+    {
+        id: 'edge',
+        group: 'Edge',
+        label: 'Hit the edge',
+        lines: [
+            'Edge. Back off. {hr} BPM.',
+            'That\'s the edge. Don\'t go over.',
+            'Hold it. {hr} of {maxHr}.',
+            'Back off now. Edge {edges}.',
+            'Right there. Stay on it.',
+            'Pulse at the line. Don\'t come.',
+            'Too close. Ease off.',
+            'That\'s it. Ride the edge.',
+            '{hr} BPM. Hold, don\'t finish.',
+            'Stop climbing. Stay edged.',
+            'You\'re there. Breathe through it.',
+            'On the brink. Not yet.'
+        ]
+    },
+    { id: 'stallHalt', group: 'Edge', label: 'Stall pause starts', lines: ['Stall guard. Primary halted. Recover.', 'Too long on the edge. Halt. Recover.'] },
+    { id: 'stallResume', group: 'Edge', label: 'Stall pause ends', lines: ['Hold window reset. Crawl.', 'Crawl again. Don\'t dump it.'] },
+    { id: 'stallRecover', group: 'Edge', label: 'Left the edge', lines: ['Recovered. Resume.', 'Off the edge. Climb again.'] },
+    {
+        id: 'forceOrgasm',
+        group: 'Climax',
+        label: 'Force orgasm / make you come',
+        lines: [
+            'Force orgasm. You don\'t get to hold back.',
+            'Come. Now.',
+            'That\'s it. Finish.',
+            'No more holding. Come for it.',
+            'Over the edge. Let go.',
+            'Forced. You come now.',
+            'Ceiling is gone. Come.',
+            '{hr} BPM. Don\'t stop until you finish.',
+            'Take it. Come.',
+            'This is the one. Come.',
+            'You are allowed to come. Do it.',
+            'No denial. Finish.'
+        ]
+    },
+    {
+        id: 'forceOrgasmOff',
+        group: 'Climax',
+        label: 'Force orgasm cancelled',
+        lines: [
+            'Force orgasm cancelled. Back to the edge.',
+            'Denied again. Climb.',
+            'Climax withdrawn. Hold.',
+            'Not this time. Stay edged.'
+        ]
+    },
+    { id: 'oracleWatching', group: 'Climax', label: 'Oracle approach', lines: ['The Oracle is watching. Climb.'] },
+    { id: 'oracleHold', group: 'Climax', label: 'Oracle hold', lines: ['Hold. Fifteen seconds.'] },
+    {
+        id: 'oracleClimax',
+        group: 'Climax',
+        label: 'Oracle chooses climax',
+        lines: [
+            'The Oracle chooses climax.',
+            'The Oracle says come.',
+            'Oracle: you finish now.'
+        ]
+    },
+    { id: 'oraclePurgatory', group: 'Climax', label: 'Oracle purgatory', lines: ['The Oracle chooses purgatory.'] },
+    { id: 'oracleWithdrawn', group: 'Climax', label: 'Oracle climax cancelled', lines: ['Climax withdrawn. Climb again.'] },
+    { id: 'oracleReset', group: 'Climax', label: 'Oracle purgatory reset', lines: ['Purgatory resets. Climb again.'] },
+    {
+        id: 'cameEarly',
+        group: 'Premature',
+        label: 'Came early / premature ejaculation',
+        lines: [
+            'Came early. Limit tightened.',
+            'Premature. Ceiling drops next time.',
+            'You came too soon. Learning that.',
+            'Accidental release. {hr} BPM. Limits tighter.',
+            'Too soon. We\'ll keep you lower.',
+            'Breakthrough logged. Hold better next time.',
+            'You spilled. Working climax HR goes down.',
+            'Premature ejaculation. The next session is meaner.'
+        ]
+    },
+    { id: 'idle', group: 'Session', label: 'Resting prompt', lines: ['Calm and steady. Breathe.'] },
+    { id: 'preview', group: 'Session', label: 'Voice preview', lines: ['EdgeLoop voice preview. Stay right on the edge.'] },
+    { id: 'sessionStart', group: 'Session', label: 'Session start', lines: ['Session started. Breathe.'] },
+    { id: 'paused', group: 'Session', label: 'Paused', lines: ['Paused.'] },
+    { id: 'sessionStop', group: 'Session', label: 'Session stop', lines: ['Session stopped.'] },
+    { id: 'survivalBreach', group: 'Guards', label: 'Survival over the limit', lines: ['Over the limit. Drop it.'] },
+    { id: 'signalLost', group: 'Guards', label: 'Heart-rate signal lost', lines: ['Heart rate signal lost. Motors stopped.'] },
+    { id: 'signalRestored', group: 'Guards', label: 'Heart-rate restored', lines: ['Signal restored. Resuming.'] }
 ];
 
 export const DEFAULT_VOICE_CUES = Object.fromEntries(

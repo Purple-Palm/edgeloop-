@@ -1027,7 +1027,9 @@ function tickSessionGuardsAndGames() {
                 const roll = Math.random();
                 if (roll < 0.33) {
                     state.oracleState = 'CLIMAX';
-                    if (!state.orgasmMode) orgasmBtn?.click();
+                    // Arm Force Orgasm without its own bank so Oracle climax
+                    // is the one phrase the wearer hears.
+                    if (!state.orgasmMode) setOrgasmMode(true);
                     cueVoice('oracleClimax');
                 } else if (roll < 0.66) {
                     state.oracleState = 'DENIAL';
@@ -1517,7 +1519,7 @@ cameEarlyBtn?.addEventListener('click', () => {
         }
         persistSettings();
         renderLearningStatus();
-        stopSession("Premature Release", "Premature release. Limit tightened.");
+        stopSession("Premature Release", "cameEarly");
     }
 });
 
@@ -1533,8 +1535,10 @@ document.getElementById('wipeLearningBtn')?.addEventListener('click', () => {
 // toggle, stop, reset and remote telemetry all agree. The ceiling boost
 // counter restarts from zero on every change and the typed Climax HR input
 // is never modified.
-function setOrgasmMode(on) {
-    state.orgasmMode = Boolean(on);
+function setOrgasmMode(on, { voice = false } = {}) {
+    const next = Boolean(on);
+    const changed = next !== Boolean(state.orgasmMode);
+    state.orgasmMode = next;
     state.orgasmBoost = 0;
     if (orgasmBtnText) orgasmBtnText.textContent = state.orgasmMode ? 'Forcing...' : 'Force Orgasm';
     if (orgasmBtn) {
@@ -1542,6 +1546,14 @@ function setOrgasmMode(on) {
             ? 'bg-rose-700 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center animate-pulse cursor-pointer shadow-lg shadow-rose-950/40'
             : 'bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-amber-950/30';
     }
+    if (!changed || !voice) return;
+    if (next) {
+        cueVoice('forceOrgasm');
+        return;
+    }
+    // Oracle CLIMAX already has oracleWithdrawn on the next tick.
+    if (state.activeMode === 'oracle' && state.oracleState === 'CLIMAX') return;
+    cueVoice('forceOrgasmOff');
 }
 
 orgasmBtn?.addEventListener('click', () => {
@@ -1551,7 +1563,7 @@ orgasmBtn?.addEventListener('click', () => {
         sendPeerCommand({ type: 'ORGASM_TOGGLE' });
         return;
     }
-    setOrgasmMode(!state.orgasmMode);
+    setOrgasmMode(!state.orgasmMode, { voice: true });
     syncTelemetry();
     updateEngine();
 });
@@ -1860,10 +1872,16 @@ function renderVoiceCueEditor() {
     const root = document.getElementById('voiceCuesList');
     if (!root) return;
     const merged = mergeVoiceCues(advancedSettings.voiceCues);
+    let lastGroup = '';
     root.innerHTML = VOICE_CUE_CATALOG.map((cue) => {
         const lines = merged[cue.id] || cue.lines;
         const rows = Math.min(8, Math.max(3, lines.length + 1));
-        return `<div class="space-y-0.5">
+        const group = cue.group || '';
+        const heading = group && group !== lastGroup
+            ? `<p class="text-[9px] uppercase tracking-wider text-purple-400 font-bold pt-1">${escapeAttr(group)}</p>`
+            : '';
+        lastGroup = group;
+        return `${heading}<div class="space-y-0.5">
             <div class="flex justify-between items-center gap-2">
               <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)} <span class="text-slate-600 font-mono">(${lines.length})</span></label>
               <button type="button" data-voice-preview="${cue.id}" class="text-[9px] text-purple-300 hover:underline cursor-pointer">Speak</button>
