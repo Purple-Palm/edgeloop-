@@ -130,6 +130,8 @@ The **Guards** tab of Session Setup holds every safety rule. They are independen
 
 The **Audio & Mic** tab has spoken voice guidance (local browser TTS, with a voice picker and Preview). When it is on, each cue is shown on the dashboard **and** spoken. Phrase banks are grouped: **Build-up** encouragement on a timer (default every 45 s, 0 = off), **Edge** when pulse hits the pullback mark, **Climax** when you tap Force Orgasm (or the orgasm endgame arms it; Oracle climax uses its own lines), and **Premature** when you tap Came Early. Every event can hold many phrases (one per line; a random line is picked each time). Tokens `{hr}`, `{maxHr}`, `{minHr}`, `{edges}`, `{minutes}` fill in live session values. **Export phrases** / **Import phrases** save or load a JSON (or a `# edge` / `# encourage` / `# forceOrgasm` / `# cameEarly` text file); the full Backup export includes the same lists.
 
+The microphone monitor (optional) is a second arousal datapoint: louder voice/panting above the noise gate adds extra BPM to the working heart rate, so the loop treats you as closer to the edge. It never goes past the effective Climax HR. **Louder → closer (max extra BPM)** (0–20, default 8) is how hard that push is; 0 listens without changing the toys. The cockpit shows **MIC +N** while it is boosting.
+
 ---
 
 ## Hosting your own copy

@@ -183,10 +183,36 @@ export const MIN_MIC_GATE = 8;
 export const MAX_MIC_GATE = 90;
 export const DEFAULT_MIC_GATE = 40;
 
+// Extra BPM added to the working heart rate when the wearer is louder
+// than the gate. 0 = listen only (meter and badge, no loop effect).
+export const MIN_MIC_BOOST_BPM = 0;
+export const MAX_MIC_BOOST_BPM = 20;
+export const DEFAULT_MIC_BOOST_BPM = 8;
+
 export function clampMicGate(value, fallback = DEFAULT_MIC_GATE) {
     const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
     if (!Number.isFinite(n)) return fallback;
     return Math.max(MIN_MIC_GATE, Math.min(MAX_MIC_GATE, n));
+}
+
+export function clampMicBoostBpm(value, fallback = DEFAULT_MIC_BOOST_BPM) {
+    const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(MIN_MIC_BOOST_BPM, Math.min(MAX_MIC_BOOST_BPM, n));
+}
+
+// Map voice-band level (0-100) onto 0..maxBpm. Silence or anything at/under
+// the gate is 0; full-band loudness (100) is the cap. Louder = closer to the
+// edge. The engine still cannot pass the effective climax ceiling.
+export function micBoostFromLevel(level, gate, maxBpm) {
+    const cap = clampMicBoostBpm(maxBpm, 0);
+    if (cap <= 0) return 0;
+    const g = clampMicGate(gate);
+    const lv = typeof level === 'number' && Number.isFinite(level) ? level : parseInt(String(level), 10);
+    if (!Number.isFinite(lv) || lv <= g) return 0;
+    const span = Math.max(1, 100 - g);
+    const t = Math.min(1, (lv - g) / span);
+    return Math.round(t * cap);
 }
 
 // Pure: average magnitude of analyser frequency bins inside the voice band,

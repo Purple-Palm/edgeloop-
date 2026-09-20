@@ -126,6 +126,7 @@ export const advancedSettings = {
     voiceEncourageSeconds: 45,
     micEnabled: false,
     micSensitivityThreshold: 40,
+    micBoostMaxBpm: 8,
     customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,

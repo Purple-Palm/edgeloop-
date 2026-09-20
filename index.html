@@ -923,7 +923,7 @@
             <div class="flex justify-between items-center">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Microphone Monitor (Experimental)</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. The louder you get above the gate, the closer the loop treats you to the edge (extra BPM on the working heart rate, never past Climax HR). Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights. Set extra BPM to 0 to listen without affecting the toys.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramMicToggle" type="checkbox" class="sr-only peer">
@@ -944,6 +944,13 @@
                 <div class="flex items-center gap-2">
                   <input id="micGateInput" type="range" min="8" max="90" value="40" class="w-28 accent-purple-500">
                   <span id="micGateValue" class="font-mono text-[10px] text-purple-300 w-8 text-right">40</span>
+                </div>
+              </div>
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-[9px] text-slate-400 font-semibold">Louder → closer (max extra BPM)</span>
+                <div class="flex items-center gap-2">
+                  <input id="micBoostBpmInput" type="range" min="0" max="20" value="8" class="w-28 accent-purple-500">
+                  <span id="micBoostBpmValue" class="font-mono text-[10px] text-purple-300 w-8 text-right">8</span>
                 </div>
               </div>
             </div>

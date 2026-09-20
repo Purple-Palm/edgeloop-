@@ -88,7 +88,9 @@ import {
     stopMicMonitor,
     sampleMicLevel,
     listSpeechVoices,
-    clampMicGate
+    clampMicGate,
+    clampMicBoostBpm,
+    micBoostFromLevel
 } from './voice.js';
 import {
     VOICE_CUE_CATALOG,
@@ -157,6 +159,7 @@ function syncGuardSettings() {
     advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
     advancedSettings.trainEdges = clampTrainEdges(advancedSettings.trainEdges);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
+    advancedSettings.micBoostMaxBpm = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
     advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
 }
@@ -664,6 +667,17 @@ function updateEngine() {
     if (advancedSettings.micEnabled && state.micBoost > 0 && hr < max) {
         hr = Math.min(max, hr + state.micBoost);
     }
+    const micBadge = document.getElementById('micActiveBadge');
+    if (micBadge && advancedSettings.micEnabled && state.micAnalyser) {
+        if (state.micBoost > 0) {
+            micBadge.textContent = `MIC +${state.micBoost}`;
+            micBadge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1';
+        } else {
+            micBadge.textContent = 'MIC LISTEN';
+            micBadge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1';
+        }
+        micBadge.classList.remove('hidden');
+    }
     state.effectiveMinHr = min;
     state.effectiveMaxHr = max;
     state.effectiveHr = hr;
@@ -1042,8 +1056,7 @@ function tickSessionGuardsAndGames() {
 
     if (advancedSettings.micEnabled && state.micAnalyser) {
         const level = sampleMicLevel(state);
-        const threshold = clampMicGate(advancedSettings.micSensitivityThreshold);
-        state.micBoost = level >= threshold ? Math.round((level - threshold) / 8) : 0;
+        state.micBoost = micBoostFromLevel(level, liveMicGate(), liveMicBoostCap());
         paintMicMeter(level);
     } else if (!state.isTestingMic) {
         state.micBoost = 0;
@@ -1915,6 +1928,11 @@ function syncParamsUI() {
     const gate = clampMicGate(advancedSettings.micSensitivityThreshold);
     if (gateInput) gateInput.value = gate;
     if (gateValue) gateValue.textContent = String(gate);
+    const boostInput = document.getElementById('micBoostBpmInput');
+    const boostValue = document.getElementById('micBoostBpmValue');
+    const boostCap = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
+    if (boostInput) boostInput.value = boostCap;
+    if (boostValue) boostValue.textContent = String(boostCap);
     populateVoiceSelect();
     renderVoiceCueEditor();
     setMindgamePrompt(state.lastSpokenPrompt || dashboardIdlePrompt(), advancedSettings.voiceEnabled);
@@ -2111,12 +2129,22 @@ function liveMicGate() {
     return clampMicGate(advancedSettings.micSensitivityThreshold);
 }
 
+function liveMicBoostCap() {
+    const fromSlider = document.getElementById('micBoostBpmInput')?.value;
+    if (fromSlider !== undefined && fromSlider !== null && fromSlider !== '') {
+        return clampMicBoostBpm(fromSlider);
+    }
+    return clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
+}
+
 function paintMicMeter(level) {
     const bar = document.getElementById('micLevelBar');
     const label = document.getElementById('micLevelLabel');
     const badge = document.getElementById('micActiveBadge');
     const gate = liveMicGate();
+    const cap = liveMicBoostCap();
     const value = Number.isFinite(level) ? Math.max(0, Math.min(100, level)) : 0;
+    const boost = micBoostFromLevel(value, gate, cap);
     const gated = value >= gate;
     if (bar) {
         bar.style.width = `${value}%`;
@@ -2126,23 +2154,33 @@ function paintMicMeter(level) {
         if (!state.micAnalyser) {
             label.textContent = 'Tap Test, then make noise. Toys should stay below the gate.';
             label.className = 'text-[9px] font-mono text-slate-500';
+        } else if (boost > 0) {
+            label.textContent = `Voice ${value} — +${boost} BPM toward the edge (max ${cap}).`;
+            label.className = 'text-[9px] font-mono text-rose-300';
         } else if (gated) {
-            label.textContent = `Voice ${value} — above gate ${gate}. Monitor would boost.`;
+            label.textContent = `Voice ${value} — above gate ${gate}, extra BPM is 0.`;
             label.className = 'text-[9px] font-mono text-emerald-300';
         } else {
             label.textContent = `Level ${value} — below gate ${gate}. Toys/noise ignored.`;
             label.className = 'text-[9px] font-mono text-slate-400';
         }
     }
+    if (advancedSettings.micEnabled && state.micAnalyser) {
+        const prev = state.micBoost;
+        state.micBoost = boost;
+        if (prev !== boost && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
+            updateEngine();
+        }
+    }
     if (badge && (advancedSettings.micEnabled || state.isTestingMic) && state.micAnalyser) {
-        badge.textContent = gated ? 'MIC VOICE' : 'MIC LISTEN';
         badge.classList.remove('hidden');
-        badge.classList.toggle('border-emerald-700', !gated);
-        badge.classList.toggle('text-emerald-300', !gated);
-        badge.classList.toggle('bg-emerald-950/80', !gated);
-        badge.classList.toggle('border-rose-700', gated);
-        badge.classList.toggle('text-rose-300', gated);
-        badge.classList.toggle('bg-rose-950/80', gated);
+        if (boost > 0) {
+            badge.textContent = `MIC +${boost}`;
+            badge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1';
+        } else {
+            badge.textContent = 'MIC LISTEN';
+            badge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1';
+        }
     }
 }
 
@@ -2186,6 +2224,13 @@ document.getElementById('micGateInput')?.addEventListener('input', (e) => {
     paintMicMeter(sampleMicLevel(state));
 });
 
+document.getElementById('micBoostBpmInput')?.addEventListener('input', (e) => {
+    const cap = clampMicBoostBpm(e.target.value);
+    const disp = document.getElementById('micBoostBpmValue');
+    if (disp) disp.textContent = String(cap);
+    paintMicMeter(sampleMicLevel(state));
+});
+
 // Apply Session Setup
 document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
@@ -2211,6 +2256,7 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
     advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);
+    advancedSettings.micBoostMaxBpm = clampMicBoostBpm(document.getElementById('micBoostBpmInput')?.value);
     syncGuardSettings();
     const micWasOn = Boolean(state.micAnalyser);
     // Only (re)start the monitor when the setting changed: the button click
