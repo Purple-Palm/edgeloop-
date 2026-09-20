@@ -125,6 +125,19 @@ export function createHrWatchdog(settings = {}) {
         get tripped() {
             return tripped;
         },
+        // Whether a usable reading arrived recently enough that the signal is
+        // not stale right now. Side-effect free: START / RESUME gate on it
+        // without disturbing the once-per-transition bookkeeping.
+        isFresh(now) {
+            return classifyHrSignal({
+                lastPacketAt,
+                lastValidAt,
+                now,
+                staleMs: opts.staleMs,
+                holdMs: opts.holdMs,
+                sensorContact
+            }).status !== 'stale';
+        },
         // One verdict per tick. `tripped` in the result is true only on the
         // tick that crossed into 'stale'; `recovered` only on the tick that
         // first saw a usable reading again after a loss.

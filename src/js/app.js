@@ -6,7 +6,9 @@ import {
     sanitizeHrLimits,
     parseSessionDuration,
     countSurvivalBreach,
-    isSurvivalDefeated
+    isSurvivalDefeated,
+    clampStallGuardSeconds,
+    tickStallGuard
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
@@ -14,7 +16,7 @@ import { drawTelemetryChart, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
-import { connectHandy, disconnectHandy, dispatchHandy, handyConnected, setHandyHandlers } from './hardware/handy.js';
+import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import {
     connectIntifaceServer,
@@ -102,8 +104,10 @@ if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(store
 }
 
 // Heart-rate signal watchdog (hr-watchdog.js). Its clocks are reset on BLE
-// connect, on START / RESUME and when the simulator is engaged; its settings
-// mirror the Guards tab and are re-applied after load, apply and import.
+// connect and when the simulator is engaged, never on START / RESUME: a
+// session may only start or resume on a fresh valid reading, so the clocks
+// must tell the truth at that moment. Its settings mirror the Guards tab and
+// are re-applied after load, apply and import.
 const hrWatchdog = createHrWatchdog();
 function syncWatchdogSettings() {
     advancedSettings.hrStaleSeconds = clampStaleSeconds(advancedSettings.hrStaleSeconds);
@@ -113,7 +117,14 @@ function syncWatchdogSettings() {
         autoResume: advancedSettings.hrAutoResume
     });
 }
+// The stall-guard timeout is clamped to its supported range (3-25 s) wherever
+// it enters: load, Apply and import. A negative or garbage value would fire
+// the guard on the first tick at the ceiling.
+function syncGuardSettings() {
+    advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
+}
 syncWatchdogSettings();
+syncGuardSettings();
 hrWatchdog.reset(Date.now());
 
 // Live funscript sample buffer: one 4 Hz timeline of { at, speed, secondary,
@@ -238,6 +249,9 @@ function maybeShowFirstRunWizard() {
 
 document.getElementById('ageConfirmBtn')?.addEventListener('click', () => {
     if (location.protocol === 'file:') return;
+    // The wizard walks the host through pairing hardware; a partner or viewer
+    // page has none.
+    if (isRemotePage) return;
     setTimeout(maybeShowFirstRunWizard, 50);
 });
 
@@ -373,6 +387,28 @@ function hardwareReadiness() {
     return { hrReady, toyReady };
 }
 
+// True when the pulse source has delivered a usable reading recently enough
+// for the watchdog (the simulator is never stale: its value is the slider).
+function pulseIsFresh(now = Date.now()) {
+    if (state.simEngaged) return true;
+    return hrWatchdog.isFresh(now);
+}
+
+// Why START / RESUME must stay disabled right now, or null when the session
+// may start. Shared by checkReadiness() and startOrResumeSession() so a
+// remote command can never bypass what the button shows: resuming on a
+// frozen heart rate would drive the toys for a full tick (or the whole
+// signal-loss timeout) before the watchdog re-paused.
+function transportWaitingReason(now = Date.now()) {
+    const { hrReady, toyReady } = hardwareReadiness();
+    if (!hrReady && !toyReady) return "WAITING FOR HR SENSOR & TOY";
+    if (!hrReady) return "WAITING FOR HR SENSOR";
+    if (!toyReady) return "WAITING FOR TOY CONNECTION";
+    if (state.sessionStatus === 'PAUSED' && state.hrSignalPaused) return "WAITING FOR PULSE";
+    if (!pulseIsFresh(now)) return "WAITING FOR PULSE";
+    return null;
+}
+
 function checkReadiness() {
     if (!playPauseBtn) return;
 
@@ -392,16 +428,16 @@ function checkReadiness() {
         return;
     }
 
-    if (active) {
+    if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         playPauseBtn.disabled = false;
         return;
     }
 
-    const { hrReady, toyReady } = hardwareReadiness();
-    if (!hrReady && !toyReady) renderTransportWaiting("WAITING FOR HR SENSOR & TOY");
-    else if (!hrReady) renderTransportWaiting("WAITING FOR HR SENSOR");
-    else if (!toyReady) renderTransportWaiting("WAITING FOR TOY CONNECTION");
-    else renderTransport('IDLE');
+    // IDLE and PAUSED alike: START / RESUME need a pulse source with a fresh
+    // valid reading and a toy.
+    const reason = transportWaitingReason();
+    if (reason) renderTransportWaiting(reason);
+    else renderTransport(state.sessionStatus === 'PAUSED' ? 'PAUSED' : 'IDLE');
 }
 
 // Center Intensity Slider
@@ -807,6 +843,7 @@ function resetSessionCounters() {
     state.rampdownSecondsLeft = 45;
     state.resumeStatus = null;
     state.durationFallback = false;
+    state.endgameFired = false;
     state.strokerSpeed = 0;
     state.prostateSpeed = 0;
     funscriptSamples = [];
@@ -833,6 +870,7 @@ function resetGameState() {
     state.survivalSpeedFloor = 30;
     state.survivalTimer = 0;
     state.survivalBreachTicks = 0;
+    state.survivalLastReadingAt = null;
     state.edgeStallSeconds = 0;
     state.stallGuardEngaged = false;
     state.ruinHoldSeconds = 0;
@@ -854,21 +892,21 @@ function tickSessionGuardsAndGames() {
     const nearCeiling = hr >= (ceiling - 2);
 
     // The stall guard only has something to cut in Crawl mode: with Full
-    // Stop the primary is already parked at 0% at the ceiling.
+    // Stop the primary is already parked at 0% at the ceiling. Whenever its
+    // preconditions are not met (guard off, Full Stop, orgasm, a game mode)
+    // an engaged guard is released at once, even with the pulse still parked
+    // at the ceiling.
     const crawlAtCeiling = advancedSettings.ceilingBehaviour !== 'stop';
-    if (advancedSettings.stallGuard && crawlAtCeiling && state.isEdged && !state.orgasmMode && state.activeMode !== 'oracle' && state.activeMode !== 'survival') {
-        state.edgeStallSeconds += 1;
-        if (state.edgeStallSeconds >= (advancedSettings.stallGuardSeconds || 8)) {
-            if (!state.stallGuardEngaged) {
-                state.stallGuardEngaged = true;
-                cueVoice('Stall guard. Primary halted. Recover.');
-            }
-        }
-    } else if (!nearCeiling || !state.isEdged) {
-        if (state.stallGuardEngaged) cueVoice('Recovered. Resume.');
-        state.edgeStallSeconds = 0;
-        state.stallGuardEngaged = false;
-    }
+    const guardArmed = Boolean(advancedSettings.stallGuard) && crawlAtCeiling && !state.orgasmMode
+        && state.activeMode !== 'oracle' && state.activeMode !== 'survival';
+    const guard = tickStallGuard(
+        { seconds: state.edgeStallSeconds, engaged: state.stallGuardEngaged },
+        { armed: guardArmed, isEdged: state.isEdged, timeoutSeconds: advancedSettings.stallGuardSeconds }
+    );
+    state.edgeStallSeconds = guard.seconds;
+    state.stallGuardEngaged = guard.engaged;
+    if (guard.justEngaged) cueVoice('Stall guard. Primary halted. Recover.');
+    if (guard.justReleased) cueVoice('Recovered. Resume.');
 
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
     if (warmupSeconds > 0 && state.sessionSeconds === warmupSeconds) {
@@ -914,6 +952,15 @@ function tickSessionGuardsAndGames() {
                     cueVoice('The Oracle chooses purgatory.');
                 }
             }
+        } else if (state.oracleState === 'CLIMAX') {
+            // app.js switched Force Orgasm on with the roll; if the wearer
+            // taps it off again the climax is withdrawn and the ceiling
+            // rules apply as in APPROACH (the engine cuts CLIMAX at the
+            // ceiling too, this keeps the game state honest).
+            if (!state.orgasmMode) {
+                state.oracleState = 'APPROACH';
+                cueVoice('Climax withdrawn. Climb again.');
+            }
         } else if (state.oracleState === 'PURGATORY') {
             // Purgatory lasts 28 s, but the edge flag is only cleared once the
             // pulse has genuinely dropped below the release band; resetting it
@@ -930,8 +977,14 @@ function tickSessionGuardsAndGames() {
         state.survivalTimer += 1;
         state.survivalSpeedFloor = Math.min(100, 28 + state.survivalTimer * 0.45);
         // One spike is not a defeat: the ceiling must be breached on
-        // consecutive ticks (SURVIVAL_BREACH_TICKS) before the game ends.
-        state.survivalBreachTicks = state.orgasmMode ? 0 : countSurvivalBreach(state.survivalBreachTicks, hr, ceiling);
+        // SURVIVAL_BREACH_TICKS consecutive READINGS before the game ends. A
+        // watch or relay app that updates every 2-5 s holds one value across
+        // several ticks; only a tick that saw a new reading advances the
+        // streak (the simulator's slider counts on every tick).
+        const readingAt = state.simEngaged ? Date.now() : hrWatchdog.lastValidAt;
+        const newReading = readingAt !== state.survivalLastReadingAt;
+        state.survivalLastReadingAt = readingAt;
+        state.survivalBreachTicks = state.orgasmMode ? 0 : countSurvivalBreach(state.survivalBreachTicks, hr, ceiling, newReading);
         if (isSurvivalDefeated(state.survivalBreachTicks)) {
             stopSession('Survival Defeat', 'Survival failed. Limit breached.');
             return;
@@ -1052,13 +1105,20 @@ function handleHrSignalReturned() {
         resumeAfterSignalReturn();
         return;
     }
-    // Auto-resume is off: leave the session paused, drop the overlay and
-    // keep a badge up until the user presses RESUME.
+    holdAfterSignalReturn();
+}
+
+// The signal is back but the session stays paused: drop the overlay and
+// keep a badge up until the user presses RESUME. Used when auto-resume is
+// off and when the simulator is engaged during a watchdog pause (a
+// synthetic source must never restart the motors by itself).
+function holdAfterSignalReturn() {
     state.hrSignalPaused = false;
     state.hrSignalState = 'ok';
     state.hrSignalSilentMs = 0;
     renderHrSignal(null);
     showHrSignalBadge('SIGNAL BACK, PRESS RESUME', 0);
+    checkReadiness();
 }
 
 function resumeAfterSignalReturn() {
@@ -1133,7 +1193,10 @@ setInterval(() => {
         updateEngine();
         tickSessionGuardsAndGames();
 
-        if (state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
+        // The endgame fires exactly once per session: the Orgasm endgame
+        // arms Force Orgasm, which stays a toggle the wearer can cancel.
+        if (!state.endgameFired && state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
+            state.endgameFired = true;
             handleTargetTimeReached();
         }
         if (state.orgasmMode) {
@@ -1157,6 +1220,10 @@ setInterval(() => {
     } else if (state.hrSignalState !== 'ok') {
         clearHrSignalPause();
     }
+
+    // The START / RESUME gate depends on the age of the last valid reading,
+    // so the label is refreshed every second while the session is not live.
+    if (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') checkReadiness();
 
     pruneStalePeers(Date.now());
     syncTelemetry();
@@ -1204,9 +1271,15 @@ function updateTimerDisplay() {
 }
 
 // Start from IDLE or resume from PAUSED. Returns false when the session was
-// in neither state. Both paths give the watchdog a fresh grace window.
+// in neither state, or when the hardware is not ready: a pulse source with a
+// fresh valid reading and a toy are required, so a resume can never run the
+// motors on a frozen heart rate. The watchdog clocks are left untouched.
 function startOrResumeSession() {
     if (state.sessionStatus !== 'IDLE' && state.sessionStatus !== 'PAUSED') return false;
+    if (transportWaitingReason()) {
+        checkReadiness();
+        return false;
+    }
     let resumingRampdown = false;
     if (state.sessionStatus === 'IDLE') {
         // A fresh run never inherits time, edges or samples from the last one.
@@ -1224,7 +1297,6 @@ function startOrResumeSession() {
     state.sessionStatus = resumingRampdown ? 'RAMPDOWN' : 'RUNNING';
     state.resumeStatus = null;
     clearHrSignalPause();
-    hrWatchdog.reset(Date.now());
     document.getElementById('rampdownNotice')?.classList.toggle('hidden', !resumingRampdown);
     renderTransport(state.sessionStatus);
     return true;
@@ -1244,6 +1316,7 @@ playPauseBtn?.addEventListener('click', () => {
     } else if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         pauseSession('Paused.');
     }
+    checkReadiness();
     syncTelemetry();
     updateEngine();
 });
@@ -1610,7 +1683,7 @@ function syncParamsUI() {
     const warmupDisp = document.getElementById('warmupValDisplay');
 
     if (stallToggle) stallToggle.checked = Boolean(advancedSettings.stallGuard);
-    if (stallSec) stallSec.value = advancedSettings.stallGuardSeconds || 8;
+    if (stallSec) stallSec.value = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
     const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
     if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
@@ -1724,7 +1797,7 @@ async function applyMicSetting(enabled) {
 // Apply Session Setup
 document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
-    advancedSettings.stallGuardSeconds = parseInt(document.getElementById('stallGuardSecondsInput')?.value, 10) || 8;
+    advancedSettings.stallGuardSeconds = clampStallGuardSeconds(document.getElementById('stallGuardSecondsInput')?.value);
     advancedSettings.ceilingBehaviour = document.getElementById('ceilingBehaviourSelect')?.value === 'stop' ? 'stop' : 'crawl';
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
     advancedSettings.dualDampeningBpm = parseInt(document.getElementById('dualDampeningOffsetInput')?.value, 10) || 15;
@@ -1781,6 +1854,7 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             Object.assign(advancedSettings, parsed);
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
+            syncGuardSettings();
             persistSettings();
             syncParamsUI();
             updateEngine();
@@ -1790,6 +1864,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
         }
     };
     reader.readAsText(file);
+    // A file input fires no change event for the same file twice: clear it
+    // so importing the same backup again (to revert edits) works.
+    e.target.value = '';
 });
 
 // Partner Tab Switcher
@@ -1836,7 +1913,8 @@ function bleBadgeName() {
 function warnBluetoothUnsupported() {
     if (navigator.bluetooth) return false;
     setBleStatus(describeBluetoothSupport(navigator.userAgent), 'error');
-    setBadgeState('Ble', 'disconnected', 'Unsupported');
+    // The modal status line explains it; the card keeps the source in use.
+    if (!state.simEngaged) setBadgeState('Ble', 'disconnected', 'Unsupported');
     return true;
 }
 
@@ -1923,8 +2001,10 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
             setBadgeState('Ble', 'connected', bleBadgeName(), bleBatteryLabel());
         } else {
             // A re-scan drops the previous link before subscribing to the new
-            // sensor, so a failure here leaves no pulse source at all.
-            setBadgeState('Ble', 'disconnected', described.kind === 'cancelled' ? 'Disconnected' : 'Failed');
+            // sensor, so a failure here leaves no pulse source at all, unless
+            // the simulator is engaged and keeps driving the session.
+            if (state.simEngaged) setBadgeState('Ble', 'connected', 'Simulator', null);
+            else setBadgeState('Ble', 'disconnected', described.kind === 'cancelled' ? 'Disconnected' : 'Failed');
             document.getElementById('modalBleDisconnectBtn')?.classList.add('hidden');
             document.getElementById('modalBleBatteryDisplay')?.classList.add('hidden');
             const devName = document.getElementById('modalBleDeviceName');
@@ -1958,6 +2038,9 @@ document.getElementById('modalEngageSimBtn')?.addEventListener('click', () => {
     state.hrDeviceName = 'Simulator';
     hrWatchdog.reset(Date.now());
     renderHrSignal(null);
+    // A session the watchdog paused stays paused: the slider's first sample
+    // is not a returning pulse, the user presses RESUME when ready.
+    if (state.hrSignalPaused) holdAfterSignalReturn();
     recordHrReading(parseInt(modalSimSlider?.value || 70, 10), true);
     document.getElementById('simActiveTag')?.classList.remove('hidden');
     document.getElementById('hrWarningTag')?.classList.add('hidden');
@@ -2010,8 +2093,19 @@ setHandyHandlers({
         document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
         // Pauses the session and issues a stop to every other toy.
         triggerDisconnectAlert(reason || 'The Handy went offline. Motors paused for safety.');
+    },
+    // Not gated on handyConnected: the Disconnect and offline paths drop the
+    // link before their stop resolves, and an unconfirmed stop there is the
+    // one thing the user must hear about.
+    onStopUnconfirmed: (message) => {
+        setHandyStatus(message, 'error');
+        setBadgeState('Handy', handyConnected ? 'warning' : 'disconnected', 'Stop unconfirmed', handyConnected ? handyBatteryLabel() : null);
+        triggerDisconnectAlert(`The Handy did not confirm a stop and may still be moving: check the device. (${message})`);
     }
 });
+
+// One connect at a time; a second click while a key is being verified is ignored.
+let handyConnectInFlight = false;
 
 document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async () => {
     const key = handyInput?.value.trim() || '';
@@ -2019,9 +2113,15 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
         setHandyStatus('Enter your Handy Connection Key first.', 'error');
         return;
     }
+    if (handyConnectInFlight) return;
+    handyConnectInFlight = true;
     safeSet('handy_connection_key', key);
-    setHandyStatus('Connecting...', 'busy');
-    setBadgeState('Handy', 'connecting', 'Connecting...');
+    // A live link is only replaced once the new key has been verified and
+    // the connected device has confirmed a stop (see connectHandy); until
+    // then it keeps driving, and stopping, the toy.
+    const wasConnected = handyConnected;
+    setHandyStatus(wasConnected ? 'Verifying the key, then stopping the connected Handy...' : 'Connecting...', 'busy');
+    setBadgeState('Handy', 'connecting', wasConnected ? 'Reconnecting...' : 'Connecting...');
 
     try {
         const result = await connectHandy(key);
@@ -2033,20 +2133,49 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
         closeModal();
         syncTelemetry();
     } catch (e) {
-        state.handyBattery = null;
-        setHandyStatus(e && e.message ? e.message : 'Connection failed', 'error');
-        setBadgeState('Handy', 'disconnected', 'Offline');
+        const message = e && e.message ? e.message : 'Connection failed';
+        if (handyConnected) {
+            // The new key was refused or the live device would not stop: the
+            // previous link is untouched and still owns the toy.
+            setHandyStatus(`${message} The current connection is unchanged.`, 'error');
+            setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
+        } else {
+            state.handyBattery = null;
+            setHandyStatus(message, 'error');
+            setBadgeState('Handy', 'disconnected', 'Offline');
+            if (wasConnected) triggerDisconnectAlert('The Handy connection was lost while reconnecting. Motors paused for safety.');
+        }
+    } finally {
+        handyConnectInFlight = false;
     }
 });
 
-document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', () => {
-    disconnectHandy();
+document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', async () => {
+    // The link drops at once; the verified stop it sends is awaited so the
+    // modal can say whether the device confirmed it.
+    const stopped = disconnectHandy();
     state.handyBattery = null;
-    setHandyStatus('Offline', 'idle');
-    setBadgeState('Handy', 'disconnected', 'Disconnected');
+    setHandyStatus('Stopping the device...', 'busy');
+    setBadgeState('Handy', 'disconnected', 'Stopping...');
     document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
     triggerDisconnectAlert("The Handy disconnected.");
+    const ok = await stopped.catch(() => false);
+    // Reconnected meanwhile: the new link owns the modal and the badge.
+    if (handyConnected) return;
+    if (ok) {
+        setHandyStatus('Offline', 'idle');
+        setBadgeState('Handy', 'disconnected', 'Disconnected');
+    } else {
+        setHandyStatus('Disconnected, but the stop was not confirmed: check that The Handy is not moving.', 'error');
+        setBadgeState('Handy', 'disconnected', 'Stop unconfirmed');
+    }
 });
+
+// Best effort: a keepalive stop to The Handy when the page goes away or is
+// frozen. The motor is driven through the cloud and cannot notice that the
+// app is gone, so this is the only stop it would ever get.
+window.addEventListener('pagehide', () => { stopHandyOnUnload(); });
+document.addEventListener('freeze', () => { stopHandyOnUnload(); });
 
 // Intiface Central WebSocket. The driver reports its state through
 // onStatus; the modal label, the summary badge and the buttons follow it.
@@ -2270,7 +2399,7 @@ function renderIntifaceSummaryBadge() {
 // the modal label, the summary badge and the buttons follow it.
 function warnSerialUnsupported() {
     if (isSerialSupported()) return false;
-    renderTCodeStatus({ state: 'error', text: describeSerialSupport(navigator.userAgent) });
+    renderTCodeStatus({ state: 'error', text: describeSerialSupport(navigator.userAgent, window.isSecureContext !== false) });
     setBadgeState('TCode', 'disconnected', 'Unsupported');
     return true;
 }
@@ -2626,6 +2755,23 @@ function lockViewerControls() {
     modeCards.forEach(lockElement);
 }
 
+// A controller page sends transport, Force Orgasm and mode commands only.
+// Everything else is host-only (its handlers return or its state never
+// leaves the page), so it is locked rather than left looking clickable.
+const CONTROLLER_LOCKED_IDS = [
+    'cameEarlyBtn', 'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
+    'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode'
+];
+function lockControllerControls() {
+    CONTROLLER_LOCKED_IDS.forEach((id) => lockElement(document.getElementById(id)));
+}
+
+// Re-applied after every telemetry frame because some renderers reset classes.
+function lockRemoteControls() {
+    if (isRemoteViewer) lockViewerControls();
+    else if (isRemoteController) lockControllerControls();
+}
+
 // The typed limits belong to the host: on a remote page the inputs only
 // mirror what the host reports.
 function lockRemoteLimitInputs() {
@@ -2727,7 +2873,7 @@ function applyRemoteTelemetry(data) {
     if (pauseEl) pauseEl.textContent = state.pauses;
     updateTimerDisplay();
     redrawChart();
-    if (isRemoteViewer) lockViewerControls();
+    lockRemoteControls();
 }
 
 function syncTelemetry() {
@@ -2817,7 +2963,7 @@ if (advancedSettings.voiceEnabled) setMindgamePrompt('Calm and steady. Breathe.'
 watchChartResize(document.getElementById('hrChart'), redrawChart);
 if (isRemotePage && remoteRoom) {
     lockRemoteLimitInputs();
-    if (isRemoteViewer) lockViewerControls();
+    lockRemoteControls();
     const started = initRemotePeer(remoteRoom, isRemoteViewer ? 'viewer' : 'controller', {
         onConnected: () => {
             remoteLinkUp = true;

@@ -171,7 +171,7 @@ export function calculateEngineOutputs({
         secondaryPercent = Math.round(50 * rampFactor);
         strokeMaxPercent = Math.max(25, Math.round(100 - (1.0 - rampFactor) * depthContractAmount));
     } else if (mode === 'oracle') {
-        const oracle = applyOracle(oracleState, progress, nextIsEdged, orgasmMode, seconds);
+        const oracle = applyOracle(oracleState, progress, nextIsEdged, orgasmMode, seconds, crawlPercent);
         primaryPercent = oracle.primary;
         secondaryPercent = oracle.secondary;
         strokeMinPercent = oracle.strokeMin;
@@ -297,7 +297,7 @@ export function calculateEngineOutputs({
     };
 }
 
-function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeconds) {
+function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeconds, crawlPercent = CRAWL_PERCENT) {
     const out = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
     if (orgasmMode) {
         out.primary = 100;
@@ -311,8 +311,11 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             out.strokeMax = 70;
             break;
         case 'CLIMAX':
-            out.primary = 100;
-            out.secondary = 100;
+            // Reached only with Force Orgasm off (app.js switches it on with
+            // the roll): the wearer cancelled it, so the climax is withdrawn
+            // and the ceiling rule (Full Stop / Crawl) applies like anywhere.
+            out.primary = nextIsEdged ? crawlPercent : 100;
+            out.secondary = nextIsEdged ? crawlPercent : 100;
             break;
         case 'DENIAL':
             out.primary = 0;

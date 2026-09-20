@@ -76,7 +76,12 @@ describe('stroke planner', () => {
         assert.equal(p.legEndsAt(), a.durationMs);
         const b = p.next(a.durationMs);
         assert.equal(b.position, 0.4);
-        assert.equal(b.durationMs, legDurationMs(10, 0.2));
+        // The sleeve sits at 0.8 after leg a: the move to 0.4 covers 0.4, not
+        // the new zone's 0.2, and is timed for what it really travels.
+        assert.equal(b.durationMs, legDurationMs(10, 0.4));
+        const c = p.next(a.durationMs + b.durationMs);
+        assert.equal(c.position, 0.6);
+        assert.equal(c.durationMs, legDurationMs(10, 0.2));
     });
 
     it('issues a single rest move on speed 0 and then stays silent', () => {
@@ -137,5 +142,46 @@ describe('stroke planner', () => {
         assert.equal(p.next(REST_MOVE_MS), null);
         p.reset();
         assert.equal(p.next(REST_MOVE_MS).kind, 'rest');
+    });
+    it('sizes the first leg after a rest or zone shift by the distance really travelled', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 0, zoneMin: 0, zoneMax: 1 });
+        assert.equal(p.next(0).position, 0, 'resting at the envelope bottom');
+        p.setInput({ speed: 100, zoneMin: 0.6, zoneMax: 0.8 });
+        const leg = p.next(REST_MOVE_MS);
+        assert.equal(leg.position, 0.8);
+        assert.equal(leg.durationMs, legDurationMs(100, 0.8), 'an 80 % move is not timed like a 20 % zone');
+        const back = p.next(REST_MOVE_MS + leg.durationMs);
+        assert.equal(back.position, 0.6);
+        assert.equal(back.durationMs, legDurationMs(100, 0.2));
+    });
+
+    it('role OFF interrupts the leg in flight with an immediate rest move', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 5, zoneMin: 0, zoneMax: 1 });
+        const leg = p.next(0);
+        assert.ok(leg.durationMs > 2000);
+        p.setInput({ enabled: false });
+        const rest = p.next(100);
+        assert.deepEqual(rest, { position: 0, durationMs: REST_MOVE_MS, kind: 'rest' });
+        assert.equal(p.next(200), null);
+        // Speed 0 (STOP / pause) still lets the running stroke finish.
+        p.setInput({ speed: 5, enabled: true });
+        const again = p.next(100 + REST_MOVE_MS);
+        assert.equal(again.kind, 'stroke');
+        p.setInput({ speed: 0 });
+        assert.equal(p.next(100 + REST_MOVE_MS + 50), null);
+    });
+
+    it('legTravel times the leg by speed alone so a small swing is a slow swing', () => {
+        const slow = createStrokePlanner();
+        slow.setInput({ speed: 10, zoneMin: 0.45, zoneMax: 0.55, legTravel: 1 });
+        const fast = createStrokePlanner();
+        fast.setInput({ speed: 50, zoneMin: 0.25, zoneMax: 0.75, legTravel: 1 });
+        const a = slow.next(0).durationMs;
+        const b = fast.next(0).durationMs;
+        assert.equal(a, legDurationMs(10, 1));
+        assert.equal(b, legDurationMs(50, 1));
+        assert.ok(a > b, 'the period falls as the speed rises');
     });
 });

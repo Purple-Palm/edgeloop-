@@ -29,6 +29,11 @@ const OSR_REPLIES = {
     D1: ['TCode v0.3'],
     D2: ['L0 stroke', 'R0 twist', 'R1 roll', 'V0 vibe']
 };
+const SR6_REPLIES = {
+    D0: ['SR6'],
+    D1: ['TCode v0.3'],
+    D2: ['L0 stroke', 'L1 surge', 'L2 sway', 'R0 twist', 'R1 roll', 'R2 pitch', 'V0 vibe']
+};
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -87,7 +92,9 @@ function makeFakePort(replies = OSR_REPLIES) {
             const text = decoder.decode(chunk);
             written.push(text);
             const cmd = text.trim();
-            if (replies && replies[cmd]) replies[cmd].forEach((line) => enqueue(`${line}\n`));
+            // A reply table entry may be a function (answers can differ per query).
+            const reply = replies && typeof replies[cmd] === 'function' ? replies[cmd]() : (replies ? replies[cmd] : null);
+            if (reply) reply.forEach((line) => enqueue(`${line}\n`));
         }
     });
     return port;
@@ -153,6 +160,8 @@ const originalStorage = globalThis.localStorage;
 
 beforeEach(() => {
     resetTCodeForTests();
+    TCODE_TIMINGS.bootQuietMs = 10;
+    TCODE_TIMINGS.bootCapMs = 40;
     TCODE_TIMINGS.identifyMs = 40;
     TCODE_TIMINGS.replyQuietMs = 15;
     TCODE_TIMINGS.restMs = 30;
@@ -218,14 +227,15 @@ describe('connect and identify', () => {
         assert.equal(lines()[3], `L00000I${TCODE_TIMINGS.restMs} R05000I${TCODE_TIMINGS.restMs} R15000I${TCODE_TIMINGS.restMs} V00000`);
         assert.equal(getTCodeStatus().state, 'connected');
         assert.match(getTCodeStatus().text, /OSR2 Test Rig, TCode v0\.3/);
-        assert.deepEqual(events.status.map((s) => s.state), ['connecting', 'connecting', 'handshake', 'connected']);
+        assert.deepEqual(events.status.map((s) => s.state), ['connecting', 'connecting', 'handshake', 'handshake', 'connected']);
         assert.equal(port.listenerCount('disconnect'), 1);
     });
     it('falls back to the OSR2 axis set when the device stays silent', async () => {
         const started = Date.now();
         assert.equal(await connect({}), true);
         const elapsed = Date.now() - started;
-        assert.ok(elapsed < 3 * TCODE_TIMINGS.identifyMs + 200, `identification took ${elapsed} ms`);
+        // Settle, then D0 twice (a silent first query is retried), D1, D2.
+        assert.ok(elapsed < 4 * TCODE_TIMINGS.identifyMs + TCODE_TIMINGS.bootCapMs + 200, `identification took ${elapsed} ms`);
         const dev = getTCodeDevice();
         assert.equal(dev.name, 'TCode device');
         assert.equal(dev.version, '');
@@ -274,7 +284,8 @@ describe('dispatch', () => {
         dispatchTCode(100, 0, 20, 80, 0, 100);
         await flush();
         assert.equal(port.written.length, before + 1);
-        const duration = legDurationMs(100, 0.6);
+        // From the rest position (0) to the zone top: an 80 % move, timed as such.
+        const duration = legDurationMs(100, 0.8);
         assert.equal(lastLine(), `L08000I${duration}`);
         // Ticks while the leg is in flight change nothing.
         dispatchTCode(100, 0, 20, 80, 0, 100);
@@ -306,9 +317,10 @@ describe('dispatch', () => {
         await sleep(TCODE_TIMINGS.restMs + 5);
         dispatchTCode(100, 0, 0, 100, 0, 100);
         await flush();
-        // amplitude 0.5 * 1.0 * 0.5 = 0.25 -> zone 0.25..0.75; effective speed 50 %
+        // amplitude 0.5 * 1.0 * 0.5 = 0.25 -> zone 0.25..0.75; effective speed
+        // 50 %; the swing period follows the speed alone, not the amplitude
         const rot = lines().filter((l) => l.startsWith('R0'));
-        assert.equal(rot[rot.length - 1], `R07500I${legDurationMs(50, 0.5)}`);
+        assert.equal(rot[rot.length - 1], `R07500I${legDurationMs(50, 1)}`);
     });
     it('applies the cap and the invert flag to linear axes', async () => {
         await connect();
@@ -324,8 +336,8 @@ describe('dispatch', () => {
         setAxisInvert(0, true);
         dispatchTCode(100, 0, 20, 90, 20, 90);
         await flush();
-        // zone max 0.9 mirrored inside 0.2..0.9 -> 0.2, never 0.1
-        assert.equal(lastLine(), `L02000I${legDurationMs(100, 0.7)}`);
+        // zone max 0.9 mirrored inside 0.2..0.9 -> 0.2, never 0.1 (from rest 0: a 90 % move)
+        assert.equal(lastLine(), `L02000I${legDurationMs(100, 0.9)}`);
         stopTCode();
         await flush();
         // rest = envelope min 0.2 mirrored -> 0.9
@@ -335,7 +347,31 @@ describe('dispatch', () => {
         await connect();
         dispatchTCode(100, 0, 0, 100, 10, 90);
         await flush();
-        assert.equal(lastLine(), `L09000I${legDurationMs(100, 0.8)}`);
+        assert.equal(lastLine(), `L09000I${legDurationMs(100, 0.9)}`);
+    });
+    it('a rotation axis swings slower, not faster, at a low speed', async () => {
+        await connect();
+        assert.equal(setAxisRole(1, 'primary'), true);
+        await sleep(TCODE_TIMINGS.restMs + 5);
+        dispatchTCode(10, 0, 0, 100, 0, 100);
+        await flush();
+        const rot = lines().filter((l) => l.startsWith('R0'));
+        const slow = Number(rot[rot.length - 1].split('I')[1]);
+        assert.equal(slow, legDurationMs(10, 1));
+        assert.ok(slow > legDurationMs(50, 1));
+    });
+    it('role OFF mid-leg rests the axis at once instead of after the running stroke', async () => {
+        await connect();
+        dispatchTCode(5, 0, 0, 100, 0, 100);
+        await flush();
+        assert.equal(lastLine(), `L09999I${legDurationMs(5, 1)}`);
+        const before = port.written.length;
+        setAxisRole(0, 'off');
+        await flush();
+        assert.equal(port.written.length, before + 1, 'the rest line is written without waiting for the leg');
+        assert.equal(lastLine(), `L00000I${TCODE_TIMINGS.restMs}`);
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        assert.equal(port.written.length, before + 1, 'and nothing after it');
     });
     it('rests an axis whose role is switched OFF', async () => {
         await connect();
@@ -353,6 +389,33 @@ describe('dispatch', () => {
         assert.equal(stopTCode(), false);
         assert.equal(setAxisRole(0, 'primary'), false);
         assert.equal(testAxis(0), false);
+    });
+});
+
+describe('surge and sway', () => {
+    it('rest at the mechanical centre on connect and on STOP, never in a corner', async () => {
+        assert.equal(await connect(SR6_REPLIES), true);
+        const r = TCODE_TIMINGS.restMs;
+        assert.deepEqual(getTCodeDevice().axes.map((a) => a.role), ['primary', 'off', 'off', 'off', 'off', 'off', 'secondary']);
+        assert.equal(lines()[3], `L00000I${r} L15000I${r} L25000I${r} R05000I${r} R15000I${r} R25000I${r} V00000`);
+        dispatchTCode(100, 0, 0, 100, 20, 90);
+        await flush();
+        stopTCode();
+        await flush();
+        assert.equal(lastLine(), `L02000I${r} L15000I${r} L25000I${r} R05000I${r} R15000I${r} R25000I${r} V00000`);
+    });
+    it('an assigned surge axis swings around the centre like a rotation axis', async () => {
+        assert.equal(await connect(SR6_REPLIES), true);
+        assert.equal(setAxisRole(1, 'primary'), true);
+        setAxisCap(1, 50);
+        await sleep(TCODE_TIMINGS.restMs + 5);
+        dispatchTCode(100, 0, 20, 80, 0, 100);
+        await flush();
+        const surge = lines().filter((l) => l.startsWith('L1'));
+        // amplitude 0.25 around 0.5, timed by the speed alone; L0 still strokes the zone
+        assert.equal(surge[surge.length - 1], `L17500I${legDurationMs(50, 1)}`);
+        const stroke = lines().filter((l) => l.startsWith('L0'));
+        assert.match(stroke[stroke.length - 1], /^L08000I/);
     });
 });
 
@@ -451,6 +514,21 @@ describe('disconnect', () => {
         assert.equal(events.close[0].assignedAxes, 2);
         assert.equal(await disconnectTCode(), false);
         assert.equal(events.close.length, 1);
+    });
+    it('refuses motion while the rest line is being flushed', async () => {
+        await connect();
+        dispatchTCode(0, 50, 0, 100, 0, 100);
+        await flush();
+        assert.equal(lastLine(), 'V05000');
+        const closing = disconnectTCode();
+        assert.equal(isTCodeConnected(), false, 'a closing session is not connected');
+        // An engine tick landing in the flush window must not reach the port.
+        dispatchTCode(0, 60, 0, 100, 0, 100);
+        assert.equal(testAxis(3), false);
+        assert.equal(await closing, true);
+        assert.equal(port.closed, true);
+        assert.equal(lastLine(), `L00000I${TCODE_TIMINGS.restMs} R05000I${TCODE_TIMINGS.restMs} R15000I${TCODE_TIMINGS.restMs} V00000`);
+        assert.ok(!lines().includes('V06000'), lines().join(' | '));
     });
     it('a second Connect while the chooser is open is ignored', async () => {
         port = makeFakePort();
@@ -553,6 +631,56 @@ describe('test button', () => {
         assert.equal(lastLine(), `R07500I${TCODE_TIMINGS.testMoveMs}`);
         await sleep(TCODE_TIMINGS.testMoveMs + 70);
         assert.equal(lastLine(), `R05000I${TCODE_TIMINGS.testMoveMs}`);
+    });
+});
+
+describe('auto-resetting boards', () => {
+    it('drains boot chatter before D0 and never takes the banner for a name', async () => {
+        port = makeFakePort(OSR_REPLIES);
+        const open = port.open.bind(port);
+        port.open = async (options) => {
+            await open(options);
+            // An ESP32 prints its ROM banner right after the DTR toggle.
+            setTimeout(() => port.push('ets Jul 29 2019 12:21:46\r\nrst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)\r\n'), 2);
+        };
+        requestPortImpl = async () => port;
+        assert.equal(await connectTCode(handlers()), true);
+        await sleep(TCODE_TIMINGS.restMs + 5);
+        assert.equal(getTCodeDevice().name, 'OSR2 Test Rig');
+        assert.equal(getTCodeDevice().version, 'TCode v0.3');
+        assert.equal(lines()[0], 'D0');
+        assert.ok(events.status.some((s) => /settle/i.test(s.text)));
+    });
+    it('asks D0 again when the first query was swallowed by the reboot', async () => {
+        let queries = 0;
+        const replies = {
+            ...OSR_REPLIES,
+            D0: () => (queries++ === 0 ? ['ets Jul 29 2019 12:21:46'] : ['OSR2 Test Rig'])
+        };
+        assert.equal(await connect(replies), true);
+        assert.equal(lines().filter((l) => l === 'D0').length, 2);
+        assert.equal(getTCodeDevice().name, 'OSR2 Test Rig');
+        assert.equal(getTCodeDevice().identified, true);
+    });
+    it('a silent device gets one D0 retry and then the fallback', async () => {
+        assert.equal(await connect({}), true);
+        assert.equal(lines().filter((l) => l === 'D0').length, 2);
+        assert.equal(lines().filter((l) => l === 'D1').length, 1);
+        assert.equal(getTCodeDevice().name, 'TCode device');
+    });
+});
+
+describe('secure origin', () => {
+    it('tells desktop Chrome on a plain http origin about the secure-origin rule', async () => {
+        installNavigator({ serial: false });
+        globalThis.isSecureContext = false;
+        try {
+            assert.equal(await connectTCode(handlers()), false);
+            assert.match(getTCodeStatus().text, /secure origin/);
+            assert.match(getTCodeStatus().text, /https:\/\/ or http:\/\/localhost/);
+        } finally {
+            delete globalThis.isSecureContext;
+        }
     });
 });
 

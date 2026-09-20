@@ -12,9 +12,14 @@ export const MIN_CEILING_GAP = 15;
 // cannot drift the ceiling into nonsense territory.
 export const ORGASM_BOOST_CAP = 60;
 
-// Survival Mode only ends after this many consecutive 1 s ticks at or above
+// Survival Mode only ends after this many consecutive READINGS at or above
 // the ceiling, so a single HR-sensor spike cannot end the game.
 export const SURVIVAL_BREACH_TICKS = 3;
+
+// Stall guard timeout (seconds at the ceiling before the primary is cut).
+export const MIN_STALL_GUARD_SECONDS = 3;
+export const MAX_STALL_GUARD_SECONDS = 25;
+export const DEFAULT_STALL_GUARD_SECONDS = 8;
 
 export const DEFAULT_MIN_HR = 70;
 export const DEFAULT_MAX_HR = 140;
@@ -157,11 +162,35 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
     return { targetSeconds: mins * 60, valid: true, invalid: [] };
 }
 
-// Survival breach counter: consecutive ticks at or above the ceiling. Any
-// tick below the ceiling resets the streak.
-export function countSurvivalBreach(previousTicks, hr, ceiling) {
+// Survival breach counter: consecutive readings at or above the ceiling. A
+// reading below the ceiling resets the streak. A tick that saw no new
+// reading (a watch or relay app holding its last value for 2-5 s) leaves
+// the streak as it is: one spike must never be counted several times.
+export function countSurvivalBreach(previousTicks, hr, ceiling, newReading = true) {
     if (!Number.isFinite(hr) || !Number.isFinite(ceiling)) return 0;
+    if (!newReading) return previousTicks || 0;
     return hr >= ceiling ? (previousTicks || 0) + 1 : 0;
+}
+
+// Clamp the typed stall-guard timeout to its supported range (seconds).
+export function clampStallGuardSeconds(value, fallback = DEFAULT_STALL_GUARD_SECONDS) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_STALL_GUARD_SECONDS, MAX_STALL_GUARD_SECONDS);
+}
+
+// One 1 s tick of the stall guard. `armed` is whether the guard may act at
+// all (setting on, Crawl selected, no Force Orgasm, no game mode); while
+// armed and edged the seconds count up and the guard engages at the
+// timeout. Whenever the guard is not armed or the edge has released, it is
+// released at once, even if the pulse is still parked at the ceiling.
+export function tickStallGuard({ seconds = 0, engaged = false } = {}, { armed = false, isEdged = false, timeoutSeconds } = {}) {
+    if (!armed || !isEdged) {
+        return { seconds: 0, engaged: false, justEngaged: false, justReleased: Boolean(engaged) };
+    }
+    const next = (Number.isFinite(seconds) ? seconds : 0) + 1;
+    const engagedNow = Boolean(engaged) || next >= clampStallGuardSeconds(timeoutSeconds);
+    return { seconds: next, engaged: engagedNow, justEngaged: engagedNow && !engaged, justReleased: false };
 }
 
 export function isSurvivalDefeated(breachTicks) {

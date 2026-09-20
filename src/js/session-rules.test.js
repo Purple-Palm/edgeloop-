@@ -8,7 +8,12 @@ import {
     computeEffectiveCeiling,
     parseSessionDuration,
     countSurvivalBreach,
-    isSurvivalDefeated
+    isSurvivalDefeated,
+    MIN_STALL_GUARD_SECONDS,
+    MAX_STALL_GUARD_SECONDS,
+    DEFAULT_STALL_GUARD_SECONDS,
+    clampStallGuardSeconds,
+    tickStallGuard
 } from './session-rules.js';
 
 describe('sanitizeHrLimits', () => {
@@ -179,5 +184,51 @@ describe('survival breach counter', () => {
     it('treats non-finite readings as no breach', () => {
         assert.equal(countSurvivalBreach(2, NaN, 140), 0);
         assert.equal(countSurvivalBreach(2, 150, NaN), 0);
+    });
+
+    it('a tick without a new reading leaves the streak untouched', () => {
+        // A watch pushing every 5 s holds one spike across five ticks.
+        let ticks = countSurvivalBreach(0, 141, 140);
+        for (let i = 0; i < 4; i++) ticks = countSurvivalBreach(ticks, 141, 140, false);
+        assert.equal(ticks, 1);
+        assert.equal(isSurvivalDefeated(ticks), false);
+        ticks = countSurvivalBreach(ticks, 139, 140, false);
+        assert.equal(ticks, 1, 'a held value is not a new reading below the ceiling either');
+        ticks = countSurvivalBreach(ticks, 139, 140, true);
+        assert.equal(ticks, 0);
+    });
+});
+
+describe('stall guard', () => {
+    it('clamps the typed timeout to its range and falls back on garbage', () => {
+        assert.equal(clampStallGuardSeconds(-5), MIN_STALL_GUARD_SECONDS);
+        assert.equal(clampStallGuardSeconds('99'), MAX_STALL_GUARD_SECONDS);
+        assert.equal(clampStallGuardSeconds('12'), 12);
+        assert.equal(clampStallGuardSeconds('abc'), DEFAULT_STALL_GUARD_SECONDS);
+        assert.equal(clampStallGuardSeconds(undefined), DEFAULT_STALL_GUARD_SECONDS);
+        assert.equal(clampStallGuardSeconds(NaN), DEFAULT_STALL_GUARD_SECONDS);
+    });
+
+    it('counts up while armed and edged and engages at the timeout', () => {
+        let g = { seconds: 0, engaged: false };
+        for (let i = 0; i < 2; i++) g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
+        assert.deepEqual(g, { seconds: 2, engaged: false, justEngaged: false, justReleased: false });
+        g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
+        assert.deepEqual(g, { seconds: 3, engaged: true, justEngaged: true, justReleased: false });
+        g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
+        assert.equal(g.justEngaged, false, 'engages once');
+        // A negative typed timeout is clamped, so the guard cannot fire on the first tick.
+        assert.equal(tickStallGuard({ seconds: 0 }, { armed: true, isEdged: true, timeoutSeconds: -5 }).engaged, false);
+    });
+
+    it('releases at once when disarmed while engaged, even with the pulse still at the ceiling', () => {
+        const engaged = { seconds: 9, engaged: true };
+        const off = tickStallGuard(engaged, { armed: false, isEdged: true, timeoutSeconds: 8 });
+        assert.deepEqual(off, { seconds: 0, engaged: false, justEngaged: false, justReleased: true });
+        const released = tickStallGuard(engaged, { armed: true, isEdged: false, timeoutSeconds: 8 });
+        assert.equal(released.engaged, false);
+        assert.equal(released.justReleased, true);
+        const idle = tickStallGuard({ seconds: 0, engaged: false }, { armed: false, isEdged: true, timeoutSeconds: 8 });
+        assert.equal(idle.justReleased, false);
     });
 });

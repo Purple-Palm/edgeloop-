@@ -89,7 +89,7 @@ Every toy has its own card on the cockpit; tap the card to open its modal. A toy
 
 1. Put your **Connection Key** from handyfeeling.com into the Handy modal and press **Connect Handy**. The driver talks to the official API v2 in **HAMP** mode and checks every reply, so a wrong key, a sleeping Handy or an API error is shown in the modal status line and on the connection badge instead of failing silently.
 2. Set the **Hardware Travel Envelope** (Min 0-90%, Max 10-100%) to the physical range your sleeve allows. Every stroke zone, including Head Play, Glans Protector, warm-up and Full Length Strokes, is scaled inside these bounds, so the sleeve can never slip out or jam at the base.
-3. Pick the role and the **Max Speed Cap**. STOP is confirmed and retried, and an offline Handy is detected mid-session, which pauses the session rather than leaving the motor running.
+3. Pick the role and the **Max Speed Cap**. STOP is confirmed and retried, and an offline Handy is detected mid-session, which pauses the session; the device then keeps receiving stops in the background until one is confirmed, so a Wi-Fi blip cannot leave the motor running. Pressing **Connect Handy** again (a new key, or the same one after an API error) verifies the new key first and brings the connected device to a confirmed stop before the link is switched; if either fails the current connection is left as it was. **Disconnect** reports whether its stop was confirmed, and closing the tab sends a last stop.
 
 ### Intiface Central (Buttplug.io)
 
@@ -121,7 +121,7 @@ The **Guards** tab of Session Setup holds every safety rule. They are independen
 
 * **At the ceiling: Full Stop vs Crawl.** What the strokers do while your pulse sits at the climax ceiling. *Full Stop* parks the primary at 0%; *Crawl* keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
 * **Prolonged Edge Auto-Cutoff (Stall Guard).** With Crawl selected, cuts the primary stroker from Crawl to 0% when your pulse stays parked at the ceiling for longer than the timeout (3-25 s, default 8). The secondary channel keeps running.
-* **Heart-Rate Signal Watchdog (always on).** A short gap holds the last valid reading instead of dropping to 0, because watches and relay apps often update only every 2-5 s. When no usable pulse has arrived for the **signal-loss timeout** (3-20 s, default 8 s) every motor stops and the session pauses. Readings below 35 BPM are ignored rather than treated as silence, poor electrode contact is flagged, and a dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost.
+* **Heart-Rate Signal Watchdog (always on).** A short gap holds the last valid reading instead of dropping to 0, because watches and relay apps often update only every 2-5 s. When no usable pulse has arrived for the **signal-loss timeout** (3-20 s, default 8 s) every motor stops and the session pauses. Readings below 35 BPM are ignored rather than treated as silence, poor electrode contact is flagged, and a dropped Bluetooth link is retried three times (1 s, 2 s, 4 s) before it is reported as lost. START and RESUME (from the cockpit or a remote controller) need a usable reading younger than the timeout, so the transport reads WAITING FOR PULSE instead of driving the toys on a frozen heart rate; engaging the simulator during a watchdog pause keeps the session paused until you press RESUME.
 * **Auto-resume when signal returns.** On by default: the session resumes by itself once readings are back. Off: it stays paused until you press RESUME.
 * **Dual Stimulation Dampening.** When a secondary (prostate) toy is active alongside a stroker, the climax ceiling is offset down (5-30 BPM, default 15) to balance nerve summation. The cockpit shows a DUAL STIM badge while it applies.
 * **Adaptive Ceiling Decay.** Every X edges (1-10, default 2) the ceiling drops by Y BPM (1-5, default 2) to counteract fatigue over a long session, down to a **floor** (80-130, default 105). The floor can *stop* the decay but can never *raise* the ceiling: if you typed a Climax HR below the floor, your value wins. No offset can push the working ceiling below Resting HR + 15 BPM or above the Climax HR you typed. The DECAY badge shows the amount currently applied.
@@ -165,7 +165,7 @@ The project uses modular, native JavaScript files without mandatory complex bund
 edgeloop/
 ├── .github/
 │   └── workflows/
-│       └── test.yml            # GitHub Actions: node --check every module, then npm test on every push and PR
+│       └── test.yml            # GitHub Actions: node --check every module, then npm test on every push to main and every PR
 ├── CHANGELOG.md                # What changed since v1.0, by area, with forum credits
 ├── LICENSE                     # AGPL-3.0
 ├── README.md
@@ -241,7 +241,7 @@ npx playwright install chromium     # once
 npm run smoke                       # same as: node tools/smoke.js
 ```
 
-`tools/smoke.js` serves the repository on a local port, drives the real UI in headless Chromium (age gate, wizard, every device modal, Session Setup, Guide / History / Share, a simulated heart-rate sweep, the transport buttons, the remote viewer and controller pages) and exits non-zero on any page error, `console.error`, failed request or broken assertion. Screenshots, `snapshot.json` and `report.json` land in `tools/smoke-out/`. Run it before opening a pull request that touches `index.html` or `app.js`.
+`tools/smoke.js` serves the repository on a local port, drives the real UI in headless Chromium (age gate, wizard, every device modal, Session Setup including Apply, Guide / History / Share, a simulated heart-rate sweep, a full session on a mocked Handy API with START / PAUSE / RESUME / STOP / Reset and the API calls asserted, the History entry it leaves with its funscript buttons, the remote viewer and controller pages) and exits non-zero on any page error, `console.error`, failed request or broken assertion. Screenshots, `snapshot.json` and `report.json` land in `tools/smoke-out/`. Run it before opening a pull request that touches `index.html` or `app.js`.
 
 **Continuous integration:** `.github/workflows/test.yml` runs `node --check` on every module and then `npm test` on every push to `main` and on every pull request. A syntax check of a single file is `node --check src/js/app.js`.
 

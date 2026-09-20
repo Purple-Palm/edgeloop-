@@ -86,6 +86,17 @@ const VORZE = {
     DeviceName: 'Vorze A10 Cyclone',
     DeviceMessages: { RotateCmd: [{ StepCount: 100, ActuatorType: 'Rotate' }], StopDeviceCmd: {} }
 };
+const SR6 = {
+    DeviceIndex: 3,
+    DeviceName: 'TCode v0.3 (SR6)',
+    DeviceMessages: {
+        LinearCmd: [
+            { StepCount: 1000, FeatureDescriptor: 'L0', ActuatorType: 'Position' },
+            { StepCount: 1000, FeatureDescriptor: 'L1', ActuatorType: 'Position' }
+        ],
+        StopDeviceCmd: {}
+    }
+};
 
 let events;
 function handlersRecorder() {
@@ -365,6 +376,26 @@ describe('dispatch', () => {
         dispatchIntiface(95, 95, 20, 80);
         const after = ws.messages('ScalarCmd').slice(scalarsBefore + 1);
         assert.ok(after.every((m) => m.Scalars[0].Index !== 0));
+    });
+
+    it('one axis OFF mid-leg on a multi-axis stroker rests that axis at once', async () => {
+        const ws = connectWith([SR6]);
+        const dev = intifaceDevices.get(3);
+        assert.deepEqual(dev.axes.map((a) => a.role), ['primary', 'secondary']);
+        dispatchIntiface(5, 5, 0, 100);
+        const legs = ws.messages('LinearCmd');
+        assert.equal(legs.length, 2);
+        assert.ok(legs.every((m) => m.Vectors[0].Duration > 2000), 'slow legs are in flight');
+        setAxisRole(3, 1, 'off');
+        const after = ws.messages('LinearCmd');
+        assert.equal(after.length, 3, 'the rest move goes out immediately, not after the leg');
+        assert.equal(after[2].Vectors[0].Index, 1);
+        assert.equal(after[2].Vectors[0].Duration, REST_MOVE_MS);
+        assert.equal(after[2].Vectors[0].Position, 0);
+        assert.equal(ws.messages('StopDeviceCmd').length, 0, 'the other axis keeps its leg');
+        await sleep(REST_MOVE_MS + 40);
+        dispatchIntiface(5, 5, 0, 100);
+        assert.equal(ws.messages('LinearCmd').length, 3, 'nothing more for the OFF axis');
     });
 
     it('applies the cap to scalars and honours linear invert', async () => {

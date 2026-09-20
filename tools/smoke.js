@@ -2,10 +2,12 @@
 //
 // Drives the real app in headless Chromium: serves the repository over a local
 // python http.server, walks the age gate, the setup wizard, every device modal,
-// Session Setup, Guide / History / Share, the simulator HR sweep, the transport
-// buttons and the remote viewer / controller pages, and fails on any page
-// error, console.error, failed request or broken assertion. Screenshots and a
-// JSON report land in the output directory.
+// Session Setup, Guide / History / Share, the simulator HR sweep, a full
+// session on a mocked Handy API (START / PAUSE / RESUME / STOP / Reset, with
+// the API calls asserted), the History entry it leaves and the remote viewer /
+// controller pages, and fails on any page error, console.error, failed request
+// or broken assertion. Screenshots and a JSON report land in the output
+// directory.
 //
 // It is the twin of the script used while developing the app, so a contributor
 // can run the same checks before opening a pull request. It is NOT part of
@@ -62,6 +64,20 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   });
   page.on('requestfailed', r => { if (!r.url().includes('favicon')) errors.push('requestfailed: ' + r.url() + ' ' + (r.failure() || {}).errorText); });
   page.on('response', r => { if (r.status() >= 400 && !r.url().includes('favicon')) errors.push(`http ${r.status()}: ${r.url()}`); });
+
+  // The Handy cloud API is mocked inside the browser, so the transport can be driven end to end
+  // without hardware: every request is answered the way the real API v2 would, and recorded, so the
+  // steps below can assert what the driver really sent (slide before start, a stop after STOP).
+  const handyCalls = [];
+  await page.route('**/api/handy/v2/**', async route => {
+    const req = route.request();
+    const p = new URL(req.url()).pathname.replace(/^.*\/api\/handy\/v2/, '');
+    handyCalls.push({ method: req.method(), path: p, key: req.headers()['x-connection-key'] || '' });
+    let body = { result: 0 };
+    if (p === '/connected') body = { connected: true };
+    else if (p === '/info') body = { fwVersion: '3.2.3', model: 'Handy 1.1' };
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
 
   const steps = [];
   const step = async (name, fn) => {
@@ -193,7 +209,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     // walk tabs inside the modal if present
     const tabs = page.locator('#modalOverlay button');
     const n = await tabs.count();
-    for (let i = 0; i < Math.min(n, 12); i++) { const t = tabs.nth(i); const txt = (await t.textContent() || '').trim(); if (/guards|duration|motion|audio|profiles|tuning|general/i.test(txt)) { await t.click().catch(() => {}); await sleep(150); } }
+    for (let i = 0; i < Math.min(n, 12); i++) { const t = tabs.nth(i); const txt = (await t.textContent() || '').trim(); if (/guards|duration|motion|audio|profiles|tuning|general|backup/i.test(txt)) { await t.click().catch(() => {}); await sleep(150); } }
+    // Apply persists the form and closes the modal; it must not throw.
+    const apply = page.locator('#applyParamsBtn');
+    if (await apply.isVisible().catch(() => false)) { await apply.click(); await sleep(300); }
     await closeModal();
   });
   await step('open Guide / History / Share', async () => {
@@ -217,12 +236,73 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     await page.getByText(/prostate milker/i).first().click().catch(() => {}); await sleep(200);
     await page.getByText(/classic tease/i).first().click().catch(() => {}); await sleep(200);
   });
-  await step('start/stop/reset buttons do not throw', async () => {
-    const play = page.locator('#playPauseBtn'); if (await play.count()) await play.click({ force: true }).catch(() => {});
-    await sleep(1500);
-    const stop = page.locator('#stopBtn'); if (await stop.count()) await stop.click({ force: true }).catch(() => {});
-    const reset = page.locator('#resetBtn'); if (await reset.count()) await reset.click({ force: true }).catch(() => {});
-    await sleep(300); await shot('10-after-controls');
+  await step('connect the mocked Handy', async () => {
+    await page.locator('#cardHandy').click(); await sleep(300);
+    handyCalls.length = 0;
+    await page.locator('#modalHandyInput').fill('SMOKE-KEY-0001');
+    await page.locator('#modalHandyConnectBtn').click(); await sleep(800);
+    const badge = (await page.locator('#badgeHandyText').textContent() || '').trim();
+    if (!/the handy/i.test(badge)) throw new Error('Handy badge after Connect: ' + badge + ' / ' + ((await page.locator('#modalHandyMsg').textContent()) || '').trim());
+    const seq = handyCalls.map(c => c.method + ' ' + c.path);
+    for (const want of ['GET /connected', 'PUT /mode', 'PUT /hamp/stop']) if (!seq.includes(want)) throw new Error('connect did not send ' + want + ': ' + JSON.stringify(seq));
+    const playText = (await page.locator('#playPauseText').textContent() || '').trim();
+    if (!/START SESSION/i.test(playText)) throw new Error('transport not ready with simulator + Handy: ' + playText);
+    await shot('10a-handy-connected');
+  });
+  await step('transport: START drives the Handy, PAUSE / RESUME / STOP / Reset bring it to rest', async () => {
+    const play = page.locator('#sessionPlayPauseBtn');
+    const playText = async () => (await page.locator('#playPauseText').textContent() || '').trim();
+    if (await play.count() !== 1) throw new Error('#sessionPlayPauseBtn missing');
+    if (await play.isDisabled()) throw new Error('START is disabled: ' + await playText());
+    handyCalls.length = 0;
+    await play.click(); await sleep(1500);
+    if ((await playText()) !== 'PAUSE') throw new Error('expected PAUSE after START, got: ' + await playText());
+    const seq = handyCalls.map(c => c.method + ' ' + c.path);
+    const slideAt = seq.indexOf('PUT /slide'), startAt = seq.indexOf('PUT /hamp/start');
+    if (startAt < 0) throw new Error('no PUT /hamp/start after START: ' + JSON.stringify(seq));
+    if (slideAt < 0 || slideAt > startAt) throw new Error('PUT /slide must precede PUT /hamp/start: ' + JSON.stringify(seq));
+    // Keep the session running past the 10 s history threshold with a simulated pulse sweep.
+    await page.locator('#cardBle').click(); await sleep(200);
+    await page.getByRole('button', { name: /manual simulator/i }).click(); await sleep(150);
+    for (const v of ['100', '115', '130', '120', '105', '95']) { await setRange('#modalSimHrSlider', v); await sleep(1700); }
+    await closeModal();
+    await shot('10b-session-running');
+    handyCalls.length = 0;
+    await play.click(); await sleep(700);
+    if ((await playText()) !== 'RESUME') throw new Error('expected RESUME after PAUSE, got: ' + await playText());
+    if (!handyCalls.some(c => c.path === '/hamp/stop')) throw new Error('PAUSE sent no PUT /hamp/stop: ' + JSON.stringify(handyCalls));
+    await play.click(); await sleep(1200);
+    if ((await playText()) !== 'PAUSE') throw new Error('expected PAUSE after RESUME, got: ' + await playText());
+    handyCalls.length = 0;
+    await page.locator('#sessionStopBtn').click(); await sleep(700);
+    if (!/START SESSION/i.test(await playText())) throw new Error('expected START SESSION after STOP, got: ' + await playText());
+    const motion = handyCalls.filter(c => /^\/hamp\/(start|stop|velocity)$/.test(c.path));
+    if (!motion.length || motion[motion.length - 1].path !== '/hamp/stop') throw new Error('the last motion command after STOP must be PUT /hamp/stop: ' + JSON.stringify(motion));
+    await page.locator('#sessionResetBtn').click(); await sleep(300);
+    const edges = (await page.locator('#edgeCount').textContent() || '').trim();
+    const timer = (await page.locator('#sessionTimer').textContent() || '').trim();
+    if (edges !== '0' || !/^00:00$/.test(timer)) throw new Error('Reset did not zero the counters: edges=' + edges + ' timer=' + timer);
+    await shot('10-after-controls');
+  });
+  await step('history holds the session with its funscript downloads', async () => {
+    await page.locator('#historyBtn').click(); await sleep(300);
+    try {
+      const n = await page.locator('#historyList button', { hasText: /\.funscript/ }).count();
+      if (n < 1) throw new Error('no .funscript button in History after a 10 s+ session');
+      await shot('10c-history');
+    } finally { await closeModal(); }
+  });
+  await step('disconnect the mocked Handy sends a stop', async () => {
+    await page.locator('#cardHandy').click(); await sleep(200);
+    try {
+      handyCalls.length = 0;
+      await page.locator('#modalHandyDisconnectBtn').click(); await sleep(500);
+      if (!handyCalls.some(c => c.method === 'PUT' && c.path === '/hamp/stop')) throw new Error('Disconnect sent no PUT /hamp/stop: ' + JSON.stringify(handyCalls));
+      const txt = (await page.locator('#modalHandyMsg').textContent() || '').trim();
+      if (!/offline/i.test(txt)) throw new Error('expected Offline after Disconnect, got: ' + txt);
+      const badge = (await page.locator('#badgeHandyText').textContent() || '').trim();
+      if (!/disconnected/i.test(badge)) throw new Error('expected Disconnected badge, got: ' + badge);
+    } finally { await closeModal(); }
   });
   await step('viewer page (?group_sub=) locks every control', async () => {
     await page.goto(`http://127.0.0.1:${PORT}/?group_sub=smokeroom`, { waitUntil: 'load', timeout: 60000 });

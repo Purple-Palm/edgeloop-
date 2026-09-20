@@ -206,4 +206,16 @@ describe('createHrWatchdog', () => {
         assert.equal(v.status, 'ok');
         assert.equal(v.recovered, false);
     });
+    it('isFresh follows the stale threshold without touching the transition bookkeeping', () => {
+        const wd = createHrWatchdog({ staleMs: 8000 });
+        wd.reset(0);
+        assert.equal(wd.isFresh(7999), true);
+        assert.equal(wd.isFresh(8001), false);
+        assert.equal(wd.tripped, false);
+        wd.recordPacket(9000, 0);        // a packet without a pulse
+        assert.equal(wd.isFresh(9000), false);
+        wd.recordPacket(9500, 88);
+        assert.equal(wd.isFresh(9600), true);
+        assert.equal(wd.evaluate(9600).status, 'ok');
+    });
 });

@@ -29,6 +29,8 @@ export const state = {
     resumeStatus: null,
     // True when the typed duration was invalid and the session fell back to endless.
     durationFallback: false,
+    // The endgame (orgasm / soft landing / denied) fires once per session.
+    endgameFired: false,
     activeMode: 'classic',
     alwaysFullStroke: false,
     lastHrTimestamp: Date.now(),
@@ -67,6 +69,9 @@ export const state = {
     survivalSpeedFloor: 30,
     survivalTimer: 0,
     survivalBreachTicks: 0,
+    // Timestamp of the reading the last Survival tick judged, so a value held
+    // across ticks by a slow source counts as one breach reading.
+    survivalLastReadingAt: null,
     lastSpokenPrompt: '',
     lastSpokenAt: 0,
     isTestingMic: false,

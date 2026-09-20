@@ -15,8 +15,9 @@
 //     R2 pitch, V0 vibe, V1 lube / aux, A0 valve / suck, A1 aux.
 //   - Identification: D0 -> device name, D1 -> T-Code version, D2 -> axis
 //     list, one line per axis ("L0 stroke" style). Replies end in "\n".
-//   - Rest: linear axes at 0 (bottom), rotation axes centred at 0.5, vibe
-//     and aux axes at 0 (off).
+//   - Rest: the stroke axis L0 at 0 (bottom), surge / sway (L1 / L2) and the
+//     rotation axes centred at 0.5, vibe and aux axes at 0 (off). Driving
+//     L1 / L2 to 0 would slam the sleeve into a corner of the mechanism.
 
 export const TCODE_BAUD_RATE = 115200;
 export const AXIS_ROLES = ['primary', 'secondary', 'off'];
@@ -56,9 +57,17 @@ export function axisKind(id) {
     }
 }
 
+// Axes whose neutral is the mechanical centre: every rotation axis and the
+// linear axes other than the stroke (surge L1, sway L2). They swing around
+// 0.5 by the engine speed instead of being mapped onto the stroke envelope.
+export function isCentredAxis(id) {
+    const kind = axisKind(id);
+    return kind === 'rotate' || (kind === 'linear' && id !== 'L0');
+}
+
 // The safe position for an axis when the engine is silent.
 export function restPositionFor(id) {
-    return axisKind(id) === 'rotate' ? 0.5 : 0;
+    return isCentredAxis(id) ? 0.5 : 0;
 }
 
 export function describeAxis(id, description = '') {
@@ -125,11 +134,22 @@ export function parseAxisLine(line) {
     return { id, description: describeAxis(id, match[2]) };
 }
 
+// Boot output of an auto-resetting board (opening the port toggles DTR /
+// RTS, which restarts Arduino-class boards and ESP32 dev kits). The ESP32
+// ROM prints its banner at 115200 baud and it must never be taken for a
+// device name or version.
+const BOOT_BANNER_RE = /^(ets\s|rst:|boot:|configsip|clk_drv|mode:|load:|entry\s|ho \d|[IEWD] \(\d+\)|waiting for download|invalid header)/i;
+
+export function looksLikeBootBanner(line) {
+    return BOOT_BANNER_RE.test(String(line || '').trim());
+}
+
 function cleanReply(line, command) {
     const text = String(line || '').replace(/\r/g, '').trim();
     if (!text) return '';
     // Some firmware echoes the command before answering it.
     if (text.toUpperCase() === command) return '';
+    if (looksLikeBootBanner(text)) return '';
     return text;
 }
 
@@ -215,8 +235,11 @@ export function scalarLevel(speedPercent, capPercent = 100) {
     return Math.round((s / 100) * (c / 100) * 1000) / 1000;
 }
 
-// Why Web Serial is missing, with the browsers that do have it.
-export function describeSerialSupport(userAgent = '') {
+// Why Web Serial is missing, with the browsers that do have it. On a
+// supporting desktop browser the usual reason is a plain http:// origin
+// (navigator.serial only exists in secure contexts), so the caller passes
+// `secureContext` and gets that told instead of a wrong browser hint.
+export function describeSerialSupport(userAgent = '', secureContext = true) {
     const ua = String(userAgent || '');
     const isIOS = /iPhone|iPad|iPod/i.test(ua);
     const isAndroid = /Android/i.test(ua);
@@ -227,6 +250,7 @@ export function describeSerialSupport(userAgent = '') {
     if (isAndroid) return `Web Serial is not available on Android. ${supported}; on Android use Intiface Central instead.`;
     if (isFirefox) return `Firefox does not implement Web Serial. ${supported}.`;
     if (isSafari) return `Safari does not implement Web Serial. ${supported}.`;
+    if (secureContext === false) return 'Web Serial needs a secure origin: open EdgeLoop over https:// or http://localhost, then press Connect again.';
     return `Web Serial is not available in this browser. ${supported}; it is not available on Android, iOS, Firefox or Safari.`;
 }
 

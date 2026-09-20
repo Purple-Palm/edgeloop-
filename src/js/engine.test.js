@@ -202,6 +202,18 @@ describe('engine modes', () => {
         assert.ok(purgatory.primaryPercent < 100);
     });
 
+    it('oracle climax with Force Orgasm cancelled obeys the ceiling rule', () => {
+        const base = { ...running, activeMode: 'oracle', oracleState: 'CLIMAX', orgasmMode: false, isEdged: true, hr: 170 };
+        const stop = calculateEngineOutputs({ ...base, ceilingBehaviour: 'stop' });
+        assert.equal(stop.primaryPercent, 0);
+        assert.equal(stop.secondaryPercent, 0);
+        const crawl = calculateEngineOutputs({ ...base, ceilingBehaviour: 'crawl' });
+        assert.equal(crawl.primaryPercent, CRAWL_PERCENT);
+        assert.equal(crawl.secondaryPercent, CRAWL_PERCENT);
+        const below = calculateEngineOutputs({ ...base, isEdged: false, hr: 100 });
+        assert.equal(below.primaryPercent, 100);
+    });
+
     it('survival uses the accelerating floor', () => {
         const result = calculateEngineOutputs({ ...running, activeMode: 'survival', survivalSpeedFloor: 61 });
         assert.equal(result.primaryPercent, 61);

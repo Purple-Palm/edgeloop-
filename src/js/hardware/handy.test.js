@@ -2,15 +2,20 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    HANDY_TIMINGS,
     connectHandy,
     disconnectHandy,
     dispatchHandy,
     stopHandy,
+    stopHandyOnUnload,
     pollHandyConnected,
     queryHandyBattery,
     setHandyHandlers,
     getHandyKey,
-    isHandyMoving
+    isHandyMoving,
+    isHandyMotionUnknown,
+    isHandyOfflineStopPending,
+    handyConnected
 } from './handy.js';
 import { HANDY_API_BASE } from './handy-protocol.js';
 
@@ -20,6 +25,7 @@ let calls = [];
 let routes = {};
 let errors = [];
 let offline = [];
+let unconfirmed = [];
 let sessionActive = true;
 
 function jsonResponse(body, status = 200) {
@@ -36,10 +42,11 @@ function installFetch() {
         const path = pathOf(url);
         const method = init.method || 'GET';
         const body = init.body ? JSON.parse(init.body) : undefined;
-        calls.push({ path, method, body, key: init.headers['X-Connection-Key'] });
+        const key = init.headers['X-Connection-Key'];
+        calls.push({ path, method, body, key, keepalive: init.keepalive === true });
         const handler = routes[`${method} ${path}`] || routes[path];
         let result;
-        if (typeof handler === 'function') result = handler({ path, method, body });
+        if (typeof handler === 'function') result = handler({ path, method, body, key });
         else if (handler === undefined) result = jsonResponse({ result: 0 });
         else result = handler;
         // Honour the abort signal like a real fetch would.
@@ -79,11 +86,17 @@ describe('handy driver', () => {
         routes = {};
         errors = [];
         offline = [];
+        unconfirmed = [];
         sessionActive = true;
+        // Short backoffs keep the retry tests fast; the attempt counts are unchanged.
+        HANDY_TIMINGS.requestTimeoutMs = 6000;
+        HANDY_TIMINGS.stopRetryDelaysMs = [5, 10, 20];
+        HANDY_TIMINGS.offlineStopRetryMs = 80;
         installFetch();
         setHandyHandlers({
             onError: (m) => errors.push(m),
             onOffline: (r) => offline.push(r),
+            onStopUnconfirmed: (m) => unconfirmed.push(m),
             isSessionActive: () => sessionActive
         });
     });
@@ -274,7 +287,7 @@ describe('handy driver', () => {
         assert.ok(errors.some((m) => m && /Device busy/.test(m)));
     });
 
-    it('goes offline after five consecutive dispatch failures', async () => {
+    it('goes offline after five consecutive failed dispatch ticks (not requests)', async () => {
         await connectOk();
         routes['PUT /slide'] = jsonResponse(null, 500);
         routes['PUT /hamp/start'] = jsonResponse(null, 500);
@@ -283,8 +296,13 @@ describe('handy driver', () => {
             dispatchHandy(50, 0, 100, true, 0, 100);
             await tick(5);
         }
+        assert.equal(offline.length, 0, 'four failed ticks are not yet offline');
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
         assert.equal(offline.length, 1);
         assert.match(offline[0], /stopped responding/);
+        assert.equal(handyConnected, false);
+        assert.ok(sent('/hamp/stop').length >= 1, 'going offline sends a stop');
         dispatchHandy(50, 0, 100, true, 0, 100);
         await tick(5);
         assert.equal(offline.length, 1, 'offline is reported once');
@@ -346,5 +364,255 @@ describe('handy driver', () => {
         routes['/info'] = jsonResponse({ battery: 1 });
         assert.equal(await queryHandyBattery(), 1);
         assert.ok(calls.every((c) => c.path === '/info'));
+    });
+    // ---- reconnect ---------------------------------------------------------------
+
+    it('a reconnect whose verification fails leaves the live link, and its stop path, untouched', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        routes['/connected'] = () => { throw new TypeError('Failed to fetch'); };
+        await assert.rejects(connectHandy(KEY), /Network error/);
+        assert.equal(handyConnected, true);
+        assert.equal(getHandyKey(), KEY);
+        assert.equal(isHandyMoving(), true, 'the running device is still owned');
+        calls = [];
+        assert.equal(await stopHandy(), true);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(sent('/hamp/stop')[0].key, KEY);
+        assert.equal(isHandyMoving(), false);
+    });
+
+    it('a reconnect brings the running device to a confirmed stop before switching keys', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        calls = [];
+        const result = await connectHandy('second-key');
+        assert.equal(result.description, 'fw 3.2.3, Handy 1.1');
+        assert.equal(getHandyKey(), 'second-key');
+        assert.equal(isHandyMoving(), false);
+        const stops = sent('/hamp/stop');
+        assert.ok(stops.some((c) => c.key === 'second-key'), 'the new key is verified with a stop');
+        assert.ok(stops.some((c) => c.key === KEY), 'the running device is stopped with its own key');
+        const verify = calls.findIndex((c) => c.path === '/connected' && c.key === 'second-key');
+        const oldStop = calls.findIndex((c) => c.path === '/hamp/stop' && c.key === KEY);
+        assert.ok(verify >= 0 && verify < oldStop, 'the old device is only stopped once the new key passed');
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start')[0].key, 'second-key');
+    });
+
+    it('refuses to switch keys when the running device will not confirm a stop', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? jsonResponse(null, 503) : jsonResponse({ result: 0 }));
+        await assert.rejects(connectHandy('second-key'), /did not confirm a stop/);
+        assert.equal(handyConnected, true);
+        assert.equal(getHandyKey(), KEY);
+        assert.equal(isHandyMoving(), true);
+        assert.equal(unconfirmed.length, 1);
+    });
+
+    // ---- stops that must still reach a device the driver no longer owns -------------
+
+    it('a start that resolves after Disconnect is followed by a stop with the old key', async () => {
+        await connectOk();
+        let releaseStart;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+        assert.equal(await disconnectHandy(), true);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(getHandyKey(), '');
+        releaseStart();
+        await tick(5);
+        assert.equal(isHandyMoving(), false, 'stale start must not flip running=true');
+        assert.equal(sent('/hamp/velocity').length, 0, 'stale start must not send velocity');
+        assert.equal(sent('/hamp/stop').length, 2, 'a safety stop follows the stale start');
+        assert.equal(sent('/hamp/stop')[1].key, KEY);
+    });
+
+    it('a start that resolves after the device went offline is followed by a stop', async () => {
+        await connectOk();
+        let releaseStart;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['/connected'] = () => { throw new TypeError('Failed to fetch'); };
+        for (let i = 0; i < 3; i++) await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        await tick(5);
+        const stopsAfterOffline = sent('/hamp/stop').length;
+        assert.ok(stopsAfterOffline >= 1, 'going offline sends a stop');
+        releaseStart();
+        await tick(5);
+        assert.equal(isHandyMoving(), false);
+        assert.equal(sent('/hamp/stop').length, stopsAfterOffline + 1, 'a safety stop follows the stale start');
+        assert.equal(sent('/hamp/stop')[stopsAfterOffline].key, KEY);
+    });
+
+    it('a hanging stop for a disconnected key never masks a stop for the new device', async () => {
+        await connectOk();
+        HANDY_TIMINGS.requestTimeoutMs = 60;
+        // The old device is out of reach: its stop hangs until the timeout and retries.
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? new Promise(() => {}) : jsonResponse({ result: 0 }));
+        const oldStop = disconnectHandy();
+        await tick(5);
+        await connectHandy('second-key');
+        dispatchHandy(60, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        calls = [];
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').filter((c) => c.key === 'second-key').length, 1, 'STOP reaches the new device at once');
+        assert.equal(isHandyMoving(), false);
+        assert.equal(await oldStop, false, 'the old chain ends unconfirmed on its own');
+    });
+
+    it('keeps sending stops to an offline device until one is confirmed', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        const fail = () => { throw new TypeError('Failed to fetch'); };
+        routes['PUT /slide'] = fail;
+        routes['PUT /hamp/velocity'] = fail;
+        routes['PUT /hamp/stop'] = fail;
+        for (let i = 0; i < 5; i++) {
+            dispatchHandy(50 + i, 0, 100, true, 0, 100);
+            await tick(5);
+        }
+        assert.equal(offline.length, 1);
+        assert.equal(handyConnected, false);
+        // First background round: four attempts, none confirmed, reported once.
+        await tick(60);
+        assert.ok(sent('/hamp/stop').length >= 4);
+        assert.equal(unconfirmed.length, 1);
+        assert.equal(isHandyOfflineStopPending(), true);
+        // The network is back: the next round confirms the stop and the job ends.
+        routes['PUT /hamp/stop'] = undefined;
+        const before = sent('/hamp/stop').length;
+        await tick(HANDY_TIMINGS.offlineStopRetryMs + 40);
+        assert.ok(sent('/hamp/stop').length > before, 'another stop round went out');
+        assert.equal(sent('/hamp/stop')[sent('/hamp/stop').length - 1].key, KEY);
+        assert.equal(isHandyOfflineStopPending(), false);
+    });
+
+    it('disconnect resolves false and reports when the stop is never confirmed', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['PUT /hamp/stop'] = jsonResponse(null, 500);
+        assert.equal(await disconnectHandy(), false);
+        assert.equal(sent('/hamp/stop').length, 4);
+        assert.equal(unconfirmed.length, 1);
+        assert.match(unconfirmed[0], /Stop not confirmed/);
+        assert.equal(getHandyKey(), '');
+    });
+
+    it('stopHandyOnUnload sends a keepalive stop and treats the device as stopped', async () => {
+        await connectOk();
+        assert.equal(stopHandyOnUnload(), false, 'nothing to stop while idle');
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        calls = [];
+        assert.equal(stopHandyOnUnload(), true);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(sent('/hamp/stop')[0].keepalive, true);
+        assert.equal(sent('/hamp/stop')[0].key, KEY);
+        assert.equal(isHandyMoving(), false);
+        // A page that comes back restarts the motor on its next tick.
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+    });
+
+    // ---- ordering and unknown states -------------------------------------------------
+
+    it('starts the motor only after the slide range has been confirmed', async () => {
+        await connectOk();
+        let releaseSlide;
+        routes['PUT /slide'] = () => new Promise((resolve) => { releaseSlide = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 20, 80, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/slide').length, 1);
+        assert.equal(sent('/hamp/start').length, 0, 'no start before the range landed');
+        releaseSlide();
+        await tick(5);
+        assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['PUT /slide', 'PUT /hamp/start', 'PUT /hamp/velocity']);
+        assert.equal(isHandyMoving(), true);
+    });
+
+    it('does not start at an unknown range: a rejected slide is re-sent before any start', async () => {
+        await connectOk();
+        routes['PUT /slide'] = jsonResponse(null, 500);
+        dispatchHandy(50, 20, 80, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 0);
+        assert.equal(isHandyMoving(), false);
+        routes['PUT /slide'] = undefined;
+        dispatchHandy(50, 20, 80, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/slide').length, 2);
+        assert.equal(sent('/hamp/start').length, 1);
+        assert.equal(isHandyMoving(), true);
+    });
+
+    it('a start that times out after a stop is followed by a fresh stop', async () => {
+        await connectOk();
+        HANDY_TIMINGS.requestTimeoutMs = 40;
+        routes['PUT /hamp/start'] = () => new Promise(() => {});
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
+        await tick(70);
+        assert.equal(sent('/hamp/stop').length, 2, 'the relay may still deliver the start: stop again');
+        assert.equal(isHandyMoving(), false);
+    });
+
+    it('a start that times out leaves the motion unknown, so the next zero dispatch sends a stop', async () => {
+        await connectOk();
+        HANDY_TIMINGS.requestTimeoutMs = 40;
+        routes['PUT /hamp/start'] = () => new Promise(() => {});
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(70);
+        assert.equal(isHandyMoving(), false);
+        assert.equal(isHandyMotionUnknown(), true);
+        assert.ok(errors.some((m) => m && /timed out/.test(m)));
+        routes['PUT /hamp/start'] = undefined;
+        // An unforced zero (the IDLE tick) after the throttle window.
+        await tick(400);
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(isHandyMotionUnknown(), false);
+    });
+
+    it('a success on another path does not clear a velocity error', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['PUT /hamp/velocity'] = jsonResponse({ error: { code: 3000, message: 'HampError' } });
+        dispatchHandy(60, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.match(errors[errors.length - 1], /HampError/);
+        routes['/connected'] = jsonResponse({ connected: true });
+        await pollHandyConnected();
+        assert.match(errors[errors.length - 1], /HampError/, 'the poll must not clear it');
+        dispatchHandy(70, 10, 90, true, 0, 100);
+        await tick(5);
+        assert.match(errors[errors.length - 1], /HampError/, 'a slide reply must not clear it');
+        routes['PUT /hamp/velocity'] = undefined;
+        dispatchHandy(80, 10, 90, true, 0, 100);
+        await tick(5);
+        assert.equal(errors[errors.length - 1], null, 'cleared once velocity succeeds again');
     });
 });

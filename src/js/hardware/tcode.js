@@ -8,7 +8,8 @@
 //      told through onClose so the session pauses. dispatch never throws.
 //   2. Never exceed the user's limits: the stroke zone arrives already mapped
 //      into the hardware envelope; every axis has its own cap; STOP moves
-//      L axes to the bottom of the envelope, R axes to centre, V/A to 0.
+//      L0 to the bottom of the envelope, L1 / L2 and the R axes to centre,
+//      V/A to 0.
 //   3. Smooth motion: linear and rotation axes are driven by the shared
 //      stroke planner (stroke-planner.js): ONE command per leg carrying the
 //      full leg duration, timed by a per-axis setTimeout at leg end. Engine
@@ -22,7 +23,9 @@ import { safeParse, safeSet } from '../storage.js';
 import {
     TCODE_BAUD_RATE,
     axisKind,
+    isCentredAxis,
     restPositionFor,
+    looksLikeBootBanner,
     formatAxisCommand,
     formatLine,
     splitLines,
@@ -40,6 +43,8 @@ export const TCODE_STORAGE_KEY = 'edgeloop_tcode_devices';
 
 // Mutable so tests can shorten the waits.
 export const TCODE_TIMINGS = {
+    bootQuietMs: 300,      // after open: wait for this much silence before D0 (boot chatter)
+    bootCapMs: 2000,       // ... but never longer than this
     identifyMs: 1500,      // per D0 / D1 / D2 query: give up when nothing arrives
     replyQuietMs: 200,     // a multi-line reply is complete after this silence
     restMs: 400,           // STOP: move to rest over this
@@ -102,8 +107,10 @@ export function isSerialSupported() {
     return Boolean(serial && typeof serial.requestPort === 'function');
 }
 
+// A session that is closing (Disconnect pressed, rest line queued) no longer
+// accepts motion: nothing may be flushed after the rest line.
 export function isTCodeConnected() {
-    return Boolean(session && !session.finished && session.identified && device);
+    return Boolean(session && !session.finished && !session.closing && session.identified && device);
 }
 
 export function getTCodeStatus() {
@@ -132,9 +139,10 @@ function describeConnected() {
 
 // ---- writing -------------------------------------------------------------------
 
-// Serialised, never-throwing writes. A failed write ends the session.
+// Serialised, never-throwing writes. A failed write ends the session. A
+// closing session refuses new writes, so the rest line stays the last one.
 function queueWrite(s, text) {
-    if (!s || s.finished || !s.writer || !text) return false;
+    if (!s || s.finished || s.closing || !s.writer || !text) return false;
     const encoder = s.encoder;
     s.writeChain = s.writeChain
         .then(() => s.writer.write(encoder.encode(text)))
@@ -183,6 +191,33 @@ async function runReadLoop(s) {
         return;
     }
     if (!s.finished) markLost(s, 'The serial port closed. Motors are assumed stopped.');
+}
+
+// Swallow whatever the device prints right after the port opened (opening
+// toggles DTR / RTS, which resets Arduino-class boards and ESP32 dev kits;
+// the bootloader takes 1-2 s and prints a banner) and resolve once the line
+// has been quiet for quietMs, or after capMs at the latest.
+function settle(s, { quietMs, capMs }) {
+    return new Promise((resolve) => {
+        let timer = null;
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            clearTimeout(hardStop);
+            if (s.lineSink === sink) s.lineSink = null;
+            resolve();
+        };
+        const arm = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(finish, quietMs);
+        };
+        const sink = () => arm();
+        const hardStop = setTimeout(finish, capMs);
+        s.lineSink = sink;
+        arm();
+    });
 }
 
 // Send one identification command and collect its reply lines: give up after
@@ -274,12 +309,15 @@ async function finishSession(s, reason, text) {
     if (!s || s.finished || s.closing) return;
     // A write failure during the final rest move must not start a second,
     // concurrent teardown (and a second onClose).
-    s.closing = true;
     const wasConnected = Boolean(s.identified);
     const assignedAxes = countAssignedTCodeAxes();
+    // Bring every axis to rest before the port goes away; the session is
+    // then closing, which refuses every later write (an engine tick landing
+    // in the flush window must not queue a motor command behind the rest
+    // line) and stops a second, concurrent teardown.
+    if (reason === 'user' && wasConnected) stopTCode();
+    s.closing = true;
     if (reason === 'user' && wasConnected) {
-        // Bring every axis to rest before the port goes away.
-        stopTCode();
         try { await s.writeChain; } catch (e) {}
     }
     s.finished = true;
@@ -320,6 +358,9 @@ function makeAxis(parsedAxis, saved, defaults) {
     return {
         id,
         kind,
+        // Rotation axes and the surge / sway axes rest at and swing around
+        // the mechanical centre; only L0 is mapped onto the stroke envelope.
+        centred: isCentredAxis(id),
         description: parsedAxis.description,
         role,
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
@@ -352,7 +393,7 @@ export async function connectTCode(newHandlers) {
     const serial = getSerial();
     if (!serial || typeof serial.requestPort !== 'function') {
         const ua = globalThis.navigator && globalThis.navigator.userAgent ? globalThis.navigator.userAgent : '';
-        setStatus('error', describeSerialSupport(ua));
+        setStatus('error', describeSerialSupport(ua, globalThis.isSecureContext !== false));
         return false;
     }
     // A second click while the port chooser is open must not open another.
@@ -433,10 +474,21 @@ async function openAndIdentify(serial) {
     attachDisconnectListeners(s);
     s.readLoop = runReadLoop(s);
 
+    // Let an auto-resetting board finish booting (and printing) first.
+    setStatus('handshake', 'Waiting for the device to settle...');
+    await settle(s, { quietMs: TCODE_TIMINGS.bootQuietMs, capMs: TCODE_TIMINGS.bootCapMs });
+    if (s.finished) return false;
+
     setStatus('handshake', 'Identifying the device (D0 / D1 / D2)...');
     const timing = { firstMs: TCODE_TIMINGS.identifyMs, quietMs: TCODE_TIMINGS.replyQuietMs };
-    const name = await query(s, 'D0', timing);
+    let name = await query(s, 'D0', timing);
     if (s.finished) return false;
+    // A board that was still booting swallows the first query (or answers
+    // it with the tail of its banner): ask once more.
+    if (name.filter((line) => !looksLikeBootBanner(line)).length === 0) {
+        name = await query(s, 'D0', timing);
+        if (s.finished) return false;
+    }
     const version = await query(s, 'D1', timing);
     if (s.finished) return false;
     const axisLines = await query(s, 'D2', timing);
@@ -485,11 +537,13 @@ export function saveTCodeConfig() {
 
 // ---- per-axis output -------------------------------------------------------------------
 
-// Invert mirrors a linear axis INSIDE the hardware envelope (min + max -
+// Invert mirrors the stroke axis INSIDE the hardware envelope (min + max -
 // position), not around 0.5: a 20-100 % envelope must never produce a
-// physical 0-80 % move just because the sleeve is mounted upside down.
+// physical 0-80 % move just because the sleeve is mounted upside down. A
+// centred linear axis (surge / sway) mirrors around its centre instead.
 function physicalPosition(axis, position) {
     if (axis.kind !== 'linear' || !axis.invert) return position;
+    if (axis.centred) return 1 - position;
     return lastEnvelope.min + lastEnvelope.max - position;
 }
 
@@ -523,13 +577,16 @@ function speedForRole(role, primary, secondary) {
 function applyAxis(axis, primary, secondary, zone, now) {
     const speed = speedForRole(axis.role, primary, secondary);
     const enabled = axis.role !== 'off';
-    if (axis.kind === 'linear') {
+    if (axis.kind === 'linear' && !axis.centred) {
         axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled });
         pumpPlanner(axis, now);
-    } else if (axis.kind === 'rotate') {
-        // Swing around the centre; amplitude 0 (speed 0 or OFF) rests at 0.5.
+    } else if (axis.planner) {
+        // Rotation and surge / sway: swing around the centre; amplitude 0
+        // (speed 0 or OFF) rests at 0.5. The leg time follows the speed
+        // alone (legTravel 1), so a small swing is a slow swing, not a
+        // fast twitch.
         const amp = enabled ? rotationAmplitude(speed, axis.maxCap) : 0;
-        axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: 0.5 - amp, zoneMax: 0.5 + amp, enabled: enabled && amp > 0 });
+        axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: 0.5 - amp, zoneMax: 0.5 + amp, enabled: enabled && amp > 0, legTravel: 1 });
         pumpPlanner(axis, now);
     } else {
         sendScalar(axis, enabled ? scalarLevel(speed, axis.maxCap) : 0);
@@ -578,10 +635,10 @@ export function dispatchTCode(primarySpeed, secondarySpeed, strokeMin = 0, strok
     }
 }
 
-// Immediate stop: every in-flight leg is forgotten, L axes go to the bottom
-// of the envelope over restMs, R axes to centre over restMs, V/A axes to 0.
-// One line carries all of it. Safe to call at any time; returns whether a
-// command was queued.
+// Immediate stop: every in-flight leg is forgotten, L0 goes to the bottom
+// of the envelope over restMs, L1 / L2 and the R axes to centre over restMs,
+// V/A axes to 0. One line carries all of it. Safe to call at any time;
+// returns whether a command was queued.
 export function stopTCode() {
     lastSpeeds = { primary: 0, secondary: 0 };
     if (!isTCodeConnected()) return false;
@@ -592,8 +649,8 @@ export function stopTCode() {
         if (axis.testTimer) { clearTimeout(axis.testTimer); axis.testTimer = null; }
         if (axis.planner) {
             axis.planner.reset();
-            const rest = axis.kind === 'rotate' ? 0.5 : lastEnvelope.min;
-            axis.planner.setInput({ speed: 0, zoneMin: rest, zoneMax: axis.kind === 'rotate' ? 0.5 : lastEnvelope.max, enabled: false });
+            const rest = axis.centred ? 0.5 : lastEnvelope.min;
+            axis.planner.setInput({ speed: 0, zoneMin: rest, zoneMax: axis.centred ? 0.5 : lastEnvelope.max, enabled: false });
             const leg = axis.planner.next(now);
             const position = leg ? leg.position : rest;
             commands.push(formatAxisCommand(axis.id, physicalPosition(axis, position), { intervalMs: leg ? leg.durationMs : TCODE_TIMINGS.restMs }));
@@ -611,9 +668,11 @@ function findAxis(axisIdx) {
     return device && device.axes[axisIdx] ? device.axes[axisIdx] : null;
 }
 
+// Role OFF: the planner interrupts the leg in flight, so the rest move goes
+// out at once instead of after the running stroke.
 function restAxisNow(axis) {
     if (axis.planner) {
-        axis.planner.setInput({ enabled: false, zoneMin: axis.kind === 'rotate' ? 0.5 : lastEnvelope.min });
+        axis.planner.setInput({ enabled: false, zoneMin: axis.centred ? 0.5 : lastEnvelope.min });
         pumpPlanner(axis);
     } else {
         sendScalar(axis, 0);
@@ -663,7 +722,7 @@ export function testAxis(axisIdx) {
         const moveMs = TCODE_TIMINGS.testMoveMs;
         let up;
         let down;
-        if (axis.kind === 'rotate') {
+        if (axis.centred) {
             up = 0.5 + rotationAmplitude(50, axis.maxCap);
             down = 0.5;
         } else {

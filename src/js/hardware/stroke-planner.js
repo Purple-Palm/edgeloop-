@@ -8,8 +8,16 @@
 //   - A stroke alternates between zone min and zone max; each leg is one
 //     LinearCmd carrying the FULL leg duration.
 //   - Speed, cap and zone changes apply to the NEXT leg only.
-//   - Speed 0, role OFF, pause or stop -> a single move to the rest position
-//     (zone min) over REST_MOVE_MS, then silence until speed > 0 again.
+//   - Speed 0, pause or stop -> the leg in flight finishes, then a single
+//     move to the rest position (zone min) over REST_MOVE_MS, then silence
+//     until speed > 0 again.
+//   - Role OFF (enabled: false) interrupts the leg in flight: the rest move
+//     is the next thing sent.
+//   - A leg's duration follows the distance really travelled: the first leg
+//     after a rest or a zone shift that has to cross more than the zone
+//     width gets proportionally longer, never a snap. `legTravel` overrides
+//     the zone width as the base (rotation axes: 1, so the swing period
+//     depends on the speed alone, not on the amplitude).
 
 export const FAST_LEG_MS = 180;
 export const SLOW_LEG_MS = 2200;
@@ -39,12 +47,13 @@ export function legDurationMs(speedPercent, travel) {
 }
 
 // Normalise the planner inputs: percentages clamped, zone ordered.
-export function normalizePlannerInput({ speed = 0, zoneMin = 0, zoneMax = 1, cap = 100, enabled = true } = {}) {
+export function normalizePlannerInput({ speed = 0, zoneMin = 0, zoneMax = 1, cap = 100, enabled = true, legTravel = null } = {}) {
     const min = clamp01(zoneMin, 0);
     const max = Math.max(min, clamp01(zoneMax, 1));
     const capPct = clampPercent(cap, 100);
     const effectiveSpeed = clampPercent(speed) * (capPct / 100);
-    return { speed: clampPercent(speed), cap: capPct, effectiveSpeed, zoneMin: min, zoneMax: max, enabled: enabled !== false };
+    const travelBase = legTravel === null || legTravel === undefined ? null : clamp01(legTravel, 1);
+    return { speed: clampPercent(speed), cap: capPct, effectiveSpeed, zoneMin: min, zoneMax: max, enabled: enabled !== false, legTravel: travelBase };
 }
 
 export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
@@ -59,9 +68,13 @@ export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
     }
 
     return {
-        // Update the inputs. Takes effect on the next leg; never interrupts one.
+        // Update the inputs. Takes effect on the next leg, except that role
+        // OFF (enabled false) interrupts the leg in flight so the rest move
+        // goes out at once.
         setInput(next) {
+            const wasEnabled = input.enabled;
             input = normalizePlannerInput({ ...input, ...next });
+            if (wasEnabled && !input.enabled) legEndsAt = 0;
         },
         getInput() {
             return { ...input };
@@ -92,7 +105,12 @@ export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
             atRest = false;
             const travel = input.zoneMax - input.zoneMin;
             const position = goingUp ? input.zoneMax : input.zoneMin;
-            const durationMs = legDurationMs(input.effectiveSpeed, travel);
+            // Size the leg by what it really has to cover: the zone width
+            // (or legTravel) at least, the distance from the last position
+            // when that is longer (first leg after a rest or a zone shift).
+            const base = input.legTravel !== null ? input.legTravel : travel;
+            const distance = lastPosition === null ? 0 : Math.abs(position - lastPosition);
+            const durationMs = legDurationMs(input.effectiveSpeed, Math.max(base, distance));
             goingUp = !goingUp;
             lastPosition = position;
             legEndsAt = now + durationMs;

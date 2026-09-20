@@ -7,7 +7,9 @@ import {
     DEFAULT_DEVICE_NAME,
     isAxisId,
     axisKind,
+    isCentredAxis,
     restPositionFor,
+    looksLikeBootBanner,
     describeAxis,
     formatMagnitude,
     formatAxisCommand,
@@ -44,6 +46,13 @@ describe('axis ids', () => {
         assert.equal(restPositionFor('R1'), 0.5);
         assert.equal(restPositionFor('V0'), 0);
         assert.equal(restPositionFor('A0'), 0);
+        // Surge and sway are neutral at the mechanical centre, not in a corner.
+        assert.equal(restPositionFor('L1'), 0.5);
+        assert.equal(restPositionFor('L2'), 0.5);
+        assert.equal(isCentredAxis('L0'), false);
+        assert.equal(isCentredAxis('L1'), true);
+        assert.equal(isCentredAxis('R2'), true);
+        assert.equal(isCentredAxis('V0'), false);
     });
     it('describes axes with the device text or the spec name', () => {
         assert.equal(describeAxis('L0'), 'Stroke (up / down)');
@@ -144,6 +153,22 @@ describe('reply parsing', () => {
         const named = parseIdentification({ name: ['OSSM'], portInfo: { usbVendorId: 0x1a86, usbProductId: 0x7523 } });
         assert.equal(named.name, 'OSSM');
     });
+    it('never takes an auto-reset boot banner for a name or version', () => {
+        assert.equal(looksLikeBootBanner('ets Jul 29 2019 12:21:46'), true);
+        assert.equal(looksLikeBootBanner('rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)'), true);
+        assert.equal(looksLikeBootBanner('I (31) boot: ESP-IDF v4.4'), true);
+        assert.equal(looksLikeBootBanner('OSR2 Test Rig'), false);
+        const ident = parseIdentification({
+            name: ['ets Jul 29 2019 12:21:46', 'configsip: 0, SPIWP:0xee', 'SR6'],
+            version: ['mode:DIO, clock div:1', 'TCode v0.3'],
+            axisLines: ['L0 stroke']
+        });
+        assert.equal(ident.name, 'SR6');
+        assert.equal(ident.version, 'TCode v0.3');
+        const onlyBanner = parseIdentification({ name: ['rst:0x1 (POWERON_RESET)'], version: [], axisLines: [] });
+        assert.equal(onlyBanner.name, DEFAULT_DEVICE_NAME);
+    });
+
     it('truncates absurd names', () => {
         const ident = parseIdentification({ name: ['x'.repeat(200)] });
         assert.equal(ident.name.length, 60);
@@ -182,6 +207,15 @@ describe('browser text', () => {
         const generic = describeSerialSupport('');
         assert.match(generic, /Chrome and Edge on a desktop/);
         assert.match(generic, /not available on Android, iOS, Firefox or Safari/);
+    });
+    it('blames the insecure origin, not the browser, on desktop Chrome over plain http', () => {
+        const chrome = 'Mozilla/5.0 (X11; Linux x86_64) Chrome/128';
+        assert.match(describeSerialSupport(chrome, false), /secure origin/);
+        assert.match(describeSerialSupport(chrome, false), /https:\/\/ or http:\/\/localhost/);
+        assert.doesNotMatch(describeSerialSupport(chrome, false), /not available in this browser/);
+        assert.match(describeSerialSupport(chrome, true), /not available in this browser/);
+        // A browser that lacks Web Serial altogether is still told so.
+        assert.match(describeSerialSupport('Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0', false), /Firefox does not implement/);
     });
     it('maps serial errors to actionable text', () => {
         assert.equal(describeSerialError({ name: 'NotFoundError' }).kind, 'cancelled');
