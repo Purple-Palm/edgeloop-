@@ -2,7 +2,8 @@ import { state, advancedSettings } from './state.js';
 import { calculateEngineOutputs, resolveEngineMode } from './engine.js';
 import { drawTelemetryChart } from './chart.js';
 import { connectBleHeartRate, disconnectBle, bleDeviceRef } from './hardware/ble.js';
-import { connectHandy, disconnectHandy, dispatchHandy, handyConnected } from './hardware/handy.js';
+import { connectHandy, disconnectHandy, dispatchHandy, handyConnected, setHandyHandlers } from './hardware/handy.js';
+import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import {
     connectIntifaceServer,
     disconnectIntiface,
@@ -17,16 +18,24 @@ import {
 import { initHostPeer, initControllerPeer, broadcastPeerTelemetry, sendPeerCommand } from './webrtc.js';
 import { speakPrompt, setMindgamePrompt, startMicMonitor, stopMicMonitor, sampleMicLevel, listSpeechVoices } from './voice.js';
 
-// Auto-migrate legacy storage
+// Load persisted settings. The old 15/85 default envelope is migrated to
+// 0/100 exactly once (flagged), so a user who deliberately types 15/85 later
+// keeps it.
 const storedSettings = localStorage.getItem('edgeloop_advanced_settings');
 if (storedSettings) {
     try {
         const parsed = JSON.parse(storedSettings);
-        if (parsed.handyHwMin === 15 && parsed.handyHwMax === 85) {
-            parsed.handyHwMin = 0;
-            parsed.handyHwMax = 100;
+        let migrated = false;
+        if (!parsed.envelopeMigrated) {
+            if (parsed.handyHwMin === 15 && parsed.handyHwMax === 85) {
+                parsed.handyHwMin = 0;
+                parsed.handyHwMax = 100;
+            }
+            parsed.envelopeMigrated = true;
+            migrated = true;
         }
         Object.assign(advancedSettings, parsed);
+        if (migrated) localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
     } catch (e) {}
 }
 
@@ -131,6 +140,9 @@ function setBadgeState(type, status, nameLabel, batteryLabel = null) {
         } else if (status === 'connecting') {
             card.className = "text-left p-2 rounded-xl bg-amber-950/20 border border-amber-800/80 hover:border-amber-600 transition flex items-start gap-2 cursor-pointer min-w-0";
             dot.className = "h-2 w-2 rounded-full bg-amber-400 animate-ping shrink-0 mt-1";
+        } else if (status === 'warning') {
+            card.className = "text-left p-2 rounded-xl bg-amber-950/20 border border-amber-700 hover:border-amber-500 transition flex items-start gap-2 cursor-pointer min-w-0";
+            dot.className = "h-2 w-2 rounded-full bg-amber-400 shrink-0 mt-1";
         } else {
             card.className = "text-left p-2 rounded-xl bg-slate-900 border border-slate-800 hover:border-slate-700 transition flex items-start gap-2 cursor-pointer min-w-0";
             dot.className = "h-2 w-2 rounded-full bg-rose-500/30 border border-rose-500 shrink-0 mt-1";
@@ -203,12 +215,43 @@ fullStrokeToggleBtn?.addEventListener('click', () => {
 
 // Update Handy Travel Envelope Bounds Display
 function updateHwEnvelopeDisplay() {
+    const hwEnv = document.getElementById('hwEnvelopeDisplay');
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    if (hwEnv) hwEnv.textContent = `Bounds: ${env.min}% - ${env.max}%`;
+}
+
+// Normalise the persisted envelope and push it into the modal inputs. Used on
+// boot and after a settings import, so a hand-edited or imported file can
+// never produce an inverted or zero-width envelope.
+function syncHwEnvelopeInputs() {
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    advancedSettings.handyHwMin = env.min;
+    advancedSettings.handyHwMax = env.max;
     const hwMin = document.getElementById('hwMinInput');
     const hwMax = document.getElementById('hwMaxInput');
-    const hwEnv = document.getElementById('hwEnvelopeDisplay');
-    const minVal = parseInt(hwMin?.value || advancedSettings.handyHwMin || 0, 10);
-    const maxVal = parseInt(hwMax?.value || advancedSettings.handyHwMax || 100, 10);
-    if (hwEnv) hwEnv.textContent = `Bounds: ${minVal}% - ${maxVal}%`;
+    if (hwMin) hwMin.value = env.min;
+    if (hwMax) hwMax.value = env.max;
+    updateHwEnvelopeDisplay();
+}
+
+// Validate the typed envelope: clamp to 0-100, keep at least a 10% stroke by
+// moving the bound the user did NOT just edit, then write the corrected values
+// back into the inputs and persisted settings. `changed` is 'min' or 'max'.
+function applyHwEnvelopeInput(changed, commit = false) {
+    const hwMin = document.getElementById('hwMinInput');
+    const hwMax = document.getElementById('hwMaxInput');
+    const rawMin = hwMin && hwMin.value !== '' ? hwMin.value : advancedSettings.handyHwMin;
+    const rawMax = hwMax && hwMax.value !== '' ? hwMax.value : advancedSettings.handyHwMax;
+    const env = normalizeEnvelope(rawMin, rawMax, changed);
+    advancedSettings.handyHwMin = env.min;
+    advancedSettings.handyHwMax = env.max;
+    // While typing, only rewrite the input the user is NOT focused on so a
+    // half-typed number is not yanked away; on commit, rewrite both.
+    if (hwMin && (commit || changed !== 'min') && String(hwMin.value) !== String(env.min)) hwMin.value = env.min;
+    if (hwMax && (commit || changed !== 'max') && String(hwMax.value) !== String(env.max)) hwMax.value = env.max;
+    localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
+    updateHwEnvelopeDisplay();
+    updateEngine();
 }
 
 // The Handy Role, Speed Cap & Physical Travel Envelope Controls
@@ -233,25 +276,15 @@ function initHandyRoleUI() {
     }
 
     // Envelope inputs located inside Handy modal
+    syncHwEnvelopeInputs();
     if (hwMin) {
-        hwMin.value = advancedSettings.handyHwMin ?? 0;
-        hwMin.addEventListener('input', (e) => {
-            advancedSettings.handyHwMin = parseInt(e.target.value, 10) || 0;
-            localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
-            updateHwEnvelopeDisplay();
-        });
+        hwMin.addEventListener('input', () => applyHwEnvelopeInput('min', false));
+        hwMin.addEventListener('change', () => applyHwEnvelopeInput('min', true));
     }
-
     if (hwMax) {
-        hwMax.value = advancedSettings.handyHwMax ?? 100;
-        hwMax.addEventListener('input', (e) => {
-            advancedSettings.handyHwMax = parseInt(e.target.value, 10) || 100;
-            localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
-            updateHwEnvelopeDisplay();
-        });
+        hwMax.addEventListener('input', () => applyHwEnvelopeInput('max', false));
+        hwMax.addEventListener('change', () => applyHwEnvelopeInput('max', true));
     }
-
-    updateHwEnvelopeDisplay();
 
     const applyRole = (role) => {
         state.handyRole = role;
@@ -305,9 +338,12 @@ function updateEngine() {
         learnBadge?.classList.add('hidden');
     }
 
-    // Dual Stimulation Offset Check
-    const hasSecondary = Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === 'secondary'));
-    const isDualStimActive = hasSecondary && (handyConnected || Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === 'primary')));
+    // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
+    // (secondary) are both live. The Handy counts for whichever role it holds.
+    const intifaceHasRole = (role) => Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === role));
+    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary');
+    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary');
+    const isDualStimActive = hasPrimary && hasSecondary;
     const dualBadge = document.getElementById('dualStimBadge');
     if (isDualStimActive && advancedSettings.dualDampening) {
         const offset = advancedSettings.dualDampeningBpm || 15;
@@ -404,9 +440,18 @@ function updateEngine() {
     dispatchHardware(result.primaryPercent, result.secondaryPercent, result.strokeMinPercent, result.strokeMaxPercent);
 }
 
+// Physical stroke bounds to send to the toys. engine.js has ALREADY mapped
+// strokeMin/strokeMax into the hardware envelope, so they are passed through;
+// "Full Length Strokes Only" swaps in the full envelope instead of raw 0-100
+// so the user's typed guards are never exceeded.
+function effectiveStrokeRange(strokeMin, strokeMax) {
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    if (state.alwaysFullStroke) return { min: env.min, max: env.max, env };
+    return { min: strokeMin, max: strokeMax, env };
+}
+
 function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false) {
     if (isRemoteController) return;
-    const key = document.getElementById('modalHandyInput')?.value.trim() || '';
 
     let targetHandySpeed = 0;
     const handyCap = (state.handyMaxCap ?? 100) / 100;
@@ -418,11 +463,10 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
         targetHandySpeed = 0;
     }
 
-    const effStrokeMin = state.alwaysFullStroke ? 0 : strokeMin;
-    const effStrokeMax = state.alwaysFullStroke ? 100 : strokeMax;
+    const range = effectiveStrokeRange(strokeMin, strokeMax);
 
-    dispatchHandy(key, targetHandySpeed, effStrokeMin, effStrokeMax, force);
-    dispatchIntiface(primarySpeed, secondarySpeed, effStrokeMin, effStrokeMax);
+    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max);
+    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max);
 }
 
 function cueVoice(text) {
@@ -579,9 +623,8 @@ function tickSessionGuardsAndGames() {
 setInterval(() => {
     if (isRemoteController) return;
     if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
-        const effStrokeMin = state.alwaysFullStroke ? 0 : state.strokeMin;
-        const effStrokeMax = state.alwaysFullStroke ? 100 : state.strokeMax;
-        dispatchIntiface(state.strokerSpeed, state.prostateSpeed, effStrokeMin, effStrokeMax);
+        const range = effectiveStrokeRange(state.strokeMin, state.strokeMax);
+        dispatchIntiface(state.strokerSpeed, state.prostateSpeed, range.min, range.max);
     }
 }, 200);
 
@@ -1156,9 +1199,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
         try {
             const parsed = JSON.parse(evt.target.result);
             Object.assign(advancedSettings, parsed);
+            syncHwEnvelopeInputs();
             localStorage.setItem('edgeloop_advanced_settings', JSON.stringify(advancedSettings));
             syncParamsUI();
-            updateHwEnvelopeDisplay();
             updateEngine();
             alert("Settings successfully imported!");
         } catch (err) {
@@ -1266,28 +1309,77 @@ document.getElementById('modalEngageSimBtn')?.addEventListener('click', () => {
 // The Handy Connection
 const handyInput = document.getElementById('modalHandyInput');
 if (handyInput) handyInput.value = localStorage.getItem('handy_connection_key') || '';
+let handyConnectedLabel = 'The Handy';
+
+// Modal "Status:" line. tone: 'idle' | 'busy' | 'ok' | 'error'
+function setHandyStatus(text, tone = 'idle') {
+    const el = document.getElementById('modalHandyMsg');
+    if (!el) return;
+    el.textContent = `Status: ${text}`;
+    const toneClass = tone === 'ok' ? 'text-emerald-400'
+        : tone === 'error' ? 'text-rose-400'
+        : tone === 'busy' ? 'text-amber-300'
+        : 'text-slate-500';
+    el.className = `text-xs ${toneClass}`;
+}
+
+function handyBatteryLabel() {
+    return state.handyBattery !== null && state.handyBattery !== undefined ? `🔋 ${state.handyBattery}%` : null;
+}
+
+setHandyHandlers({
+    isSessionActive: () => state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN',
+    onError: (message) => {
+        if (!handyConnected) return;
+        if (message) {
+            const short = message.length > 70 ? `${message.slice(0, 67)}...` : message;
+            setHandyStatus(`API error: ${short}`, 'error');
+            setBadgeState('Handy', 'warning', 'API Error', handyBatteryLabel());
+        } else {
+            setHandyStatus(handyConnectedLabel, 'ok');
+            setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
+        }
+    },
+    onOffline: (reason) => {
+        state.handyBattery = null;
+        setHandyStatus('Offline', 'error');
+        setBadgeState('Handy', 'disconnected', 'Offline');
+        document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
+        // Pauses the session and issues a stop to every other toy.
+        triggerDisconnectAlert(reason || 'The Handy went offline. Motors paused for safety.');
+    }
+});
+
 document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async () => {
     const key = handyInput?.value.trim() || '';
-    if (!key) return alert("Please enter your Handy Connection Key.");
+    if (!key) {
+        setHandyStatus('Enter your Handy Connection Key first.', 'error');
+        return;
+    }
     localStorage.setItem('handy_connection_key', key);
+    setHandyStatus('Connecting...', 'busy');
     setBadgeState('Handy', 'connecting', 'Connecting...');
 
     try {
-        const bat = await connectHandy(key);
-        state.handyBattery = bat;
-        setBadgeState('Handy', 'connected', 'The Handy', bat !== null ? `🔋 ${bat}%` : null);
+        const result = await connectHandy(key);
+        state.handyBattery = result.battery;
+        handyConnectedLabel = result.description ? `Connected (${result.description})` : 'Connected';
+        setHandyStatus(handyConnectedLabel, 'ok');
+        setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
         document.getElementById('modalHandyDisconnectBtn')?.classList.remove('hidden');
         closeModal();
         syncTelemetry();
     } catch (e) {
+        state.handyBattery = null;
+        setHandyStatus(e && e.message ? e.message : 'Connection failed', 'error');
         setBadgeState('Handy', 'disconnected', 'Offline');
     }
 });
 
 document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', () => {
-    const key = handyInput?.value.trim() || '';
-    disconnectHandy(key);
+    disconnectHandy();
     state.handyBattery = null;
+    setHandyStatus('Offline', 'idle');
     setBadgeState('Handy', 'disconnected', 'Disconnected');
     document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
     triggerDisconnectAlert("The Handy disconnected.");
