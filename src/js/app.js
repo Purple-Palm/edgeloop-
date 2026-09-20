@@ -89,7 +89,11 @@ import {
     VOICE_CUE_CATALOG,
     DEFAULT_VOICE_CUES,
     mergeVoiceCues,
-    resolveVoiceCue
+    resolveVoiceCue,
+    applyImportedCues,
+    parseVoiceCuesText,
+    serializeVoiceCues,
+    clampEncourageSeconds
 } from './voice-cues.js';
 
 // Load persisted settings. The old 15/85 default envelope is migrated to
@@ -147,6 +151,7 @@ function syncGuardSettings() {
     advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
+    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
 }
 syncWatchdogSettings();
 syncGuardSettings();
@@ -807,13 +812,20 @@ function sessionVoiceVars() {
 }
 
 function dashboardIdlePrompt() {
-    return resolveVoiceCue(advancedSettings.voiceCues, 'idle', sessionVoiceVars()) || DEFAULT_VOICE_CUES.idle;
+    const { text } = resolveVoiceCue(advancedSettings.voiceCues, 'idle', sessionVoiceVars());
+    return text || DEFAULT_VOICE_CUES.idle[0];
 }
 
 // Queue a spoken cue. Voice guidance ON both paints the dashboard line and
 // speaks it. An `urgent` cue (signal lost, stop) jumps the TTS queue.
 function cueVoice(key, urgent = false) {
-    const text = resolveVoiceCue(advancedSettings.voiceCues, key, sessionVoiceVars());
+    const lastTemplate = state.lastCueTemplateById?.[key] || '';
+    const { text, template } = resolveVoiceCue(
+        advancedSettings.voiceCues,
+        key,
+        sessionVoiceVars(),
+        { lastTemplate }
+    );
     if (!advancedSettings.voiceEnabled || !text) {
         setMindgamePrompt(text || '', Boolean(advancedSettings.voiceEnabled && text));
         return;
@@ -822,6 +834,10 @@ function cueVoice(key, urgent = false) {
     if (!urgent && text === state.lastSpokenPrompt && (now - (state.lastSpokenAt || 0) < 7000)) return;
     state.lastSpokenPrompt = text;
     state.lastSpokenAt = now;
+    if (template) {
+        if (!state.lastCueTemplateById) state.lastCueTemplateById = {};
+        state.lastCueTemplateById[key] = template;
+    }
     setMindgamePrompt(text, true);
     if (urgent) speakNow(text, advancedSettings.voiceURI);
     else speakPrompt(true, text, advancedSettings.voiceURI);
@@ -970,6 +986,18 @@ function tickSessionGuardsAndGames() {
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
     if (warmupSeconds > 0 && state.sessionSeconds === warmupSeconds) {
         cueVoice('warmupDone');
+    }
+
+    const encourageEvery = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
+    if (
+        advancedSettings.voiceEnabled
+        && encourageEvery > 0
+        && state.sessionStatus === 'RUNNING'
+        && !state.orgasmMode
+        && state.sessionSeconds > 0
+        && state.sessionSeconds % encourageEvery === 0
+    ) {
+        cueVoice('encourage');
     }
 
     if (advancedSettings.micEnabled && state.micAnalyser) {
@@ -1816,7 +1844,7 @@ document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () =>
     const select = document.getElementById('paramVoiceSelect');
     if (select) advancedSettings.voiceURI = select.value;
     readVoiceCuesFromForm();
-    const text = resolveVoiceCue(advancedSettings.voiceCues, 'preview', sessionVoiceVars());
+    const { text } = resolveVoiceCue(advancedSettings.voiceCues, 'preview', sessionVoiceVars());
     if (text) speakNow(text, advancedSettings.voiceURI);
 });
 
@@ -1832,15 +1860,19 @@ function renderVoiceCueEditor() {
     const root = document.getElementById('voiceCuesList');
     if (!root) return;
     const merged = mergeVoiceCues(advancedSettings.voiceCues);
-    root.innerHTML = VOICE_CUE_CATALOG.map((cue) => (
-        `<div class="space-y-0.5">
+    root.innerHTML = VOICE_CUE_CATALOG.map((cue) => {
+        const lines = merged[cue.id] || cue.lines;
+        const rows = Math.min(8, Math.max(3, lines.length + 1));
+        return `<div class="space-y-0.5">
             <div class="flex justify-between items-center gap-2">
-              <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)}</label>
+              <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)} <span class="text-slate-600 font-mono">(${lines.length})</span></label>
               <button type="button" data-voice-preview="${cue.id}" class="text-[9px] text-purple-300 hover:underline cursor-pointer">Speak</button>
             </div>
-            <input id="voiceCue-${cue.id}" data-voice-cue="${cue.id}" value="${escapeAttr(merged[cue.id])}" maxlength="140" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-[10px] text-slate-200 outline-none focus:border-purple-500">
-        </div>`
-    )).join('');
+            <textarea id="voiceCue-${cue.id}" data-voice-cue="${cue.id}" rows="${rows}" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-[10px] text-slate-200 outline-none focus:border-purple-500 font-mono leading-snug">${escapeAttr(lines.join('\n'))}</textarea>
+        </div>`;
+    }).join('');
+    const interval = document.getElementById('voiceEncourageSecondsInput');
+    if (interval) interval.value = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
 }
 
 function readVoiceCuesFromForm() {
@@ -1849,19 +1881,58 @@ function readVoiceCuesFromForm() {
         raw[el.getAttribute('data-voice-cue')] = el.value;
     });
     if (Object.keys(raw).length > 0) advancedSettings.voiceCues = mergeVoiceCues(raw);
+    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(document.getElementById('voiceEncourageSecondsInput')?.value);
 }
 
 document.getElementById('voiceCuesList')?.addEventListener('click', (e) => {
     const btn = e.target?.closest?.('[data-voice-preview]');
     if (!btn) return;
     readVoiceCuesFromForm();
-    const text = resolveVoiceCue(advancedSettings.voiceCues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
+    const { text } = resolveVoiceCue(advancedSettings.voiceCues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
     if (text) speakNow(text, advancedSettings.voiceURI);
 });
 
 document.getElementById('voiceCuesResetBtn')?.addEventListener('click', () => {
     advancedSettings.voiceCues = mergeVoiceCues({});
     renderVoiceCueEditor();
+});
+
+function downloadNamedText(filename, body, mime = 'application/json') {
+    const blob = new Blob([body], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+document.getElementById('voiceCuesExportBtn')?.addEventListener('click', () => {
+    readVoiceCuesFromForm();
+    const payload = {
+        voiceCues: serializeVoiceCues(advancedSettings.voiceCues),
+        voiceEncourageSeconds: clampEncourageSeconds(advancedSettings.voiceEncourageSeconds)
+    };
+    downloadNamedText('edgeloop_voice_cues.json', JSON.stringify(payload, null, 2));
+});
+
+document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+        const parsed = parseVoiceCuesText(String(evt.target.result || ''));
+        if (parsed.error || !parsed.cues || Object.keys(parsed.cues).length === 0) {
+            alert('That file did not look like an EdgeLoop phrase list. Use Export phrases, a settings backup, or a text file with # edge / # encourage sections.');
+            return;
+        }
+        readVoiceCuesFromForm();
+        advancedSettings.voiceCues = applyImportedCues(advancedSettings.voiceCues, parsed.cues);
+        renderVoiceCueEditor();
+        persistSettings();
+    };
+    reader.readAsText(file);
+    e.target.value = '';
 });
 
 document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
@@ -2025,6 +2096,7 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
     readVoiceCuesFromForm();
+    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
     if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
     advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);

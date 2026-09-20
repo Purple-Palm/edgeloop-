@@ -873,10 +873,24 @@
               <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug pt-1 border-t border-slate-900">
-              When this is on, each cue is shown on the dashboard <em>and</em> spoken. Tokens you can drop into a phrase: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
+              One phrase per line. As many lines as you want for each event — a random unused line is picked each time. Tokens: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
             </p>
-            <div id="voiceCuesList" class="space-y-1.5 max-h-56 overflow-y-auto pr-0.5"></div>
-            <button id="voiceCuesResetBtn" type="button" class="text-[10px] text-slate-400 hover:text-purple-300 font-bold cursor-pointer">Reset phrases to defaults</button>
+            <div class="flex items-center justify-between gap-2 pt-1">
+              <span class="text-[9px] text-slate-400 font-semibold">Encouragement every</span>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="voiceEncourageSecondsInput" type="number" min="0" max="180" value="45" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec (0 = off)</span>
+              </div>
+            </div>
+            <div id="voiceCuesList" class="space-y-1.5 max-h-72 overflow-y-auto pr-0.5"></div>
+            <div class="flex flex-wrap gap-2 pt-1">
+              <button id="voiceCuesExportBtn" type="button" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer">Export phrases</button>
+              <label class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer text-center">
+                Import phrases
+                <input id="voiceCuesImportFile" type="file" accept=".json,.txt,text/plain,application/json" class="hidden">
+              </label>
+              <button id="voiceCuesResetBtn" type="button" class="text-[10px] text-slate-400 hover:text-purple-300 font-bold cursor-pointer px-1">Reset defaults</button>
+            </div>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
@@ -914,6 +928,7 @@
         <div id="paramsBackupSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <span class="text-xs font-bold text-slate-200 block">Backup & Restore</span>
+            <p class="text-[9px] text-slate-400 leading-snug">Exports every Session Setup value, including your voice-phrase lists. Import restores them. Phrase files can also be exported on their own from the Audio &amp; Mic tab.</p>
             <div class="flex gap-2 pt-1">
               <button id="exportSettingsBtn" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer">
                 Export (.json)

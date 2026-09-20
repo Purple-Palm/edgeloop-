@@ -178,8 +178,9 @@ credited by username.
   Test button and a noise-gate slider; the sampler uses the 250-4000 Hz
   voice band so toy motors do not trip it.
 - Spoken Voice Guidance shows the current cue on the dashboard and speaks
-  it. The phrases are editable on the Audio tab, with `{hr}`, `{maxHr}`,
-  `{minHr}`, `{edges}` and `{minutes}` filled from the live session.
+  it. Each event is a list of phrases (one per line, randomly rotated).
+  Phrase files can be imported/exported on the Audio tab and are included
+  in the full settings backup. Encouragement lines play on a timer.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.

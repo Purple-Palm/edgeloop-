@@ -74,6 +74,7 @@ export const state = {
     // across ticks by a slow source counts as one breach reading.
     survivalLastReadingAt: null,
     lastSpokenPrompt: '',
+    lastCueTemplateById: {},
     lastSpokenAt: 0,
     isTestingMic: false,
     micStream: null,
@@ -115,6 +116,7 @@ export const advancedSettings = {
     voiceEnabled: false,
     voiceURI: '',
     voiceCues: {},
+    voiceEncourageSeconds: 45,
     micEnabled: false,
     micSensitivityThreshold: 40,
     customProfiles: {},
