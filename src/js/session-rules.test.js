@@ -12,7 +12,11 @@ import {
     MIN_STALL_GUARD_SECONDS,
     MAX_STALL_GUARD_SECONDS,
     DEFAULT_STALL_GUARD_SECONDS,
+    MIN_STALL_PAUSE_SECONDS,
+    MAX_STALL_PAUSE_SECONDS,
+    DEFAULT_STALL_PAUSE_SECONDS,
     clampStallGuardSeconds,
+    clampStallPauseSeconds,
     tickStallGuard
 } from './session-rules.js';
 
@@ -200,7 +204,7 @@ describe('survival breach counter', () => {
 });
 
 describe('stall guard', () => {
-    it('clamps the typed timeout to its range and falls back on garbage', () => {
+    it('clamps the typed timeouts to their ranges and falls back on garbage', () => {
         assert.equal(clampStallGuardSeconds(-5), MIN_STALL_GUARD_SECONDS);
         assert.equal(clampStallGuardSeconds('200'), MAX_STALL_GUARD_SECONDS);
         assert.equal(clampStallGuardSeconds('12'), 12);
@@ -210,28 +214,46 @@ describe('stall guard', () => {
         assert.equal(clampStallGuardSeconds(NaN), DEFAULT_STALL_GUARD_SECONDS);
         assert.equal(MAX_STALL_GUARD_SECONDS, 120);
         assert.equal(DEFAULT_STALL_GUARD_SECONDS, 20);
+        assert.equal(clampStallPauseSeconds(1), MIN_STALL_PAUSE_SECONDS);
+        assert.equal(clampStallPauseSeconds(99), MAX_STALL_PAUSE_SECONDS);
+        assert.equal(clampStallPauseSeconds('8'), 8);
+        assert.equal(clampStallPauseSeconds('nope'), DEFAULT_STALL_PAUSE_SECONDS);
+        assert.equal(DEFAULT_STALL_PAUSE_SECONDS, 8);
+        assert.equal(MIN_STALL_PAUSE_SECONDS, 2);
+        assert.equal(MAX_STALL_PAUSE_SECONDS, 60);
     });
 
-    it('counts up while armed and edged and engages at the timeout', () => {
-        let g = { seconds: 0, engaged: false };
-        for (let i = 0; i < 2; i++) g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
-        assert.deepEqual(g, { seconds: 2, engaged: false, justEngaged: false, justReleased: false });
-        g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
-        assert.deepEqual(g, { seconds: 3, engaged: true, justEngaged: true, justReleased: false });
-        g = tickStallGuard(g, { armed: true, isEdged: true, timeoutSeconds: 3 });
-        assert.equal(g.justEngaged, false, 'engages once');
-        // A negative typed timeout is clamped, so the guard cannot fire on the first tick.
-        assert.equal(tickStallGuard({ seconds: 0 }, { armed: true, isEdged: true, timeoutSeconds: -5 }).engaged, false);
+    it('counts the hold window while armed and edged, then pauses, then resumes', () => {
+        let g = { holdSeconds: 0, pauseSeconds: 0, engaged: false };
+        const opts = { armed: true, isEdged: true, holdTimeoutSeconds: 3, pauseTimeoutSeconds: 2 };
+        for (let i = 0; i < 2; i++) g = tickStallGuard(g, opts);
+        assert.equal(g.holdSeconds, 2);
+        assert.equal(g.engaged, false);
+        g = tickStallGuard(g, opts);
+        assert.equal(g.engaged, true);
+        assert.equal(g.justEngaged, true);
+        g = tickStallGuard(g, opts);
+        assert.equal(g.engaged, true);
+        assert.equal(g.pauseSeconds, 1);
+        assert.equal(g.justEngaged, false);
+        g = tickStallGuard(g, opts);
+        assert.equal(g.engaged, false);
+        assert.equal(g.justResumed, true);
+        assert.equal(g.holdSeconds, 0);
+        // A negative hold timeout is clamped, so the guard cannot fire on the first tick.
+        assert.equal(tickStallGuard({ holdSeconds: 0 }, { armed: true, isEdged: true, holdTimeoutSeconds: -5, pauseTimeoutSeconds: 8 }).engaged, false);
     });
 
     it('releases at once when disarmed while engaged, even with the pulse still at the ceiling', () => {
-        const engaged = { seconds: 9, engaged: true };
-        const off = tickStallGuard(engaged, { armed: false, isEdged: true, timeoutSeconds: 8 });
-        assert.deepEqual(off, { seconds: 0, engaged: false, justEngaged: false, justReleased: true });
-        const released = tickStallGuard(engaged, { armed: true, isEdged: false, timeoutSeconds: 8 });
+        const engaged = { holdSeconds: 9, pauseSeconds: 1, engaged: true };
+        const off = tickStallGuard(engaged, { armed: false, isEdged: true, holdTimeoutSeconds: 8, pauseTimeoutSeconds: 8 });
+        assert.equal(off.engaged, false);
+        assert.equal(off.justReleased, true);
+        assert.equal(off.holdSeconds, 0);
+        const released = tickStallGuard(engaged, { armed: true, isEdged: false, holdTimeoutSeconds: 8, pauseTimeoutSeconds: 8 });
         assert.equal(released.engaged, false);
         assert.equal(released.justReleased, true);
-        const idle = tickStallGuard({ seconds: 0, engaged: false }, { armed: false, isEdged: true, timeoutSeconds: 8 });
+        const idle = tickStallGuard({ holdSeconds: 0, engaged: false }, { armed: false, isEdged: true, holdTimeoutSeconds: 8, pauseTimeoutSeconds: 8 });
         assert.equal(idle.justReleased, false);
     });
 });

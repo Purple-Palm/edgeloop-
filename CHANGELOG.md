@@ -111,12 +111,13 @@ credited by username.
   the ceiling rule applies again; pausing during Soft Landing resumes it.
 - Stall guard stops only the primary channel, as the UI states; it is
   released at once when it is switched off, Full Stop is selected or Force
-  Orgasm starts, and its timeout is clamped to 3-120 s (default 20) wherever
-  it enters. The Guards toggle turns the auto-cutoff off entirely.
-- Edge hold overshoot (0-15%, default 5%) stretches the tease up to
-  Climax HR plus that percent before crawl / Full Stop / stall engage, so
-  the typed max is a hold rather than an immediate pullback. The edge still
-  releases 5 BPM below the typed Climax HR.
+  Orgasm starts. Two timers: how long you may stay at the pullback mark
+  (3-120 s, default 20) before the primary is cut, and how long that halt
+  lasts (2-60 s, default 8) before crawl resumes and the hold window
+  restarts. The Guards toggle turns the auto-cutoff off entirely.
+- Pullback is a percent of typed Climax HR (90-115, default 100): 95%
+  pulls back early, 105% holds a little past the typed max. A saved 0-15
+  offset from the previous build is migrated to 100-115.
 - The endgame (Orgasm / Soft Landing / Denied) fires once per session, so
   Force Orgasm stays a toggle the wearer can cancel after the target time.
 - Importing the same settings file twice works (the file input is cleared

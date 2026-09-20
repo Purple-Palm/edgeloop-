@@ -213,7 +213,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     if (!(await page.locator('#stallGuardToggle').count())) throw new Error('stall guard toggle missing');
     const stallMax = await page.locator('#stallGuardSecondsInput').getAttribute('max');
     if (stallMax !== '120') throw new Error('stall timeout max expected 120, got ' + stallMax);
-    if (!(await page.locator('#edgeOvershootInput').count())) throw new Error('edge overshoot input missing');
+    if (!(await page.locator('#edgeHoldPercentInput').count())) throw new Error('edge hold percent input missing');
+    if (!(await page.locator('#stallPauseSecondsInput').count())) throw new Error('stall pause input missing');
     await page.locator('#paramsTabAudioBtn').click(); await sleep(150);
     if (!(await page.locator('#paramMicTestBtn').count())) throw new Error('mic test button missing');
     if (!(await page.locator('#micGateInput').count())) throw new Error('mic noise gate missing');

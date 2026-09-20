@@ -24,22 +24,28 @@ export const ENGINE_MODES = [
 // limit cannot flap the motors on and off or count phantom edges.
 export const EDGE_RELEASE_BPM = 5;
 
-// Extra headroom above the typed Climax HR before crawl / Full Stop / stall
-// engage. 0% pulls back at the typed max; 5% holds through 105% of it.
-export const MIN_EDGE_OVERSHOOT_PERCENT = 0;
-export const MAX_EDGE_OVERSHOOT_PERCENT = 15;
-export const DEFAULT_EDGE_OVERSHOOT_PERCENT = 5;
+// Pullback as a percent of typed Climax HR. 100% is the typed max; 95%
+// pulls back early; 105% lets pulse sit 5% past the typed max.
+export const MIN_EDGE_HOLD_PERCENT = 90;
+export const MAX_EDGE_HOLD_PERCENT = 115;
+export const DEFAULT_EDGE_HOLD_PERCENT = 100;
 
-export function clampEdgeOvershootPercent(value, fallback = DEFAULT_EDGE_OVERSHOOT_PERCENT) {
+export function clampEdgeHoldPercent(value, fallback = DEFAULT_EDGE_HOLD_PERCENT) {
     const n = typeof value === 'number' ? Math.round(value) : parseInt(String(value), 10);
     if (!Number.isFinite(n)) return fallback;
-    return clamp(n, MIN_EDGE_OVERSHOOT_PERCENT, MAX_EDGE_OVERSHOOT_PERCENT);
+    return clamp(n, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT);
 }
 
-export function resolveEdgeTriggerHr(maxHr, overshootPercent = 0) {
+export function resolveEdgeTriggerHr(maxHr, holdPercent = DEFAULT_EDGE_HOLD_PERCENT) {
     if (!Number.isFinite(maxHr)) return maxHr;
-    const pct = clampEdgeOvershootPercent(overshootPercent, 0);
-    return Math.max(maxHr, Math.round(maxHr * (1 + pct / 100)));
+    const pct = clampEdgeHoldPercent(holdPercent, DEFAULT_EDGE_HOLD_PERCENT);
+    return Math.max(1, Math.round(maxHr * (pct / 100)));
+}
+
+export function edgeReleaseHr(maxHr, triggerHr) {
+    if (!Number.isFinite(maxHr)) return maxHr;
+    const top = Number.isFinite(triggerHr) ? Math.min(maxHr, triggerHr) : maxHr;
+    return top - EDGE_RELEASE_BPM;
 }
 
 // The narrowest stroke zone (percent of the hardware envelope) the engine
@@ -63,8 +69,9 @@ export function resolveEngineMode(mode) {
     return ENGINE_MODES.includes(mode) ? mode : 'classic';
 }
 
-export function hasReleasedEdge(hr, maxHr) {
-    return Number.isFinite(hr) && Number.isFinite(maxHr) && hr < (maxHr - EDGE_RELEASE_BPM);
+export function hasReleasedEdge(hr, maxHr, triggerHr) {
+    const release = edgeReleaseHr(maxHr, triggerHr);
+    return Number.isFinite(hr) && Number.isFinite(release) && hr < release;
 }
 
 function finiteOr(value, fallback) {
@@ -105,9 +112,7 @@ export function calculateEngineOutputs({
     milkingWave = false,
     stallGuardEngaged = false,
     ceilingBehaviour = 'crawl',
-    // 0 keeps the historical "edged at typed max" behaviour so tests that
-    // omit the field stay on the old curve. The cockpit default is 5%.
-    edgeOvershootPercent = 0,
+    edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,
     ruinHoldSeconds = 0,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30
@@ -145,19 +150,19 @@ export function calculateEngineOutputs({
     let nextIsEdged = Boolean(isEdged);
     let newEdgeTriggered = false;
 
-    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeOvershootPercent);
+    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent);
 
     if (hr >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
             newEdgeTriggered = true;
             nextIsEdged = true;
         }
-    } else if (hasReleasedEdge(hr, maxHr)) {
+    } else if (hasReleasedEdge(hr, maxHr, triggerHr)) {
         nextIsEdged = false;
     }
 
-    // Stretch the tease band up to the overshoot trigger so typed max is a
-    // hold, not an automatic 0%. Crawl / Full Stop only apply once edged.
+    // Stretch the tease band up to the pullback trigger so a hold above
+    // 100% does not already sit at 0% at the typed max.
     const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);

@@ -52,6 +52,7 @@ export const state = {
     strokeMax: 100,
     ruinHoldSeconds: 0,
     edgeStallSeconds: 0,
+    stallPauseElapsed: 0,
     stallGuardEngaged: false,
     intensityValue: 50,
     history: [70],
@@ -95,11 +96,12 @@ export const advancedSettings = {
     envelopeMigrated: true,
     stallGuard: true,
     stallGuardSeconds: 20,
+    stallPauseSeconds: 8,
     // What the primary does while parked at the pullback trigger: 'stop'
     // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
     ceilingBehaviour: 'crawl',
-    // Extra % of Climax HR allowed before crawl / Full Stop / stall engage.
-    edgeOvershootPercent: 5,
+    // Pullback as a percent of typed Climax HR (90-115, default 100).
+    edgeHoldPercent: 100,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,

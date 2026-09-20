@@ -110,7 +110,7 @@
               <span id="decayBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 ml-1">DECAY: -<span id="decayAmountText">0</span> BPM</span>
               <span id="learnBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 ml-1">LEARNED -<span id="learnAmountText">0</span> BPM</span>
               <span id="effectiveCeilingBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1" title="The climax ceiling the engine is using right now, after every offset"><span id="effectiveCeilingLabel">CEILING</span> <span id="effectiveCeilingText">140</span> BPM</span>
-              <span id="edgeHoldBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1" title="Pulse may climb this far past Climax HR before crawl / Full Stop">HOLD TO <span id="edgeHoldText">147</span></span>
+              <span id="edgeHoldBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-950/80 border border-purple-700 text-purple-300 ml-1" title="Pulse relative to this percent of Climax HR is the pullback trigger">HOLD TO <span id="edgeHoldText">140</span></span>
               <span id="micActiveBadge" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1">MIC LISTEN</span>
               <button id="micReenableBtn" type="button" class="hidden text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700 text-amber-300 hover:bg-amber-900 ml-1 cursor-pointer" title="Browsers only grant the microphone after a tap">Tap to re-enable microphone</button>
             </div>
@@ -181,7 +181,7 @@
             CLIMAX LIMIT REACHED: PRIMARY CUT — SECONDARY MILKING ACTIVE
           </div>
           <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse">
-            PROLONGED CEILING LOCK: PRIMARY HALTED UNTIL PULSE RECOVERS
+            STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE
           </div>
           <div id="gameNotice" class="hidden text-center text-[11px] font-bold text-purple-300 bg-purple-950/50 border border-purple-800/80 rounded-lg py-1 animate-pulse">
             GAME MODE ACTIVE
@@ -736,22 +736,22 @@
               </select>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              What the strokers do once your pulse crosses the pullback trigger (Climax HR plus the overshoot below). <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
             </p>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <div class="flex justify-between items-center gap-2">
-              <label for="edgeOvershootInput" class="text-xs font-bold text-slate-200">Edge hold overshoot</label>
+              <label for="edgeHoldPercentInput" class="text-xs font-bold text-slate-200">Pullback at</label>
               <div class="flex items-center gap-1 font-mono">
-                <input id="edgeOvershootInput" type="number" min="0" max="15" value="5" class="w-12 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
-                <span class="text-slate-500 text-[10px]">%</span>
+                <input id="edgeHoldPercentInput" type="number" min="90" max="115" value="100" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">% of Climax HR</span>
               </div>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Stay on the tease at your typed Climax HR. Crawl / Full Stop (and the stall timer) only start after pulse reaches this extra percent — 5% of 140 BPM is 147. 0% pulls back at the typed max; 10% holds through 110%. Dropping back below Climax HR − 5 BPM releases the edge.
+              100% is the Climax HR you typed. 95% pulls back early; 105% lets you sit a little past it. Crawl / Full Stop and the stall timers start at this mark. The edge releases 5 BPM below the lower of Climax HR and this trigger.
             </p>
-            <p id="edgeOvershootPreview" class="text-[10px] font-mono text-purple-300">Pullback at 147 BPM (105% of 140)</p>
+            <p id="edgeHoldPreview" class="text-[10px] font-mono text-purple-300">Pullback at 140 BPM (100% of 140)</p>
           </div>
 
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
@@ -763,12 +763,19 @@
               </label>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Optional. When on, and Crawl is selected, cuts the primary stroker from Crawl to 0% after the pulse has sat at the pullback trigger longer than the timeout. Turn it off to stay on the crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running either way.
+              Two timers, only used with Crawl. <strong>Allow on the edge</strong> is how long pulse may sit at the pullback mark before the primary is cut. <strong>Pause the primary</strong> is how long that halt lasts (then crawl resumes and the allow window starts again). Turn the guard off to stay on crawl until you recover, Force Orgasm, or STOP. The secondary channel keeps running either way.
             </p>
             <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
-              <span class="text-[9px] text-slate-400 font-semibold">Timeout:</span>
+              <span class="text-[9px] text-slate-400 font-semibold">Allow on the edge:</span>
               <div class="flex items-center gap-1 font-mono">
                 <input id="stallGuardSecondsInput" type="number" min="3" max="120" value="20" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec</span>
+              </div>
+            </div>
+            <div class="flex items-center justify-between pt-1 border-t border-slate-900 text-xs">
+              <span class="text-[9px] text-slate-400 font-semibold">Pause the primary:</span>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="stallPauseSecondsInput" type="number" min="2" max="60" value="8" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-purple-400 font-bold outline-none">
                 <span class="text-slate-500 text-[10px]">sec</span>
               </div>
             </div>

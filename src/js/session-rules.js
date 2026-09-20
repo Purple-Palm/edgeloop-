@@ -16,10 +16,16 @@ export const ORGASM_BOOST_CAP = 60;
 // the ceiling, so a single HR-sensor spike cannot end the game.
 export const SURVIVAL_BREACH_TICKS = 3;
 
-// Stall guard timeout (seconds at the ceiling before the primary is cut).
+// How long pulse may sit at the pullback trigger before the primary is cut.
 export const MIN_STALL_GUARD_SECONDS = 3;
 export const MAX_STALL_GUARD_SECONDS = 120;
 export const DEFAULT_STALL_GUARD_SECONDS = 20;
+
+// How long the primary stays halted after that cut, then crawl resumes
+// (still edged) and the hold window starts again.
+export const MIN_STALL_PAUSE_SECONDS = 2;
+export const MAX_STALL_PAUSE_SECONDS = 60;
+export const DEFAULT_STALL_PAUSE_SECONDS = 8;
 
 export const DEFAULT_MIN_HR = 70;
 export const DEFAULT_MAX_HR = 140;
@@ -172,25 +178,77 @@ export function countSurvivalBreach(previousTicks, hr, ceiling, newReading = tru
     return hr >= ceiling ? (previousTicks || 0) + 1 : 0;
 }
 
-// Clamp the typed stall-guard timeout to its supported range (seconds).
 export function clampStallGuardSeconds(value, fallback = DEFAULT_STALL_GUARD_SECONDS) {
     const n = toInt(value);
     if (n === null) return fallback;
     return clamp(n, MIN_STALL_GUARD_SECONDS, MAX_STALL_GUARD_SECONDS);
 }
 
-// One 1 s tick of the stall guard. `armed` is whether the guard may act at
-// all (setting on, Crawl selected, no Force Orgasm, no game mode); while
-// armed and edged the seconds count up and the guard engages at the
-// timeout. Whenever the guard is not armed or the edge has released, it is
-// released at once, even if the pulse is still parked at the ceiling.
-export function tickStallGuard({ seconds = 0, engaged = false } = {}, { armed = false, isEdged = false, timeoutSeconds } = {}) {
+export function clampStallPauseSeconds(value, fallback = DEFAULT_STALL_PAUSE_SECONDS) {
+    const n = toInt(value);
+    if (n === null) return fallback;
+    return clamp(n, MIN_STALL_PAUSE_SECONDS, MAX_STALL_PAUSE_SECONDS);
+}
+
+// One 1 s tick of the stall guard.
+// holdTimeoutSeconds: how long you may stay edged before the primary is cut.
+// pauseTimeoutSeconds: how long that halt lasts, then crawl resumes and the
+// hold window starts over. Disarm or leaving the edge clears both clocks.
+export function tickStallGuard(
+    { holdSeconds = 0, pauseSeconds = 0, engaged = false, seconds } = {},
+    { armed = false, isEdged = false, holdTimeoutSeconds, pauseTimeoutSeconds, timeoutSeconds } = {}
+) {
+    const hold = Number.isFinite(holdSeconds) ? holdSeconds : (Number.isFinite(seconds) ? seconds : 0);
+    const pause = Number.isFinite(pauseSeconds) ? pauseSeconds : 0;
     if (!armed || !isEdged) {
-        return { seconds: 0, engaged: false, justEngaged: false, justReleased: Boolean(engaged) };
+        return {
+            holdSeconds: 0,
+            pauseSeconds: 0,
+            seconds: 0,
+            engaged: false,
+            justEngaged: false,
+            justReleased: Boolean(engaged),
+            justResumed: false
+        };
     }
-    const next = (Number.isFinite(seconds) ? seconds : 0) + 1;
-    const engagedNow = Boolean(engaged) || next >= clampStallGuardSeconds(timeoutSeconds);
-    return { seconds: next, engaged: engagedNow, justEngaged: engagedNow && !engaged, justReleased: false };
+    const holdLimit = clampStallGuardSeconds(holdTimeoutSeconds ?? timeoutSeconds);
+    const pauseLimit = clampStallPauseSeconds(pauseTimeoutSeconds);
+
+    if (engaged) {
+        const nextPause = pause + 1;
+        if (nextPause >= pauseLimit) {
+            return {
+                holdSeconds: 0,
+                pauseSeconds: 0,
+                seconds: 0,
+                engaged: false,
+                justEngaged: false,
+                justReleased: false,
+                justResumed: true
+            };
+        }
+        return {
+            holdSeconds: hold,
+            pauseSeconds: nextPause,
+            seconds: hold,
+            engaged: true,
+            justEngaged: false,
+            justReleased: false,
+            justResumed: false
+        };
+    }
+
+    const nextHold = hold + 1;
+    const engagedNow = nextHold >= holdLimit;
+    return {
+        holdSeconds: nextHold,
+        pauseSeconds: 0,
+        seconds: nextHold,
+        engaged: engagedNow,
+        justEngaged: engagedNow,
+        justReleased: false,
+        justResumed: false
+    };
 }
 
 export function isSurvivalDefeated(breachTicks) {

@@ -3,7 +3,7 @@ import {
     calculateEngineOutputs,
     resolveEngineMode,
     hasReleasedEdge,
-    clampEdgeOvershootPercent,
+    clampEdgeHoldPercent,
     resolveEdgeTriggerHr
 } from './engine.js';
 import {
@@ -14,6 +14,7 @@ import {
     countSurvivalBreach,
     isSurvivalDefeated,
     clampStallGuardSeconds,
+    clampStallPauseSeconds,
     tickStallGuard
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
@@ -106,6 +107,14 @@ if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(store
         parsed.ceilingBehaviour = parsed.stallGuard === false ? 'stop' : 'crawl';
         migrated = true;
     }
+    // Old builds stored an offset (0-15 meaning 100-115% of Climax HR).
+    if (!Number.isFinite(Number(parsed.edgeHoldPercent))) {
+        const old = Number(parsed.edgeOvershootPercent);
+        parsed.edgeHoldPercent = (Number.isFinite(old) && old >= 0 && old <= 20)
+            ? 100 + Math.round(old)
+            : 100;
+        migrated = true;
+    }
     Object.assign(advancedSettings, parsed);
     if (migrated) persistSettings();
 }
@@ -124,12 +133,12 @@ function syncWatchdogSettings() {
         autoResume: advancedSettings.hrAutoResume
     });
 }
-// Stall timeout (3-120 s), edge overshoot (0-15 %) and the mic gate are
-// clamped wherever they enter: load, Apply and import. A negative stall
-// timeout would fire the guard on the first tick at the ceiling.
+// Stall hold (3-120 s), stall pause (2-60 s), edge hold percent (90-115)
+// and the mic gate are clamped wherever they enter: load, Apply and import.
 function syncGuardSettings() {
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
-    advancedSettings.edgeOvershootPercent = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
+    advancedSettings.stallPauseSeconds = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
+    advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
 }
 syncWatchdogSettings();
@@ -668,12 +677,12 @@ function updateEngine() {
     if (ceilingText) ceilingText.textContent = max;
     ceilingBadge?.classList.toggle('hidden', max === typedMax);
 
-    const overshoot = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
-    const triggerHr = resolveEdgeTriggerHr(max, overshoot);
+    const holdPct = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
+    const triggerHr = resolveEdgeTriggerHr(max, holdPct);
     const holdBadge = document.getElementById('edgeHoldBadge');
     const holdText = document.getElementById('edgeHoldText');
     if (holdText) holdText.textContent = `${triggerHr}`;
-    holdBadge?.classList.toggle('hidden', overshoot <= 0 || triggerHr <= max);
+    holdBadge?.classList.toggle('hidden', holdPct === 100 || triggerHr === max);
     state.edgeTriggerHr = triggerHr;
 
     const result = calculateEngineOutputs({
@@ -696,7 +705,7 @@ function updateEngine() {
         milkingWave: advancedSettings.milkingWave,
         stallGuardEngaged: state.stallGuardEngaged,
         ceilingBehaviour: advancedSettings.ceilingBehaviour,
-        edgeOvershootPercent: advancedSettings.edgeOvershootPercent,
+        edgeHoldPercent: advancedSettings.edgeHoldPercent,
         ruinHoldSeconds: state.ruinHoldSeconds,
         oracleState: state.oracleState,
         survivalSpeedFloor: state.survivalSpeedFloor
@@ -890,6 +899,7 @@ function resetGameState() {
     state.survivalBreachTicks = 0;
     state.survivalLastReadingAt = null;
     state.edgeStallSeconds = 0;
+    state.stallPauseElapsed = 0;
     state.stallGuardEngaged = false;
     state.ruinHoldSeconds = 0;
     state.lastSpokenPrompt = '';
@@ -918,12 +928,19 @@ function tickSessionGuardsAndGames() {
     const guardArmed = Boolean(advancedSettings.stallGuard) && crawlAtCeiling && !state.orgasmMode
         && state.activeMode !== 'oracle' && state.activeMode !== 'survival';
     const guard = tickStallGuard(
-        { seconds: state.edgeStallSeconds, engaged: state.stallGuardEngaged },
-        { armed: guardArmed, isEdged: state.isEdged, timeoutSeconds: advancedSettings.stallGuardSeconds }
+        { holdSeconds: state.edgeStallSeconds, pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged },
+        {
+            armed: guardArmed,
+            isEdged: state.isEdged,
+            holdTimeoutSeconds: advancedSettings.stallGuardSeconds,
+            pauseTimeoutSeconds: advancedSettings.stallPauseSeconds
+        }
     );
-    state.edgeStallSeconds = guard.seconds;
+    state.edgeStallSeconds = guard.holdSeconds;
+    state.stallPauseElapsed = guard.pauseSeconds;
     state.stallGuardEngaged = guard.engaged;
     if (guard.justEngaged) cueVoice('Stall guard. Primary halted. Recover.');
+    if (guard.justResumed) cueVoice('Hold window reset. Crawl.');
     if (guard.justReleased) cueVoice('Recovered. Resume.');
 
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
@@ -1491,8 +1508,8 @@ orgasmBtn?.addEventListener('click', () => {
 // the next clock tick.
 ['minHr', 'maxHr'].forEach((id) => {
     const input = document.getElementById(id);
-    input?.addEventListener('input', () => { updateEngine(); syncTelemetry(); updateEdgeOvershootPreview(); });
-    input?.addEventListener('change', () => { updateEngine(); syncTelemetry(); updateEdgeOvershootPreview(); });
+    input?.addEventListener('input', () => { updateEngine(); syncTelemetry(); updateEdgeHoldPreview(); });
+    input?.addEventListener('change', () => { updateEngine(); syncTelemetry(); updateEdgeHoldPreview(); });
 });
 
 // Experience Modes vs Games Tab Switching
@@ -1710,11 +1727,13 @@ function syncParamsUI() {
 
     if (stallToggle) stallToggle.checked = Boolean(advancedSettings.stallGuard);
     if (stallSec) stallSec.value = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
+    const stallPause = document.getElementById('stallPauseSecondsInput');
+    if (stallPause) stallPause.value = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
     const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
     if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
-    const overshootInput = document.getElementById('edgeOvershootInput');
-    if (overshootInput) overshootInput.value = clampEdgeOvershootPercent(advancedSettings.edgeOvershootPercent);
-    updateEdgeOvershootPreview();
+    const holdInput = document.getElementById('edgeHoldPercentInput');
+    if (holdInput) holdInput.value = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
+    updateEdgeHoldPreview();
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
     if (dualBpm) dualBpm.value = advancedSettings.dualDampeningBpm || 15;
     if (decayToggle) decayToggle.checked = Boolean(advancedSettings.adaptiveDecay);
@@ -1883,16 +1902,16 @@ function startMicMeterLoop() {
     tick();
 }
 
-function updateEdgeOvershootPreview() {
-    const preview = document.getElementById('edgeOvershootPreview');
+function updateEdgeHoldPreview() {
+    const preview = document.getElementById('edgeHoldPreview');
     if (!preview) return;
     const typedMax = readHrLimits().maxHr;
-    const pct = clampEdgeOvershootPercent(document.getElementById('edgeOvershootInput')?.value);
+    const pct = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
     const trigger = resolveEdgeTriggerHr(typedMax, pct);
-    preview.textContent = `Pullback at ${trigger} BPM (${100 + pct}% of ${typedMax})`;
+    preview.textContent = `Pullback at ${trigger} BPM (${pct}% of ${typedMax})`;
 }
 
-document.getElementById('edgeOvershootInput')?.addEventListener('input', updateEdgeOvershootPreview);
+document.getElementById('edgeHoldPercentInput')?.addEventListener('input', updateEdgeHoldPreview);
 
 document.getElementById('paramMicTestBtn')?.addEventListener('click', async () => {
     try {
@@ -1918,8 +1937,9 @@ document.getElementById('micGateInput')?.addEventListener('input', (e) => {
 document.getElementById('applyParamsBtn')?.addEventListener('click', async () => {
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(document.getElementById('stallGuardSecondsInput')?.value);
+    advancedSettings.stallPauseSeconds = clampStallPauseSeconds(document.getElementById('stallPauseSecondsInput')?.value);
     advancedSettings.ceilingBehaviour = document.getElementById('ceilingBehaviourSelect')?.value === 'stop' ? 'stop' : 'crawl';
-    advancedSettings.edgeOvershootPercent = clampEdgeOvershootPercent(document.getElementById('edgeOvershootInput')?.value);
+    advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
     advancedSettings.dualDampeningBpm = parseInt(document.getElementById('dualDampeningOffsetInput')?.value, 10) || 15;
     advancedSettings.adaptiveDecay = document.getElementById('adaptiveDecayToggle')?.checked ?? true;
