@@ -43,6 +43,40 @@ credited by username.
   choice fell through to a coin flip that could arm Force Orgasm - motors
   at 100% with the working ceiling climbing - for the wearer who had asked
   for the gentlest ending. Climax and Strict Denial are unchanged.
+- **The Oracle** obeys your "At the ceiling" setting too. Its hold, its
+  purgatory swing and its climb are all reached with your pulse parked on
+  the pullback mark, yet the primary ran at 14% through every hold (21% at
+  Global Intensity 100) and swung between 28% and 60% for the whole 28 s of
+  purgatory, whichever you had picked - and the stall guard is deliberately
+  disarmed for this mode, so nothing else could cut it. Full Stop now parks
+  the primary at 0% in all of them and Crawl keeps its 10%, the way the
+  Guards tab says and the way Edge Training already did. The secondary
+  channel is unchanged, and Force Orgasm still overrides both.
+- **The Oracle** no longer unlocks climax and denial at half the Mystery
+  minimum you typed. A Mystery duration rolls its hidden target anywhere in
+  your range including the low end, and a roll that landed exactly on the
+  minimum was treated as a Fixed length: the window opened halfway, so a
+  30-60 minute Mystery could arm Force Orgasm - or stop the session outright
+  with a denial - from 15 minutes. It happened about one session in
+  (max - min + 1). Only a Fixed length, whose window is genuinely
+  zero-width, still opens halfway.
+- Cancelling Force Orgasm is final. If the target time passed while Force
+  Orgasm was running - which defers the endgame - the very next second's
+  endgame check used to synthesise a click on the same button and switch it
+  straight back on, seconds after you said no, in both **Edge Training** and
+  an Oracle climax (where you first heard "Climax withdrawn" and then had it
+  reversed). The orgasm endgame now counts as spent; Soft Landing and Denied
+  still run, because cancelling an orgasm is not a request to skip the
+  gentle ending you picked.
+- A pause no longer counts a phantom edge. The engine cleared the edge flag
+  in every non-running state, so the first tick after RESUME re-detected the
+  edge you were still sitting on as a brand new one: +1 on the counter, the
+  edge cue spoken, a connected rotator reversed, and Adaptive Ceiling Decay
+  walking your working ceiling down. You did not have to touch the
+  transport - the heart-rate watchdog pauses on a stale signal and
+  auto-resume (on by default) restarts it, so a strap dropping one packet
+  burst did it by itself, every time. The motors are still silenced in every
+  non-running state; only the flag now survives.
 - **Edge Training** obeys your "At the ceiling" setting. A training hold is
   a hold at the pullback mark, so Full Stop parks the primary at 0% there
   and Crawl keeps its 10%; the hold used to run 14% whichever you picked,
@@ -241,6 +275,15 @@ credited by username.
   typing into them: the partner could set 90 s and 20 edges, see them stick
   on their own screen and in that device's own saved settings, while the
   wearer's host went on running its own 15 s and 5.
+- Telemetry also carries the host's **Edge Training** hold length and edge
+  count and its pullback percent, and a remote page renders those instead of
+  its own. Locking the inputs stopped the partner CHANGING them, but the
+  boot pass still filled them from that device's own saved settings, so the
+  card read "Hold 5 s / 20 edges, then finish" for a wearer actually set to
+  45 s and 9 - right beside an edge counter that was live telemetry, so the
+  two disagreed in a way that looked like a fault in the session. Until a
+  frame carries the host's numbers the fields are blank rather than showing
+  a wrong one.
 - Telemetry carries the pullback mark, so a remote chart draws the host's
   real purple line. It was drawn at a hardcoded 140 BPM: a host edging at
   a Climax HR of 92 showed the partner a pullback line 48 BPM above the
@@ -265,9 +308,8 @@ credited by username.
   ceiling to 210), end a Survival run, and be stored as the session peak.
   The BPM readout, the edge counter, the Oracle, Survival, Edge Training,
   the stall guard and the saved record all read the pulse your monitor
-  measured; only the speed curve sees the boost. It is also no longer
-  added while the signal watchdog is holding a reading, so the engine
-  cannot climb on sound during a dropout.
+  measured; only the falling tease curve (and the stroke-depth contraction
+  that shares it) sees the boost.
 - The microphone is now captured with the browser's own audio processing
   asked OFF (noise suppression and automatic gain control; echo
   cancellation stays on). Both are on by default in Chrome and Firefox,
@@ -306,6 +348,48 @@ credited by username.
   meter no longer re-runs the engine from its animation frame: the boost
   is read once a second with the rest of the session tick, so sound alone
   can never move the toys between heart-rate readings.
+- Room noise can no longer drive the toys HARDER. **Edge Training**'s climb
+  and **The Oracle**'s approach map arousal onto a RISING primary, the
+  inverse of every tease mode, so feeding them the boosted pulse pushed the
+  strokers up rather than easing them off - and because the boost is capped
+  at the working ceiling rather than at the pullback mark, it saturated:
+  with a 90% pullback and a measured pulse of 118 the primary ran at 100%
+  instead of 86%, and stayed there for the last 8 BPM of the approach, the
+  window where you are closest to coming. Video on speakers or in a headset
+  sits squarely in the band the sampler listens to, so the room, not the
+  wearer, was holding the gate open. Those two ramps now read the measured
+  pulse alone. The tease modes are unchanged: there a louder wearer is still
+  treated as closer to the edge, which slows the toys down.
+- The boost is frozen, not dropped, while the signal watchdog is holding a
+  reading. The hold window is a fixed 5 s that raising the signal-loss
+  timeout does not widen, so a watch or relay app pushing every ~5 s trips
+  it on ordinary jitter - and removing the whole boost in one tick made the
+  speed curve jump, which in every tease mode means the toys speed UP: a
+  measured 31-point surge on both the stroker and the vibrator, at the
+  moment the reading is least trustworthy. It now keeps the value measured
+  on the last fresh reading, so it can neither climb on sound while no pulse
+  is arriving nor step the motors at all. A stale signal stops everything as
+  before.
+- **Soft Landing** no longer shows a stale **MIC +N** for its whole 45 s.
+  The rampdown computes both channels from the ramp alone and never looks at
+  the heart rate, so no boost was reaching the toys, but the session tick
+  that refreshes and clears the boost only runs while RUNNING: the badge sat
+  frozen at a measurement up to 45 seconds old through the gentlest ending
+  the app offers. The boost is cleared when the rampdown starts.
+- A microphone the system MUTES is now torn down exactly like one that is
+  unplugged. It used to clear only the boost, leaving the capture, the
+  AudioContext, the analyser and the 60 Hz meter loop running on a dead
+  stream after the app had already told you the microphone was gone: the
+  browser kept its recording indicator lit, and the meter under the warning
+  read "below gate" - the wording for a working microphone in a quiet room.
+- A microphone advisory can no longer destroy a safety report. Every alert
+  in the app shares one banner, with no precedence, so whichever fired last
+  won: a microphone taken by another app a second after "The Handy did not
+  confirm a stop and may still be moving" replaced that warning with a
+  harmless notice, and a returning heart rate erased a standing microphone
+  warning. The banner is ranked now - a safety report is never overwritten
+  or hidden by an advisory, which is appended to it instead, and a banner is
+  only cleared again by whoever raised it or by you dismissing it.
 - The **MIC +N** badge shows the boost that is actually reaching the toys,
   and goes back to MIC LISTEN whenever none is (the watchdog is holding a
   reading, or your pulse is already at the ceiling). The big BPM number no
@@ -345,6 +429,32 @@ credited by username.
 - Clearing a phrase box now mutes that cue (the label reads *muted*)
   instead of quietly restoring the factory lines. A cue a file does not
   mention still falls back to the factory lines.
+- A muted bank can be restored from your own backup. **Export phrases**
+  wrote the mute out faithfully, but **Import phrases** skipped any empty
+  list, so the one part of your configuration a backup could not carry was
+  the silence you had chosen: re-importing your own file brought the twelve
+  factory Climax lines back and the next Force Orgasm said one of them out
+  loud. The same bytes through **Import Settings** had always kept the mute,
+  so the two buttons gave two answers. Import now writes every bank the file
+  mentions, and the alert reports what was really applied (and how many of
+  them are mutes) rather than how many keys the file had.
+- A muted cue no longer wipes the dashboard prompt. An emptied bank resolves
+  to nothing with voice guidance still on, and that was being treated as
+  "voice is off": muting only the build-up encouragement blanked the edge
+  warning one second after it appeared, every 45 seconds, all session. A
+  muted cue now simply says nothing and leaves the line that is there.
+- A muted **Resting prompt** stays muted on screen. The dashboard
+  substituted the factory sentence whenever the bank resolved to nothing, so
+  the exact line you had just deleted came back at every idle moment and
+  after every reopen of Session Setup.
+- Text above the first section header in a phrase file is refused instead of
+  being filed as a phrase. Hand-written and hand-edited files routinely
+  start with a title, a date or a note; those lines landed in the Build-up
+  bank, and because an import REPLACES a bank, your fourteen encouragement
+  phrases were swapped for the file's letterhead and read at you every 45
+  seconds. The alert now quotes the offending line; prefix it with `//` to
+  keep it as a comment. A JSON export with a comment line in front of it is
+  still read as JSON, rather than becoming one 140-character phrase.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.
@@ -358,6 +468,15 @@ credited by username.
   throw.
 
 ### Project
+- Source-grep guards in the test suite fail on a missing anchor instead of
+  passing. Slicing app.js between two literals yields the empty string once
+  one of them is renamed, and every NEGATIVE assertion made against the
+  empty string passes - so the one guard proving the 60 Hz microphone meter
+  does not re-enter the engine went quietly vacuous on a rename while its
+  louder siblings failed and got fixed. The release check the Oracle and
+  Edge Training make is no longer grepped for its arity either: it is a
+  named helper that refuses to answer "released" without a pullback mark,
+  tested as a property.
 - `npm test` runs the unit tests (about 330 at the time of writing) and a GitHub
   Actions workflow runs them, plus `node --check` on every module, on every
   push to `main` and on every pull request.

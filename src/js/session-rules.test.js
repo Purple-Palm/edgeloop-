@@ -237,13 +237,30 @@ describe('oracle timing and fate', () => {
         assert.equal(rollOracleFate(due, { random: () => 0.9, endgameType: 'orgasm' }), 'CLIMAX');
     });
 
-    it('a Mystery target on the minimum keeps its window too', () => {
-        // 1 roll in 21 lands the secret target on the minimum; that must not
-        // flatten the ramp for the whole session either.
+    it('a Mystery target on the minimum still honours the typed minimum', () => {
+        // 1 roll in 21 lands the secret target on the wearer's minimum. The
+        // window is NOT halved there: they typed 30 minutes to mean "do not
+        // finish me before then", and they cannot see the roll, so climax and
+        // denial stay locked until the minimum exactly as the README and the
+        // mode card promise. Only a FIXED length (min === max === target)
+        // opens halfway, because its window is otherwise zero-width.
         const timing = oracleTiming({ sessionSeconds: 20 * 60, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 1800 });
-        assert.equal(timing.openAt, 900);
-        assert.equal(timing.canEnd, true);
+        assert.equal(timing.openAt, 1800);
+        assert.equal(timing.canEnd, false, 'locked before the typed minimum');
         assert.equal(timing.mustEnd, false);
+
+        const atMin = oracleTiming({ sessionSeconds: 1800, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 1800 });
+        assert.equal(atMin.canEnd, true);
+        assert.equal(atMin.mustEnd, true, 'the rolled target is still the latest it waits');
+
+        // Half the typed minimum is the number the old rule unlocked at.
+        const half = oracleTiming({ sessionSeconds: 901, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 1800 });
+        assert.equal(half.canEnd, false, 'never at half the minimum the wearer typed');
+
+        // A Fixed length keeps its documented halfway ramp.
+        const fixedRun = oracleTiming({ sessionSeconds: 901, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800 });
+        assert.equal(fixedRun.openAt, 900);
+        assert.equal(fixedRun.canEnd, true);
     });
 
     it('later holds inside the window are likelier to end the session', () => {

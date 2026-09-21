@@ -24,9 +24,28 @@ import {
     stopMicMonitor,
     speechHooks,
     MIC_VOICE_BAND_LO_HZ,
-    MIC_VOICE_BAND_HI_HZ
+    MIC_VOICE_BAND_HI_HZ,
+    resolveMicBoost
 } from './voice.js';
 import { calculateEngineOutputs, hasReleasedEdge, resolveEdgeTriggerHr } from './engine.js';
+
+// Slice app.js between two literal anchors, FAILING when either is missing.
+//
+// A plain `src.slice(src.indexOf(a))` yields the empty string once `a` has
+// been renamed (indexOf -1 -> slice(-1) -> one character -> slice(0, -1) ->
+// ''), and every NEGATIVE assertion made against '' passes. A guard written
+// that way stops guarding on the next innocuous rename, silently, while its
+// louder siblings fail and get fixed. Every source-grep test in this file
+// goes through here, so a missing anchor is a failure, never a pass.
+function anchoredBody(src, startAnchor, endAnchor, { maxLength = 0 } = {}) {
+    const start = src.indexOf(startAnchor);
+    assert.ok(start >= 0, `anchor not found in app.js: ${startAnchor}`);
+    const from = maxLength > 0 ? src.slice(start, start + maxLength) : src.slice(start);
+    if (!endAnchor) return from;
+    const end = from.indexOf(endAnchor, startAnchor.length);
+    assert.ok(end > 0, `end anchor not found after "${startAnchor}": ${endAnchor}`);
+    return from.slice(0, end);
+}
 import { countSurvivalBreach, isSurvivalDefeated, tickEdgeTraining } from './session-rules.js';
 
 const SAMPLE_RATE = 44100;
@@ -125,6 +144,45 @@ describe('the microphone boost stays on the engine path', () => {
         assert.equal(micBoostedHr({ ...loud, pulseFresh: false }), 132);
     });
 
+    it('freezes the boost through the watchdog hold window instead of dropping it', () => {
+        // The hold band is 5 s and is NOT user-configurable (hr-watchdog.js
+        // keeps holdMs at 5000; raising the signal-loss timeout, which the
+        // README tells watch users to do, never widens it). A watch relaying
+        // every ~5 s trips it on ordinary jitter.
+        //
+        // A binary gate removed the whole boost in one tick, and in every
+        // tease mode the speed curve FALLS as heart rate rises, so the toys
+        // sped UP at the moment the reading was least trustworthy.
+        assert.equal(resolveMicBoost({ micBoost: 20, heldBoost: 0, pulseFresh: true }), 20);
+        assert.equal(resolveMicBoost({ micBoost: 20, heldBoost: 8, pulseFresh: false }), 8, 'frozen at the last fresh value');
+        assert.equal(resolveMicBoost({ micBoost: 0, heldBoost: 8, pulseFresh: false }), 8, 'a quiet tick cannot drop it either');
+        assert.equal(resolveMicBoost({ micBoost: -4, heldBoost: -4, pulseFresh: false }), 0);
+        assert.equal(resolveMicBoost({ micBoost: NaN, heldBoost: NaN, pulseFresh: true }), 0);
+        assert.equal(resolveMicBoost(), 0);
+
+        // A caller that tracks no held value keeps the old behaviour.
+        assert.equal(micBoostedHr({ ...loud, pulseFresh: false }), 132);
+        assert.equal(micBoostedHr({ ...loud, pulseFresh: false, heldBoost: 20 }), 150, 'the held boost still applies');
+
+        // Continuity across ok -> holding, on the real engine. Pixel Watch
+        // setup from the README: Resting 70 / Climax 150, Classic Tease,
+        // gamma 2, mic cap 20, sensor 110.
+        const shared = {
+            minHr: 70, maxHr: 150, sessionStatus: 'RUNNING', activeMode: 'classic', gamma: 2, intensityValue: 50
+        };
+        const sensorHr = 110;
+        const fresh = micBoostedHr({ sensorHr, micBoost: 20, heldBoost: 20, ceiling: 150, micEnabled: true, pulseFresh: true });
+        const holding = micBoostedHr({ sensorHr, micBoost: 20, heldBoost: 20, ceiling: 150, micEnabled: true, pulseFresh: false });
+        const before = calculateEngineOutputs({ ...shared, hr: fresh, edgeHr: sensorHr, isEdged: false });
+        const during = calculateEngineOutputs({ ...shared, hr: holding, edgeHr: sensorHr, isEdged: false });
+        assert.equal(during.primaryPercent, before.primaryPercent, 'a missed packet must not move the stroker');
+        assert.equal(during.secondaryPercent, before.secondaryPercent, 'nor the vibrator');
+
+        // What the old gate did: a 31-point surge on both channels.
+        const dropped = calculateEngineOutputs({ ...shared, hr: sensorHr, edgeHr: sensorHr, isEdged: false });
+        assert.ok(dropped.primaryPercent - before.primaryPercent > 25, 'the regression this pins is a real surge');
+    });
+
     it('leaves a missing or broken pulse alone', () => {
         assert.ok(Number.isNaN(micBoostedHr({ ...loud, sensorHr: NaN })));
         assert.equal(micBoostedHr({ ...loud, ceiling: NaN }), 132);
@@ -157,10 +215,29 @@ describe('the microphone boost stays on the engine path', () => {
         assert.equal(train.edgesDone, 0);
         assert.equal(train.justFinished, false, 'noise must never arm Force Orgasm');
 
-        // The engine's own behaviour is unchanged: a louder wearer is driven
-        // as if closer to the edge.
-        const quiet = calculateEngineOutputs({ ...shared, hr: sensorHr, edgeHr: sensorHr, isEdged: false });
-        assert.ok(out.primaryPercent > quiet.primaryPercent || out.secondaryPercent > quiet.secondaryPercent);
+        // Nor may it drive the two CLIMB games harder. Their ramp is
+        // `48 + progress * 52` - inverted against every tease mode - so a
+        // boosted progress would push the primary UP, and `micBoostedHr` caps
+        // the boost at the ceiling, not at the pullback mark, so room noise
+        // could pin it at 100% for the last BPM of the approach: hardest
+        // exactly where the wearer is closest to climax. Those ramps read the
+        // sensor alone.
+        const quietTrain = calculateEngineOutputs({ ...shared, hr: sensorHr, edgeHr: sensorHr, isEdged: false });
+        assert.equal(out.primaryPercent, quietTrain.primaryPercent, 'noise must not speed up the Edge Training climb');
+        assert.equal(out.secondaryPercent, quietTrain.secondaryPercent);
+
+        const oracleShared = { ...shared, activeMode: 'oracle', oracleState: 'APPROACH' };
+        const oracleLoud = calculateEngineOutputs({ ...oracleShared, hr: engineHr, edgeHr: sensorHr, isEdged: false });
+        const oracleQuiet = calculateEngineOutputs({ ...oracleShared, hr: sensorHr, edgeHr: sensorHr, isEdged: false });
+        assert.equal(oracleLoud.primaryPercent, oracleQuiet.primaryPercent, 'noise must not speed up the Oracle approach');
+
+        // In a tease mode the curve FALLS with heart rate, so the boost does
+        // what the design says: a louder wearer is treated as closer to the
+        // edge and the toys back off.
+        const teaseShared = { ...shared, activeMode: 'classic' };
+        const teaseLoud = calculateEngineOutputs({ ...teaseShared, hr: engineHr, edgeHr: sensorHr, isEdged: false });
+        const teaseQuiet = calculateEngineOutputs({ ...teaseShared, hr: sensorHr, edgeHr: sensorHr, isEdged: false });
+        assert.ok(teaseLoud.primaryPercent < teaseQuiet.primaryPercent, 'a louder wearer is teased more slowly');
     });
 
     it('app.js gates the boost on a LIVE reading, not merely a non-stale one', () => {
@@ -169,18 +246,21 @@ describe('the microphone boost stays on the engine path', () => {
         // still climb on room noise during a dropout, which is exactly what
         // the README and the Audio tab promise it does not do.
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-        const call = src.slice(src.indexOf('micBoostedHr({'));
-        const args = call.slice(0, call.indexOf('});'));
-        assert.ok(args.includes('pulseFresh:'), 'the boost must be gated on the reading');
+        const args = anchoredBody(src, 'micBoostedHr({', '});');
+        assert.ok(args.includes('pulseFresh'), 'the boost must be gated on the reading');
         assert.ok(
-            /pulseFresh:\s*pulseIsLive\(\)/.test(args),
+            /const pulseFresh = pulseIsLive\(\);/.test(src),
             'app.js must gate the boost on pulseIsLive(), not on pulseIsFresh()'
+        );
+        assert.ok(
+            args.includes('heldBoost:'),
+            'and it must hand over the held boost, so a hold window freezes it rather than dropping it'
         );
         // ...and pulseIsLive() must mean the watchdog's own 'ok', so the gate
         // cannot drift out of step with a verdict mirrored into state.
-        const gate = src.slice(src.indexOf('function pulseIsLive('));
+        const gate = anchoredBody(src, 'function pulseIsLive(', '}');
         assert.ok(
-            /hrWatchdog\.status\([^)]*\)\s*===\s*'ok'/.test(gate.slice(0, gate.indexOf('}'))),
+            /hrWatchdog\.status\([^)]*\)\s*===\s*'ok'/.test(gate),
             "pulseIsLive() must read the watchdog status and accept only 'ok'"
         );
     });
@@ -194,8 +274,7 @@ describe('the microphone boost stays on the engine path', () => {
         assert.equal(micBoostedHr({ sensorHr: 120, micBoost: 8, ceiling: 150, micEnabled: true, pulseFresh: false }), 120);
 
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-        const block = src.slice(src.indexOf("getElementById('micActiveBadge')"));
-        const branch = block.slice(0, block.indexOf('MIC LISTEN'));
+        const branch = anchoredBody(src, "getElementById('micActiveBadge')", 'MIC LISTEN');
         assert.ok(!/state\.micBoost/.test(branch), 'the badge must not read the raw state.micBoost');
         assert.ok(/micApplied/.test(branch), 'the badge must read the applied delta');
     });
@@ -444,13 +523,25 @@ describe('microphone boost lifecycle', () => {
             assert.equal(typeof track.onended, 'function');
             assert.equal(typeof track.onmute, 'function');
 
+            const onmute = track.onmute;
+            const onended = track.onended;
+
             state.micBoost = 8;
-            track.onmute();
+            onmute();
             assert.equal(state.micBoost, 0, 'a muted microphone must not leave a boost latched');
+            // The app has just told the wearer the microphone is gone, so the
+            // capture, the AudioContext, the analyser and the ~60 Hz meter
+            // loop must be gone too: otherwise the browser keeps its
+            // recording indicator lit on a device the app declared lost and
+            // the meter keeps reading "below gate" off a dead stream.
+            assert.equal(state.micAnalyser, null, 'onmute must tear the monitor down');
+            assert.equal(state.micStream, null);
+            assert.equal(state.micAudioCtx, null);
+            assert.equal(track.stopped, true, 'the capture track must be stopped');
             assert.equal(lost.length, 1);
 
             state.micBoost = 8;
-            track.onended();
+            onended();
             assert.equal(state.micBoost, 0, 'a dead microphone must not leave a boost latched');
             assert.equal(state.micAnalyser, null, 'and the badge condition must go false');
             assert.equal(lost.length, 2);
@@ -466,8 +557,7 @@ describe('the microphone cannot reach the engine by the back door', () => {
     const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 
     it('the running engine reads the applied gate and cap, not the modal sliders', () => {
-        const tick = src.slice(src.indexOf('function tickSessionGuardsAndGames'));
-        const body = tick.slice(0, tick.indexOf('paintMicMeter(level)'));
+        const body = anchoredBody(src, 'function tickSessionGuardsAndGames', 'paintMicMeter(level)');
         assert.ok(/micBoostFromLevel\(/.test(body));
         assert.ok(
             /clampMicGate\(advancedSettings\.micSensitivityThreshold\)/.test(body),
@@ -482,20 +572,23 @@ describe('the microphone cannot reach the engine by the back door', () => {
     });
 
     it('the meter paints without driving the engine', () => {
-        const paint = src.slice(src.indexOf('function paintMicMeter'));
-        const body = paint.slice(0, paint.indexOf('\nfunction renderMicProcessingNote'));
+        // Both assertions below are negative, so the body must be proved to
+        // exist first: anchoredBody() fails on a missing anchor instead of
+        // handing back '' (against which every negative assertion passes).
+        const body = anchoredBody(src, 'function paintMicMeter', '\nfunction renderMicProcessingNote');
+        assert.ok(body.includes('micLevelBar'), 'the meter body must have been found');
         assert.ok(!/updateEngine\(\)/.test(body), 'a ~60 Hz animation frame must not re-enter the engine');
         assert.ok(!/state\.micBoost\s*=/.test(body), 'only the once-a-second tick owns the boost');
     });
 
     it('every stop path clears the boost', () => {
         for (const fn of ['function resetSessionCounters', 'function pauseSession']) {
-            const body = src.slice(src.indexOf(fn), src.indexOf(fn) + 1400);
+            const body = anchoredBody(src, fn, '', { maxLength: 1400 });
             assert.ok(/clearMicBoost\(state\)/.test(body), `${fn} must clear the microphone boost`);
         }
         // STOP and Reset both run resetSessionCounters().
         for (const fn of ['function stopSession', "resetBtn?.addEventListener('click'"]) {
-            const body = src.slice(src.indexOf(fn), src.indexOf(fn) + 1600);
+            const body = anchoredBody(src, fn, '', { maxLength: 1600 });
             assert.ok(/resetSessionCounters\(\)/.test(body), `${fn} must go through resetSessionCounters`);
         }
     });
@@ -506,8 +599,7 @@ describe('the microphone cannot reach the engine by the back door', () => {
         // its own is not evidence that Session Setup is still up. Read it
         // alone and a dragged, never-applied gate goes on driving the meter
         // and the cockpit badge for the rest of the session.
-        const fn = src.slice(src.indexOf('function paramsModalOpen'));
-        const body = fn.slice(0, fn.indexOf('\n}'));
+        const body = anchoredBody(src, 'function paramsModalOpen', '\n}');
         assert.ok(/overlay/.test(body), 'a dismissed modal must not count as open');
     });
 
@@ -516,22 +608,19 @@ describe('the microphone cannot reach the engine by the back door', () => {
         // overwrite the honest badge updateEngine just painted, announcing
         // MIC +N from a raw level while the boost was suppressed (watchdog
         // holding a reading, or the pulse already at the ceiling).
-        const paint = src.slice(src.indexOf('function paintMicMeter'));
-        const body = paint.slice(0, paint.indexOf('\nfunction renderMicProcessingNote'));
+        const body = anchoredBody(src, 'function paintMicMeter', '\nfunction renderMicProcessingNote');
         assert.ok(/state\.micApplied/.test(body), 'the badge must read the applied delta');
-        const badge = body.slice(body.indexOf('if (badge &&'));
+        const badge = anchoredBody(body, 'if (badge &&', '');
         assert.ok(!/\bboost\b/.test(badge), 'the meter preview must not reach the cockpit badge');
         assert.ok(/MIC \+\$\{applied\}/.test(badge), 'the badge must print the applied delta');
     });
 
     it('the MIC badge is hidden again when the monitor is not live', () => {
-        const engine = src.slice(src.indexOf("const micBadge = document.getElementById('micActiveBadge')"));
-        const engineBlock = engine.slice(0, engine.indexOf('state.effectiveMinHr'));
+        const engineBlock = anchoredBody(src, "const micBadge = document.getElementById('micActiveBadge')", 'state.effectiveMinHr');
         assert.ok(/classList\.add\('hidden'\)/.test(engineBlock), 'the cockpit badge must be able to go dark');
 
-        const paint = src.slice(src.indexOf('function paintMicMeter'));
-        const paintBlock = paint.slice(0, paint.indexOf('\nfunction renderMicProcessingNote'));
-        const tail = paintBlock.slice(paintBlock.indexOf('MIC LISTEN'));
+        const paintBlock = anchoredBody(src, 'function paintMicMeter', '\nfunction renderMicProcessingNote');
+        const tail = anchoredBody(paintBlock, 'MIC LISTEN', '');
         assert.ok(
             /else if \(badge\)[\s\S]*classList\.add\('hidden'\)/.test(tail),
             'Test microphone with the toggle off must not leave MIC LISTEN lit forever'

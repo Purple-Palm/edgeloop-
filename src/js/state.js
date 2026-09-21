@@ -39,6 +39,10 @@ export const state = {
     durationFallback: false,
     // The endgame (orgasm / soft landing / denied) fires once per session.
     endgameFired: false,
+    // True once the target time has passed while Force Orgasm was already
+    // running, so the endgame was held back by it. The wearer cancelling
+    // that orgasm must not make the endgame re-arm it a second later.
+    endgameHeldByOrgasm: false,
     activeMode: 'classic',
     alwaysFullStroke: false,
     lastHrTimestamp: Date.now(),
@@ -93,6 +97,11 @@ export const state = {
     micAnalyser: null,
     micAnimId: null,
     micBoost: 0,
+    // The boost measured on the last FRESH reading. During the watchdog's
+    // hold window the pulse is frozen and the engine runs on this instead,
+    // so a missed packet can neither grow the boost on room noise nor drop
+    // it and step the motors up. Cleared by every stop path.
+    micBoostHeld: 0,
     // What updateEngine last actually added to the engine's heart rate (0
     // when the boost was suppressed). The cockpit badge reads THIS, never
     // the meter's own preview.

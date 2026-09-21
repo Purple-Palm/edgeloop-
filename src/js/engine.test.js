@@ -15,7 +15,8 @@ import {
     resolveEdgeTriggerHr,
     DEFAULT_EDGE_HOLD_PERCENT,
     MIN_EDGE_HOLD_PERCENT,
-    MAX_EDGE_HOLD_PERCENT
+    MAX_EDGE_HOLD_PERCENT,
+    gameEdgeReleased
 } from './engine.js';
 
 const running = {
@@ -64,6 +65,35 @@ describe('engine modes', () => {
             assert.equal(result.secondaryPercent, 0);
         });
     }
+
+    it('a pause keeps the edge flag, so resuming does not count a phantom edge', () => {
+        // The master clock calls the engine every second in every status and
+        // writes result.isEdged straight back. Clearing the flag while paused
+        // re-armed the detector, so the first RUNNING tick counted a brand
+        // new edge: +1 on the counter, the 'edge' cue spoken, a connected
+        // rotator reversed, and Adaptive Ceiling Decay walking the working
+        // ceiling down. The heart-rate watchdog pauses and (with auto-resume,
+        // the default) restarts the session by itself, so a strap that drops
+        // one packet burst did this without the wearer touching anything.
+        const atMark = { ...running, activeMode: 'classic', hr: 140, isEdged: true };
+        const first = calculateEngineOutputs(atMark);
+        assert.equal(first.isEdged, true);
+
+        for (const status of ['PAUSED', 'IDLE', 'STOPPED']) {
+            const paused = calculateEngineOutputs({ ...atMark, sessionStatus: status });
+            assert.equal(paused.primaryPercent, 0, `${status} must still silence the motors`);
+            assert.equal(paused.secondaryPercent, 0);
+            assert.equal(paused.newEdgeTriggered, false);
+            assert.equal(paused.isEdged, true, `${status} must not release the edge`);
+
+            const resumed = calculateEngineOutputs({ ...atMark, isEdged: paused.isEdged });
+            assert.equal(resumed.newEdgeTriggered, false, `resuming after ${status} must not count a new edge`);
+        }
+
+        // A session that was never edged still resumes un-edged.
+        const clean = calculateEngineOutputs({ ...running, sessionStatus: 'PAUSED', isEdged: false, hr: 140 });
+        assert.equal(clean.isEdged, false);
+    });
 
     it('classic full-stops at the ceiling with Full Stop selected', () => {
         const result = calculateEngineOutputs({
@@ -201,11 +231,46 @@ describe('engine modes', () => {
         const denial = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'DENIAL', hr: 140 });
         const climax = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'CLIMAX', orgasmMode: true, hr: 140 });
         const purgatory = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'PURGATORY', sessionSeconds: 4 });
-        assert.equal(hold.primaryPercent, 14);
+        // HOLD is a hold AT the pullback mark, so it obeys the wearer's
+        // ceiling rule; `running` selects Full Stop.
+        assert.equal(hold.primaryPercent, 0);
+        assert.ok(hold.secondaryPercent > 0, 'the secondary channel keeps running');
         assert.equal(denial.primaryPercent, 0);
         assert.ok(climax.primaryPercent >= 85);
         assert.ok(purgatory.primaryPercent > 0);
         assert.ok(purgatory.primaryPercent < 100);
+    });
+
+    it('every Oracle state at the pullback mark obeys the ceiling rule, exactly as Edge Training does', () => {
+        // HOLD, PURGATORY and an edged APPROACH are all holds at the mark:
+        // app.js only enters HOLD from state.isEdged and does not clear the
+        // flag until the pulse leaves the release band. The stall guard is
+        // deliberately disarmed for this mode (app.js), so the ceiling rule
+        // is the ONLY thing that can stop the primary here. The two games
+        // must never drift apart again.
+        const atMark = { ...running, hr: 140, isEdged: true, orgasmMode: false, sessionSeconds: 4 };
+        const oracleStates = ['HOLD', 'PURGATORY', 'APPROACH'];
+        const trainStates = ['hold', 'recover', 'climb'];
+        for (const oracleState of oracleStates) {
+            const stop = calculateEngineOutputs({ ...atMark, activeMode: 'oracle', oracleState, ceilingBehaviour: 'stop' });
+            assert.equal(stop.primaryPercent, 0, `oracle ${oracleState} must park the primary with Full Stop`);
+            const crawl = calculateEngineOutputs({ ...atMark, activeMode: 'oracle', oracleState, ceilingBehaviour: 'crawl' });
+            assert.equal(crawl.primaryPercent, CRAWL_PERCENT, `oracle ${oracleState} must crawl with Crawl`);
+        }
+        for (const trainingState of trainStates) {
+            const stop = calculateEngineOutputs({ ...atMark, activeMode: 'edgetrain', trainingState, ceilingBehaviour: 'stop' });
+            assert.equal(stop.primaryPercent, 0, `edgetrain ${trainingState} must park the primary with Full Stop`);
+        }
+        // Force Orgasm is still the one thing that overrides it.
+        const forced = calculateEngineOutputs({
+            ...atMark, activeMode: 'oracle', oracleState: 'HOLD', ceilingBehaviour: 'stop', orgasmMode: true
+        });
+        assert.ok(forced.primaryPercent >= 85);
+        // Global Intensity cannot smuggle motion past Full Stop either.
+        const loud = calculateEngineOutputs({
+            ...atMark, activeMode: 'oracle', oracleState: 'PURGATORY', ceilingBehaviour: 'stop', intensityValue: 100
+        });
+        assert.equal(loud.primaryPercent, 0);
     });
 
     it('oracle climax with Force Orgasm cancelled obeys the ceiling rule', () => {
@@ -660,16 +725,47 @@ describe('game-side edge release', () => {
         assert.equal(phantom.newEdgeTriggered, true, 'clearing the flag at 130 costs one phantom edge');
     });
 
-    it('every app.js call passes the pullback mark', () => {
-        // The Oracle and Edge Training both ask this question once a second.
-        // A signature change that updates only one of them is exactly how the
-        // phantom-edge bug happened, so pin both call sites.
-        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-        const calls = src.match(/hasReleasedEdge\([^)]*\)/g) || [];
-        assert.ok(calls.length >= 2, 'expected the Oracle and Edge Training call sites');
-        for (const call of calls) {
-            const args = call.slice('hasReleasedEdge('.length, -1).split(',');
-            assert.equal(args.length, 3, `two-argument release check in app.js: ${call}`);
+    it('gameEdgeReleased refuses to answer without a pullback mark', () => {
+        // The property, not the shape of the call. `hasReleasedEdge` falls
+        // back to maxHr - 5 when it is handed no mark, and with any pullback
+        // below 100% that band sits ABOVE the mark: the game clears the edge
+        // flag while the engine still reads the pulse as edged, and the next
+        // tick counts an invented edge that Adaptive Ceiling Decay acts on.
+        const trigger = resolveEdgeTriggerHr(140, 90, 70);
+        assert.equal(trigger, 126);
+        assert.equal(gameEdgeReleased(130, 140, trigger), false, 'still on the mark');
+        assert.equal(gameEdgeReleased(120, 140, trigger), true);
+
+        // state.edgeTriggerHr starts as null (state.js) and is only written by
+        // the engine loop. A caller that reaches this before the first tick,
+        // or after a reordering, must get "not released" - never the silent
+        // maxHr - 5 fallback that hasReleasedEdge would use.
+        for (const noMark of [null, undefined, NaN, 'abc']) {
+            assert.equal(gameEdgeReleased(130, 140, noMark), false, `no mark (${String(noMark)}) is not a release`);
+            assert.equal(gameEdgeReleased(70, 140, noMark), false, 'not even far below the ceiling');
         }
+        assert.equal(hasReleasedEdge(130, 140, undefined), true, 'what the unguarded call wrongly answers');
+    });
+
+    it('app.js asks the release question only through gameEdgeReleased', () => {
+        // The Oracle and Edge Training both ask it once a second. A call site
+        // that reaches hasReleasedEdge directly can be handed a null mark, so
+        // there must be no such call site at all.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const guarded = src.match(/gameEdgeReleased\(/g) || [];
+        assert.ok(guarded.length >= 2, 'expected the Oracle and Edge Training call sites');
+        const raw = src.match(/(?<![A-Za-z0-9_])hasReleasedEdge\(/g) || [];
+        assert.equal(raw.length, 0, 'app.js must not call hasReleasedEdge directly');
+        const sites = /gameEdgeReleased\(([^)]*)\)/g;
+        let seen = 0;
+        let match;
+        while ((match = sites.exec(src)) !== null) {
+            seen += 1;
+            assert.ok(
+                /edgeTriggerHr/.test(match[1]),
+                `the release check must be given the pullback mark: ${match[0]}`
+            );
+        }
+        assert.equal(seen, guarded.length, 'every call site must have been inspected');
     });
 });

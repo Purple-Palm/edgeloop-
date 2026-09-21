@@ -384,7 +384,7 @@
                 <span class="mode-check hidden text-fuchsia-400">●</span>
               </div>
               <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
-                Pulls you to the ceiling and holds 15s. Climax and Denial stay locked until the Duration minimum (Mystery window, or halfway through a Fixed length); then it rolls how you end, more often the nearer the target. At the target it ends you the way your Endgame Trigger says. Endless has no minimum.
+                Pulls you to the ceiling and holds 15s, then rolls how you end - more often the nearer the target; at the target it ends you the way your Endgame Trigger says. While you are on the mark, the hold, purgatory and the climb all obey your "At the ceiling" setting, so Full Stop really does park the primary. Climax and Denial stay locked until your Mystery minimum (with a Fixed length, until halfway through it). Endless has no minimum.
               </p>
             </button>
 
@@ -405,7 +405,7 @@
                 <span class="mode-check hidden text-amber-400">●</span>
               </div>
               <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
-                Pulls you to the ceiling and holds you there. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Tapping Force Orgasm yourself suspends the training instead of completing it, and cancelling it after the finish starts a fresh set, so the game never re-arms Force Orgasm right after you said no. Stall guard is off so the hold is the goal, not a cutoff.
+                Pulls you to the ceiling and holds you there, obeying your "At the ceiling" setting while you are on the mark. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Tapping Force Orgasm yourself suspends the training instead of completing it, and cancelling it after the finish starts a fresh set. Cancelling it is final: if the target time passed while it was running, the endgame will not switch it back on. Stall guard is off so the hold is the goal, not a cutoff.
               </p>
               <div class="flex flex-wrap items-center gap-2 mt-1.5 pt-1.5 border-t border-slate-800 text-[9px] text-slate-400" data-train-settings>
                 <label class="flex items-center gap-1 font-mono">
@@ -728,7 +728,7 @@
               <span class="text-purple-400 font-mono text-[10px] font-semibold">Runs indefinitely until manually stopped</span>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug pt-1">
-              With <strong>The Oracle</strong>, climax and denial stay locked until the Mystery minimum (with a Fixed length, until halfway). Endless has no minimum.
+              With <strong>The Oracle</strong>, climax and denial stay locked until the Mystery minimum you typed - always, including on the roll that lands on it. A <strong>Fixed</strong> length has no window of its own, so there they unlock halfway through instead. Endless has no minimum.
             </p>
           </div>
 
@@ -762,7 +762,7 @@
               </select>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. Force Orgasm overrides both.
+              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. This applies in every mode, including an Edge Training hold and every Oracle state you reach while on the mark. Force Orgasm overrides both.
             </p>
           </div>
 
@@ -899,7 +899,10 @@
               <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug pt-1 border-t border-slate-900">
-              One phrase per line. As many lines as you want for each event — a random unused line is picked each time. Tokens: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
+              One phrase per line. As many lines as you want for each event — a random unused line is picked each time. Empty a box and that cue is muted: it says nothing and paints nothing, and <strong>Export phrases</strong> carries the mute so <strong>Import phrases</strong> restores it. Tokens: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
+            </p>
+            <p class="text-[9px] text-slate-400 leading-snug">
+              A hand-written file needs a <span class="font-mono text-purple-300"># edge</span> style section header above every phrase. Anything before the first header (a title, a date, a note) cannot be placed, so the import is refused and names the line rather than filing it as a phrase and reading it back at you; start such a line with <span class="font-mono text-purple-300">//</span> to make it a comment. A file with no headers at all is taken as build-up encouragement.
             </p>
             <div class="flex items-center justify-between gap-2 pt-1">
               <span class="text-[9px] text-slate-400 font-semibold">Encouragement every</span>
@@ -923,7 +926,7 @@
             <div class="flex justify-between items-center">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Microphone Monitor (Experimental)</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. The louder you get above the gate, the closer the loop treats you to the edge (extra BPM on the speed the toys run at, never past Climax HR). It only moves the toys: the BPM readout, the edge counter, the games, the guards and the saved record always use the pulse your monitor measured, and nothing is added while the signal watchdog is holding a reading. Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights. Set extra BPM to 0 to listen without affecting the toys. The cockpit badge reads MIC +N only while a boost is really reaching the toys, and MIC LISTEN otherwise.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Listens for <strong>your</strong> voice and panting. The louder you get above the gate, the closer the loop treats you to the edge, so the tease modes slow down sooner (extra BPM on the speed the toys run at, never past Climax HR). It can only ever ease the toys off: the rising climb in Edge Training and The Oracle is driven by your measured pulse alone, so a loud room can never push the strokers harder. The BPM readout, the edge counter, the games, the guards and the saved record all use the pulse your monitor measured. While the signal watchdog is holding a reading the boost is frozen at its last measured value rather than dropped, so a missed packet cannot make the toys jump. Stroker and vibrator rumble is filtered out. Raise the noise gate until the meter stays dark with toys running, then speak or pant to confirm it lights. Set extra BPM to 0 to listen without affecting the toys. The cockpit badge reads MIC +N only while a boost is really reaching the toys, and MIC LISTEN otherwise.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramMicToggle" type="checkbox" class="sr-only peer">

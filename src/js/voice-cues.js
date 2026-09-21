@@ -302,11 +302,31 @@ export function applyImportedCues(current, incoming) {
     const base = mergeVoiceCues(current);
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return base;
     for (const cue of VOICE_CUE_CATALOG) {
+        // Presence of the key is the whole test. An emptied bank is a real,
+        // persisted state ("say nothing for this cue") and Export writes it
+        // out as `[]`, so a file that mentions the cue with an empty list is
+        // restoring a mute, not saying nothing. Only an unusable value (not a
+        // string, not an array) falls back to what is already there.
         if (!Object.prototype.hasOwnProperty.call(incoming, cue.id)) continue;
-        const list = sanitizeCueList(incoming[cue.id], []);
-        if (list.length > 0) base[cue.id] = list;
+        base[cue.id] = sanitizeCueList(incoming[cue.id], base[cue.id]);
     }
     return base;
+}
+
+// The catalog ids an import will really write, and which of them are mutes.
+// The alert used to count the keys in the FILE, which could not be trusted:
+// it over-reported whenever a key was dropped, and it can say nothing about
+// how many banks the file silences.
+export function describeImport(incoming) {
+    const applied = [];
+    const muted = [];
+    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return { applied, muted };
+    for (const cue of VOICE_CUE_CATALOG) {
+        if (!Object.prototype.hasOwnProperty.call(incoming, cue.id)) continue;
+        applied.push(cue.id);
+        if (sanitizeCueList(incoming[cue.id], []).length === 0) muted.push(cue.id);
+    }
+    return { applied, muted };
 }
 
 function presentCueMap(src) {
@@ -319,11 +339,35 @@ function presentCueMap(src) {
     return incoming;
 }
 
+// Does this line open a JSON document rather than a phrase? `{` alone (the
+// first line of a pretty-printed export) and `{"voiceCues": ...` both do; a
+// line that begins with an interpolation token - the same `\{([a-zA-Z]+)\}`
+// shape resolveCueTemplate substitutes - does not.
+function opensJsonDocument(line) {
+    return line.startsWith('{') && !/^\{[a-zA-Z]+\}/.test(line);
+}
+
 export function parseVoiceCuesText(raw) {
     const text = typeof raw === 'string' ? raw.replace(/^\uFEFF/, '') : '';
     if (!text.trim()) return { cues: {}, error: 'empty', encourageSeconds: null };
 
-    const trimmed = text.trim();
+    // Blank and `//` comment lines above the content are dropped before the
+    // shape is decided: a hand-annotated export ("// my backup" on line one)
+    // is still JSON, and reading it as text would file the whole blob as a
+    // single phrase and speak the first 140 characters of it at the wearer.
+    const allLines = text.split(/\r?\n/);
+    let firstIdx = 0;
+    while (firstIdx < allLines.length) {
+        const probe = allLines[firstIdx].trim();
+        if (!probe || probe.startsWith('//')) {
+            firstIdx += 1;
+            continue;
+        }
+        break;
+    }
+    const body = allLines.slice(firstIdx).join('\n');
+
+    const trimmed = body.trim();
     if (trimmed.startsWith('{')) {
         try {
             const parsed = JSON.parse(trimmed);
@@ -342,9 +386,12 @@ export function parseVoiceCuesText(raw) {
     }
 
     const buckets = {};
-    let current = 'encourage';
+    const preamble = [];
+    // `null`, not 'encourage': nothing has been named yet, so nothing may be
+    // filed yet either.
+    let current = null;
     let sawHeader = false;
-    for (const rawLine of text.split(/\r?\n/)) {
+    for (const rawLine of body.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith('//')) continue;
         const headerName = headerNameOf(line);
@@ -357,9 +404,35 @@ export function parseVoiceCuesText(raw) {
             sawHeader = true;
             continue;
         }
+        if (current === null) {
+            preamble.push(line);
+            continue;
+        }
         if (!KNOWN_IDS.has(current)) continue;
         if (!buckets[current]) buckets[current] = [];
         buckets[current].push(line);
+    }
+    // Text above the first section is held back for the same reason an
+    // unplaceable header is: a title, a date or a note is not a phrase, and
+    // an imported bank REPLACES the wearer's own, so filing it would silently
+    // swap their build-up lines for the file's letterhead and read it aloud
+    // every encouragement tick. Refused, naming the line that caused it.
+    if (sawHeader && preamble.length > 0) {
+        return { cues: {}, error: 'preamble', line: preamble[0], encourageSeconds: null };
+    }
+    // A file with no sections at all stays the documented shorthand for the
+    // build-up bank - unless it is really a JSON export with something in
+    // front of it. A line that opens a JSON object is never a phrase, and
+    // filing the blob would make it one 140-character phrase to speak aloud.
+    // A phrase may legitimately START with a token, though: `{hr} BPM. Hold,
+    // don't finish.` is one of the factory lines and the tokens are exactly
+    // what the editor tells the wearer to use, so a bare `{token}` opening is
+    // a phrase and must not cost them the whole file.
+    if (!sawHeader && preamble.length > 0) {
+        if (preamble.some(opensJsonDocument)) {
+            return { cues: {}, error: 'json', encourageSeconds: null };
+        }
+        buckets.encourage = preamble;
     }
     const hasAny = Object.values(buckets).some((list) => list.length > 0);
     if (!hasAny) return { cues: {}, error: sawHeader ? 'empty' : 'format' };

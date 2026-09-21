@@ -174,6 +174,7 @@ export function describeMicProcessing(settings) {
 export function clearMicBoost(state) {
     if (!state) return;
     state.micBoost = 0;
+    state.micBoostHeld = 0;
     state.micApplied = 0;
     state.micLastLevel = 0;
     state.micSpeechAt = 0;
@@ -224,7 +225,13 @@ export async function startMicMonitor(state, { onLost = null } = {}) {
             if (onLost) onLost('The microphone stopped (revoked, unplugged or taken by another app).');
         };
         track.onmute = () => {
-            clearMicBoost(state);
+            // Torn down exactly like `onended`. Clearing the boost alone left
+            // the capture, the AudioContext, the analyser and the ~60 Hz
+            // meter loop running on a dead stream after the app had already
+            // told the wearer the microphone was gone: the browser kept its
+            // recording indicator lit, and the meter kept reading "below
+            // gate" - the wording for a working microphone in a quiet room.
+            stopMicMonitor(state);
             if (onLost) onLost('The microphone went silent (muted by the system or another app).');
         };
     }
@@ -312,16 +319,41 @@ export function micBoostFromLevel(level, gate, maxBpm) {
 export function micBoostedHr({
     sensorHr,
     micBoost = 0,
+    heldBoost = 0,
     ceiling,
     micEnabled = false,
     pulseFresh = false
 } = {}) {
     if (!Number.isFinite(sensorHr)) return sensorHr;
-    if (!micEnabled || !pulseFresh) return sensorHr;
-    const boost = Number.isFinite(micBoost) ? micBoost : 0;
+    if (!micEnabled) return sensorHr;
+    const boost = resolveMicBoost({ micBoost, heldBoost, pulseFresh });
     if (boost <= 0) return sensorHr;
     if (!Number.isFinite(ceiling) || sensorHr >= ceiling) return sensorHr;
     return Math.min(ceiling, sensorHr + boost);
+}
+
+// Pure: how much boost the engine may use this tick.
+//
+// On a fresh reading it is the live measurement. During the watchdog's HOLD
+// window the pulse is frozen, and so is the boost: it keeps the value
+// measured on the LAST fresh reading and neither grows nor drops out.
+//
+// Growing it there would let sound alone drive the toys while no pulse is
+// arriving. Dropping it there is worse, and is what a plain on/off gate did:
+// the engine's heart rate fell by the whole boost in a single tick, and in
+// every tease mode the speed curve falls as heart rate rises, so the motors
+// SPED UP - measured at +31 points on both channels with a 20 BPM cap - at
+// the exact moment the reading was least trustworthy. A watch or relay app
+// pushing every ~5 s trips the 5 s hold band on ordinary jitter.
+//
+// `heldBoost` defaults to 0, so a caller that does not track it gets the old
+// "no boost without a fresh reading" behaviour. A stale reading pauses the
+// session and every stop path calls clearMicBoost(), so nothing is held past
+// a dropout that actually matters.
+export function resolveMicBoost({ micBoost = 0, heldBoost = 0, pulseFresh = false } = {}) {
+    const live = Number.isFinite(micBoost) && micBoost > 0 ? micBoost : 0;
+    if (pulseFresh) return live;
+    return Number.isFinite(heldBoost) && heldBoost > 0 ? heldBoost : 0;
 }
 
 // Pure: average magnitude of analyser frequency bins inside the voice band,

@@ -2,7 +2,7 @@ import { state, advancedSettings } from './state.js';
 import {
     calculateEngineOutputs,
     resolveEngineMode,
-    hasReleasedEdge,
+    gameEdgeReleased,
     clampEdgeHoldPercent,
     resolveEdgeTriggerHr
 } from './engine.js';
@@ -23,6 +23,7 @@ import {
     tickStallGuard
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
+import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
@@ -96,10 +97,10 @@ import {
 } from './voice.js';
 import {
     VOICE_CUE_CATALOG,
-    DEFAULT_VOICE_CUES,
     mergeVoiceCues,
     resolveVoiceCue,
     applyImportedCues,
+    describeImport,
     parseVoiceCuesText,
     serializeVoiceCues,
     clampEncourageSeconds
@@ -298,15 +299,32 @@ document.getElementById('ageConfirmBtn')?.addEventListener('click', () => {
 });
 
 // Disconnect / Watchdog Alert Banner
+//
+// One banner carries every report, so it is ranked (see alert-banner.js): an
+// advisory can never overwrite a safety report, and a banner is only hidden
+// again by whoever raised it or by the wearer.
+let bannerState = hiddenBannerState();
+
 document.getElementById('dismissBannerBtn')?.addEventListener('click', () => {
-    document.getElementById('disconnectBanner')?.classList.add('hidden');
+    hideAlertBanner(BANNER_OWNER_ANY);
 });
 
-function triggerDisconnectAlert(message) {
+function showAlertBanner(message, { severity = 'safety', source = 'device' } = {}) {
     const banner = document.getElementById('disconnectBanner');
     const msg = document.getElementById('disconnectMsg');
-    if (msg) msg.textContent = message;
+    bannerState = planBannerUpdate(bannerState, { message, severity, source });
+    if (msg) msg.textContent = bannerState.text;
     if (banner) banner.classList.remove('hidden');
+}
+
+function hideAlertBanner(owner) {
+    if (!canClearBanner(bannerState, owner)) return;
+    bannerState = hiddenBannerState();
+    document.getElementById('disconnectBanner')?.classList.add('hidden');
+}
+
+function triggerDisconnectAlert(message, source = 'device') {
+    showAlertBanner(message, { severity: 'safety', source });
 
     if (pauseSession(null)) syncTelemetry();
     checkReadiness();
@@ -680,15 +698,23 @@ function updateEngine() {
     // Two heart rates from here on. `sensorHr` is what the monitor measured:
     // every guard, game, counter, the cockpit readout and the session record
     // judge THAT number. `hr` may additionally carry the microphone boost,
-    // which drives the engine's speed curve only, and only while the reading
-    // is fresh (never during the watchdog's hold window).
+    // which drives the engine's falling tease curve only - never the two
+    // climb games' rising ramps, which read the sensor alone.
     const sensorHr = hr;
+    // The boost is frozen with the pulse. Inside the watchdog's hold window
+    // the engine keeps the boost measured on the last fresh reading, so an
+    // ordinary inter-packet gap (a watch relaying every ~5 s trips the 5 s
+    // band on jitter alone) can neither grow it on room noise nor drop it
+    // out - and a drop-out speeds the motors UP in every tease mode.
+    const pulseFresh = pulseIsLive();
+    if (pulseFresh) state.micBoostHeld = Number.isFinite(state.micBoost) ? state.micBoost : 0;
     hr = micBoostedHr({
         sensorHr,
         micBoost: state.micBoost,
+        heldBoost: state.micBoostHeld,
         ceiling: max,
         micEnabled: Boolean(advancedSettings.micEnabled),
-        pulseFresh: pulseIsLive()
+        pulseFresh
     });
     // What the boost actually added this tick. It is 0 whenever the boost is
     // suppressed (no live reading, or the pulse is already at the ceiling),
@@ -871,9 +897,19 @@ function sessionVoiceVars() {
     };
 }
 
+// The resting line for the dashboard. An emptied Resting prompt bank is a
+// mute the wearer chose (the editor labels it so), and substituting the
+// factory sentence put the exact line they had just deleted back on the
+// cockpit at every idle moment. Empty means empty; paintIdlePrompt() then
+// leaves the box hidden rather than inventing one.
 function dashboardIdlePrompt() {
     const { text } = resolveVoiceCue(advancedSettings.voiceCues, 'idle', sessionVoiceVars());
-    return text || DEFAULT_VOICE_CUES.idle[0];
+    return text;
+}
+
+function paintIdlePrompt() {
+    const text = state.lastSpokenPrompt || dashboardIdlePrompt();
+    setMindgamePrompt(text, Boolean(advancedSettings.voiceEnabled && text));
 }
 
 // Queue a spoken cue. Voice guidance ON both paints the dashboard line and
@@ -886,8 +922,17 @@ function cueVoice(key, urgent = false) {
         sessionVoiceVars(),
         { lastTemplate }
     );
-    if (!advancedSettings.voiceEnabled || !text) {
-        setMindgamePrompt(text || '', Boolean(advancedSettings.voiceEnabled && text));
+    // "Muted" and "voice guidance off" are different states. An emptied
+    // phrase bank resolves to '' with voice still ON: that cue simply says
+    // nothing this tick, so the dashboard must keep whatever the last unmuted
+    // cue wrote. Hiding the box there wiped a live edge warning one second
+    // after it appeared, every encouragement interval, all session.
+    if (!text) {
+        if (!advancedSettings.voiceEnabled) setMindgamePrompt('', false);
+        return;
+    }
+    if (!advancedSettings.voiceEnabled) {
+        setMindgamePrompt(text, false);
         return;
     }
     const now = Date.now();
@@ -999,6 +1044,7 @@ function resetSessionCounters() {
     state.resumeStatus = null;
     state.durationFallback = false;
     state.endgameFired = false;
+    state.endgameHeldByOrgasm = false;
     state.strokerSpeed = 0;
     state.prostateSpeed = 0;
     funscriptSamples = [];
@@ -1168,7 +1214,7 @@ function tickSessionGuardsAndGames() {
             // pulse has genuinely dropped below the release band; resetting it
             // while HR still sits at the ceiling would count a phantom edge.
             state.oracleTimer += 1;
-            if (state.oracleTimer >= 28 && hasReleasedEdge(hr, ceiling, state.edgeTriggerHr)) {
+            if (state.oracleTimer >= 28 && gameEdgeReleased(hr, ceiling, state.edgeTriggerHr)) {
                 state.oracleState = 'APPROACH';
                 state.oracleTimer = 0;
                 state.isEdged = false;
@@ -1197,7 +1243,7 @@ function tickSessionGuardsAndGames() {
             { state: state.trainState, holdSeconds: state.trainHoldSeconds, edgesDone: state.trainEdgesDone },
             {
                 isEdged: state.isEdged,
-                released: hasReleasedEdge(hr, ceiling, state.edgeTriggerHr),
+                released: gameEdgeReleased(hr, ceiling, state.edgeTriggerHr),
                 holdGoal: advancedSettings.trainHoldSeconds,
                 edgesGoal: advancedSettings.trainEdges,
                 orgasmMode: state.orgasmMode
@@ -1347,7 +1393,9 @@ function holdAfterSignalReturn() {
 function resumeAfterSignalReturn() {
     state.hrSignalPaused = false;
     if (!startOrResumeSession()) return;
-    document.getElementById('disconnectBanner')?.classList.add('hidden');
+    // Only the signal-loss banner this function raised. A standing report
+    // about a device that may still be moving is not the pulse's to clear.
+    hideAlertBanner('hrSignal');
     cueVoice('signalRestored');
     showHrSignalBadge('SIGNAL RESTORED, RESUMED', 6000);
     syncTelemetry();
@@ -1380,7 +1428,7 @@ function evaluateHrWatchdog(now = Date.now()) {
     if (verdict.status === 'stale' && !state.hrSignalPaused) {
         state.hrSignalPaused = true;
         dispatchHardware(0, 0, 0, 100, true);
-        triggerDisconnectAlert(describeHrLoss(verdict));
+        triggerDisconnectAlert(describeHrLoss(verdict), 'hrSignal');
         cueVoice('signalLost', true);
     }
 }
@@ -1426,9 +1474,19 @@ setInterval(() => {
             // training state alone must never suppress it: a cancelled Force
             // Orgasm would leave a timed session with no way to end.
             const trainResolving = state.activeMode === 'edgetrain' && state.orgasmMode;
+            if (state.orgasmMode && (oracleResolving || trainResolving)) state.endgameHeldByOrgasm = true;
             if (!oracleResolving && !trainResolving) {
                 state.endgameFired = true;
-                handleTargetTimeReached();
+                // The only way to get here with the endgame still pending
+                // after an orgasm held it back is that the wearer tapped
+                // Force Orgasm OFF. Running the orgasm endgame now would
+                // synthesise a click on that same button within a second of
+                // them saying no, surging both channels back to 100%. The
+                // orgasm endgame is spent; Soft Landing and Denied still run,
+                // because cancelling an orgasm is not a request to skip the
+                // gentle ending the wearer picked.
+                const cancelled = state.endgameHeldByOrgasm && !state.orgasmMode && state.endgameType === 'orgasm';
+                if (!cancelled) handleTargetTimeReached();
             }
         }
         if (state.orgasmMode) {
@@ -1469,6 +1527,12 @@ function handleTargetTimeReached() {
     } else if (state.endgameType === 'rampdown') {
         state.sessionStatus = 'RAMPDOWN';
         state.rampdownSecondsLeft = 45;
+        // RAMPDOWN computes both channels from the ramp factor alone and
+        // never looks at the heart rate, so no boost reaches the toys. The
+        // session tick that refreshes (and clears) the boost is RUNNING-only,
+        // so without this the badge would show a MIC +N frozen at whatever
+        // the room was when the target time arrived, for the whole 45 s.
+        clearMicBoost(state);
         document.getElementById('rampdownNotice')?.classList.remove('hidden');
     } else {
         stopSession("Denied");
@@ -1961,12 +2025,21 @@ function syncParamsUI() {
     const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
     if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
     const holdInput = document.getElementById('edgeHoldPercentInput');
-    if (holdInput) holdInput.value = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
-    updateEdgeHoldPreview();
+    if (holdInput) holdInput.value = isRemotePage ? '' : clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
+    if (isRemotePage && holdInput) holdInput.placeholder = '--';
+    if (!isRemotePage) updateEdgeHoldPreview();
     const trainHold = document.getElementById('trainHoldSecondsInput');
     const trainEdges = document.getElementById('trainEdgesInput');
-    if (trainHold) trainHold.value = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
-    if (trainEdges) trainEdges.value = clampTrainEdges(advancedSettings.trainEdges);
+    // On a remote page these belong to the HOST. Writing this browser's own
+    // persisted values would show the partner their own Hold / edges while
+    // they pace the wearer's session by them; the HTML defaults would be just
+    // as wrong. They stay blank until telemetry carries the host's numbers.
+    if (trainHold) trainHold.value = isRemotePage ? '' : clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
+    if (trainEdges) trainEdges.value = isRemotePage ? '' : clampTrainEdges(advancedSettings.trainEdges);
+    if (isRemotePage) {
+        if (trainHold) trainHold.placeholder = '--';
+        if (trainEdges) trainEdges.placeholder = '--';
+    }
     if (dualToggle) dualToggle.checked = Boolean(advancedSettings.dualDampening);
     if (dualBpm) dualBpm.value = advancedSettings.dualDampeningBpm || 15;
     if (decayToggle) decayToggle.checked = Boolean(advancedSettings.adaptiveDecay);
@@ -1998,7 +2071,7 @@ function syncParamsUI() {
     if (boostValue) boostValue.textContent = String(boostCap);
     populateVoiceSelect();
     renderVoiceCueEditor();
-    setMindgamePrompt(state.lastSpokenPrompt || dashboardIdlePrompt(), advancedSettings.voiceEnabled);
+    paintIdlePrompt();
 }
 
 function populateVoiceSelect() {
@@ -2139,6 +2212,13 @@ document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) =
             alert(`"${parsed.header}" is not a phrase section EdgeLoop knows, so nothing was imported. Sections are # edge, # encourage, # forceOrgasm, # cameEarly and the other cue names (upper or lower case).`);
             return;
         }
+        if (parsed.error === 'preamble') {
+            // Filing a title or a note as a phrase would replace a whole
+            // bank with it and then speak it at the wearer, so the file is
+            // refused and the offending line is named.
+            alert(`"${parsed.line}" sits above the first # section, so EdgeLoop cannot tell which cue it belongs to and nothing was imported. Put every phrase under a section header (# edge, # encourage, ...), or start the file with "// " to make that line a comment.`);
+            return;
+        }
         if (parsed.error || !parsed.cues || Object.keys(parsed.cues).length === 0) {
             alert('That file did not look like an EdgeLoop phrase list. Use Export phrases, a settings backup, or a text file with # edge / # encourage sections.');
             return;
@@ -2149,12 +2229,15 @@ document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) =
         advancedSettings.voiceCues = applyImportedCues(live.cues, parsed.cues);
         advancedSettings.voiceEncourageSeconds = parsed.encourageSeconds ?? live.encourageSeconds;
         renderVoiceCueEditor();
-        const count = Object.keys(parsed.cues).length;
+        // What was really written, not how many keys the file had.
+        const summary = describeImport(parsed.cues);
+        const count = summary.applied.length;
+        const muted = summary.muted.length > 0 ? ` (${summary.muted.length} muted)` : '';
         if (!persistSettings()) {
-            alert(`Imported ${count} phrase list(s), but the browser refused to save them (storage full or unavailable). They are live for this session only.`);
+            alert(`Imported ${count} phrase list(s)${muted}, but the browser refused to save them (storage full or unavailable). They are live for this session only.`);
             return;
         }
-        alert(`Imported and saved ${count} phrase list(s).`);
+        alert(`Imported and saved ${count} phrase list(s)${muted}.`);
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -2323,10 +2406,10 @@ function handleMicLost(message) {
     clearMicBoost(state);
     paintMicMeter(0);
     showMicReenable(true);
-    const banner = document.getElementById('disconnectBanner');
-    const msg = document.getElementById('disconnectMsg');
-    if (msg) msg.textContent = message;
-    banner?.classList.remove('hidden');
+    // An advisory: nothing is moving because of this. It must never replace a
+    // safety report (a motor that may still be running, a lost pulse) that is
+    // already on the banner - it is appended to it instead.
+    showAlertBanner(message, { severity: 'advisory', source: 'mic' });
 }
 
 function startMicMeterLoop() {
@@ -2421,7 +2504,7 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
         advancedSettings.micEnabled = micOn;
         if (!micOn) showMicReenable(false);
     }
-    setMindgamePrompt(state.lastSpokenPrompt || dashboardIdlePrompt(), advancedSettings.voiceEnabled);
+    paintIdlePrompt();
 
     persistSettings();
     closeModal();
@@ -3395,10 +3478,7 @@ let lastTelemetryAt = 0;
 let remoteLinkUp = false;
 
 function showRemoteBanner(message) {
-    const banner = document.getElementById('disconnectBanner');
-    const msg = document.getElementById('disconnectMsg');
-    if (msg) msg.textContent = message;
-    banner?.classList.remove('hidden');
+    showAlertBanner(message, { severity: 'safety', source: 'remote' });
 }
 
 // Telemetry arrives every second; a long silence with the channel still
@@ -3429,7 +3509,7 @@ function applyRemoteTelemetry(data) {
         // Also clears a transient "Signalling lost" once frames keep coming.
         remoteLinkLost = false;
         setRemoteRoleStatus('Live');
-        document.getElementById('disconnectBanner')?.classList.add('hidden');
+        hideAlertBanner('remote');
     }
     if (data.hr !== undefined) state.hrCurrent = data.hr;
     if (data.seconds !== undefined) state.sessionSeconds = data.seconds;
@@ -3443,6 +3523,11 @@ function applyRemoteTelemetry(data) {
     if (data.minHr !== undefined) state.effectiveMinHr = data.minHr;
     if (data.maxHr !== undefined) state.effectiveMaxHr = data.maxHr;
     if (data.edgeTriggerHr !== undefined) state.edgeTriggerHr = data.edgeTriggerHr;
+    // The Edge Training card and the pullback input are host settings, so a
+    // remote page mirrors the host rather than its own localStorage. Until a
+    // frame carries them they stay blank (see syncParamsUI), never a number
+    // from this browser.
+    renderRemoteHostSettings(data);
     // The HOLD TO badge is written by the host's engine loop, which never
     // runs here, so a remote page labels the chart's pullback line itself.
     const remoteHoldBadge = document.getElementById('edgeHoldBadge');
@@ -3491,6 +3576,16 @@ function applyRemoteTelemetry(data) {
     lockRemoteControls();
 }
 
+// A remote page renders the host's game settings; it never computes them.
+function renderRemoteHostSettings(data) {
+    const trainHold = document.getElementById('trainHoldSecondsInput');
+    const trainEdges = document.getElementById('trainEdgesInput');
+    const holdInput = document.getElementById('edgeHoldPercentInput');
+    if (trainHold && data.trainHoldSeconds !== undefined) trainHold.value = data.trainHoldSeconds;
+    if (trainEdges && data.trainEdges !== undefined) trainEdges.value = data.trainEdges;
+    if (holdInput && data.edgeHoldPercent !== undefined) holdInput.value = data.edgeHoldPercent;
+}
+
 function syncTelemetry() {
     if (isRemotePage) return;
     const readiness = hardwareReadiness();
@@ -3511,6 +3606,12 @@ function syncTelemetry() {
         maxHr: state.effectiveMaxHr,
         edgeTriggerHr: state.edgeTriggerHr,
         activeMode: state.activeMode,
+        // The host's game settings. A remote page holds its own persisted
+        // copies of these; without them on the wire the Edge Training card a
+        // partner is reading quotes THEIR numbers for the wearer's session.
+        trainHoldSeconds: clampTrainHoldSeconds(advancedSettings.trainHoldSeconds),
+        trainEdges: clampTrainEdges(advancedSettings.trainEdges),
+        edgeHoldPercent: clampEdgeHoldPercent(advancedSettings.edgeHoldPercent),
         orgasmMode: state.orgasmMode,
         ready: readiness.hrReady && readiness.toyReady,
         hrSignal: {
@@ -3575,7 +3676,7 @@ renderLearningStatus();
 syncParamsUI();
 // A persisted mic setting waits for a tap (browser gesture rule).
 if (advancedSettings.micEnabled && !isRemotePage) showMicReenable(true);
-if (advancedSettings.voiceEnabled) setMindgamePrompt(dashboardIdlePrompt(), true);
+if (advancedSettings.voiceEnabled) paintIdlePrompt();
 watchChartResize(document.getElementById('hrChart'), redrawChart);
 if (isRemotePage && remoteRoom) {
     lockRemoteLimitInputs();
@@ -3586,7 +3687,7 @@ if (isRemotePage && remoteRoom) {
             remoteLinkLost = false;
             lastTelemetryAt = Date.now();
             setRemoteRoleStatus('Live');
-            document.getElementById('disconnectBanner')?.classList.add('hidden');
+            hideAlertBanner('remote');
         },
         onTelemetryReceived: applyRemoteTelemetry,
         onDisconnected: () => {

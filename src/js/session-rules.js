@@ -198,13 +198,20 @@ export function oracleTiming({
     const max = Math.max(0, Number(maxSeconds) || 0);
     const target = Math.max(0, Number(targetSeconds) || 0);
     const closeAt = target > 0 ? target : max;
-    // A duration whose minimum IS its own target (every Fixed length, and a
-    // Mystery roll that happens to land on its minimum) would leave a window
-    // of zero width: every hold to the final second would be purgatory and
-    // the Oracle would never choose at all. Such a session opens the window
-    // halfway instead, so the ramp still runs and the length the wearer typed
-    // stays the latest the Oracle will wait.
-    const openAt = closeAt > 0 && min >= closeAt
+    // A FIXED length leaves a window of zero width (min === max === target):
+    // every hold to the final second would be purgatory and the Oracle would
+    // never choose at all. That session opens the window halfway instead, so
+    // the ramp still runs and the length the wearer typed stays the latest
+    // the Oracle will wait - which is what the UI promises for Fixed.
+    //
+    // A Mystery window is NOT collapsed, even when the hidden roll happens to
+    // land on its own minimum. The wearer typed that minimum to mean "do not
+    // finish me before then", and halving it because of a roll they cannot
+    // see would unlock climax and denial at half the time they asked for.
+    // Such a session simply has canEnd false until the minimum and mustEnd
+    // true at it.
+    const fixedWindow = min >= closeAt && min >= max;
+    const openAt = closeAt > 0 && fixedWindow
         ? Math.floor(closeAt * ORACLE_MIN_WINDOW_SHARE)
         : min;
     const endless = openAt === 0 && closeAt === 0;

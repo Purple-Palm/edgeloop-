@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { sanitizeCommand, sanitizeTelemetry, HISTORY_LENGTH } from './peer-messages.js';
 
 describe('sanitizeCommand', () => {
@@ -104,6 +105,55 @@ describe('sanitizeTelemetry', () => {
         assert.ok(t.history.every((v) => Number.isFinite(v) && v >= 0 && v <= 250));
         assert.equal(t.history[t.history.length - 1], 0);
         assert.equal(t.history[t.history.length - 2], 250);
+    });
+
+    it('carries the host\'s Edge Training and pullback settings', () => {
+        // A remote page has its own persisted copies of these. Without them
+        // on the wire, the Edge Training card a partner reads while pacing
+        // the wearer's session quotes the PARTNER's own numbers, right under
+        // a mode name and an edge counter that ARE live telemetry.
+        const t = sanitizeTelemetry({
+            type: 'TELEMETRY', trainHoldSeconds: 45, trainEdges: 9, edgeHoldPercent: 95
+        });
+        assert.equal(t.trainHoldSeconds, 45);
+        assert.equal(t.trainEdges, 9);
+        assert.equal(t.edgeHoldPercent, 95);
+
+        // Clamped to the same bounds the host's own inputs use.
+        const wild = sanitizeTelemetry({
+            type: 'TELEMETRY', trainHoldSeconds: 5000, trainEdges: 0, edgeHoldPercent: 400
+        });
+        assert.equal(wild.trainHoldSeconds, 90);
+        assert.equal(wild.trainEdges, 1);
+        assert.equal(wild.edgeHoldPercent, 100);
+
+        // Absent stays absent, so a remote page keeps its previous value
+        // rather than snapping to a fabricated 0.
+        const bare = sanitizeTelemetry({ type: 'TELEMETRY' });
+        assert.equal(bare.trainHoldSeconds, undefined);
+        assert.equal(bare.trainEdges, undefined);
+        assert.equal(bare.edgeHoldPercent, undefined);
+        for (const junk of ['abc', null, true, {}]) {
+            const t2 = sanitizeTelemetry({ type: 'TELEMETRY', trainEdges: junk });
+            assert.equal(t2.trainEdges, undefined, `${String(junk)} is not a count`);
+        }
+    });
+
+    it('the host really sends them, and a remote page never shows its own', () => {
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const start = src.indexOf('function syncTelemetry');
+        assert.ok(start >= 0, 'syncTelemetry not found in app.js');
+        const body = src.slice(start, src.length > start + 2000 ? start + 2000 : src.length);
+        for (const field of ['trainHoldSeconds:', 'trainEdges:', 'edgeHoldPercent:']) {
+            assert.ok(body.includes(field), `telemetry must carry ${field}`);
+        }
+        // syncParamsUI runs at boot on a remote page too; writing this
+        // browser's persisted values (or the HTML defaults) into the Edge
+        // Training card is exactly the display artefact this closes.
+        const sync = src.indexOf('const trainHold = document.getElementById(\'trainHoldSecondsInput\');');
+        assert.ok(sync >= 0, 'the syncParamsUI writes were not found');
+        const syncBody = src.slice(sync, sync + 700);
+        assert.ok(/isRemotePage \? '' :/.test(syncBody), 'a remote page must not show its own Edge Training numbers');
     });
 
     it('normalises the watchdog block', () => {

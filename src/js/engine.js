@@ -86,6 +86,20 @@ export function hasReleasedEdge(hr, maxHr, triggerHr) {
     return Number.isFinite(hr) && Number.isFinite(release) && hr < release;
 }
 
+// The release question the Oracle and Edge Training ask once a second, and
+// the ONLY way they may ask it. `hasReleasedEdge` falls back to `maxHr - 5`
+// when it is handed no pullback mark, and with any pullback below 100% that
+// band sits ABOVE the mark: the game would clear the edge flag while the
+// engine still reads the pulse as edged, and the next tick counts an invented
+// edge that Adaptive Ceiling Decay then acts on. A mark that is not a finite
+// number is not an answer, so this refuses to say "released" rather than
+// guessing one - `state.edgeTriggerHr` starts as null, and a caller that
+// reaches this before the engine's first tick must get "no", not a fallback.
+export function gameEdgeReleased(hr, maxHr, triggerHr) {
+    if (!Number.isFinite(triggerHr)) return false;
+    return hasReleasedEdge(hr, maxHr, triggerHr);
+}
+
 function finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
 }
@@ -107,8 +121,12 @@ function safeEnvelope(hwMin, hwMax) {
 export function calculateEngineOutputs({
     hr,
     // The sensor's own pulse. `hr` may carry the microphone boost, which
-    // drives the speed curve only; the edge flag, and every guard, game and
-    // counter that reads it, must judge the pulse that was measured.
+    // drives the FALLING tease curve and the stroke-depth contraction that
+    // shares it (`strokeMax` everywhere, plus `strokeMin` in Glans Protector
+    // and Head Play): more progress there means less motion, so the boost can
+    // only ever back the toys off. The edge flag, every guard, game and
+    // counter, and the two climb games' rising ramps all judge `edgeHr`, the
+    // pulse that was actually measured.
     edgeHr,
     minHr,
     maxHr,
@@ -148,8 +166,12 @@ export function calculateEngineOutputs({
         resolvedMode: mode
     };
 
+    // Motors are silent in every other status, but the edge flag is state,
+    // not output: clearing it here would re-arm the detector, so the first
+    // RUNNING tick after a pause (including every watchdog auto-resume) would
+    // count the edge the wearer is still sitting on as a brand-new one.
     if (sessionStatus !== 'RUNNING' && sessionStatus !== 'RAMPDOWN') {
-        return silent;
+        return { ...silent, isEdged: Boolean(isEdged) };
     }
 
     // Fail safe: a NaN heart rate or limit stops the motors and keeps the
@@ -185,6 +207,14 @@ export function calculateEngineOutputs({
     const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);
+    // The same curve on the MEASURED pulse. Every tease mode maps progress
+    // onto a falling speed, so the boost can only ever back the motors off
+    // there. The two climb games invert it (`48 + progress * 52`), where the
+    // boost would instead drive the primary UP - to 100% for the last BPM of
+    // the approach, in the exact window the wearer is closest to climax, off
+    // nothing but room noise. Those ramps read the sensor alone.
+    const sensorRawProgress = clamp((edgeSource - minHr) / span, 0, 1);
+    const climbProgress = Math.pow(sensorRawProgress, gammaSafe);
 
     let primaryPercent = 0;
     let secondaryPercent = 0;
@@ -220,7 +250,7 @@ export function calculateEngineOutputs({
         secondaryPercent = Math.round(50 * rampFactor);
         strokeMaxPercent = Math.max(25, Math.round(100 - (1.0 - rampFactor) * depthContractAmount));
     } else if (mode === 'oracle') {
-        const oracle = applyOracle(oracleState, progress, nextIsEdged, orgasmMode, seconds, crawlPercent);
+        const oracle = applyOracle(oracleState, climbProgress, nextIsEdged, orgasmMode, seconds, crawlPercent);
         primaryPercent = oracle.primary;
         secondaryPercent = oracle.secondary;
         strokeMinPercent = oracle.strokeMin;
@@ -231,7 +261,7 @@ export function calculateEngineOutputs({
         secondaryPercent = orgasmMode ? 100 : Math.round(floor * 0.7);
         strokeMaxPercent = Math.round(100 - (progress * depthContractAmount * 0.4));
     } else if (mode === 'edgetrain') {
-        const train = applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent);
+        const train = applyEdgeTrain(trainingState, climbProgress, nextIsEdged, orgasmMode, crawlPercent);
         primaryPercent = train.primary;
         secondaryPercent = train.secondary;
         strokeMinPercent = train.strokeMin;
@@ -359,9 +389,17 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
         out.secondary = 100;
         return out;
     }
+    // Every Oracle state below HOLD is reached with the wearer parked at the
+    // pullback mark (app.js only enters HOLD from `state.isEdged`, and the
+    // flag is not cleared until the pulse drops out of the release band), so
+    // the wearer's "At the ceiling" rule decides the primary there exactly as
+    // it does in Edge Training and every tease mode: Full Stop parks it at
+    // 0%, Crawl keeps the micro-motion. Only Force Orgasm (above) overrides
+    // it. The stall guard is disarmed for this mode, so nothing else would.
+    // The secondary channel keeps the game's own level.
     switch (oracleState) {
         case 'HOLD':
-            out.primary = 14;
+            out.primary = crawlPercent;
             out.secondary = 55;
             out.strokeMax = 70;
             break;
@@ -379,7 +417,7 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             break;
         case 'PURGATORY': {
             const swing = 28 + Math.round(32 * (0.5 + 0.5 * Math.sin(sessionSeconds * 1.3)));
-            out.primary = swing;
+            out.primary = nextIsEdged ? crawlPercent : swing;
             out.secondary = 40 + Math.round(30 * (0.5 + 0.5 * Math.sin(sessionSeconds * 0.8)));
             out.strokeMax = 80;
             break;
@@ -387,7 +425,7 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
         case 'APPROACH':
         default: {
             const pull = Math.round(48 + progress * 52);
-            out.primary = nextIsEdged ? 14 : pull;
+            out.primary = nextIsEdged ? crawlPercent : pull;
             out.secondary = nextIsEdged ? 40 : Math.round(30 + progress * 50);
             out.strokeMax = 100;
         }

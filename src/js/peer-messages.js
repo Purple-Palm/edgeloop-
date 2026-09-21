@@ -5,7 +5,13 @@
 // speeds), a viewer may only ping, and the host's telemetry is coerced and
 // clamped before it touches the remote page's state. Anything else is
 // dropped, never partially applied.
-import { ENGINE_MODES } from './engine.js';
+import { ENGINE_MODES, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT } from './engine.js';
+import {
+    MIN_TRAIN_HOLD_SECONDS,
+    MAX_TRAIN_HOLD_SECONDS,
+    MIN_TRAIN_EDGES,
+    MAX_TRAIN_EDGES
+} from './session-rules.js';
 
 export const PEER_ROLES = ['controller', 'viewer'];
 
@@ -84,6 +90,12 @@ export function sanitizeTelemetry(raw) {
     // instead of one of its own.
     out.edgeTriggerHr = clampNumber(raw.edgeTriggerHr, 30, HR_MAX_BPM, true);
     out.activeMode = oneOf(raw.activeMode, ENGINE_MODES);
+    // The host's own game settings. A remote page has its own persisted
+    // copies of these, and showing those would quote the PARTNER's numbers
+    // back at them while they pace the wearer's session by them.
+    out.trainHoldSeconds = clampNumber(raw.trainHoldSeconds, MIN_TRAIN_HOLD_SECONDS, MAX_TRAIN_HOLD_SECONDS, true);
+    out.trainEdges = clampNumber(raw.trainEdges, MIN_TRAIN_EDGES, MAX_TRAIN_EDGES, true);
+    out.edgeHoldPercent = clampNumber(raw.edgeHoldPercent, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT, true);
     out.orgasmMode = typeof raw.orgasmMode === 'boolean' ? raw.orgasmMode : undefined;
     out.ready = typeof raw.ready === 'boolean' ? raw.ready : undefined;
 
