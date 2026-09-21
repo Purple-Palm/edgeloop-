@@ -136,7 +136,16 @@ export function hasReleasedEdge(hr, maxHr, triggerHr) {
 // number is not an answer, so this refuses to say "released" rather than
 // guessing one - `state.edgeTriggerHr` starts as null, and a caller that
 // reaches this before the engine's first tick must get "no", not a fallback.
-export function gameEdgeReleased(hr, maxHr, triggerHr) {
+//
+// Force Orgasm is the same answer here as it is inside the engine: no. The
+// overdrive raises the working ceiling 1 BPM per second and the release band
+// rides up with it, so after a few seconds a pulse parked ON the mark reads
+// as "released" against a ceiling that only moved because the wearer armed
+// the button. calculateEngineOutputs freezes the edge flag for exactly that
+// reason; a game asking its own release question has to get the same answer,
+// or cancelling Force Orgasm counts an edge the pulse never gave.
+export function gameEdgeReleased(hr, maxHr, triggerHr, { orgasmMode = false } = {}) {
+    if (orgasmMode) return false;
     if (!Number.isFinite(triggerHr)) return false;
     return hasReleasedEdge(hr, maxHr, triggerHr);
 }
@@ -519,7 +528,13 @@ function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlP
             out.strokeMax = 70;
             break;
         case 'recover':
-            out.primary = 0;
+            // Recover is still a hold at the mark: tickEdgeTraining only
+            // leaves it once the pulse has dropped out of the release band,
+            // so the ceiling rule governs the primary here exactly as it
+            // does in the hold. A dead stop is the premise of Ruin & Leak,
+            // not of recover - a wearer who picked Crawl because a full stop
+            // kills their edge was given 0% after every counted hold.
+            out.primary = crawlPercent;
             out.secondary = 35;
             out.strokeMax = 55;
             break;

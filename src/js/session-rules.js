@@ -3,6 +3,11 @@
 // parsing and the Survival breach counter. No DOM and no storage, so all of
 // it runs under node:test.
 
+// The one thing this file reads from the engine: the crawl level, so the
+// cockpit banner can tell a crawling motor from a running one with the same
+// number the engine sends.
+import { CRAWL_PERCENT } from './engine.js';
+
 // The effective ceiling can never be pushed closer than this to the resting
 // HR, otherwise the tease band collapses into a permanent cut-off.
 export const MIN_CEILING_GAP = 15;
@@ -460,6 +465,49 @@ export function tickEdgeTraining(
 // and Denied stops the session (which clears the latch anyway).
 export function endgameKeepsOrgasmLatch(endgameType) {
     return endgameType === 'orgasm';
+}
+
+// The highest reading a crawl can give: Global Intensity scales every motor
+// term by 0.5x to 1.5x, so the 10% micro-motion reaches the toys as 5-15%.
+// Nothing above this is a crawl, so nothing above it may be called one.
+const MAX_CRAWL_READING = Math.round(CRAWL_PERCENT * 1.5);
+
+// One channel of the cockpit's cutoff banner, named by what the engine really
+// sent it on this tick rather than by what the mode is supposed to do.
+function describeCutoffChannel(label, percent) {
+    if (!Number.isFinite(percent)) return `${label} UNKNOWN`;
+    const pct = Math.max(0, Math.min(100, Math.round(percent)));
+    if (pct === 0) return label === 'PRIMARY' ? 'PRIMARY CUT' : 'SECONDARY STOPPED';
+    if (pct <= MAX_CRAWL_READING) return `${label} CRAWLING (${pct}%)`;
+    return label === 'PRIMARY' ? `PRIMARY RUNNING (${pct}%)` : `SECONDARY MILKING (${pct}%)`;
+}
+
+// The cockpit's cutoff banner, as pure text: the caller paints what comes
+// back and hides the banner on ''. It used to be one fixed sentence - PRIMARY
+// CUT, SECONDARY MILKING ACTIVE - shown whenever the pulse sat on the mark,
+// whatever the engine was doing. In Classic Tease with Full Stop both motors
+// are parked at 0% and the wearer was told an idle vibrator was milking them,
+// so they went looking for a broken toy or a wrong role; in Survival the
+// primary is still climbing while the banner called it cut. Worse, the edge
+// flag deliberately survives a pause, so a watchdog pause on a lost signal
+// left the banner asserting an active secondary with every motor stopped.
+// It now reports the two numbers the engine produced on this tick, and says
+// nothing at all unless the session is RUNNING.
+export function describeCutoffNotice({
+    sessionStatus,
+    isEdged = false,
+    orgasmMode = false,
+    stallGuardEngaged = false,
+    primaryPercent,
+    secondaryPercent
+} = {}) {
+    if (sessionStatus !== 'RUNNING') return '';
+    // Force Orgasm is not a cutoff, and the stall guard raises its own
+    // banner for the halt it is running.
+    if (!isEdged || orgasmMode || stallGuardEngaged) return '';
+    const primary = describeCutoffChannel('PRIMARY', primaryPercent);
+    const secondary = describeCutoffChannel('SECONDARY', secondaryPercent);
+    return `CLIMAX LIMIT REACHED: ${primary} \u2014 ${secondary}`;
 }
 
 // The cockpit's game banner, as pure text: the caller paints what comes back

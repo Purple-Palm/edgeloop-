@@ -23,6 +23,7 @@ import {
     isSurvivalDefeated,
     endgameKeepsOrgasmLatch,
     describeGameNotice,
+    describeCutoffNotice,
     MIN_STALL_GUARD_SECONDS,
     MAX_STALL_GUARD_SECONDS,
     DEFAULT_STALL_GUARD_SECONDS,
@@ -667,5 +668,94 @@ describe('the cockpit game banner', () => {
                 assert.ok(!lie.test(text), `the banner still claims the game is running: ${text}`);
             }
         }
+    });
+});
+
+describe('the cockpit cutoff banner', () => {
+    const edged = {
+        sessionStatus: 'RUNNING',
+        isEdged: true,
+        orgasmMode: false,
+        stallGuardEngaged: false,
+        primaryPercent: 0,
+        secondaryPercent: 100
+    };
+
+    it('names what each channel was really sent', () => {
+        // Ultimate Milker at the mark: the primary is parked, the secondary
+        // really is milking, and that is the only case the old fixed
+        // sentence described.
+        assert.equal(
+            describeCutoffNotice(edged),
+            'CLIMAX LIMIT REACHED: PRIMARY CUT \u2014 SECONDARY MILKING (100%)'
+        );
+        // Crawl keeps the micro-motion on both channels in Classic Tease.
+        assert.equal(
+            describeCutoffNotice({ ...edged, primaryPercent: 10, secondaryPercent: 10 }),
+            'CLIMAX LIMIT REACHED: PRIMARY CRAWLING (10%) \u2014 SECONDARY CRAWLING (10%)'
+        );
+        // Survival keeps climbing through the mark; the banner used to call
+        // that running primary cut.
+        assert.equal(
+            describeCutoffNotice({ ...edged, primaryPercent: 52, secondaryPercent: 36 }),
+            'CLIMAX LIMIT REACHED: PRIMARY RUNNING (52%) \u2014 SECONDARY MILKING (36%)'
+        );
+    });
+
+    it('never calls a stopped secondary milking', () => {
+        // Classic Tease with Full Stop and a vibrator on the secondary: both
+        // motors are at 0%, and the banner told the wearer the secondary was
+        // milking them, so they went looking for a broken toy or a wrong
+        // role assignment.
+        const text = describeCutoffNotice({ ...edged, primaryPercent: 0, secondaryPercent: 0 });
+        assert.equal(text, 'CLIMAX LIMIT REACHED: PRIMARY CUT \u2014 SECONDARY STOPPED');
+        assert.ok(!/MILKING/.test(text), `a stopped secondary is not milking: ${text}`);
+        // Nor a crawling one - Global Intensity scales the 10% crawl to
+        // anywhere from 5% to 15%, and all of that is still a crawl.
+        for (const pct of [5, 10, 15]) {
+            const crawling = describeCutoffNotice({ ...edged, secondaryPercent: pct });
+            assert.ok(!/MILKING/.test(crawling), `${pct}% is a crawl, not milking: ${crawling}`);
+            assert.match(crawling, new RegExp(`SECONDARY CRAWLING \\(${pct}%\\)`));
+        }
+    });
+
+    it('asserts nothing at all once the session is not running', () => {
+        // The edge flag deliberately survives a pause (clearing it counted a
+        // phantom edge on the first tick after RESUME), so the banner went on
+        // claiming an active secondary through every watchdog pause with all
+        // motors stopped.
+        for (const sessionStatus of ['PAUSED', 'IDLE', 'STOPPED', 'RAMPDOWN', undefined]) {
+            assert.equal(
+                describeCutoffNotice({ ...edged, sessionStatus }),
+                '',
+                `the banner must be silent in ${String(sessionStatus)}`
+            );
+        }
+        // And the cases the banner never covered: not on the mark, Force
+        // Orgasm (not a cutoff) and the stall guard (its own banner).
+        assert.equal(describeCutoffNotice({ ...edged, isEdged: false }), '');
+        assert.equal(describeCutoffNotice({ ...edged, orgasmMode: true }), '');
+        assert.equal(describeCutoffNotice({ ...edged, stallGuardEngaged: true }), '');
+        assert.equal(describeCutoffNotice(), '');
+    });
+
+    it('refuses to guess at a percentage it was not given', () => {
+        const text = describeCutoffNotice({ ...edged, primaryPercent: NaN, secondaryPercent: undefined });
+        assert.equal(text, 'CLIMAX LIMIT REACHED: PRIMARY UNKNOWN \u2014 SECONDARY UNKNOWN');
+        // Out-of-range numbers are reported inside the scale, never as a
+        // negative or a 300% motor.
+        assert.match(describeCutoffNotice({ ...edged, primaryPercent: -5, secondaryPercent: 300 }), /PRIMARY CUT/);
+        assert.match(describeCutoffNotice({ ...edged, primaryPercent: -5, secondaryPercent: 300 }), /SECONDARY MILKING \(100%\)/);
+    });
+
+    it('is the only thing app.js paints into the cutoff banner', () => {
+        // index.html no longer carries the sentence, and app.js must not
+        // reinvent one: a hand-built string is how the last one drifted away
+        // from what the engine was sending.
+        const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+        assert.ok(!/SECONDARY MILKING ACTIVE/.test(html), 'the fixed banner sentence must be gone from the markup');
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        assert.ok(/describeCutoffNotice\(/.test(src), 'app.js must ask for the text');
+        assert.ok(!/CLIMAX LIMIT REACHED/.test(src), 'app.js must not build the text itself');
     });
 });

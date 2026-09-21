@@ -24,7 +24,8 @@ import {
     clampStallPauseSeconds,
     tickStallGuard,
     endgameKeepsOrgasmLatch,
-    describeGameNotice
+    describeGameNotice,
+    describeCutoffNotice
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
@@ -845,9 +846,22 @@ function updateEngine() {
     if (prostateBar) prostateBar.style.width = `${result.secondaryPercent}%`;
     if (strokeBadge) strokeBadge.textContent = `Zone: ${result.strokeMinPercent}-${result.strokeMaxPercent}%`;
 
+    // The banner names what each channel was really sent this tick, and is
+    // silent unless the session is running: the edge flag survives a pause on
+    // purpose, so it used to keep claiming an active secondary through a
+    // watchdog pause with every motor stopped.
     const cutoffEl = document.getElementById('cutoffNotice');
     if (cutoffEl) {
-        cutoffEl.classList.toggle('hidden', !state.isEdged || state.orgasmMode || state.sessionStatus === 'RAMPDOWN' || state.stallGuardEngaged);
+        const cutoffText = describeCutoffNotice({
+            sessionStatus: state.sessionStatus,
+            isEdged: state.isEdged,
+            orgasmMode: state.orgasmMode,
+            stallGuardEngaged: state.stallGuardEngaged,
+            primaryPercent: result.primaryPercent,
+            secondaryPercent: result.secondaryPercent
+        });
+        cutoffEl.textContent = cutoffText;
+        cutoffEl.classList.toggle('hidden', !cutoffText);
     }
 
     const stallNotice = document.getElementById('stallGuardNotice');
@@ -1218,7 +1232,7 @@ function tickSessionGuardsAndGames() {
             // pulse has genuinely dropped below the release band; resetting it
             // while HR still sits at the ceiling would count a phantom edge.
             state.oracleTimer += 1;
-            if (state.oracleTimer >= 28 && gameEdgeReleased(hr, ceiling, state.edgeTriggerHr)) {
+            if (state.oracleTimer >= 28 && gameEdgeReleased(hr, ceiling, state.edgeTriggerHr, { orgasmMode: state.orgasmMode })) {
                 state.oracleState = 'APPROACH';
                 state.oracleTimer = 0;
                 state.isEdged = false;
@@ -1247,7 +1261,7 @@ function tickSessionGuardsAndGames() {
             { state: state.trainState, holdSeconds: state.trainHoldSeconds, edgesDone: state.trainEdgesDone },
             {
                 isEdged: state.isEdged,
-                released: gameEdgeReleased(hr, ceiling, state.edgeTriggerHr),
+                released: gameEdgeReleased(hr, ceiling, state.edgeTriggerHr, { orgasmMode: state.orgasmMode }),
                 holdGoal: advancedSettings.trainHoldSeconds,
                 edgesGoal: advancedSettings.trainEdges,
                 orgasmMode: state.orgasmMode

@@ -262,6 +262,13 @@ describe('engine modes', () => {
         for (const trainingState of trainStates) {
             const stop = calculateEngineOutputs({ ...atMark, activeMode: 'edgetrain', trainingState, ceilingBehaviour: 'stop' });
             assert.equal(stop.primaryPercent, 0, `edgetrain ${trainingState} must park the primary with Full Stop`);
+            // 'recover' is reached with the pulse still on the mark -
+            // tickEdgeTraining only leaves it once the pulse drops out of the
+            // release band - and it used to dead-stop the primary whichever
+            // rule the wearer picked, so every counted hold was followed by
+            // 0% for a wearer who chose Crawl to keep the edge alive.
+            const crawl = calculateEngineOutputs({ ...atMark, activeMode: 'edgetrain', trainingState, ceilingBehaviour: 'crawl' });
+            assert.equal(crawl.primaryPercent, CRAWL_PERCENT, `edgetrain ${trainingState} must crawl with Crawl`);
         }
         // Force Orgasm is still the one thing that overrides it.
         const forced = calculateEngineOutputs({
@@ -400,6 +407,7 @@ describe('engine modes', () => {
             ceilingBehaviour: 'crawl'
         });
         assert.equal(climbEdgedCrawl.primaryPercent, CRAWL_PERCENT);
+        // Recover is a hold at the mark too, so it answers to the same rule.
         const recover = calculateEngineOutputs({
             ...running,
             activeMode: 'edgetrain',
@@ -408,6 +416,16 @@ describe('engine modes', () => {
             hr: 140
         });
         assert.equal(recover.primaryPercent, 0);
+        const recoverCrawl = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'recover',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'crawl'
+        });
+        assert.equal(recoverCrawl.primaryPercent, CRAWL_PERCENT);
+        assert.ok(recoverCrawl.secondaryPercent > 0, 'the secondary channel keeps running');
     });
 
     it('warmup caps travel at session start', () => {
@@ -805,6 +823,56 @@ describe('game-side edge release', () => {
             assert.equal(gameEdgeReleased(70, 140, noMark), false, 'not even far below the ceiling');
         }
         assert.equal(hasReleasedEdge(130, 140, undefined), true, 'what the unguarded call wrongly answers');
+    });
+
+    it('gameEdgeReleased says "no" for as long as Force Orgasm is on', () => {
+        // The overdrive lifts the working ceiling 1 BPM per second and the
+        // release band rides up with it, so a pulse parked ON the mark reads
+        // as released against a ceiling that only moved because the wearer
+        // armed the button. calculateEngineOutputs freezes the edge flag for
+        // that reason; the games ask their own release question once a second
+        // and have to get the same answer, or the Oracle's purgatory reset
+        // counts an edge - and walks Adaptive Ceiling Decay - on a pulse that
+        // never left the mark.
+        const typed = 140;
+        const mark = resolveEdgeTriggerHr(typed, 100, 70);
+        assert.equal(mark, typed);
+        const onTheMark = 140;
+        assert.equal(gameEdgeReleased(onTheMark, typed, mark), false, 'on the mark, no overdrive');
+        // Six seconds of Force Orgasm: the ceiling (and the mark with it) is
+        // six BPM higher, which puts the unchanged pulse below the band.
+        const boosted = typed + 6;
+        const boostedMark = resolveEdgeTriggerHr(boosted, 100, 70);
+        assert.equal(
+            gameEdgeReleased(onTheMark, boosted, boostedMark),
+            true,
+            'what the inflated ceiling wrongly answers'
+        );
+        assert.equal(
+            gameEdgeReleased(onTheMark, boosted, boostedMark, { orgasmMode: true }),
+            false,
+            'Force Orgasm freezes the answer, exactly as the engine freezes the flag'
+        );
+        // A genuine release is still a release the moment the button is off.
+        assert.equal(gameEdgeReleased(120, typed, mark, { orgasmMode: false }), true);
+        assert.equal(gameEdgeReleased(120, typed, mark, { orgasmMode: true }), false);
+    });
+
+    it('app.js hands both game release checks the Force Orgasm flag', () => {
+        // The Oracle's purgatory reset and Edge Training's recover both ask
+        // it once a second while the wearer may be holding Force Orgasm.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const sites = /gameEdgeReleased\(([^)]*)\)/g;
+        let seen = 0;
+        let match;
+        while ((match = sites.exec(src)) !== null) {
+            seen += 1;
+            assert.ok(
+                /orgasmMode/.test(match[1]),
+                `the release check must be told about Force Orgasm: ${match[0]}`
+            );
+        }
+        assert.ok(seen >= 2, 'expected the Oracle and Edge Training call sites');
     });
 
     it('app.js asks the release question only through gameEdgeReleased', () => {

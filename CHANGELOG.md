@@ -103,6 +103,26 @@ credited by username.
   it leaves the game state exactly where it stood: for the whole tease-down
   the cockpit told you the Oracle was still deciding, or the training still
   climbing, while neither was true. Every game reads SOFT LANDING there now.
+- **The Oracle** no longer counts a phantom edge when you cancel Force
+  Orgasm mid-purgatory. The engine freezes the edge flag while the overdrive
+  runs, but the purgatory reset asked its own release question in app.js and
+  still asked it against the inflated ceiling: tap Force Orgasm during the
+  28 s swing and six seconds later the ceiling has climbed far enough that a
+  pulse parked ON the mark reads as released, so the game dropped back to
+  APPROACH and the cancel was then read as a brand-new edge - +1 on the
+  counter, the edge cue spoken, a rotator reversed and Adaptive Ceiling
+  Decay walking your working ceiling down, on a pulse that never moved.
+  Both games now ask that question the way the engine answers it: while
+  Force Orgasm is on, nothing is released.
+- **Edge Training** obeys your "At the ceiling" setting in recover too. The
+  hold already did, but the recover that follows every counted hold parked
+  the primary at 0% whichever you had picked, and recover only ends once
+  your pulse has dropped 5 BPM below the mark - so a wearer who chose Crawl
+  because a dead stop kills their edge got a dead stop after every single
+  edge of the set. Recover is a hold at the mark like any other: Full Stop
+  parks the primary there, Crawl keeps its 10%. The secondary channel is
+  unchanged, and Ruin & Leak's 18 s lockout is still the one halt the
+  setting does not govern.
 
 ### The Handy
 - Connect now selects HAMP mode (mode 0). The driver previously selected
@@ -283,6 +303,18 @@ credited by username.
   Adaptive Ceiling Decay walking your working ceiling down. The edge flag is
   frozen while Force Orgasm runs and judged against your real ceiling again
   the moment it stops.
+- The cockpit cutoff banner says what the motors are really doing. It was
+  one fixed sentence - PRIMARY CUT, SECONDARY MILKING ACTIVE - shown
+  whenever your pulse sat on the pullback mark, whatever the engine was
+  sending. In Classic Tease with Full Stop and a vibrator on the secondary
+  both motors are parked at 0% and the banner still claimed the secondary
+  was milking you, so people went looking for a broken toy or a wrong role
+  assignment; in Survival the primary keeps climbing and the banner called
+  it cut. Worse, the edge flag survives a pause on purpose, so a watchdog
+  pause on a lost signal left the banner asserting an active secondary with
+  every motor stopped. It now names each channel by the number the engine
+  produced on that tick - CUT / STOPPED, CRAWLING (n%), RUNNING (n%) or
+  MILKING (n%) - and shows nothing at all unless the session is running.
 - Funscript export produces real stroke actions from the recorded speed and
   zone instead of writing the speed percentage as a position.
 - Storage is corruption-safe and trims the oldest history on quota errors;

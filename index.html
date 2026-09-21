@@ -177,9 +177,10 @@
             </div>
           </div>
 
-          <div id="cutoffNotice" class="hidden text-center text-[11px] font-bold text-rose-400 bg-rose-950/40 border border-rose-900/60 rounded-lg py-1">
-            CLIMAX LIMIT REACHED: PRIMARY CUT — SECONDARY MILKING ACTIVE
-          </div>
+          <!-- Filled by app.js with what the engine really sent each channel on
+               this tick (describeCutoffNotice); empty while there is nothing
+               true to say, so it can never claim a motor that is stopped. -->
+          <div id="cutoffNotice" class="hidden text-center text-[11px] font-bold text-rose-400 bg-rose-950/40 border border-rose-900/60 rounded-lg py-1"></div>
           <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse">
             STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE
           </div>
@@ -405,7 +406,7 @@
                 <span class="mode-check hidden text-amber-400">●</span>
               </div>
               <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
-                Pulls you to the ceiling and holds you there, obeying your "At the ceiling" setting while you are on the mark. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Tapping Force Orgasm yourself suspends the training instead of completing it, and cancelling it after the finish starts a fresh set. Cancelling it is final: if the target time passed while it was running, the endgame will not switch it back on. Stall guard is off so the hold is the goal, not a cutoff.
+                Pulls you to the ceiling and holds you there, obeying your "At the ceiling" setting for as long as you are on the mark - the hold and the recover after it alike. A hold only counts if you stay on it for the full time; drop early and it does not count. After the set number of edges it lets you finish. Tapping Force Orgasm yourself suspends the training instead of completing it, and cancelling it after the finish starts a fresh set. Cancelling it is final: if the target time passed while it was running, the endgame will not switch it back on. Stall guard is off so the hold is the goal, not a cutoff.
               </p>
               <div class="flex flex-wrap items-center gap-2 mt-1.5 pt-1.5 border-t border-slate-800 text-[9px] text-slate-400" data-train-settings>
                 <label class="flex items-center gap-1 font-mono">
@@ -762,7 +763,7 @@
               </select>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. This applies in every mode that teases you down, including an Edge Training hold and every Oracle state you reach while on the mark. Two modes it does not govern: <strong>Survival Mode</strong>, where the speed climbs on its own clock whatever your pulse does and a breach of the ceiling ends the run, and <strong>Ruin &amp; Leak</strong>, whose 18 s lockout cuts the primary dead whichever you picked. Force Orgasm overrides both.
+              What the strokers do once your pulse crosses the pullback percent of Climax HR below. <strong>Full Stop</strong> parks the primary at 0%; <strong>Crawl</strong> keeps a 10% micro-motion so the edge stays alive. This applies in every mode that teases you down, including every Edge Training and Oracle state you reach while on the mark (the training hold and its recover alike). Two modes it does not govern: <strong>Survival Mode</strong>, where the speed climbs on its own clock whatever your pulse does and a breach of the ceiling ends the run, and <strong>Ruin &amp; Leak</strong>, whose 18 s lockout cuts the primary dead whichever you picked. Force Orgasm overrides both.
             </p>
           </div>
 
