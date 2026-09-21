@@ -121,10 +121,71 @@ export function setMindgamePrompt(text, visible) {
     if (box) box.classList.toggle('hidden', !visible);
 }
 
+// What we ask the browser to capture. The browser's OWN defaults are the
+// enemy here: Chrome and Firefox both enable noise suppression (tuned to
+// keep speech and throw breathing away) and automatic gain control (which
+// moves gain at about 6 dB/s, erasing a 20 dB arousal build in roughly
+// three seconds). Left alone, the feature measures exactly what the
+// browser is deleting. Every value is `ideal`, never `exact`: a hard
+// constraint failure would leave the wearer with no microphone at all,
+// which is worse than a processed one.
+export const MIC_CAPTURE_CONSTRAINTS = Object.freeze({
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: false },
+    autoGainControl: { ideal: false },
+    channelCount: { ideal: 1 }
+});
+
+export const MIC_PROCESSING_LABELS = Object.freeze({
+    noiseSuppression: 'noise suppression',
+    autoGainControl: 'automatic gain control',
+    echoCancellation: 'echo cancellation'
+});
+
+// Pure: read `track.getSettings()` back and say whether the browser really
+// switched the processing off. Anything that is not exactly `false` counts
+// as "may still be active" - Safari reports neither flag at all, so an
+// `=== true` check would quietly call a processed stream clean.
+export function describeMicProcessing(settings) {
+    const s = settings && typeof settings === 'object' ? settings : {};
+    const active = [];
+    const unknown = [];
+    for (const key of ['noiseSuppression', 'autoGainControl']) {
+        if (s[key] === false) continue;
+        active.push(key);
+        if (s[key] === undefined) unknown.push(key);
+    }
+    const clean = active.length === 0;
+    const names = active.map((k) => MIC_PROCESSING_LABELS[k]).join(' and ');
+    let message;
+    if (clean) {
+        message = 'Browser audio processing is off. The meter shows real room loudness.';
+    } else if (unknown.length === active.length) {
+        message = `This browser will not say whether ${names} are on, so assume they are: they flatten a build-up, and your gate is calibrated against a processed signal.`;
+    } else {
+        message = `Your browser refused to switch off ${names}. It flattens a build-up, so calibrate the gate against what this meter actually shows.`;
+    }
+    return { clean, active, unknown, message };
+}
+
+// Zero the microphone's contribution to the engine and forget the held
+// level. Called from every stop path: a boost must never outlive the
+// monitor that measured it.
+export function clearMicBoost(state) {
+    if (!state) return;
+    state.micBoost = 0;
+    state.micApplied = 0;
+    state.micLastLevel = 0;
+    state.micSpeechAt = 0;
+    state.micHoldSince = 0;
+}
+
 // Must be called from inside a user gesture (a click): the AudioContext is
 // created and resumed BEFORE the permission prompt awaits, because a context
 // created after the gesture has ended starts suspended on most browsers.
-export async function startMicMonitor(state) {
+// `onLost` is called when the microphone goes away under us (revoked,
+// unplugged, grabbed by another app); the boost is already zero by then.
+export async function startMicMonitor(state, { onLost = null } = {}) {
     stopMicMonitor(state);
     if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error('Microphone not supported in this browser');
@@ -139,7 +200,7 @@ export async function startMicMonitor(state) {
     } catch (e) { /* resume is best effort; getUserMedia may still unlock it */ }
     let stream;
     try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: MIC_CAPTURE_CONSTRAINTS, video: false });
     } catch (e) {
         audioCtx.close().catch(() => {});
         throw e;
@@ -152,6 +213,21 @@ export async function startMicMonitor(state) {
     state.micStream = stream;
     state.micAudioCtx = audioCtx;
     state.micAnalyser = analyser;
+    clearMicBoost(state);
+    const track = stream.getAudioTracks?.()[0] || null;
+    state.micProcessing = describeMicProcessing(track?.getSettings?.());
+    if (track) {
+        // A dead or muted track keeps returning zeroes forever, so without
+        // these the last boost stays latched with the badge still lit.
+        track.onended = () => {
+            stopMicMonitor(state);
+            if (onLost) onLost('The microphone stopped (revoked, unplugged or taken by another app).');
+        };
+        track.onmute = () => {
+            clearMicBoost(state);
+            if (onLost) onLost('The microphone went silent (muted by the system or another app).');
+        };
+    }
     if (audioCtx.state !== 'running') {
         try {
             await audioCtx.resume();
@@ -160,19 +236,28 @@ export async function startMicMonitor(state) {
 }
 
 export function stopMicMonitor(state) {
+    // The boost goes first: nothing below may leave it latched if it throws.
+    clearMicBoost(state);
     if (state.micAnimId) {
         cancelAnimationFrame(state.micAnimId);
         state.micAnimId = null;
     }
     if (state.micStream) {
-        state.micStream.getTracks().forEach((track) => track.stop());
+        state.micStream.getTracks().forEach((track) => {
+            track.onended = null;
+            track.onmute = null;
+            track.stop();
+        });
         state.micStream = null;
     }
     if (state.micAudioCtx) {
-        state.micAudioCtx.close().catch(() => {});
+        try {
+            state.micAudioCtx.close()?.catch?.(() => {});
+        } catch (e) { /* already closed */ }
         state.micAudioCtx = null;
     }
     state.micAnalyser = null;
+    state.micProcessing = null;
 }
 
 // Voice-band gate: ignore rumble from strokers / vibrators (mostly <250 Hz)
@@ -215,6 +300,30 @@ export function micBoostFromLevel(level, gate, maxBpm) {
     return Math.round(t * cap);
 }
 
+// Fold the microphone boost into the heart rate the ENGINE runs on. This is
+// the only place room loudness becomes heart rate, and the result is used for
+// the speed curve alone: the edge flag, every guard, game, counter, the
+// cockpit readout and the session record all judge `sensorHr`, so noise can
+// never count an edge, advance a game, end Survival or enter the saved peak.
+//
+// The boost only ever pushes UP and only as far as the effective ceiling, and
+// only on a FRESH reading: during the watchdog's hold window the pulse is
+// frozen, and climbing on sound alone would drive the toys off room noise.
+export function micBoostedHr({
+    sensorHr,
+    micBoost = 0,
+    ceiling,
+    micEnabled = false,
+    pulseFresh = false
+} = {}) {
+    if (!Number.isFinite(sensorHr)) return sensorHr;
+    if (!micEnabled || !pulseFresh) return sensorHr;
+    const boost = Number.isFinite(micBoost) ? micBoost : 0;
+    if (boost <= 0) return sensorHr;
+    if (!Number.isFinite(ceiling) || sensorHr >= ceiling) return sensorHr;
+    return Math.min(ceiling, sensorHr + boost);
+}
+
 // Pure: average magnitude of analyser frequency bins inside the voice band,
 // scaled 0-100. Low-frequency motor noise is dropped on purpose.
 export function voiceBandLevel(freqBytes, sampleRate, fftSize) {
@@ -236,11 +345,62 @@ export function voiceBandLevel(freqBytes, sampleRate, fftSize) {
     return Math.min(100, Math.round((sum / n) / 2.55));
 }
 
-export function sampleMicLevel(state) {
+// How long after the app stops speaking the sampler stays suppressed, so
+// the tail of a cue (and its room reverberation) is not measured either.
+export const MIC_SPEECH_TAIL_MS = 700;
+
+// How long the sampler may keep holding one level before it gives up and
+// contributes nothing. utter() already carries a fallback timer for
+// browsers that never fire `end`; on those same browsers
+// `speechSynthesis.speaking` can stay true long after the cue is over, and
+// an unbounded hold would latch a boost measured from a room nobody is
+// listening to any more. Past this the microphone reads zero until it can
+// hear the room again: a stale measurement must never drive the toys.
+export const MIC_SPEECH_MAX_HOLD_MS = 10000;
+
+// Pure: is the sampler muted right now because the app itself is talking?
+export function micSampleSuppressed({
+    speaking = false,
+    lastSpeechAt = 0,
+    now = 0,
+    tailMs = MIC_SPEECH_TAIL_MS
+} = {}) {
+    if (speaking) return true;
+    const last = Number.isFinite(lastSpeechAt) ? lastSpeechAt : 0;
+    if (last <= 0) return false;
+    const tail = Number.isFinite(tailMs) ? Math.max(0, tailMs) : 0;
+    const t = Number.isFinite(now) ? now : 0;
+    return t >= last && (t - last) < tail;
+}
+
+// The app's own voice cues land squarely in the 250-4000 Hz band this
+// sampler was tuned to, and on speakers the echo canceller has no
+// reference for them, so every spoken cue read as +6 to +8 BPM of
+// "arousal". While the app is speaking (and for a short tail afterwards)
+// the last level is HELD instead of measured: the app never hears itself.
+export function sampleMicLevel(state, now = Date.now()) {
+    const s = synth();
+    const speaking = Boolean(s && s.speaking);
+    if (speaking) state.micSpeechAt = now;
+    const held = Number.isFinite(state.micLastLevel) ? state.micLastLevel : 0;
+    if (micSampleSuppressed({ speaking, lastSpeechAt: state.micSpeechAt, now })) {
+        if (!Number.isFinite(state.micHoldSince) || !state.micHoldSince) state.micHoldSince = now;
+        if (now - state.micHoldSince > MIC_SPEECH_MAX_HOLD_MS) {
+            state.micLastLevel = 0;
+            return 0;
+        }
+        return held;
+    }
+    state.micHoldSince = 0;
     const analyser = state.micAnalyser;
-    if (!analyser) return 0;
+    if (!analyser) {
+        state.micLastLevel = 0;
+        return 0;
+    }
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(data);
     const sampleRate = state.micAudioCtx?.sampleRate || 44100;
-    return voiceBandLevel(data, sampleRate, analyser.fftSize);
+    const level = voiceBandLevel(data, sampleRate, analyser.fftSize);
+    state.micLastLevel = level;
+    return level;
 }

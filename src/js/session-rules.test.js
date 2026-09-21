@@ -215,6 +215,64 @@ describe('oracle timing and fate', () => {
         assert.equal(open.mustEnd, false);
         assert.equal(rollOracleFate(open, { random: () => 0.5 }), 'CLIMAX');
     });
+
+    it('a Fixed length still gives the Oracle a window to roll in', () => {
+        // Fixed hands min === max === target, which used to leave a
+        // zero-width window: every hold of the whole session was PURGATORY
+        // and the game never chose anything.
+        const fixed = (t) => oracleTiming({ sessionSeconds: t, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800 });
+        const early = fixed(5 * 60);
+        assert.equal(early.canEnd, false);
+        assert.equal(rollOracleFate(early, { random: () => 0.99 }), 'PURGATORY');
+
+        const open = fixed(16 * 60);
+        assert.equal(open.canEnd, true, 'the window opens inside the session');
+        assert.equal(open.mustEnd, false);
+        assert.equal(open.openAt, 900);
+        assert.equal(open.closeAt, 1800);
+        assert.ok(rollOracleFate(open, { random: () => 0.99 }) !== 'PURGATORY');
+
+        const due = fixed(1800);
+        assert.equal(due.mustEnd, true);
+        assert.equal(rollOracleFate(due, { random: () => 0.9, endgameType: 'orgasm' }), 'CLIMAX');
+    });
+
+    it('a Mystery target on the minimum keeps its window too', () => {
+        // 1 roll in 21 lands the secret target on the minimum; that must not
+        // flatten the ramp for the whole session either.
+        const timing = oracleTiming({ sessionSeconds: 20 * 60, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 1800 });
+        assert.equal(timing.openAt, 900);
+        assert.equal(timing.canEnd, true);
+        assert.equal(timing.mustEnd, false);
+    });
+
+    it('later holds inside the window are likelier to end the session', () => {
+        const at = (t) => oracleTiming({ sessionSeconds: t, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 45 * 60 });
+        assert.equal(rollOracleFate(at(30 * 60), { random: () => 0.5 }), 'PURGATORY');
+        assert.ok(rollOracleFate(at(44 * 60), { random: () => 0.5 }) !== 'PURGATORY');
+        // The ramp is monotone: the purgatory share only ever shrinks.
+        let previous = 100;
+        for (let t = 30 * 60; t <= 45 * 60; t += 60) {
+            let purgatory = 0;
+            for (let r = 0; r < 100; r++) {
+                if (rollOracleFate(at(t), { random: () => r / 100 }) === 'PURGATORY') purgatory++;
+            }
+            assert.ok(purgatory <= previous, `purgatory share rose at ${t / 60} min`);
+            previous = purgatory;
+        }
+    });
+
+    it('a forced ending honours Soft Landing instead of flipping a coin', () => {
+        const due = oracleTiming({ sessionSeconds: 45 * 60, minSeconds: 30 * 60, maxSeconds: 60 * 60, targetSeconds: 45 * 60 });
+        assert.equal(due.mustEnd, true);
+        // Every roll: the wearer asked for a tease-down, not a 50/50 that
+        // can arm Force Orgasm on their behalf.
+        for (let r = 0; r < 100; r++) {
+            assert.equal(rollOracleFate(due, { random: () => r / 100, endgameType: 'rampdown' }), 'RAMPDOWN');
+        }
+        // An unknown endgame still resolves to an ending, never to nothing.
+        assert.ok(['CLIMAX', 'DENIAL'].includes(rollOracleFate(due, { random: () => 0.2, endgameType: 'mystery-meat' })));
+    });
 });
 
 describe('survival breach counter', () => {
@@ -342,6 +400,79 @@ describe('edge training', () => {
         assert.equal(t.state, 'finish');
         assert.equal(t.justFinished, true);
         assert.equal(t.edgesDone, 2);
+    });
+
+    it('Force Orgasm suspends training instead of completing it', () => {
+        // Tapping Force Orgasm is not five held edges: the counter and the
+        // state must be exactly where the wearer left them.
+        const fresh = tickEdgeTraining(
+            { state: 'climb', holdSeconds: 0, edgesDone: 0 },
+            { isEdged: false, holdGoal: 15, edgesGoal: 5, orgasmMode: true }
+        );
+        assert.equal(fresh.state, 'climb');
+        assert.equal(fresh.edgesDone, 0);
+        assert.equal(fresh.justFinished, false);
+
+        const mid = tickEdgeTraining(
+            { state: 'hold', holdSeconds: 3, edgesDone: 1 },
+            { isEdged: true, holdGoal: 15, edgesGoal: 5, orgasmMode: true }
+        );
+        assert.equal(mid.state, 'hold');
+        assert.equal(mid.holdSeconds, 3, 'the hold clock is frozen, not advanced');
+        assert.equal(mid.edgesDone, 1);
+
+        // Cancelling it hands the game back unchanged.
+        const back = tickEdgeTraining(mid, { isEdged: true, holdGoal: 15, edgesGoal: 5, orgasmMode: false });
+        assert.equal(back.state, 'hold');
+        assert.equal(back.holdSeconds, 4);
+        assert.equal(back.edgesDone, 1);
+    });
+
+    it('holds the finish while Force Orgasm runs and returns to the climb when it is cancelled', () => {
+        const finished = { state: 'finish', holdSeconds: 0, edgesDone: 5 };
+        const forcing = tickEdgeTraining(finished, { isEdged: true, holdGoal: 15, edgesGoal: 5, orgasmMode: true });
+        assert.equal(forcing.state, 'finish');
+        assert.equal(forcing.edgesDone, 5);
+        assert.equal(forcing.justFinished, false, 'finishing must be announced once, not every second');
+
+        // The wearer cancels Force Orgasm: the game leaves the terminal state
+        // the way the Oracle leaves CLIMAX, so the session can end normally.
+        const withdrawn = tickEdgeTraining(finished, { isEdged: false, released: true, holdGoal: 15, edgesGoal: 5, orgasmMode: false });
+        assert.equal(withdrawn.state, 'climb');
+        assert.equal(withdrawn.justFinished, false);
+        // The set is over and the wearer said no, so a NEW set starts. If the
+        // counter stayed at the goal the very next hold would re-arm Force
+        // Orgasm, seconds after it was deliberately cancelled.
+        assert.equal(withdrawn.edgesDone, 0, 'withdrawal starts a fresh set');
+    });
+
+    it('cancelling the finish cannot re-arm Force Orgasm on the next hold', () => {
+        const withdrawn = tickEdgeTraining(
+            { state: 'finish', holdSeconds: 0, edgesDone: 3 },
+            { isEdged: true, holdGoal: MIN_TRAIN_HOLD_SECONDS, edgesGoal: 3, orgasmMode: false }
+        );
+        assert.equal(withdrawn.state, 'climb');
+        assert.equal(withdrawn.edgesDone, 0);
+
+        // One full hold from here counts an edge but must NOT finish again.
+        let t = withdrawn;
+        for (let i = 0; i < MIN_TRAIN_HOLD_SECONDS; i++) {
+            t = tickEdgeTraining(t, { isEdged: true, holdGoal: MIN_TRAIN_HOLD_SECONDS, edgesGoal: 3, orgasmMode: false });
+        }
+        assert.equal(t.edgesDone, 1);
+        assert.equal(t.justFinished, false, 'one hold must never re-arm a cancelled Force Orgasm');
+        assert.notEqual(t.state, 'finish');
+
+        // The training still works: the full set finishes it again.
+        while (t.edgesDone < 3 && !t.justFinished) {
+            t = tickEdgeTraining(t, { isEdged: true, released: false, holdGoal: MIN_TRAIN_HOLD_SECONDS, edgesGoal: 3, orgasmMode: false });
+            if (t.state === 'recover') {
+                t = tickEdgeTraining(t, { isEdged: false, released: true, holdGoal: MIN_TRAIN_HOLD_SECONDS, edgesGoal: 3, orgasmMode: false });
+            }
+        }
+        assert.equal(t.state, 'finish');
+        assert.equal(t.edgesDone, 3);
+        assert.equal(t.justFinished, true);
     });
 
     it('a dropped hold does not count', () => {

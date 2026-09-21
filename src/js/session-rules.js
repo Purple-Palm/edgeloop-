@@ -179,6 +179,10 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
     };
 }
 
+// Share of a collapsed duration window (min === target) the Oracle waits
+// before climax and denial unlock.
+export const ORACLE_MIN_WINDOW_SHARE = 0.5;
+
 // When the Oracle may climax or deny. Endless (all zeros) has no clock, so
 // any hold may end the session. Mystery/Fixed keep climax and denial closed
 // until minSeconds, then open them through the window; past maxSeconds the
@@ -193,8 +197,16 @@ export function oracleTiming({
     const min = Math.max(0, Number(minSeconds) || 0);
     const max = Math.max(0, Number(maxSeconds) || 0);
     const target = Math.max(0, Number(targetSeconds) || 0);
-    const openAt = min;
     const closeAt = target > 0 ? target : max;
+    // A duration whose minimum IS its own target (every Fixed length, and a
+    // Mystery roll that happens to land on its minimum) would leave a window
+    // of zero width: every hold to the final second would be purgatory and
+    // the Oracle would never choose at all. Such a session opens the window
+    // halfway instead, so the ramp still runs and the length the wearer typed
+    // stays the latest the Oracle will wait.
+    const openAt = closeAt > 0 && min >= closeAt
+        ? Math.floor(closeAt * ORACLE_MIN_WINDOW_SHARE)
+        : min;
     const endless = openAt === 0 && closeAt === 0;
     if (endless) {
         return { canEnd: true, mustEnd: false, openAt: 0, closeAt: 0, progress: 1 };
@@ -217,8 +229,12 @@ export function rollOracleFate(timing, { random = Math.random, endgameType = 'or
     if (!gate.canEnd) return 'PURGATORY';
     const roll = clamp(Number(random()) || 0, 0, 0.999999);
     if (gate.mustEnd) {
+        // The forced ending is the one the wearer picked in Endgame Trigger.
+        // Soft Landing is a tease-down: it must never fall through to a coin
+        // flip that arms Force Orgasm on their behalf.
         if (endgameType === 'denial') return 'DENIAL';
         if (endgameType === 'orgasm') return 'CLIMAX';
+        if (endgameType === 'rampdown') return 'RAMPDOWN';
         return roll < 0.5 ? 'CLIMAX' : 'DENIAL';
     }
     // Early in the window most holds continue; near the close, climax and
@@ -354,14 +370,23 @@ export function tickEdgeTraining(
         justRecovered: false
     };
 
-    if (orgasmMode || trainState === 'finish') {
-        return {
-            ...idle,
-            state: 'finish',
-            holdSeconds: 0,
-            edgesDone: Math.max(done, need),
-            justFinished: trainState !== 'finish' && !orgasmMode
-        };
+    // Force Orgasm SUSPENDS training, it never completes it: the state, the
+    // hold clock and the edge counter are handed back exactly as they were,
+    // so tapping it can neither report unearned edges nor latch the game.
+    if (orgasmMode) {
+        return { ...idle, state: trainState, holdSeconds: held, edgesDone: done };
+    }
+
+    // Force Orgasm was cancelled after the finish. Mirroring the Oracle's
+    // withdrawal (CLIMAX -> APPROACH), the game returns to the climb instead
+    // of sitting in a terminal state the session can never leave. That set is
+    // over, so the counter starts again from zero: keeping it at the goal
+    // would let the very next completed hold re-arm Force Orgasm, seconds
+    // after the wearer deliberately cancelled it, and would read N/N (then
+    // N+1/N) on the dashboard. A fresh set is the Oracle's minimum-window
+    // equivalent: the whole training has to be earned again.
+    if (trainState === 'finish') {
+        return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: 0 };
     }
 
     if (trainState === 'hold') {

@@ -138,6 +138,21 @@ export function createHrWatchdog(settings = {}) {
                 sensorContact
             }).status !== 'stale';
         },
+        // The full verdict ('ok' | 'holding' | 'stale'), also side-effect
+        // free. isFresh() cannot tell 'ok' from 'holding', but a caller that
+        // must not act on a FROZEN pulse (the microphone boost, which would
+        // otherwise climb on room noise through a dropout) needs that
+        // distinction: only 'ok' means hrCurrent is a live reading.
+        status(now) {
+            return classifyHrSignal({
+                lastPacketAt,
+                lastValidAt,
+                now,
+                staleMs: opts.staleMs,
+                holdMs: opts.holdMs,
+                sensorContact
+            }).status;
+        },
         // One verdict per tick. `tripped` in the result is true only on the
         // tick that crossed into 'stale'; `recovered` only on the tick that
         // first saw a usable reading again after a loss.

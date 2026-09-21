@@ -108,6 +108,7 @@ export const VOICE_CUE_CATALOG = [
         ]
     },
     { id: 'oraclePurgatory', group: 'Climax', label: 'Oracle purgatory', lines: ['The Oracle chooses purgatory.'] },
+    { id: 'oracleSoftLanding', group: 'Climax', label: 'Oracle soft landing', lines: ['The Oracle chooses a soft landing. Ease down.'] },
     { id: 'oracleNotYet', group: 'Climax', label: 'Oracle too early to end', lines: ['Not yet. Keep climbing.', 'Too soon. The Oracle is still watching.'] },
     { id: 'oracleWithdrawn', group: 'Climax', label: 'Oracle climax cancelled', lines: ['Climax withdrawn. Climb again.'] },
     { id: 'oracleReset', group: 'Climax', label: 'Oracle purgatory reset', lines: ['Purgatory resets. Climb again.'] },
@@ -182,6 +183,23 @@ export const DEFAULT_VOICE_CUES = Object.fromEntries(
 
 const KNOWN_IDS = new Set(VOICE_CUE_CATALOG.map((cue) => cue.id));
 const CATALOG_BY_ID = Object.fromEntries(VOICE_CUE_CATALOG.map((cue) => [cue.id, cue]));
+const ID_BY_LOOSE_NAME = new Map(VOICE_CUE_CATALOG.map((cue) => [cue.id.toLowerCase(), cue.id]));
+
+// A hand-written file says `# edge`, but people capitalise headings: `# Edge`,
+// `[Force Orgasm]` and `# forceorgasm` all name the same cue.
+export function resolveCueHeaderName(name) {
+    if (typeof name !== 'string') return '';
+    const key = name.trim().toLowerCase();
+    if (!key) return '';
+    return ID_BY_LOOSE_NAME.get(key) || ID_BY_LOOSE_NAME.get(key.replace(/[^a-z0-9]+/g, '')) || '';
+}
+
+// `null` when the line is not header-shaped; the raw name otherwise.
+function headerNameOf(line) {
+    if (line.startsWith('#')) return line.replace(/^#+/, '').trim();
+    if (line.startsWith('[') && line.endsWith(']')) return line.slice(1, -1).trim();
+    return null;
+}
 
 export function isVoiceCueId(key) {
     return KNOWN_IDS.has(key);
@@ -217,7 +235,11 @@ export function sanitizeCueList(value, fallbackLines = [], maxLines = MAX_PHRASE
         unique.push(line);
         if (unique.length >= maxLines) break;
     }
-    return unique.length > 0 ? unique : fallback;
+    if (unique.length > 0) return unique;
+    // An emptied box means "say nothing for this cue": a bank the user cleared
+    // stays muted. Only an absent (or unusable) value falls back to the
+    // factory lines.
+    return (typeof value === 'string' || Array.isArray(value)) ? [] : fallback;
 }
 
 export function mergeVoiceCues(raw) {
@@ -299,19 +321,23 @@ function presentCueMap(src) {
 
 export function parseVoiceCuesText(raw) {
     const text = typeof raw === 'string' ? raw.replace(/^\uFEFF/, '') : '';
-    if (!text.trim()) return { cues: {}, error: 'empty' };
+    if (!text.trim()) return { cues: {}, error: 'empty', encourageSeconds: null };
 
     const trimmed = text.trim();
     if (trimmed.startsWith('{')) {
         try {
             const parsed = JSON.parse(trimmed);
             const map = extractCueMap(parsed);
-            if (!map) return { cues: {}, error: 'json' };
+            if (!map) return { cues: {}, error: 'json', encourageSeconds: null };
             const incoming = presentCueMap(map);
-            if (Object.keys(incoming).length === 0) return { cues: {}, error: 'json' };
-            return { cues: incoming, error: null };
+            if (Object.keys(incoming).length === 0) return { cues: {}, error: 'json', encourageSeconds: null };
+            return {
+                cues: incoming,
+                error: null,
+                encourageSeconds: clampEncourageSeconds(parsed.voiceEncourageSeconds, null)
+            };
         } catch (e) {
-            return { cues: {}, error: 'json' };
+            return { cues: {}, error: 'json', encourageSeconds: null };
         }
     }
 
@@ -321,9 +347,13 @@ export function parseVoiceCuesText(raw) {
     for (const rawLine of text.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith('//')) continue;
-        const header = line.match(/^(?:#|\[)\s*([a-zA-Z]+)\s*\]?$/);
-        if (header && KNOWN_IDS.has(header[1])) {
-            current = header[1];
+        const headerName = headerNameOf(line);
+        if (headerName !== null) {
+            // A header we cannot place is told to the user: it must never be
+            // filed as a phrase and spoken back at them.
+            const id = resolveCueHeaderName(headerName);
+            if (!id) return { cues: {}, error: 'header', header: headerName, encourageSeconds: null };
+            current = id;
             sawHeader = true;
             continue;
         }
@@ -333,7 +363,7 @@ export function parseVoiceCuesText(raw) {
     }
     const hasAny = Object.values(buckets).some((list) => list.length > 0);
     if (!hasAny) return { cues: {}, error: sawHeader ? 'empty' : 'format' };
-    return { cues: buckets, error: null };
+    return { cues: buckets, error: null, encourageSeconds: null };
 }
 
 export function voiceCuesToText(cues) {

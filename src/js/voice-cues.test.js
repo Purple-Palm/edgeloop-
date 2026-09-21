@@ -123,6 +123,50 @@ describe('voice cue templates', () => {
         assert.deepEqual(serializeVoiceCues(next).sessionStart, DEFAULT_VOICE_CUES.sessionStart);
     });
 
+    it('resolves section headers whatever their case or spacing', () => {
+        // "# Edge" used to fall through as a PHRASE into the Build-up bank, so
+        // the header line itself was spoken and the whole file landed in one cue.
+        const cased = parseVoiceCuesText('# Edge\nHold it there.\n\n# Force Orgasm\nCome now.\n');
+        assert.equal(cased.error, null);
+        assert.deepEqual(cased.cues.edge, ['Hold it there.']);
+        assert.deepEqual(cased.cues.forceOrgasm, ['Come now.']);
+        assert.equal(cased.cues.encourage, undefined);
+        const bracket = parseVoiceCuesText('[CameEarly]\nToo soon.\n');
+        assert.deepEqual(bracket.cues.cameEarly, ['Too soon.']);
+    });
+
+    it('reports a header that names no known cue instead of speaking it', () => {
+        const bad = parseVoiceCuesText('# Climax\nCome now.\n');
+        assert.equal(bad.error, 'header');
+        assert.equal(bad.header, 'Climax');
+        assert.deepEqual(bad.cues, {});
+        const empty = parseVoiceCuesText('# edge\nHold.\n#\nMore.\n');
+        assert.equal(empty.error, 'header');
+    });
+
+    it('carries the encouragement interval back out of a phrase file', () => {
+        const file = parseVoiceCuesText(JSON.stringify({ voiceCues: { edge: ['One.'] }, voiceEncourageSeconds: 0 }));
+        assert.equal(file.error, null);
+        assert.equal(file.encourageSeconds, 0);
+        const none = parseVoiceCuesText(JSON.stringify({ edge: ['One.'] }));
+        assert.equal(none.encourageSeconds, null);
+        const text = parseVoiceCuesText('# edge\nOne.\n');
+        assert.equal(text.encourageSeconds, null);
+    });
+
+    it('mutes a cue that the user emptied, but not one that is absent', () => {
+        assert.deepEqual(sanitizeCueList('', ['fallback']), []);
+        assert.deepEqual(sanitizeCueList(['   '], ['fallback']), []);
+        assert.deepEqual(sanitizeCueList(undefined, ['fallback']), ['fallback']);
+        assert.deepEqual(sanitizeCueList(17, ['fallback']), ['fallback']);
+        const merged = mergeVoiceCues({ edge: '' });
+        assert.deepEqual(merged.edge, []);
+        assert.deepEqual(merged.encourage, DEFAULT_VOICE_CUES.encourage);
+        // A muted bank stays muted across a save/load round trip and speaks nothing.
+        assert.deepEqual(mergeVoiceCues(serializeVoiceCues(merged)).edge, []);
+        assert.equal(resolveVoiceCue(merged, 'edge', { hr: 150 }).text, '');
+    });
+
     it('clamps the encouragement interval', () => {
         assert.equal(clampEncourageSeconds(-3), 0);
         assert.equal(clampEncourageSeconds(999), 180);

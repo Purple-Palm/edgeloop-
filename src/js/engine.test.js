@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
     calculateEngineOutputs,
     ENGINE_MODES,
@@ -224,7 +225,7 @@ describe('engine modes', () => {
         assert.equal(result.primaryPercent, 61);
     });
 
-    it('edge training pulls on the climb and crawls on a hold', () => {
+    it('edge training pulls on the climb and obeys the ceiling rule on a hold', () => {
         const classic = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 120 });
         const climb = calculateEngineOutputs({
             ...running,
@@ -233,6 +234,9 @@ describe('engine modes', () => {
             hr: 120
         });
         assert.ok(climb.primaryPercent > classic.primaryPercent);
+        // The hold sits AT the pullback mark, so the wearer's ceiling rule
+        // decides what the primary does there: Full Stop parks it at 0%,
+        // Crawl keeps the 10% micro-motion. Only Force Orgasm overrides it.
         const hold = calculateEngineOutputs({
             ...running,
             activeMode: 'edgetrain',
@@ -241,7 +245,36 @@ describe('engine modes', () => {
             hr: 140,
             ceilingBehaviour: 'stop'
         });
-        assert.equal(hold.primaryPercent, 14);
+        assert.equal(hold.primaryPercent, 0);
+        assert.ok(hold.secondaryPercent > 0, 'the secondary channel keeps running');
+        const holdCrawl = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'hold',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'crawl'
+        });
+        assert.equal(holdCrawl.primaryPercent, CRAWL_PERCENT);
+        // The climb applies the same rule the second the mark is reached.
+        const climbEdged = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'climb',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'stop'
+        });
+        assert.equal(climbEdged.primaryPercent, 0);
+        const climbEdgedCrawl = calculateEngineOutputs({
+            ...running,
+            activeMode: 'edgetrain',
+            trainingState: 'climb',
+            isEdged: true,
+            hr: 140,
+            ceilingBehaviour: 'crawl'
+        });
+        assert.equal(climbEdgedCrawl.primaryPercent, CRAWL_PERCENT);
         const recover = calculateEngineOutputs({
             ...running,
             activeMode: 'edgetrain',
@@ -334,51 +367,33 @@ describe('engine safety guards', () => {
     it('clamps hold percent and maps it onto a trigger HR', () => {
         assert.equal(DEFAULT_EDGE_HOLD_PERCENT, 100);
         assert.equal(MIN_EDGE_HOLD_PERCENT, 90);
-        assert.equal(MAX_EDGE_HOLD_PERCENT, 115);
+        // The typed Climax HR is a hard ceiling, so the pullback mark can
+        // only ever sit AT it or below it.
+        assert.equal(MAX_EDGE_HOLD_PERCENT, 100);
         assert.equal(clampEdgeHoldPercent(80), 90);
-        assert.equal(clampEdgeHoldPercent(140), 115);
+        assert.equal(clampEdgeHoldPercent(140), 100);
+        assert.equal(clampEdgeHoldPercent(115), 100);
         assert.equal(clampEdgeHoldPercent('abc'), DEFAULT_EDGE_HOLD_PERCENT);
         assert.equal(resolveEdgeTriggerHr(140, 100), 140);
-        assert.equal(resolveEdgeTriggerHr(140, 105), 147);
+        assert.equal(resolveEdgeTriggerHr(140, 105), 140);
         assert.equal(resolveEdgeTriggerHr(140, 95), 133);
         assert.ok(Number.isNaN(resolveEdgeTriggerHr(NaN, 105)));
     });
 
-    it('105% hold sits through typed max and only pulls back at the trigger', () => {
+    it('a stored hold percent above 100 pulls back AT the typed ceiling', () => {
+        // Settings saved before the range was corrected (or a hand-edited
+        // backup) may still carry 115: it must behave exactly like 100%.
         const atMax = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             hr: 140,
             isEdged: false,
             ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 105
+            edgeHoldPercent: 115
         });
-        assert.equal(atMax.isEdged, false);
-        assert.equal(atMax.newEdgeTriggered, false);
-        assert.ok(atMax.primaryPercent > CRAWL_PERCENT, 'typed max is still a tease, not crawl');
-
-        const trigger = calculateEngineOutputs({
-            ...running,
-            activeMode: 'classic',
-            hr: 147,
-            isEdged: false,
-            ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 105
-        });
-        assert.equal(trigger.newEdgeTriggered, true);
-        assert.equal(trigger.isEdged, true);
-        assert.equal(trigger.primaryPercent, CRAWL_PERCENT);
-
-        const holding = calculateEngineOutputs({
-            ...running,
-            activeMode: 'classic',
-            hr: 140,
-            isEdged: true,
-            ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 105
-        });
-        assert.equal(holding.isEdged, true);
-        assert.equal(holding.primaryPercent, CRAWL_PERCENT);
+        assert.equal(atMax.isEdged, true, 'the typed max is the pullback mark');
+        assert.equal(atMax.newEdgeTriggered, true);
+        assert.equal(atMax.primaryPercent, CRAWL_PERCENT);
 
         const released = calculateEngineOutputs({
             ...running,
@@ -386,10 +401,75 @@ describe('engine safety guards', () => {
             hr: 134,
             isEdged: true,
             ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 105
+            edgeHoldPercent: 115
         });
         assert.equal(released.isEdged, false);
         assert.ok(released.primaryPercent > CRAWL_PERCENT);
+    });
+
+    it('keeps the pullback mark above the resting rate on a narrow typed band', () => {
+        // Resting 70 / Climax 75 is a legal pair. 90% of 75 is 68, below the
+        // resting rate: the session would latch edged on the first reading
+        // with a release point (63) the wearer can never reach.
+        assert.equal(resolveEdgeTriggerHr(75, 90, 70), 75);
+        assert.equal(resolveEdgeTriggerHr(95, 90, 70), 86);
+        // Without a resting rate the mark is simply the percentage.
+        assert.equal(resolveEdgeTriggerHr(95, 90), 86);
+
+        const atRest = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 70,
+            minHr: 70,
+            maxHr: 75,
+            isEdged: false,
+            ceilingBehaviour: 'crawl',
+            edgeHoldPercent: 90
+        });
+        assert.equal(atRest.isEdged, false, 'a resting pulse must not be an edge');
+        assert.ok(atRest.primaryPercent > CRAWL_PERCENT);
+    });
+
+    it('sweeps every legal limit pair and hold percent for the ceiling contract', () => {
+        for (let minHr = 30; minHr <= 240; minHr += 1) {
+            for (const span of [1, 2, 5, 15, 40, 120]) {
+                const maxHr = minHr + span;
+                if (maxHr > 250) continue;
+                for (let pct = MIN_EDGE_HOLD_PERCENT; pct <= MAX_EDGE_HOLD_PERCENT; pct++) {
+                    const trigger = resolveEdgeTriggerHr(maxHr, pct, minHr);
+                    assert.ok(
+                        trigger <= maxHr,
+                        `trigger ${trigger} above the ceiling ${maxHr} at ${pct}%`
+                    );
+                    assert.ok(
+                        trigger >= Math.min(maxHr, minHr + EDGE_RELEASE_BPM + 1),
+                        `trigger ${trigger} too close to resting ${minHr} at ${pct}%`
+                    );
+                    assert.ok(trigger > minHr, `trigger ${trigger} at or under resting ${minHr}`);
+                }
+            }
+        }
+    });
+
+    it('sweeps the hold percents for the crawl / Full Stop rule at the typed ceiling', () => {
+        for (let pct = MIN_EDGE_HOLD_PERCENT; pct <= MAX_EDGE_HOLD_PERCENT; pct++) {
+            for (const behaviour of ['crawl', 'stop']) {
+                const atCeiling = calculateEngineOutputs({
+                    ...running,
+                    activeMode: 'classic',
+                    hr: 140,
+                    isEdged: false,
+                    ceilingBehaviour: behaviour,
+                    edgeHoldPercent: pct
+                });
+                assert.equal(atCeiling.isEdged, true, `not edged at the ceiling at ${pct}%`);
+                assert.equal(
+                    atCeiling.primaryPercent,
+                    behaviour === 'crawl' ? CRAWL_PERCENT : 0,
+                    `primary still driving at the ceiling at ${pct}%`
+                );
+            }
+        }
     });
 
     it('100% hold still edges at the typed climax', () => {
@@ -495,5 +575,101 @@ describe('engine safety guards', () => {
         assert.ok(Number.isFinite(r.primaryPercent) && r.primaryPercent > 0);
         assert.ok(Number.isFinite(r.secondaryPercent));
         assert.ok(r.strokeMaxPercent > r.strokeMinPercent);
+    });
+});
+
+describe('edge detection source', () => {
+    it('judges the edge on edgeHr while the speed curve follows hr', () => {
+        // The microphone boost moves `hr` (the engine's speed input) but never
+        // `edgeHr` (the sensor's own pulse), so a loud room cannot latch an edge.
+        const boosted = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            edgeHr: 120,
+            isEdged: false
+        });
+        assert.equal(boosted.newEdgeTriggered, false, 'noise must not count an edge');
+        assert.equal(boosted.isEdged, false);
+
+        const unboosted = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 120,
+            edgeHr: 120,
+            isEdged: false
+        });
+        assert.ok(
+            boosted.primaryPercent < unboosted.primaryPercent,
+            'the boost must still move the speed curve'
+        );
+
+        const real = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: false });
+        assert.equal(real.newEdgeTriggered, true);
+        assert.equal(real.isEdged, true);
+    });
+
+    it('releases an edge on the sensor pulse, not the boosted one', () => {
+        const held = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 120,
+            edgeHr: 138,
+            isEdged: true
+        });
+        assert.equal(held.isEdged, true, 'a low speed input must not release the edge');
+
+        const released = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            edgeHr: 120,
+            isEdged: true
+        });
+        assert.equal(released.isEdged, false, 'the sensor pulse came down, so the edge releases');
+    });
+
+    it('falls back to hr when no edgeHr is given', () => {
+        const r = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, isEdged: false });
+        assert.equal(r.newEdgeTriggered, true);
+        const bad = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, edgeHr: NaN, isEdged: false });
+        assert.equal(bad.newEdgeTriggered, true);
+    });
+});
+
+describe('game-side edge release', () => {
+    it('is judged against the pullback mark, not the ceiling', () => {
+        // Climax 140, pullback 90% -> mark 126, release 121. A game that asks
+        // "has the pulse come back down?" without the mark gets 135 instead,
+        // clears the edge flag while the engine still sees the pulse at or
+        // above the mark, and the next engine tick counts an invented edge.
+        const trigger = resolveEdgeTriggerHr(140, 90, 70);
+        assert.equal(trigger, 126);
+        assert.equal(hasReleasedEdge(130, 140, trigger), false, 'still on the mark');
+        assert.equal(hasReleasedEdge(130, 140), true, 'what the 2-argument call wrongly answers');
+        assert.equal(hasReleasedEdge(120, 140, trigger), true);
+
+        const phantom = calculateEngineOutputs({
+            ...running,
+            activeMode: 'oracle',
+            oracleState: 'PURGATORY',
+            hr: 130,
+            isEdged: false,
+            edgeHoldPercent: 90
+        });
+        assert.equal(phantom.newEdgeTriggered, true, 'clearing the flag at 130 costs one phantom edge');
+    });
+
+    it('every app.js call passes the pullback mark', () => {
+        // The Oracle and Edge Training both ask this question once a second.
+        // A signature change that updates only one of them is exactly how the
+        // phantom-edge bug happened, so pin both call sites.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const calls = src.match(/hasReleasedEdge\([^)]*\)/g) || [];
+        assert.ok(calls.length >= 2, 'expected the Oracle and Edge Training call sites');
+        for (const call of calls) {
+            const args = call.slice('hasReleasedEdge('.length, -1).split(',');
+            assert.equal(args.length, 3, `two-argument release check in app.js: ${call}`);
+        }
     });
 });

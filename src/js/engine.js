@@ -25,10 +25,12 @@ export const ENGINE_MODES = [
 // limit cannot flap the motors on and off or count phantom edges.
 export const EDGE_RELEASE_BPM = 5;
 
-// Pullback as a percent of typed Climax HR. 100% is the typed max; 95%
-// pulls back early; 105% lets pulse sit 5% past the typed max.
+// Pullback as a percent of the working Climax HR. 100% is that ceiling; 95%
+// pulls back early. It can never be more than 100%: the typed Climax HR is a
+// hard ceiling, so the crawl / Full Stop rule and the stall guard must fire
+// at it or below it, never above it.
 export const MIN_EDGE_HOLD_PERCENT = 90;
-export const MAX_EDGE_HOLD_PERCENT = 115;
+export const MAX_EDGE_HOLD_PERCENT = 100;
 export const DEFAULT_EDGE_HOLD_PERCENT = 100;
 
 export function clampEdgeHoldPercent(value, fallback = DEFAULT_EDGE_HOLD_PERCENT) {
@@ -37,10 +39,19 @@ export function clampEdgeHoldPercent(value, fallback = DEFAULT_EDGE_HOLD_PERCENT
     return clamp(n, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT);
 }
 
-export function resolveEdgeTriggerHr(maxHr, holdPercent = DEFAULT_EDGE_HOLD_PERCENT) {
+// The pullback mark. It is bounded at both ends: never above the working
+// ceiling, and never so low that its release band (EDGE_RELEASE_BPM below it)
+// falls to the resting rate, which would latch the session edged from the
+// first reading with a release point the wearer can never reach. With a typed
+// band too narrow for that margin the mark simply sits at the ceiling.
+export function resolveEdgeTriggerHr(maxHr, holdPercent = DEFAULT_EDGE_HOLD_PERCENT, minHr) {
     if (!Number.isFinite(maxHr)) return maxHr;
     const pct = clampEdgeHoldPercent(holdPercent, DEFAULT_EDGE_HOLD_PERCENT);
-    return Math.max(1, Math.round(maxHr * (pct / 100)));
+    const raw = Math.max(1, Math.round(maxHr * (pct / 100)));
+    const capped = Math.min(maxHr, raw);
+    if (!Number.isFinite(minHr)) return capped;
+    const lowest = Math.min(maxHr, minHr + EDGE_RELEASE_BPM + 1);
+    return Math.max(capped, lowest);
 }
 
 export function edgeReleaseHr(maxHr, triggerHr) {
@@ -95,6 +106,10 @@ function safeEnvelope(hwMin, hwMax) {
 
 export function calculateEngineOutputs({
     hr,
+    // The sensor's own pulse. `hr` may carry the microphone boost, which
+    // drives the speed curve only; the edge flag, and every guard, game and
+    // counter that reads it, must judge the pulse that was measured.
+    edgeHr,
     minHr,
     maxHr,
     activeMode,
@@ -152,19 +167,21 @@ export function calculateEngineOutputs({
     let nextIsEdged = Boolean(isEdged);
     let newEdgeTriggered = false;
 
-    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent);
+    const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent, minHr);
+    const edgeSource = Number.isFinite(edgeHr) ? edgeHr : hr;
 
-    if (hr >= triggerHr) {
+    if (edgeSource >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
             newEdgeTriggered = true;
             nextIsEdged = true;
         }
-    } else if (hasReleasedEdge(hr, maxHr, triggerHr)) {
+    } else if (hasReleasedEdge(edgeSource, maxHr, triggerHr)) {
         nextIsEdged = false;
     }
 
-    // Stretch the tease band up to the pullback trigger so a hold above
-    // 100% does not already sit at 0% at the typed max.
+    // The tease band runs from the resting rate to the pullback mark, so the
+    // curve reaches 0% exactly where crawl / Full Stop takes over. The mark is
+    // never above the working ceiling, so neither is the band.
     const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);
@@ -390,9 +407,14 @@ function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlP
         out.secondary = nextIsEdged ? crawlPercent : 100;
         return out;
     }
+    // A training hold is a hold AT the pullback mark, so the wearer's
+    // ceiling rule decides the primary there exactly as it does in every
+    // other mode: Full Stop parks it at 0%, Crawl keeps the micro-motion.
+    // Only Force Orgasm (above) overrides it. The secondary channel is not
+    // governed by that rule and keeps the game's own level.
     switch (trainingState) {
         case 'hold':
-            out.primary = 14;
+            out.primary = crawlPercent;
             out.secondary = 55;
             out.strokeMax = 70;
             break;
@@ -403,7 +425,7 @@ function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlP
             break;
         default: {
             const pull = Math.round(48 + progress * 52);
-            out.primary = nextIsEdged ? 14 : pull;
+            out.primary = nextIsEdged ? crawlPercent : pull;
             out.secondary = nextIsEdged ? 40 : Math.round(30 + progress * 50);
             out.strokeMax = 100;
         }

@@ -67,6 +67,15 @@ describe('sanitizeTelemetry', () => {
         assert.equal(t.maxHr, 150);
     });
 
+    it('carries the pullback mark so a remote chart draws the real one', () => {
+        const t = sanitizeTelemetry({ type: 'TELEMETRY', maxHr: 140, edgeTriggerHr: '133' });
+        assert.equal(t.edgeTriggerHr, 133);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', edgeTriggerHr: 999 }).edgeTriggerHr, 250);
+        // Absent or unusable: undefined, never a fabricated number.
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY' }).edgeTriggerHr, undefined);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', edgeTriggerHr: 'abc' }).edgeTriggerHr, undefined);
+    });
+
     it('leaves invalid or missing fields undefined instead of zeroing them', () => {
         const t = sanitizeTelemetry({ type: 'TELEMETRY', hr: 'abc', seconds: NaN, sessionStatus: 'EXPLODED', activeMode: 'ghost', orgasmMode: 'yes', ready: 1 });
         assert.equal(t.hr, undefined);

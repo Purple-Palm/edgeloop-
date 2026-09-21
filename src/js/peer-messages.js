@@ -80,6 +80,9 @@ export function sanitizeTelemetry(raw) {
     out.prostateSpeed = clampNumber(raw.prostateSpeed, 0, 100);
     out.minHr = clampNumber(raw.minHr, 30, HR_MAX_BPM, true);
     out.maxHr = clampNumber(raw.maxHr, 30, HR_MAX_BPM, true);
+    // The pullback mark, so a remote chart draws the host's line
+    // instead of one of its own.
+    out.edgeTriggerHr = clampNumber(raw.edgeTriggerHr, 30, HR_MAX_BPM, true);
     out.activeMode = oneOf(raw.activeMode, ENGINE_MODES);
     out.orgasmMode = typeof raw.orgasmMode === 'boolean' ? raw.orgasmMode : undefined;
     out.ready = typeof raw.ready === 'boolean' ? raw.ready : undefined;

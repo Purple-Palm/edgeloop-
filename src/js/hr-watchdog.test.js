@@ -218,4 +218,19 @@ describe('createHrWatchdog', () => {
         assert.equal(wd.isFresh(9600), true);
         assert.equal(wd.evaluate(9600).status, 'ok');
     });
+    it('status() reports the hold window that isFresh() cannot distinguish', () => {
+        // isFresh() answers "not stale", so it stays true all the way through
+        // 'holding', where hrCurrent is frozen on the last valid reading.
+        // Callers that must not act on a frozen pulse ask for the status.
+        const wd = createHrWatchdog({ staleMs: 8000, holdMs: 5000 });
+        wd.reset(0);
+        assert.equal(wd.status(4999), 'ok');
+        assert.equal(wd.status(6000), 'holding');
+        assert.equal(wd.isFresh(6000), true, 'the hold window is not stale');
+        assert.equal(wd.status(8001), 'stale');
+        // Side-effect free, exactly like isFresh().
+        assert.equal(wd.tripped, false);
+        wd.recordPacket(9000, 91);
+        assert.equal(wd.status(9000), 'ok');
+    });
 });

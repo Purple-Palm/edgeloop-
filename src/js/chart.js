@@ -24,6 +24,17 @@ export function computeChartScale(minHr, maxHr, triggerHr) {
     return { lo, hi };
 }
 
+// Pure: whether the purple pullback line has anything to say. At 100% the
+// mark IS the ceiling, which is already drawn in red; anywhere else (a 90-99%
+// pullback, or an overshoot mark sent by a remote host) the wearer is shown
+// where the crawl / Full Stop rule really starts. A missing or unusable mark
+// draws nothing: a remote page that has not heard the host's number yet must
+// never fabricate one.
+export function shouldDrawPullbackLine(triggerHr, maxHr) {
+    if (!Number.isFinite(triggerHr)) return false;
+    return !Number.isFinite(maxHr) || triggerHr !== maxHr;
+}
+
 // Size the bitmap from the CSS box. Returns null when the canvas has no
 // layout yet (hidden), in which case nothing should be drawn.
 function fitCanvas(canvas) {
@@ -89,8 +100,8 @@ export function drawTelemetryChart(canvas, history, minHr, maxHr, triggerHr) {
         ctx.stroke();
     }
 
-    // Overshoot pullback line (only when it sits above the typed climax)
-    if (Number.isFinite(triggerHr) && (!Number.isFinite(maxHr) || triggerHr > maxHr)) {
+    // Pullback mark (the HOLD TO badge's number)
+    if (shouldDrawPullbackLine(triggerHr, maxHr)) {
         ctx.strokeStyle = '#c084fc';
         ctx.beginPath();
         ctx.moveTo(0, scaleY(triggerHr));

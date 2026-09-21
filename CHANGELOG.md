@@ -12,10 +12,43 @@ credited by username.
   count; after the typed number of successful edges it Force-Orgasm finishes
   you. Hold length (5-90 s, default 15) and edge count (1-20, default 5)
   sit on the game card.
-- The Oracle no longer rolls climax or denial on the first edge. Mystery and
-  Fixed durations keep those endings locked until the minimum; inside the
-  window later holds are more likely to end you; the secret target is the
-  latest it will wait. Endless still has no minimum.
+- **Edge Training** and Force Orgasm no longer fight each other. Tapping
+  Force Orgasm suspends the training instead of completing it: the edge
+  counter stays where it was (it used to jump straight to N/N and report
+  every edge as held, even on the first second of the game), and the hold
+  clock is frozen rather than advanced. Cancelling Force Orgasm hands the
+  game back exactly as it was; cancelling it after the training finished
+  returns the game to the climb, the way withdrawing an Oracle climax
+  does, instead of leaving the primary at 100% in a state the session
+  could never leave.
+- Cancelling Force Orgasm after an **Edge Training** run has finished
+  starts a fresh set: the counter goes back to 0/N. It used to stay at
+  N/N, so the next completed hold (15 s by default) armed Force Orgasm
+  again all by itself, seconds after you had deliberately cancelled it,
+  and the card read N+1/N. Say no and the whole training has to be earned
+  again before it offers to finish you.
+- The Oracle no longer rolls climax or denial on the first edge. Mystery
+  keeps those endings locked until the minimum and a Fixed length until
+  halfway through it; inside the window later holds are more likely to end
+  you; the target is the latest it will wait. Endless still has no minimum.
+- A **Fixed** duration no longer neuters The Oracle. Fixed handed it a
+  window of zero width, so every 15 s hold for the whole session came back
+  NOT YET - KEEP CLIMBING and the game never chose anything at all: climax
+  and denial now unlock halfway through the fixed length and grow likelier
+  the nearer it gets. A Mystery roll that happens to land on its own
+  minimum gets the same window instead of the same dead session.
+- The Oracle honours **Soft Landing**. When the target time forces an
+  ending it now hands the session to the 45 s tease-down you picked.
+  Soft Landing matched neither of the two cases the roll knew, so the
+  choice fell through to a coin flip that could arm Force Orgasm - motors
+  at 100% with the working ceiling climbing - for the wearer who had asked
+  for the gentlest ending. Climax and Strict Denial are unchanged.
+- **Edge Training** obeys your "At the ceiling" setting. A training hold is
+  a hold at the pullback mark, so Full Stop parks the primary at 0% there
+  and Crawl keeps its 10%; the hold used to run 14% whichever you picked,
+  which is more motion than the Crawl some people avoid on purpose, for
+  the full 5-90 s and on every edge of the set. The secondary channel is
+  unchanged, and Force Orgasm still overrides both.
 
 ### The Handy
 - Connect now selects HAMP mode (mode 0). The driver previously selected
@@ -117,7 +150,10 @@ credited by username.
   Climax HR through its floor (X333, Umbra250).
 - Survival mode needs three consecutive breach readings, counted per new
   reading rather than per second, so a watch pushing every 5 s cannot end
-  the game on one spike; Oracle purgatory no longer counts phantom edges;
+  the game on one spike; Oracle purgatory no longer counts phantom edges
+  (it judged the release against the ceiling instead of the pullback mark,
+  so with a pullback under 100% it counted one invented edge per cycle and
+  Adaptive Ceiling Decay quietly dragged the ceiling down with it);
   cancelling Force Orgasm after an Oracle climax withdraws the climax and
   the ceiling rule applies again; pausing during Soft Landing resumes it.
 - Stall guard stops only the primary channel, as the UI states; it is
@@ -126,11 +162,31 @@ credited by username.
   (3-120 s, default 20) before the primary is cut, and how long that halt
   lasts (2-60 s, default 8) before crawl resumes and the hold window
   restarts. The Guards toggle turns the auto-cutoff off entirely.
-- Pullback is a percent of typed Climax HR (90-115, default 100): 95%
-  pulls back early, 105% holds a little past the typed max. A saved 0-15
-  offset from the previous build is migrated to 100-115.
+- Pullback is a percent of typed Climax HR (90-100, default 100): 95%
+  pulls back early. The range no longer goes above 100%. Values over 100
+  put the pullback mark, and with it Crawl / Full Stop and the stall
+  timers, above the Climax HR you typed: at 115% the strokers were still
+  running at 41-61% as the pulse crossed your ceiling and nothing armed in
+  that band. Your typed Climax HR is a hard ceiling, so the pullback can
+  only ever sit at it or below it; a saved value above 100 (or the 0-15
+  offset migrated from an older build) now behaves as 100.
+- The pullback mark is also kept above your Resting HR, far enough to
+  leave its 5 BPM release band. With a narrow pair such as Resting 70 /
+  Climax 75, 90% used to land at 68 BPM: the session latched edged on the
+  first reading and could never release. Such a pair now simply pulls back
+  at the ceiling.
 - The endgame (Orgasm / Soft Landing / Denied) fires once per session, so
   Force Orgasm stays a toggle the wearer can cancel after the target time.
+  It is now deferred only while an orgasm is actually in progress: an Edge
+  Training run that had finished used to suppress the endgame for the rest
+  of the session, so a timed session never ended by itself.
+- The Session Setup pullback preview quotes the number the session really
+  uses. It took the percentage from the typed Climax HR while the engine,
+  the HOLD TO badge and the guards take it from the working ceiling, so
+  with a secondary toy connected (dual-stim dampening is on by default)
+  the panel promised "Pullback at 147 BPM" for a session that pulled back
+  at 131. When the working ceiling differs from the number you typed the
+  preview now says so.
 - Importing the same settings file twice works (the file input is cleared
   after each import).
 - Stroke zones keep a minimum width; Head Play during warm-up can no longer
@@ -179,6 +235,16 @@ credited by username.
   locked rather than left looking clickable, and the first-run wizard no
   longer opens on remote pages. The group link (`?group_sub=`) opens a
   read-only viewer page with every control locked.
+- The two **Edge Training** numbers (hold length and edge count) are
+  host-only and are locked on the controller and the viewer page. They sit
+  inside the mode card, and a disabled card does not stop a browser from
+  typing into them: the partner could set 90 s and 20 edges, see them stick
+  on their own screen and in that device's own saved settings, while the
+  wearer's host went on running its own 15 s and 5.
+- Telemetry carries the pullback mark, so a remote chart draws the host's
+  real purple line. It was drawn at a hardcoded 140 BPM: a host edging at
+  a Climax HR of 92 showed the partner a pullback line 48 BPM above the
+  ceiling line, and a host that really did pull back early showed none.
 
 ### Voice, microphone, chart and sharing
 - Voice cues are queued instead of cancelling each other; safety cues jump
@@ -191,6 +257,60 @@ credited by username.
   gate raises the working heart rate so the loop treats you as nearer the
   edge; the cockpit shows MIC +N while it is boosting. The sampler uses
   the 250-4000 Hz voice band so toy motors do not trip it.
+- The microphone boost now moves the toys and nothing else. It used to be
+  added into the heart rate every guard, game and counter judged, so a
+  loud room could count edges, complete Edge Training and arm Force
+  Orgasm by itself (with a real pulse of 132, a typed Climax of 150 and a
+  20 BPM cap, room noise finished the training and took the working
+  ceiling to 210), end a Survival run, and be stored as the session peak.
+  The BPM readout, the edge counter, the Oracle, Survival, Edge Training,
+  the stall guard and the saved record all read the pulse your monitor
+  measured; only the speed curve sees the boost. It is also no longer
+  added while the signal watchdog is holding a reading, so the engine
+  cannot climb on sound during a dropout.
+- The microphone is now captured with the browser's own audio processing
+  asked OFF (noise suppression and automatic gain control; echo
+  cancellation stays on). Both are on by default in Chrome and Firefox,
+  and gain control alone moves gain at about 6 dB per second, which wipes
+  out a 20 dB build-up in roughly three seconds - the feature was
+  measuring exactly what the browser was deleting, and noise suppression
+  is tuned to keep speech and throw breathing away. The request is a
+  preference, never a demand, so a browser that cannot honour it still
+  gives you a microphone. When it refuses (or will not say, as Safari
+  does), the Audio & Mic panel says so: your noise gate then means
+  something different, because it is calibrated against a processed
+  signal.
+- The microphone no longer hears the app's own voice. Every spoken cue
+  lands in the same 250-4000 Hz band the meter listens to, and on
+  speakers the echo canceller has no reference for it, so each cue read
+  as +6 to +8 BPM of arousal. While EdgeLoop is speaking, and for a short
+  moment afterwards, the last measured level is held instead. A held level
+  keeps its boost for ten seconds at most: on a browser that leaves its
+  "still speaking" flag stuck the microphone drops to zero rather than
+  driving the toys from a room nobody is listening to any more.
+- The noise gate and the extra-BPM cap the running session uses are the
+  ones you pressed **Apply** on. Dragging either slider and dismissing
+  Session Setup without applying used to change the live session; it now
+  only previews on the meter.
+- The microphone boost is cleared by STOP, Reset, PAUSE, switching the
+  monitor off and the monitor dying. It used to survive all of them, so a
+  boost measured before a stop was still being added to the speed curve
+  afterwards.
+- A microphone that is revoked, unplugged or taken by another app is
+  reported in the banner instead of being read as silence: the boost goes
+  to zero, the badge goes dark and the "tap to re-enable microphone"
+  control comes back. It used to keep the badge lit with the last boost
+  latched.
+- The **MIC LISTEN** badge no longer sticks on the cockpit forever after
+  using **Test microphone** with the monitor switched off, and the live
+  meter no longer re-runs the engine from its animation frame: the boost
+  is read once a second with the rest of the session tick, so sound alone
+  can never move the toys between heart-rate readings.
+- The **MIC +N** badge shows the boost that is actually reaching the toys,
+  and goes back to MIC LISTEN whenever none is (the watchdog is holding a
+  reading, or your pulse is already at the ceiling). The big BPM number no
+  longer moves with the boost, so the badge is the only place you see it
+  and it has to be honest.
 - Spoken Voice Guidance shows the current cue on the dashboard and speaks
   it. Each event is a list of phrases (one per line, randomly rotated).
   Phrase files can be imported/exported on the Audio tab and are included
@@ -200,9 +320,39 @@ credited by username.
   endgame) speaks the climax bank; Came Early speaks the premature bank
   as the session stops. Oracle climax keeps its own lines so two cues do
   not stack.
+- Phrase-file sections are read whatever their case or spacing: `# Edge`,
+  `[Force Orgasm]` and `# forceorgasm` all land in the bank you meant. A
+  header that capitalised the way English capitalises headings used to be
+  filed as a phrase, so the whole file became one giant Build-up bank and
+  the header lines themselves were spoken back at you. A section that
+  names no cue EdgeLoop knows is now refused with a message naming it,
+  and nothing is imported.
+- The phrase boxes only reach the running session through **Apply**.
+  Tapping **Speak**, **Preview** or **Export phrases** used to commit
+  whatever was typed, so trying a line out and then dismissing Session
+  Setup with the X left the edit live and saved it at the next change.
+- **Import phrases** now tells you what happened: how many lists were
+  imported, a file that could not be read, and a browser that refused to
+  save them. It also reads the encouragement interval back out of a
+  phrase file, so `0 = off` survives an export/import round trip.
+- Backup **Export (.json)** carries the phrase edits that are on screen,
+  the way the panel says it does. Editing phrases and exporting a backup
+  in the same visit (no Apply in between) used to write the old lists.
+- **Reset defaults** asks before wiping all 28 banks, and saves the
+  result. It used to restore the factory lines in memory only, so the
+  next unrelated save could bring the custom phrases back, or take them
+  away long after you pressed it.
+- Clearing a phrase box now mutes that cue (the label reads *muted*)
+  instead of quietly restoring the factory lines. A cue a file does not
+  mention still falls back to the factory lines.
 - The telemetry chart sizes itself from its box and the device pixel ratio,
   so it is crisp on phones and never wider than the layout, and its scale
   always includes the Climax HR line.
+- The purple pullback line is drawn whenever the mark is not the ceiling,
+  which is what the Guards tab and the HOLD TO badge promise. It was only
+  drawn for a mark ABOVE the typed Climax HR, so with the pullback capped
+  at 100% it had stopped appearing at all: a 95% pullback showed the badge
+  and no line.
 - Copy-link buttons fall back to a hidden field and `execCommand('copy')`
   when the Clipboard API is unavailable (plain `http://` hosting) and never
   throw.

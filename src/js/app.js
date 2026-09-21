@@ -24,7 +24,7 @@ import {
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
-import { drawTelemetryChart, watchChartResize } from './chart.js';
+import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
@@ -87,10 +87,12 @@ import {
     startMicMonitor,
     stopMicMonitor,
     sampleMicLevel,
+    clearMicBoost,
     listSpeechVoices,
     clampMicGate,
     clampMicBoostBpm,
-    micBoostFromLevel
+    micBoostFromLevel,
+    micBoostedHr
 } from './voice.js';
 import {
     VOICE_CUE_CATALOG,
@@ -150,7 +152,7 @@ function syncWatchdogSettings() {
         autoResume: advancedSettings.hrAutoResume
     });
 }
-// Stall hold (3-120 s), stall pause (2-60 s), edge hold percent (90-115)
+// Stall hold (3-120 s), stall pause (2-60 s), edge hold percent (90-100)
 // and the mic gate are clamped wherever they enter: load, Apply and import.
 function syncGuardSettings() {
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
@@ -321,6 +323,7 @@ function pauseSession(voiceText = 'Paused.') {
     const pauseEl = document.getElementById('pauseCount');
     if (pauseEl) pauseEl.textContent = state.pauses;
     renderTransport('PAUSED');
+    clearMicBoost(state);
     dispatchHardware(0, 0, 0, 100, true);
     if (voiceText) cueVoice('paused');
     return true;
@@ -432,6 +435,15 @@ function hardwareReadiness() {
 function pulseIsFresh(now = Date.now()) {
     if (state.simEngaged) return true;
     return hrWatchdog.isFresh(now);
+}
+
+// Stricter than pulseIsFresh(): true only while hrCurrent is a LIVE reading.
+// pulseIsFresh() stays true throughout the watchdog's hold window, where the
+// pulse is frozen on the last valid packet; anything that would move the
+// toys on something other than a measured beat must gate on this instead.
+function pulseIsLive(now = Date.now()) {
+    if (state.simEngaged) return true;
+    return hrWatchdog.status(now) === 'ok';
 }
 
 // Why START / RESUME must stay disabled right now, or null when the session
@@ -625,6 +637,34 @@ function initHandyRoleUI() {
     applyRole(state.handyRole || 'primary');
 }
 
+// The working ceiling: typed Climax HR minus learned / dual-stim / decay
+// offsets (never raised by any of them), plus the explicit Force Orgasm
+// boost. One place only, so the engine, the cockpit badges and the Session
+// Setup preview can never quote different BPM at the wearer.
+function workingCeiling(minHr, typedMaxHr) {
+    // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
+    // (secondary) are both live. The Handy counts for whichever role it holds;
+    // Intiface and TCode axes count for the role they are assigned.
+    const intifaceHasRole = (role) => Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === role));
+    const serialHasRole = (role) => isTCodeConnected() && tcodeHasRole(role);
+    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary') || serialHasRole('primary');
+    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
+    return computeEffectiveCeiling({
+        minHr,
+        maxHr: typedMaxHr,
+        learnedOffset: advancedSettings.learningProfile?.suggestedMaxHrOffset || 0,
+        dualStimActive: hasPrimary && hasSecondary,
+        dualDampening: Boolean(advancedSettings.dualDampening),
+        dualDampeningBpm: advancedSettings.dualDampeningBpm,
+        adaptiveDecay: Boolean(advancedSettings.adaptiveDecay),
+        edges: state.edges,
+        decayEdgeCount: advancedSettings.decayEdgeCount,
+        decayBpm: advancedSettings.decayBpm,
+        decayFloor: advancedSettings.decayFloor,
+        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0
+    });
+}
+
 // Engine Calculation Loop
 function updateEngine() {
     if (isRemotePage) return;
@@ -635,56 +675,50 @@ function updateEngine() {
     let hr = state.hrCurrent;
     if (!Number.isFinite(hr) || hr < 35) hr = min;
 
-    // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
-    // (secondary) are both live. The Handy counts for whichever role it holds;
-    // Intiface and TCode axes count for the role they are assigned.
-    const intifaceHasRole = (role) => Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === role));
-    const serialHasRole = (role) => isTCodeConnected() && tcodeHasRole(role);
-    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary') || serialHasRole('primary');
-    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
-    const isDualStimActive = hasPrimary && hasSecondary;
-
-    // The working ceiling: typed Climax HR minus learned / dual-stim / decay
-    // offsets (never raised by any of them), plus the explicit Force Orgasm
-    // boost. Guards and games read the same number from state.
-    const ceiling = computeEffectiveCeiling({
-        minHr: min,
-        maxHr: typedMax,
-        learnedOffset: advancedSettings.learningProfile?.suggestedMaxHrOffset || 0,
-        dualStimActive: isDualStimActive,
-        dualDampening: Boolean(advancedSettings.dualDampening),
-        dualDampeningBpm: advancedSettings.dualDampeningBpm,
-        adaptiveDecay: Boolean(advancedSettings.adaptiveDecay),
-        edges: state.edges,
-        decayEdgeCount: advancedSettings.decayEdgeCount,
-        decayBpm: advancedSettings.decayBpm,
-        decayFloor: advancedSettings.decayFloor,
-        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0
-    });
+    const ceiling = workingCeiling(min, typedMax);
     const max = ceiling.maxHr;
-    // The microphone boost may push the working HR up to the EFFECTIVE
-    // ceiling (after every offset), never past it and never downward.
-    if (advancedSettings.micEnabled && state.micBoost > 0 && hr < max) {
-        hr = Math.min(max, hr + state.micBoost);
-    }
+    // Two heart rates from here on. `sensorHr` is what the monitor measured:
+    // every guard, game, counter, the cockpit readout and the session record
+    // judge THAT number. `hr` may additionally carry the microphone boost,
+    // which drives the engine's speed curve only, and only while the reading
+    // is fresh (never during the watchdog's hold window).
+    const sensorHr = hr;
+    hr = micBoostedHr({
+        sensorHr,
+        micBoost: state.micBoost,
+        ceiling: max,
+        micEnabled: Boolean(advancedSettings.micEnabled),
+        pulseFresh: pulseIsLive()
+    });
+    // What the boost actually added this tick. It is 0 whenever the boost is
+    // suppressed (no live reading, or the pulse is already at the ceiling),
+    // and the badge shows THAT, so it can never claim a push the engine is
+    // not making: the big BPM number no longer moves with the boost, which
+    // leaves the badge as the only signal the wearer has.
+    const micApplied = Number.isFinite(hr) && Number.isFinite(sensorHr) ? hr - sensorHr : 0;
+    state.micApplied = micApplied > 0 ? micApplied : 0;
     const micBadge = document.getElementById('micActiveBadge');
-    if (micBadge && advancedSettings.micEnabled && state.micAnalyser) {
-        if (state.micBoost > 0) {
-            micBadge.textContent = `MIC +${state.micBoost}`;
+    const micBadgeLive = Boolean(state.micAnalyser) && (Boolean(advancedSettings.micEnabled) || state.isTestingMic);
+    if (micBadge && micBadgeLive) {
+        if (micApplied > 0) {
+            micBadge.textContent = `MIC +${micApplied}`;
             micBadge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1';
         } else {
             micBadge.textContent = 'MIC LISTEN';
             micBadge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1';
         }
         micBadge.classList.remove('hidden');
+    } else if (micBadge) {
+        micBadge.classList.add('hidden');
     }
     state.effectiveMinHr = min;
     state.effectiveMaxHr = max;
     state.effectiveHr = hr;
+    state.sensorHr = sensorHr;
 
     const hrDisplay = document.getElementById('hrDisplay');
-    if (hrDisplay) hrDisplay.textContent = hr;
-    if (!Number.isFinite(state.peakHr) || hr > state.peakHr) state.peakHr = hr;
+    if (hrDisplay) hrDisplay.textContent = sensorHr;
+    if (!Number.isFinite(state.peakHr) || sensorHr > state.peakHr) state.peakHr = sensorHr;
 
     const learnBadge = document.getElementById('learnBadge');
     const learnAmount = document.getElementById('learnAmountText');
@@ -711,7 +745,7 @@ function updateEngine() {
     ceilingBadge?.classList.toggle('hidden', max === typedMax);
 
     const holdPct = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
-    const triggerHr = resolveEdgeTriggerHr(max, holdPct);
+    const triggerHr = resolveEdgeTriggerHr(max, holdPct, min);
     const holdBadge = document.getElementById('edgeHoldBadge');
     const holdText = document.getElementById('edgeHoldText');
     if (holdText) holdText.textContent = `${triggerHr}`;
@@ -720,6 +754,7 @@ function updateEngine() {
 
     const result = calculateEngineOutputs({
         hr,
+        edgeHr: sensorHr,
         minHr: min,
         maxHr: max,
         activeMode: resolveEngineMode(state.activeMode),
@@ -825,7 +860,7 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
 // lost, stop) jumps the queue and silences whatever was waiting.
 function sessionVoiceVars() {
     return {
-        hr: Math.round(Number.isFinite(state.effectiveHr) ? state.effectiveHr : (state.hrCurrent || 0)),
+        hr: Math.round(Number.isFinite(state.sensorHr) ? state.sensorHr : (state.hrCurrent || 0)),
         maxHr: Math.round(Number.isFinite(state.effectiveMaxHr) ? state.effectiveMaxHr : 0),
         minHr: Math.round(Number.isFinite(state.effectiveMinHr) ? state.effectiveMinHr : 0),
         edges: state.edges || 0,
@@ -888,6 +923,7 @@ function updateGameNotice() {
         if (state.oracleState === 'HOLD') text = `THE ORACLE: HOLDING ${state.oracleTimer}s — FATE PENDING`;
         else if (state.oracleState === 'CLIMAX') text = 'THE ORACLE: CLIMAX';
         else if (state.oracleState === 'DENIAL') text = 'THE ORACLE: DENIAL';
+        else if (state.oracleState === 'RAMPDOWN') text = 'THE ORACLE: SOFT LANDING';
         else if (state.oracleState === 'PURGATORY') {
             const timing = oracleTiming({
                 sessionSeconds: state.sessionSeconds,
@@ -958,6 +994,7 @@ function resetSessionCounters() {
     state.peakHr = Number.isFinite(state.hrCurrent) ? state.hrCurrent : 70;
     state.isEdged = false;
     state.orgasmBoost = 0;
+    clearMicBoost(state);
     state.rampdownSecondsLeft = 45;
     state.resumeStatus = null;
     state.durationFallback = false;
@@ -1006,11 +1043,12 @@ function tickSessionGuardsAndGames() {
 
     if (state.ruinHoldSeconds > 0) state.ruinHoldSeconds -= 1;
 
-    // Guards and games judge against the SAME ceiling and HR the engine used
-    // on its last tick (after dual-stim / decay / learned offsets and mic
-    // boost), never the raw typed Climax HR.
+    // Guards and games judge against the SAME ceiling the engine used on its
+    // last tick (after dual-stim / decay / learned offsets), never the raw
+    // typed Climax HR, and against the pulse the SENSOR reported: the
+    // microphone boost moves the engine's speed, never a guard or a game.
     const ceiling = Number.isFinite(state.effectiveMaxHr) ? state.effectiveMaxHr : readHrLimits().maxHr;
-    const hr = Number.isFinite(state.effectiveHr) ? state.effectiveHr : state.hrCurrent;
+    const hr = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
     const nearCeiling = hr >= (ceiling - 2);
 
     // The stall guard only has something to cut in Crawl mode: with Full
@@ -1054,12 +1092,19 @@ function tickSessionGuardsAndGames() {
         cueVoice('encourage');
     }
 
+    // The gate and the cap come from the APPLIED settings. Dragging a
+    // Session Setup slider previews on the meter; only Apply commits it,
+    // so dismissing the modal can never change the running session.
     if (advancedSettings.micEnabled && state.micAnalyser) {
         const level = sampleMicLevel(state);
-        state.micBoost = micBoostFromLevel(level, liveMicGate(), liveMicBoostCap());
+        state.micBoost = micBoostFromLevel(
+            level,
+            clampMicGate(advancedSettings.micSensitivityThreshold),
+            clampMicBoostBpm(advancedSettings.micBoostMaxBpm)
+        );
         paintMicMeter(level);
     } else if (!state.isTestingMic) {
-        state.micBoost = 0;
+        clearMicBoost(state);
         document.getElementById('micActiveBadge')?.classList.add('hidden');
     }
 
@@ -1094,6 +1139,15 @@ function tickSessionGuardsAndGames() {
                     state.oracleState = 'DENIAL';
                     stopSession('Oracle Denial', 'The Oracle chooses denial.');
                     return;
+                } else if (fate === 'RAMPDOWN') {
+                    // Soft Landing is the ending the wearer picked, so the
+                    // Oracle hands the session to that tease-down instead of
+                    // arming Force Orgasm on a coin flip.
+                    state.oracleState = 'RAMPDOWN';
+                    state.endgameFired = true;
+                    cueVoice('oracleSoftLanding');
+                    handleTargetTimeReached();
+                    return;
                 } else {
                     state.oracleState = 'PURGATORY';
                     state.oracleTimer = 0;
@@ -1114,7 +1168,7 @@ function tickSessionGuardsAndGames() {
             // pulse has genuinely dropped below the release band; resetting it
             // while HR still sits at the ceiling would count a phantom edge.
             state.oracleTimer += 1;
-            if (state.oracleTimer >= 28 && hasReleasedEdge(hr, ceiling)) {
+            if (state.oracleTimer >= 28 && hasReleasedEdge(hr, ceiling, state.edgeTriggerHr)) {
                 state.oracleState = 'APPROACH';
                 state.oracleTimer = 0;
                 state.isEdged = false;
@@ -1368,8 +1422,10 @@ setInterval(() => {
         if (!state.endgameFired && state.chosenTargetSeconds > 0 && state.sessionSeconds >= state.chosenTargetSeconds) {
             const oracleResolving = state.activeMode === 'oracle'
                 && (state.oracleState === 'HOLD' || state.oracleState === 'CLIMAX' || state.orgasmMode);
-            const trainResolving = state.activeMode === 'edgetrain'
-                && (state.trainState === 'finish' || state.orgasmMode);
+            // Only an orgasm actually in progress defers the endgame. The
+            // training state alone must never suppress it: a cancelled Force
+            // Orgasm would leave a timed session with no way to end.
+            const trainResolving = state.activeMode === 'edgetrain' && state.orgasmMode;
             if (!oracleResolving && !trainResolving) {
                 state.endgameFired = true;
                 handleTargetTimeReached();
@@ -1567,9 +1623,9 @@ resetBtn?.addEventListener('click', () => {
 
 // Came Early & Learning Profile
 function persistSettings() {
-    if (!safeSet('edgeloop_advanced_settings', advancedSettings)) {
-        console.warn('Settings could not be saved (storage full or unavailable)');
-    }
+    const saved = safeSet('edgeloop_advanced_settings', advancedSettings);
+    if (!saved) console.warn('Settings could not be saved (storage full or unavailable)');
+    return saved;
 }
 
 function renderLearningStatus() {
@@ -1722,11 +1778,18 @@ function persistTrainSettings() {
     persistSettings();
 }
 
-['trainHoldSecondsInput', 'trainEdgesInput'].forEach((id) => {
-    const el = document.getElementById(id);
-    el?.addEventListener('click', (e) => e.stopPropagation());
-    el?.addEventListener('change', persistTrainSettings);
-});
+// Host only. The hold length and the edge count are read from the WEARER's
+// own settings, so a remote page must not collect them: they would stick on
+// the partner's screen, overwrite that device's own stored training, and
+// never reach the session. They are locked below like every other host-only
+// control.
+if (!isRemotePage) {
+    ['trainHoldSecondsInput', 'trainEdgesInput'].forEach((id) => {
+        const el = document.getElementById(id);
+        el?.addEventListener('click', (e) => e.stopPropagation());
+        el?.addEventListener('change', persistTrainSettings);
+    });
+}
 
 // Pop-up Modals Router
 const overlay = document.getElementById('modalOverlay');
@@ -1966,8 +2029,7 @@ if (window.speechSynthesis) {
 document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () => {
     const select = document.getElementById('paramVoiceSelect');
     if (select) advancedSettings.voiceURI = select.value;
-    readVoiceCuesFromForm();
-    const { text } = resolveVoiceCue(advancedSettings.voiceCues, 'preview', sessionVoiceVars());
+    const { text } = resolveVoiceCue(currentVoiceCues().cues, 'preview', sessionVoiceVars());
     if (text) speakNow(text, advancedSettings.voiceURI);
 });
 
@@ -1994,7 +2056,7 @@ function renderVoiceCueEditor() {
         lastGroup = group;
         return `${heading}<div class="space-y-0.5">
             <div class="flex justify-between items-center gap-2">
-              <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)} <span class="text-slate-600 font-mono">(${lines.length})</span></label>
+              <label class="text-[9px] text-slate-400 font-semibold" for="voiceCue-${cue.id}">${escapeAttr(cue.label)} <span class="text-slate-600 font-mono">(${lines.length === 0 ? 'muted' : lines.length})</span></label>
               <button type="button" data-voice-preview="${cue.id}" class="text-[9px] text-purple-300 hover:underline cursor-pointer">Speak</button>
             </div>
             <textarea id="voiceCue-${cue.id}" data-voice-cue="${cue.id}" rows="${rows}" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-[10px] text-slate-200 outline-none focus:border-purple-500 font-mono leading-snug">${escapeAttr(lines.join('\n'))}</textarea>
@@ -2004,26 +2066,45 @@ function renderVoiceCueEditor() {
     if (interval) interval.value = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
 }
 
+// Reads the phrase editor WITHOUT committing it: Speak, Preview and both
+// exports only look at what is typed. Only Apply (and Import / Reset, which
+// the user confirms) writes these into advancedSettings, so closing the modal
+// with the X discards phrase edits like every other control in it.
 function readVoiceCuesFromForm() {
     const raw = {};
     document.querySelectorAll('[data-voice-cue]').forEach((el) => {
         raw[el.getAttribute('data-voice-cue')] = el.value;
     });
-    if (Object.keys(raw).length > 0) advancedSettings.voiceCues = mergeVoiceCues(raw);
-    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(document.getElementById('voiceEncourageSecondsInput')?.value);
+    const intervalEl = document.getElementById('voiceEncourageSecondsInput');
+    return {
+        cues: Object.keys(raw).length > 0 ? mergeVoiceCues(raw) : null,
+        encourageSeconds: intervalEl ? clampEncourageSeconds(intervalEl.value) : null
+    };
+}
+
+// The phrases as they stand right now: what is typed in the editor when it is
+// on screen, otherwise what is saved.
+function currentVoiceCues() {
+    const form = readVoiceCuesFromForm();
+    return {
+        cues: form.cues || mergeVoiceCues(advancedSettings.voiceCues),
+        encourageSeconds: form.encourageSeconds ?? clampEncourageSeconds(advancedSettings.voiceEncourageSeconds)
+    };
 }
 
 document.getElementById('voiceCuesList')?.addEventListener('click', (e) => {
     const btn = e.target?.closest?.('[data-voice-preview]');
     if (!btn) return;
-    readVoiceCuesFromForm();
-    const { text } = resolveVoiceCue(advancedSettings.voiceCues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
+    const { text } = resolveVoiceCue(currentVoiceCues().cues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
     if (text) speakNow(text, advancedSettings.voiceURI);
 });
 
 document.getElementById('voiceCuesResetBtn')?.addEventListener('click', () => {
+    if (!confirm('Restore the factory phrases for all cues? Every custom line you wrote is lost.')) return;
     advancedSettings.voiceCues = mergeVoiceCues({});
+    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
     renderVoiceCueEditor();
+    if (!persistSettings()) alert('The phrases were reset, but the browser refused to save them (storage full or unavailable).');
 });
 
 function downloadNamedText(filename, body, mime = 'application/json') {
@@ -2037,10 +2118,10 @@ function downloadNamedText(filename, body, mime = 'application/json') {
 }
 
 document.getElementById('voiceCuesExportBtn')?.addEventListener('click', () => {
-    readVoiceCuesFromForm();
+    const live = currentVoiceCues();
     const payload = {
-        voiceCues: serializeVoiceCues(advancedSettings.voiceCues),
-        voiceEncourageSeconds: clampEncourageSeconds(advancedSettings.voiceEncourageSeconds)
+        voiceCues: serializeVoiceCues(live.cues),
+        voiceEncourageSeconds: live.encourageSeconds
     };
     downloadNamedText('edgeloop_voice_cues.json', JSON.stringify(payload, null, 2));
 });
@@ -2049,16 +2130,31 @@ document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) =
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
+    reader.onerror = () => {
+        alert('That file could not be read. Nothing was changed.');
+    };
     reader.onload = (evt) => {
         const parsed = parseVoiceCuesText(String(evt.target.result || ''));
+        if (parsed.error === 'header') {
+            alert(`"${parsed.header}" is not a phrase section EdgeLoop knows, so nothing was imported. Sections are # edge, # encourage, # forceOrgasm, # cameEarly and the other cue names (upper or lower case).`);
+            return;
+        }
         if (parsed.error || !parsed.cues || Object.keys(parsed.cues).length === 0) {
             alert('That file did not look like an EdgeLoop phrase list. Use Export phrases, a settings backup, or a text file with # edge / # encourage sections.');
             return;
         }
-        readVoiceCuesFromForm();
-        advancedSettings.voiceCues = applyImportedCues(advancedSettings.voiceCues, parsed.cues);
+        // Start from what is on screen so phrase edits made before the import
+        // are not lost, then let the file win for the cues it carries.
+        const live = currentVoiceCues();
+        advancedSettings.voiceCues = applyImportedCues(live.cues, parsed.cues);
+        advancedSettings.voiceEncourageSeconds = parsed.encourageSeconds ?? live.encourageSeconds;
         renderVoiceCueEditor();
-        persistSettings();
+        const count = Object.keys(parsed.cues).length;
+        if (!persistSettings()) {
+            alert(`Imported ${count} phrase list(s), but the browser refused to save them (storage full or unavailable). They are live for this session only.`);
+            return;
+        }
+        alert(`Imported and saved ${count} phrase list(s).`);
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -2104,13 +2200,14 @@ async function applyMicSetting(enabled) {
         stopMicMonitor(state);
         state.isTestingMic = false;
         badge?.classList.add('hidden');
-        state.micBoost = 0;
+        clearMicBoost(state);
         paintMicMeter(0);
         return;
     }
     try {
-        await startMicMonitor(state);
+        await startMicMonitor(state, { onLost: handleMicLost });
         badge?.classList.remove('hidden');
+        paintMicMeter(0);
         startMicMeterLoop();
     } catch (e) {
         advancedSettings.micEnabled = false;
@@ -2121,8 +2218,18 @@ async function applyMicSetting(enabled) {
     }
 }
 
+// Slider values are a PREVIEW for the meter and only while Session Setup
+// is on screen. Dismissing the modal without Apply leaves the dragged
+// value in the DOM, and the engine must never see it.
+function paramsModalOpen() {
+    // closeModal() hides the overlay and leaves the modal body as it was,
+    // so the body's own class is not evidence that Setup is on screen.
+    if (!overlay || overlay.classList.contains('hidden')) return false;
+    return Boolean(modals.Params) && !modals.Params.classList.contains('hidden');
+}
+
 function liveMicGate() {
-    const fromSlider = document.getElementById('micGateInput')?.value;
+    const fromSlider = paramsModalOpen() ? document.getElementById('micGateInput')?.value : null;
     if (fromSlider !== undefined && fromSlider !== null && fromSlider !== '') {
         return clampMicGate(fromSlider);
     }
@@ -2130,7 +2237,7 @@ function liveMicGate() {
 }
 
 function liveMicBoostCap() {
-    const fromSlider = document.getElementById('micBoostBpmInput')?.value;
+    const fromSlider = paramsModalOpen() ? document.getElementById('micBoostBpmInput')?.value : null;
     if (fromSlider !== undefined && fromSlider !== null && fromSlider !== '') {
         return clampMicBoostBpm(fromSlider);
     }
@@ -2165,23 +2272,61 @@ function paintMicMeter(level) {
             label.className = 'text-[9px] font-mono text-slate-400';
         }
     }
-    if (advancedSettings.micEnabled && state.micAnalyser) {
-        const prev = state.micBoost;
-        state.micBoost = boost;
-        if (prev !== boost && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
-            updateEngine();
-        }
-    }
+    // The meter only paints. state.micBoost is owned by the once-a-second
+    // session tick, so a ~60 Hz animation frame can never re-enter the
+    // engine or move the toys between heart-rate readings.
+
+    // The badge reports what updateEngine actually added, never this
+    // meter's own preview: the meter repaints ~60 times a second and would
+    // otherwise claim a push the engine is suppressing.
+    const applied = Number.isFinite(state.micApplied) ? state.micApplied : 0;
     if (badge && (advancedSettings.micEnabled || state.isTestingMic) && state.micAnalyser) {
         badge.classList.remove('hidden');
-        if (boost > 0) {
-            badge.textContent = `MIC +${boost}`;
+        if (applied > 0) {
+            badge.textContent = `MIC +${applied}`;
             badge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-rose-950/80 border border-rose-700 text-rose-300 ml-1';
         } else {
             badge.textContent = 'MIC LISTEN';
             badge.className = 'text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700 text-emerald-300 ml-1';
         }
+    } else if (badge) {
+        // Test microphone with the toggle off used to leave MIC LISTEN lit
+        // on the cockpit for the rest of the session.
+        badge.classList.add('hidden');
     }
+    renderMicProcessingNote();
+}
+
+// Tell the wearer when the browser refused to switch its audio processing
+// off: their gate is then calibrated against a signal the browser is
+// already flattening, which means something different.
+function renderMicProcessingNote() {
+    const note = document.getElementById('micProcessingNote');
+    if (!note) return;
+    const report = state.micProcessing;
+    if (!state.micAnalyser || !report || report.clean) {
+        note.classList.add('hidden');
+        note.textContent = '';
+        return;
+    }
+    note.textContent = report.message;
+    note.classList.remove('hidden');
+}
+
+// A microphone that goes away mid-session is reported, never swallowed.
+function handleMicLost(message) {
+    advancedSettings.micEnabled = false;
+    const toggle = document.getElementById('paramMicToggle');
+    if (toggle) toggle.checked = false;
+    document.getElementById('micActiveBadge')?.classList.add('hidden');
+    state.isTestingMic = false;
+    clearMicBoost(state);
+    paintMicMeter(0);
+    showMicReenable(true);
+    const banner = document.getElementById('disconnectBanner');
+    const msg = document.getElementById('disconnectMsg');
+    if (msg) msg.textContent = message;
+    banner?.classList.remove('hidden');
 }
 
 function startMicMeterLoop() {
@@ -2196,10 +2341,17 @@ function startMicMeterLoop() {
 function updateEdgeHoldPreview() {
     const preview = document.getElementById('edgeHoldPreview');
     if (!preview) return;
-    const typedMax = readHrLimits().maxHr;
+    const limits = readHrLimits();
+    const typedMax = limits.maxHr;
+    // The percentage applies to the WORKING ceiling, which is what the
+    // engine, the HOLD TO badge and the guards use. Previewing it against
+    // the typed Climax HR promised a mark the session never pulls back at
+    // (dual-stim dampening and decay are on by default).
+    const max = workingCeiling(limits.minHr, typedMax).maxHr;
     const pct = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
-    const trigger = resolveEdgeTriggerHr(typedMax, pct);
-    preview.textContent = `Pullback at ${trigger} BPM (${pct}% of ${typedMax})`;
+    const trigger = resolveEdgeTriggerHr(max, pct, limits.minHr);
+    const base = max === typedMax ? `${typedMax}` : `${max}, the working ceiling right now`;
+    preview.textContent = `Pullback at ${trigger} BPM (${pct}% of ${base})`;
 }
 
 document.getElementById('edgeHoldPercentInput')?.addEventListener('input', updateEdgeHoldPreview);
@@ -2207,8 +2359,9 @@ document.getElementById('edgeHoldPercentInput')?.addEventListener('input', updat
 document.getElementById('paramMicTestBtn')?.addEventListener('click', async () => {
     try {
         state.isTestingMic = true;
-        await startMicMonitor(state);
+        await startMicMonitor(state, { onLost: handleMicLost });
         document.getElementById('micActiveBadge')?.classList.remove('hidden');
+        paintMicMeter(0);
         startMicMeterLoop();
     } catch (e) {
         state.isTestingMic = false;
@@ -2251,8 +2404,9 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
     advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
-    readVoiceCuesFromForm();
-    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
+    const voiceForm = currentVoiceCues();
+    advancedSettings.voiceCues = voiceForm.cues;
+    advancedSettings.voiceEncourageSeconds = voiceForm.encourageSeconds;
     if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
     advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);
@@ -2277,7 +2431,10 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
 
 // Export & Import Settings
 document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
-    const data = JSON.stringify(advancedSettings, null, 2);
+    // The panel promises the phrase lists, so export what the Audio & Mic tab
+    // currently shows (a backup is a copy, so this commits nothing).
+    const live = currentVoiceCues();
+    const data = JSON.stringify({ ...advancedSettings, voiceCues: live.cues, voiceEncourageSeconds: live.encourageSeconds }, null, 2);
     const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -3185,7 +3342,10 @@ function setupPartnerHost() {
 const VIEWER_LOCKED_IDS = [
     'sessionPlayPauseBtn', 'sessionStopBtn', 'sessionResetBtn', 'cameEarlyBtn', 'orgasmBtn',
     'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
-    'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode'
+    'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
+    // Nested in the Edge Training card: a disabled ancestor does not stop a
+    // browser from focusing and editing them, so they are disabled themselves.
+    'trainHoldSecondsInput', 'trainEdgesInput'
 ];
 function lockElement(el) {
     if (!el) return;
@@ -3204,7 +3364,10 @@ function lockViewerControls() {
 // leaves the page), so it is locked rather than left looking clickable.
 const CONTROLLER_LOCKED_IDS = [
     'cameEarlyBtn', 'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
-    'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode'
+    'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
+    // The mode cards stay live (MODE_CHANGE is a legal command), but the two
+    // Edge Training numbers inside one of them are host-only settings.
+    'trainHoldSecondsInput', 'trainEdgesInput'
 ];
 function lockControllerControls() {
     CONTROLLER_LOCKED_IDS.forEach((id) => lockElement(document.getElementById(id)));
@@ -3279,6 +3442,14 @@ function applyRemoteTelemetry(data) {
     if (data.history !== undefined) state.history = data.history;
     if (data.minHr !== undefined) state.effectiveMinHr = data.minHr;
     if (data.maxHr !== undefined) state.effectiveMaxHr = data.maxHr;
+    if (data.edgeTriggerHr !== undefined) state.edgeTriggerHr = data.edgeTriggerHr;
+    // The HOLD TO badge is written by the host's engine loop, which never
+    // runs here, so a remote page labels the chart's pullback line itself.
+    const remoteHoldBadge = document.getElementById('edgeHoldBadge');
+    const remoteHoldText = document.getElementById('edgeHoldText');
+    const showHoldBadge = shouldDrawPullbackLine(state.edgeTriggerHr, state.effectiveMaxHr);
+    if (remoteHoldText && showHoldBadge) remoteHoldText.textContent = `${state.edgeTriggerHr}`;
+    remoteHoldBadge?.classList.toggle('hidden', !showHoldBadge);
     if (data.activeMode !== undefined && data.activeMode !== state.activeMode) {
         state.activeMode = data.activeMode;
         highlightModeCard(state.activeMode);
@@ -3338,6 +3509,7 @@ function syncTelemetry() {
         // guide lines where edges really trigger.
         minHr: state.effectiveMinHr,
         maxHr: state.effectiveMaxHr,
+        edgeTriggerHr: state.edgeTriggerHr,
         activeMode: state.activeMode,
         orgasmMode: state.orgasmMode,
         ready: readiness.hrReady && readiness.toyReady,

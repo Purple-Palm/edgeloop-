@@ -25,7 +25,13 @@ export const state = {
     // offset; guards and games compare against these, never the raw input.
     effectiveMinHr: 70,
     effectiveMaxHr: 140,
+    // Diagnostic only: the heart rate the ENGINE last ran on, microphone
+    // boost included. Nothing reads it, and nothing should - it is not the
+    // wearer's pulse. Read sensorHr instead.
     effectiveHr: 70,
+    // The pulse the sensor reported, with no microphone boost: what every
+    // guard, game, counter, the cockpit readout and the record judge.
+    sensorHr: 70,
     lastGoodHrLimits: { minHr: 70, maxHr: 140 },
     // Status to resume into after PAUSED ('RUNNING' or 'RAMPDOWN').
     resumeStatus: null,
@@ -87,7 +93,22 @@ export const state = {
     micAnalyser: null,
     micAnimId: null,
     micBoost: 0,
-    edgeTriggerHr: 140
+    // What updateEngine last actually added to the engine's heart rate (0
+    // when the boost was suppressed). The cockpit badge reads THIS, never
+    // the meter's own preview.
+    micApplied: 0,
+    // Last measured voice-band level, held while the app itself is speaking.
+    micLastLevel: 0,
+    micSpeechAt: 0,
+    // When the current hold started, so a speech flag that never clears
+    // cannot latch one level forever.
+    micHoldSince: 0,
+    // What the browser actually did with the capture constraints.
+    micProcessing: null,
+    // The pullback mark. Null until the engine computes it (host) or
+    // telemetry carries it (remote page): a default would draw a chart
+    // line for a threshold nobody set.
+    edgeTriggerHr: null
 };
 
 export const advancedSettings = {
@@ -106,7 +127,7 @@ export const advancedSettings = {
     // What the primary does while parked at the pullback trigger: 'stop'
     // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
     ceilingBehaviour: 'crawl',
-    // Pullback as a percent of typed Climax HR (90-115, default 100).
+    // Pullback as a percent of typed Climax HR (90-100, default 100).
     edgeHoldPercent: 100,
     trainHoldSeconds: 15,
     trainEdges: 5,
