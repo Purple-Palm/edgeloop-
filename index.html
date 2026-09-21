@@ -181,9 +181,11 @@
                this tick (describeCutoffNotice); empty while there is nothing
                true to say, so it can never claim a motor that is stopped. -->
           <div id="cutoffNotice" class="hidden text-center text-[11px] font-bold text-rose-400 bg-rose-950/40 border border-rose-900/60 rounded-lg py-1"></div>
-          <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse">
-            STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE
-          </div>
+          <!-- Filled by app.js with what the ACTIVE mode will really do when the
+               pause ends (describeStallPauseNotice): Ruin &amp; Leak's lockout and
+               Full Stop both hold the primary at 0%, so neither can promise a
+               crawl that resumes. -->
+          <div id="stallGuardNotice" class="hidden text-center text-[11px] font-bold text-amber-300 bg-amber-950/50 border border-amber-800/80 rounded-lg py-1 animate-pulse"></div>
           <div id="gameNotice" class="hidden text-center text-[11px] font-bold text-purple-300 bg-purple-950/50 border border-purple-800/80 rounded-lg py-1 animate-pulse">
             GAME MODE ACTIVE
           </div>

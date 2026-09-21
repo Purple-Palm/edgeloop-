@@ -25,9 +25,12 @@ import {
     tickStallGuard,
     endgameKeepsOrgasmLatch,
     describeGameNotice,
-    describeCutoffNotice
+    describeCutoffNotice,
+    describeStallPauseNotice,
+    sanitizeSessionLimits
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
+import { createWriteCoalescer } from './write-coalescer.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
@@ -171,6 +174,10 @@ function syncGuardSettings() {
     advancedSettings.micBoostMaxBpm = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
     advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
+    // The typed HR limits, the duration window and the Endgame Trigger are
+    // stored like every other setting, and a stored one is clamped exactly
+    // as a typed one is: a hand-edited store cannot raise the ceiling.
+    Object.assign(advancedSettings, sanitizeSessionLimits(advancedSettings));
 }
 syncWatchdogSettings();
 syncGuardSettings();
@@ -865,7 +872,20 @@ function updateEngine() {
     }
 
     const stallNotice = document.getElementById('stallGuardNotice');
-    if (stallNotice) stallNotice.classList.toggle('hidden', !state.stallGuardEngaged);
+    if (stallNotice) {
+        if (state.stallGuardEngaged) {
+            stallNotice.textContent = describeStallPauseNotice({
+                mode: state.activeMode,
+                ceilingBehaviour: advancedSettings.ceilingBehaviour
+            });
+        } else if (stallNotice.textContent !== '') {
+            // Emptied as well as hidden: a banner that is not engaged has
+            // nothing true to say, and a sentence left behind display:none
+            // is one paint away from being shown for the wrong mode.
+            stallNotice.textContent = '';
+        }
+        stallNotice.classList.toggle('hidden', !state.stallGuardEngaged);
+    }
 
     updateWarmupBadge();
     updateGameNotice();
@@ -1718,6 +1738,42 @@ function persistSettings() {
     return saved;
 }
 
+// Session Setup values that used to be lost on every reload: the typed HR
+// limits, the duration window and the Endgame Trigger. They are read off the
+// page, sanitized exactly as a stored set is, and written to the same store
+// as every other setting - so the Backup export carries them and Import
+// restores them with no extra plumbing. A remote page never writes: those
+// numbers belong to the host and would overwrite the partner's own store.
+// The settings blob is JSON-encoded on every write, so a typed field does not
+// get one write per key: the new value lands in advancedSettings on the spot
+// (the engine reads it from memory on the next tick, which is what makes a
+// mid-session correction take effect immediately) and the STORE write is
+// coalesced into one per window. Anything that could take the page away
+// flushes first, so a reload can never outrun a typed limit.
+const sessionLimitsWriter = createWriteCoalescer({ write: () => persistSettings() });
+window.addEventListener('pagehide', () => { sessionLimitsWriter.flush(); });
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') sessionLimitsWriter.flush();
+});
+
+function persistSessionLimits(immediate = false) {
+    if (isRemotePage) return false;
+    const limits = readHrLimits();
+    Object.assign(advancedSettings, sanitizeSessionLimits({
+        minHr: limits.minHr,
+        maxHr: limits.maxHr,
+        durationMode: state.durationMode,
+        durationFixedMinutes: document.getElementById('paramFixedInput')?.value,
+        durationMinMinutes: document.getElementById('paramMinInput')?.value,
+        durationMaxMinutes: document.getElementById('paramMaxInput')?.value,
+        endgameType: state.endgameType
+    }));
+    sessionLimitsWriter.schedule();
+    // A single deliberate action (a button, a card, leaving a field) is not a
+    // burst and is written on the spot.
+    return immediate ? sessionLimitsWriter.flush() : true;
+}
+
 function renderLearningStatus() {
     const text = document.getElementById('learningStatusText');
     const p = advancedSettings.learningProfile || { breakthroughEvents: 0, suggestedMaxHrOffset: 0 };
@@ -1804,8 +1860,18 @@ orgasmBtn?.addEventListener('click', () => {
 // the next clock tick.
 ['minHr', 'maxHr'].forEach((id) => {
     const input = document.getElementById(id);
-    input?.addEventListener('input', () => { updateEngine(); syncTelemetry(); updateEdgeHoldPreview(); });
-    input?.addEventListener('change', () => { updateEngine(); syncTelemetry(); updateEdgeHoldPreview(); });
+    // Persisted on every edit, not only on blur: a wearer who lowers the
+    // ceiling mid-session and never leaves the field used to lose it on the
+    // next reload. A half-typed number is refused by readHrLimits, so what
+    // is stored is always the last pair the sanitiser accepted.
+    const edited = (immediate) => {
+        persistSessionLimits(immediate);
+        updateEngine();
+        syncTelemetry();
+        updateEdgeHoldPreview();
+    };
+    input?.addEventListener('input', () => edited(false));
+    input?.addEventListener('change', () => edited(true));
 });
 
 // Experience Modes vs Games Tab Switching
@@ -2014,12 +2080,16 @@ function setDurationMode(mode) {
 }
 
 ['paramFixedInput', 'paramMinInput', 'paramMaxInput'].forEach((id) => {
-    document.getElementById(id)?.addEventListener('input', () => validateDurationInputs());
+    const input = document.getElementById(id);
+    input?.addEventListener('input', () => { validateDurationInputs(); persistSessionLimits(); });
+    input?.addEventListener('change', () => { validateDurationInputs(); persistSessionLimits(true); });
 });
 
-durFixedBtn?.addEventListener('click', () => setDurationMode('fixed'));
-durRangeBtn?.addEventListener('click', () => setDurationMode('range'));
-durEndlessBtn?.addEventListener('click', () => setDurationMode('endless'));
+// setDurationMode is also how the stored mode is restored, so only a real
+// click writes the store.
+durFixedBtn?.addEventListener('click', () => { setDurationMode('fixed'); persistSessionLimits(true); });
+durRangeBtn?.addEventListener('click', () => { setDurationMode('range'); persistSessionLimits(true); });
+durEndlessBtn?.addEventListener('click', () => { setDurationMode('endless'); persistSessionLimits(true); });
 
 // Warm-up Slider Listener
 const warmupInput = document.getElementById('warmupInput');
@@ -2032,6 +2102,40 @@ warmupInput?.addEventListener('input', (e) => {
 });
 
 function syncParamsUI() {
+    // Restore the persisted session limits into the page. advancedSettings
+    // has already been through sanitizeSessionLimits (syncGuardSettings), so
+    // these are values the wearer could have typed themselves. All of it is
+    // host-only: every one of these numbers describes the WEARER's session,
+    // and a remote page shows the host's, so none of them may be supplied
+    // out of the partner's own browser.
+    if (!isRemotePage) {
+        const minInput = document.getElementById('minHr');
+        const maxInput = document.getElementById('maxHr');
+        if (minInput) minInput.value = String(advancedSettings.minHr);
+        if (maxInput) maxInput.value = String(advancedSettings.maxHr);
+        // The fallback pair readHrLimits falls back to when a field is
+        // half-typed, seeded from the same numbers that were just painted
+        // into those fields. A remote page keeps the factory 70 / 140: its
+        // two HR fields mirror the HOST's limits, so this device's stored
+        // pair must never stand in for them before the first telemetry.
+        state.lastGoodHrLimits = { minHr: advancedSettings.minHr, maxHr: advancedSettings.maxHr };
+        const fixedInput = document.getElementById('paramFixedInput');
+        const rangeMinInput = document.getElementById('paramMinInput');
+        const rangeMaxInput = document.getElementById('paramMaxInput');
+        if (fixedInput) fixedInput.value = String(advancedSettings.durationFixedMinutes);
+        if (rangeMinInput) rangeMinInput.value = String(advancedSettings.durationMinMinutes);
+        if (rangeMaxInput) rangeMaxInput.value = String(advancedSettings.durationMaxMinutes);
+        // The Target Mode and the Endgame Trigger are the WEARER's: a remote
+        // page is told neither over the wire, and the timer sub-label reads
+        // state.durationMode, so adopting this device's stored mode would
+        // have a partner's screen announce Endless while the host runs a
+        // Mystery window. A remote page keeps the built-in Mystery / Climax
+        // until the host says otherwise, exactly as it did before these
+        // values were stored at all.
+        state.endgameType = advancedSettings.endgameType;
+        highlightEndgameCard(state.endgameType);
+        state.durationMode = advancedSettings.durationMode;
+    }
     setDurationMode(state.durationMode);
     const stallToggle = document.getElementById('stallGuardToggle');
     const stallSec = document.getElementById('stallGuardSecondsInput');
@@ -2272,19 +2376,24 @@ document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
 
 // Endgame selection inside Session Setup
 const paramEndgameCards = document.querySelectorAll('.param-endgame-card');
+// Also used to paint the restored Endgame Trigger on boot (syncParamsUI).
+function highlightEndgameCard(type) {
+    paramEndgameCards.forEach(c => {
+        const bold = c.querySelector('.font-bold');
+        if (c.getAttribute('data-endgame') === type) {
+            c.className = "param-endgame-card p-1.5 rounded-lg bg-purple-950/30 border border-purple-800 text-left transition cursor-pointer";
+            if (bold) bold.className = "font-bold text-[10px] text-purple-300";
+        } else {
+            c.className = "param-endgame-card p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-left transition cursor-pointer";
+            if (bold) bold.className = "font-bold text-[10px] text-slate-300";
+        }
+    });
+}
 paramEndgameCards.forEach(card => {
     card.addEventListener('click', () => {
         state.endgameType = card.getAttribute('data-endgame');
-        paramEndgameCards.forEach(c => {
-            const bold = c.querySelector('.font-bold');
-            if (c === card) {
-                c.className = "param-endgame-card p-1.5 rounded-lg bg-purple-950/30 border border-purple-800 text-left transition cursor-pointer";
-                if (bold) bold.className = "font-bold text-[10px] text-purple-300";
-            } else {
-                c.className = "param-endgame-card p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-left transition cursor-pointer";
-                if (bold) bold.className = "font-bold text-[10px] text-slate-300";
-            }
-        });
+        highlightEndgameCard(state.endgameType);
+        persistSessionLimits(true);
     });
 });
 

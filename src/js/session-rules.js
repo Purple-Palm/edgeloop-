@@ -6,7 +6,7 @@
 // The one thing this file reads from the engine: the crawl level, so the
 // cockpit banner can tell a crawling motor from a running one with the same
 // number the engine sends.
-import { CRAWL_PERCENT } from './engine.js';
+import { CRAWL_PERCENT, resolveCeilingBehaviour } from './engine.js';
 
 // The effective ceiling can never be pushed closer than this to the resting
 // HR, otherwise the tease band collapses into a permanent cut-off.
@@ -572,4 +572,101 @@ export function describeGameNotice({
     if (trainState === 'recover') return `EDGE TRAINING: RECOVER — ${done}/${need} EDGES`;
     if (trainState === 'finish') return 'EDGE TRAINING: COMPLETE — COME';
     return `EDGE TRAINING: CLIMB — ${done}/${need} EDGES`;
+}
+
+// The cockpit's stall-pause banner, as pure text. The banner used to be one
+// fixed sentence in index.html - CRAWL RESUMES AFTER THE PAUSE - painted
+// whatever mode was running. In Ruin & Leak the primary is parked at 0% by
+// the mode's own lockout for as long as the pulse sits on the mark, so the
+// wearer held at the pullback mark on the defaults was promised a crawl in 8
+// seconds that the mode can never give: the premise of Ruin & Leak is cutting
+// penile input cold. The same sentence is wrong wherever the primary is not
+// coming back to a crawl, so the banner now names what the ACTIVE mode and
+// the "At the ceiling" setting will really do when the pause ends.
+export function describeStallPauseNotice({ mode, ceilingBehaviour } = {}) {
+    const halted = 'STALL PAUSE: PRIMARY HALTED';
+    // Ruin & Leak parks the primary at 0% at the mark whichever ceiling rule
+    // is set, so the pause ending changes nothing the wearer will feel.
+    if (mode === 'ruin') return `${halted} — RUIN LOCKOUT HOLDS IT AT 0%`;
+    // Survival never parks on the mark: its speed climbs on its own clock,
+    // and the "At the ceiling" setting does not govern it either - so this
+    // is asked BEFORE the Full Stop rule, which would otherwise promise a
+    // 0% that Survival is not going to give.
+    if (mode === 'survival') return `${halted} — SPEED RESUMES AFTER THE PAUSE`;
+    if (resolveCeilingBehaviour(ceilingBehaviour) !== 'crawl') return `${halted} — FULL STOP HOLDS IT AT 0%`;
+    return `${halted} — CRAWL RESUMES AFTER THE PAUSE`;
+}
+
+// ---- Persisted Session Setup values ---------------------------------------
+
+// Resting / Climax HR, the duration window and the Endgame Trigger are typed
+// into plain inputs and are remembered between sessions like every other
+// setting. A STORED value is never trusted more than a typed one: it goes
+// back through the same validators (sanitizeHrLimits, parseSessionDuration)
+// on the way in AND on the way out, so a corrupt or hand-edited store can
+// only ever restore limits the wearer could have typed themselves.
+export const DURATION_MODES = ['fixed', 'range', 'endless'];
+export const ENDGAME_TYPES = ['orgasm', 'rampdown', 'denial'];
+export const DEFAULT_DURATION_MODE = 'range';
+export const DEFAULT_FIXED_MINUTES = 30;
+export const DEFAULT_RANGE_MIN_MINUTES = 25;
+export const DEFAULT_RANGE_MAX_MINUTES = 45;
+export const DEFAULT_ENDGAME_TYPE = 'orgasm';
+
+// The typed HR pair, clamped for storage by exactly the validator the typed
+// fields already go through: a stored pair is never treated more harshly, or
+// more leniently, than one the wearer types, so what comes back after a
+// reload is the pair they left. A pair sanitizeHrLimits refuses (either field
+// outside 30-250, or a ceiling at or below the resting rate) falls back to
+// the factory pair rather than being repaired into something nobody chose.
+// A narrow but legal pair is restored as typed and NOT widened: the release
+// band is the engine's business (resolveEdgeTriggerHr simply pulls back at
+// the ceiling when the band is too tight) and MIN_CEILING_GAP is enforced
+// where it belongs, inside computeEffectiveCeiling, which only ever lowers
+// the working ceiling. Moving the Resting HR here would quietly change a
+// setting the wearer typed - and widening the tease band raises the rising
+// secondary channel (`20 + progress * 80`) at every heart rate.
+export function sanitizeStoredHrLimits(rawMin, rawMax) {
+    const limits = sanitizeHrLimits(rawMin, rawMax, { minHr: DEFAULT_MIN_HR, maxHr: DEFAULT_MAX_HR });
+    if (!limits.valid) return { minHr: DEFAULT_MIN_HR, maxHr: DEFAULT_MAX_HR };
+    return { minHr: limits.minHr, maxHr: limits.maxHr };
+}
+
+// The duration window, validated by the same parser the Session Setup fields
+// go through at START. A length that parser refuses falls back to the factory
+// one for that field; an unknown mode falls back to Mystery.
+export function sanitizeStoredDuration({
+    durationMode,
+    durationFixedMinutes,
+    durationMinMinutes,
+    durationMaxMinutes
+} = {}) {
+    const fixedOk = parseSessionDuration({ mode: 'fixed', fixedMinutes: durationFixedMinutes }).valid;
+    const rangeOk = parseSessionDuration({
+        mode: 'range',
+        minMinutes: durationMinMinutes,
+        maxMinutes: durationMaxMinutes,
+        random: () => 0
+    }).valid;
+    return {
+        durationMode: DURATION_MODES.includes(durationMode) ? durationMode : DEFAULT_DURATION_MODE,
+        durationFixedMinutes: fixedOk ? toInt(durationFixedMinutes) : DEFAULT_FIXED_MINUTES,
+        durationMinMinutes: rangeOk ? toInt(durationMinMinutes) : DEFAULT_RANGE_MIN_MINUTES,
+        durationMaxMinutes: rangeOk ? toInt(durationMaxMinutes) : DEFAULT_RANGE_MAX_MINUTES
+    };
+}
+
+export function sanitizeStoredEndgame(value) {
+    return ENDGAME_TYPES.includes(value) ? value : DEFAULT_ENDGAME_TYPE;
+}
+
+// One entry point for the whole set, used on load, on every write and on
+// import, so the stored form and the typed form can never drift apart. It is
+// idempotent: sanitizing an already sanitized set returns it unchanged.
+export function sanitizeSessionLimits(stored = {}) {
+    return {
+        ...sanitizeStoredHrLimits(stored.minHr, stored.maxHr),
+        ...sanitizeStoredDuration(stored),
+        endgameType: sanitizeStoredEndgame(stored.endgameType)
+    };
 }

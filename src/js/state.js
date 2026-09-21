@@ -125,6 +125,19 @@ export const state = {
 };
 
 export const advancedSettings = {
+    // Session Setup values that used to live only in the DOM and were lost on
+    // every reload. They are sanitized by session-rules.sanitizeSessionLimits
+    // wherever they enter (load, Apply, import) and wherever they are written,
+    // so a stored ceiling is clamped exactly as a typed one is. The numbers
+    // here are the factory defaults a brand-new install sees and match the
+    // values index.html ships in the inputs.
+    minHr: 70,
+    maxHr: 140,
+    durationMode: 'range',
+    durationFixedMinutes: 30,
+    durationMinMinutes: 25,
+    durationMaxMinutes: 45,
+    endgameType: 'orgasm',
     gammaCurve: 2.0,
     warmupMinutes: 5,
     edgeStrokeDepth: 100,

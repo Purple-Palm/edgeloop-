@@ -32,7 +32,19 @@ import {
     DEFAULT_STALL_PAUSE_SECONDS,
     clampStallGuardSeconds,
     clampStallPauseSeconds,
-    tickStallGuard
+    tickStallGuard,
+    describeStallPauseNotice,
+    sanitizeStoredHrLimits,
+    sanitizeStoredDuration,
+    sanitizeStoredEndgame,
+    sanitizeSessionLimits,
+    DEFAULT_MIN_HR,
+    DEFAULT_MAX_HR,
+    DEFAULT_DURATION_MODE,
+    DEFAULT_FIXED_MINUTES,
+    DEFAULT_RANGE_MIN_MINUTES,
+    DEFAULT_RANGE_MAX_MINUTES,
+    DEFAULT_ENDGAME_TYPE
 } from './session-rules.js';
 
 describe('sanitizeHrLimits', () => {
@@ -757,5 +769,357 @@ describe('the cockpit cutoff banner', () => {
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
         assert.ok(/describeCutoffNotice\(/.test(src), 'app.js must ask for the text');
         assert.ok(!/CLIMAX LIMIT REACHED/.test(src), 'app.js must not build the text itself');
+    });
+});
+
+describe('describeStallPauseNotice', () => {
+    it('promises a crawl only where a crawl really comes back', () => {
+        for (const mode of ['classic', 'milker', 'ultimate', 'shortener', 'headplay']) {
+            assert.equal(
+                describeStallPauseNotice({ mode, ceilingBehaviour: 'crawl' }),
+                'STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE',
+                `${mode} does come back to a crawl`
+            );
+        }
+    });
+
+    it('never promises a crawl in Ruin & Leak, whichever ceiling rule is set', () => {
+        // The reported defect: on the defaults (Crawl, stall guard on, 20 s /
+        // 8 s) a wearer parked on the pullback mark in Ruin & Leak was told a
+        // crawl resumes in 8 seconds. The mode's 18 s lockout parks the
+        // primary at 0% for as long as the pulse sits there, so it never did.
+        for (const behaviour of ['crawl', 'stop', undefined]) {
+            const text = describeStallPauseNotice({ mode: 'ruin', ceilingBehaviour: behaviour });
+            assert.ok(!/CRAWL RESUMES/.test(text), `Ruin & Leak promised a crawl: ${text}`);
+            assert.equal(text, 'STALL PAUSE: PRIMARY HALTED — RUIN LOCKOUT HOLDS IT AT 0%');
+        }
+    });
+
+    it('never promises a crawl under Full Stop', () => {
+        for (const mode of ['classic', 'milker', 'ultimate', 'oracle', 'edgetrain', undefined]) {
+            const text = describeStallPauseNotice({ mode, ceilingBehaviour: 'stop' });
+            assert.ok(!/CRAWL RESUMES/.test(text), `Full Stop promised a crawl in ${mode}: ${text}`);
+            assert.equal(text, 'STALL PAUSE: PRIMARY HALTED — FULL STOP HOLDS IT AT 0%');
+        }
+    });
+
+    it('says the speed comes back in Survival, which never parks on the mark', () => {
+        // Survival ignores the "At the ceiling" setting the way Ruin & Leak
+        // does - the speed climbs on its own clock - so Full Stop must not
+        // make this sentence promise a 0% Survival is not going to give.
+        for (const behaviour of ['crawl', 'stop', undefined]) {
+            assert.equal(
+                describeStallPauseNotice({ mode: 'survival', ceilingBehaviour: behaviour }),
+                'STALL PAUSE: PRIMARY HALTED — SPEED RESUMES AFTER THE PAUSE',
+                `Survival under ${behaviour}`
+            );
+        }
+    });
+
+    it('always reports the halt itself, whatever it is handed', () => {
+        for (const args of [undefined, {}, { mode: 'nonsense', ceilingBehaviour: 'nonsense' }]) {
+            assert.match(describeStallPauseNotice(args), /^STALL PAUSE: PRIMARY HALTED — /);
+        }
+    });
+
+    it('leaves no stale sentence behind display:none', () => {
+        // Between engagements the banner is hidden. It is emptied as well,
+        // so a sentence painted for the last mode cannot be shown again by a
+        // future paint that forgets to rewrite it first.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const at = src.indexOf('describeStallPauseNotice({');
+        assert.ok(at >= 0, 'the stall banner is no longer painted here');
+        const block = src.slice(at, at + 700);
+        assert.ok(/stallNotice\.textContent = '';/.test(block),
+            'the banner must be emptied when it is not engaged');
+        const clearAt = block.indexOf("stallNotice.textContent = '';");
+        const toggleAt = block.indexOf("classList.toggle('hidden'");
+        assert.ok(clearAt >= 0 && toggleAt > clearAt, 'it must be emptied before it is hidden');
+    });
+
+    it('is the only thing app.js paints into the stall banner', () => {
+        const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+        assert.ok(!/CRAWL RESUMES/.test(html), 'the fixed sentence must be gone from the markup');
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        assert.ok(/describeStallPauseNotice\(/.test(src), 'app.js must ask for the text');
+        assert.ok(!/CRAWL RESUMES/.test(src), 'app.js must not build the text itself');
+        // And it must be handed the live mode and ceiling rule, not a guess.
+        const at = src.indexOf('describeStallPauseNotice({');
+        assert.ok(at >= 0, 'app.js does not call describeStallPauseNotice with arguments');
+        const call = src.slice(at, at + 220);
+        assert.ok(/mode: state\.activeMode/.test(call), 'the banner must be told the active mode');
+        assert.ok(/ceilingBehaviour: advancedSettings\.ceilingBehaviour/.test(call), 'the banner must be told the ceiling rule');
+    });
+});
+
+describe('sanitizeStoredHrLimits', () => {
+    it('keeps a pair the wearer could have typed', () => {
+        assert.deepEqual(sanitizeStoredHrLimits(65, 95), { minHr: 65, maxHr: 95 });
+        assert.deepEqual(sanitizeStoredHrLimits('65', '95'), { minHr: 65, maxHr: 95 });
+    });
+
+    it('falls back to the factory pair on anything unusable', () => {
+        const factory = { minHr: DEFAULT_MIN_HR, maxHr: DEFAULT_MAX_HR };
+        for (const bad of [[undefined, undefined], ['', ''], ['abc', 'def'], [null, null],
+            [70, 70], [140, 70], [70, 20], [70, 999], [-5, 140], [{}, []]]) {
+            assert.deepEqual(sanitizeStoredHrLimits(bad[0], bad[1]), factory, `stored ${JSON.stringify(bad)}`);
+        }
+    });
+
+    it('never restores a ceiling the clamp would refuse', () => {
+        // A hand-edited store is the attack: every reachable result must be a
+        // ceiling sanitizeHrLimits itself accepts, and never the stored one
+        // when that is out of range.
+        for (const raw of [999, 251, 1e9, '300', Infinity, NaN, '140abc', 29]) {
+            const out = sanitizeStoredHrLimits(70, raw);
+            assert.ok(out.maxHr >= 30 && out.maxHr <= 250, `ceiling out of range for ${raw}: ${out.maxHr}`);
+            assert.ok(out.maxHr <= DEFAULT_MAX_HR, `a corrupt store raised the ceiling for ${raw}: ${out.maxHr}`);
+        }
+    });
+
+    it('restores a narrow but legal pair exactly as it was typed', () => {
+        // A pair the Session Setup fields accept must come back unchanged.
+        // Repairing it - either by raising the ceiling or by dropping the
+        // Resting HR to leave MIN_CEILING_GAP - would hand back limits the
+        // wearer never typed, which is the very complaint this persistence
+        // was added to answer. MIN_CEILING_GAP stays where it belongs, in
+        // computeEffectiveCeiling, which only ever lowers the ceiling.
+        assert.deepEqual(sanitizeStoredHrLimits(130, 140), { minHr: 130, maxHr: 140 });
+        assert.deepEqual(sanitizeStoredHrLimits(70, 75), { minHr: 70, maxHr: 75 });
+        assert.deepEqual(sanitizeStoredHrLimits(30, 31), { minHr: 30, maxHr: 31 });
+        // And a narrow restored pair still cannot lift the working ceiling.
+        const ceiling = computeEffectiveCeiling({ minHr: 130, maxHr: 140 });
+        assert.ok(ceiling.maxHr <= 140, `narrow pair raised the working ceiling to ${ceiling.maxHr}`);
+    });
+
+    it('restores every pair the typed fields accept, byte for byte', () => {
+        // The single promise of this feature: what you typed is what comes
+        // back. A stored pair is clamped by sanitizeHrLimits and nothing
+        // else, so the two paths can never disagree.
+        for (let min = 30; min <= 250; min += 13) {
+            for (let max = 30; max <= 250; max += 17) {
+                const typed = sanitizeHrLimits(min, max, { minHr: DEFAULT_MIN_HR, maxHr: DEFAULT_MAX_HR });
+                const restored = sanitizeStoredHrLimits(min, max);
+                if (typed.valid) {
+                    assert.deepEqual(restored, { minHr: typed.minHr, maxHr: typed.maxHr }, `${min}/${max}`);
+                } else {
+                    assert.deepEqual(restored, { minHr: DEFAULT_MIN_HR, maxHr: DEFAULT_MAX_HR }, `${min}/${max}`);
+                }
+                assert.ok(restored.maxHr <= Math.max(max, DEFAULT_MAX_HR), `${min}/${max} raised the ceiling`);
+            }
+        }
+    });
+
+    it('is idempotent, so a stored value survives a round trip unchanged', () => {
+        for (const pair of [[70, 140], [65, 95], [70, 75], [40, 41], ['x', 'y'], [200, 250]]) {
+            const once = sanitizeStoredHrLimits(pair[0], pair[1]);
+            assert.deepEqual(sanitizeStoredHrLimits(once.minHr, once.maxHr), once, `pair ${pair}`);
+        }
+    });
+
+    it('always leaves resting below climax', () => {
+        for (let min = 25; min <= 260; min += 7) {
+            for (let max = 25; max <= 260; max += 11) {
+                const out = sanitizeStoredHrLimits(min, max);
+                assert.ok(out.minHr < out.maxHr, `${min}/${max} restored as ${out.minHr}/${out.maxHr}`);
+                assert.ok(out.maxHr <= Math.max(max, DEFAULT_MAX_HR), `${min}/${max} raised the ceiling`);
+            }
+        }
+    });
+});
+
+describe('sanitizeStoredDuration / sanitizeStoredEndgame', () => {
+    it('keeps a window the Session Setup fields would accept', () => {
+        assert.deepEqual(sanitizeStoredDuration({
+            durationMode: 'fixed',
+            durationFixedMinutes: '42',
+            durationMinMinutes: 10,
+            durationMaxMinutes: 20
+        }), {
+            durationMode: 'fixed',
+            durationFixedMinutes: 42,
+            durationMinMinutes: 10,
+            durationMaxMinutes: 20
+        });
+    });
+
+    it('falls back per field on anything parseSessionDuration refuses', () => {
+        const out = sanitizeStoredDuration({
+            durationMode: 'sideways',
+            durationFixedMinutes: 0,
+            durationMinMinutes: 60,
+            durationMaxMinutes: 30
+        });
+        assert.deepEqual(out, {
+            durationMode: DEFAULT_DURATION_MODE,
+            durationFixedMinutes: DEFAULT_FIXED_MINUTES,
+            durationMinMinutes: DEFAULT_RANGE_MIN_MINUTES,
+            durationMaxMinutes: DEFAULT_RANGE_MAX_MINUTES
+        });
+        // An empty store is the factory window.
+        assert.deepEqual(sanitizeStoredDuration(), out);
+        assert.deepEqual(sanitizeStoredDuration({}), out);
+    });
+
+    it('keeps the three real endgames and refuses anything else', () => {
+        for (const type of ['orgasm', 'rampdown', 'denial']) {
+            assert.equal(sanitizeStoredEndgame(type), type);
+        }
+        for (const junk of [undefined, null, '', 'ORGASM', 'finish', 42, {}]) {
+            assert.equal(sanitizeStoredEndgame(junk), DEFAULT_ENDGAME_TYPE);
+        }
+    });
+});
+
+describe('sanitizeSessionLimits', () => {
+    const factory = {
+        minHr: DEFAULT_MIN_HR,
+        maxHr: DEFAULT_MAX_HR,
+        durationMode: DEFAULT_DURATION_MODE,
+        durationFixedMinutes: DEFAULT_FIXED_MINUTES,
+        durationMinMinutes: DEFAULT_RANGE_MIN_MINUTES,
+        durationMaxMinutes: DEFAULT_RANGE_MAX_MINUTES,
+        endgameType: DEFAULT_ENDGAME_TYPE
+    };
+
+    it('gives a brand-new install exactly the defaults index.html ships', () => {
+        assert.deepEqual(sanitizeSessionLimits(), factory);
+        assert.deepEqual(sanitizeSessionLimits({}), factory);
+    });
+
+    it('restores a whole typed set', () => {
+        const typed = {
+            minHr: 65,
+            maxHr: 92,
+            durationMode: 'fixed',
+            durationFixedMinutes: 40,
+            durationMinMinutes: 20,
+            durationMaxMinutes: 50,
+            endgameType: 'rampdown'
+        };
+        assert.deepEqual(sanitizeSessionLimits(typed), typed);
+    });
+
+    it('is idempotent and ignores the other settings around it', () => {
+        const stored = { minHr: 70, maxHr: 4000, endgameType: 'whatever', stallGuard: false, voiceCues: {} };
+        const once = sanitizeSessionLimits(stored);
+        assert.deepEqual(sanitizeSessionLimits(once), once);
+        assert.equal(once.maxHr, DEFAULT_MAX_HR);
+        assert.equal(once.endgameType, DEFAULT_ENDGAME_TYPE);
+        assert.ok(!('stallGuard' in once), 'it must only return the session limits');
+    });
+});
+
+describe('app.js persists and restores the typed session limits', () => {
+    const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+
+    it('clamps the stored set wherever settings enter', () => {
+        // load, Apply and import all run syncGuardSettings.
+        const at = src.indexOf('function syncGuardSettings');
+        assert.ok(at >= 0, 'syncGuardSettings not found');
+        const body = src.slice(at, src.indexOf('\n}', at));
+        assert.ok(/sanitizeSessionLimits\(advancedSettings\)/.test(body),
+            'the stored session limits must go through the sanitiser on the way in');
+    });
+
+    it('writes them through the same sanitiser and the same store as every other setting', () => {
+        const at = src.indexOf('function persistSessionLimits');
+        assert.ok(at >= 0, 'persistSessionLimits not found');
+        const body = src.slice(at, src.indexOf('\n}', at));
+        assert.ok(/sanitizeSessionLimits\(/.test(body), 'a written value is clamped exactly as a stored one is');
+        assert.ok(/readHrLimits\(\)/.test(body), 'the HR pair must come from the validated reader');
+        assert.ok(/if \(isRemotePage\) return/.test(body), 'a remote page must never write the host limits');
+        // The write itself is coalesced (write-coalescer.js) so a burst of
+        // keystrokes does not re-encode the whole settings blob per key, but
+        // it must still end in the ONE store every other setting uses.
+        assert.ok(/sessionLimitsWriter\.(schedule|flush)\(/.test(body), 'it must go through the settings writer');
+        assert.ok(/createWriteCoalescer\(\{ write: \(\) => persistSettings\(\) \}\)/.test(src),
+            'the coalesced write must be the existing settings store');
+    });
+
+    it('is wired to every field the wearer can type', () => {
+        // #minHr / #maxHr, the duration window, the three mode buttons and
+        // the endgame cards. Each one used to be lost on reload.
+        // persistSessionLimits(true) writes on the spot, persistSessionLimits()
+        // joins the coalescing window; both count as wired. The function's own
+        // declaration is not a call.
+        const calls = (src.match(/persistSessionLimits\(/g) || []).length
+            - (src.match(/function persistSessionLimits\(/g) || []).length;
+        assert.ok(calls >= 7, `only ${calls} persist calls: a field is still unsaved`);
+        // The typed HR pair, saved as it is typed rather than only on blur.
+        const hrAt = src.indexOf("['minHr', 'maxHr'].forEach(");
+        assert.ok(hrAt >= 0, 'the HR inputs are no longer wired in one place - move this guard with them');
+        const hrBlock = src.slice(hrAt, hrAt + 700);
+        assert.ok(/persistSessionLimits\(/.test(hrBlock), 'a typed HR limit must be saved');
+        assert.ok(/addEventListener\('input'/.test(hrBlock), 'it must be saved while typing, not only on blur');
+        assert.ok(/durFixedBtn\?\.addEventListener\('click', \(\) => \{ setDurationMode\('fixed'\); persistSessionLimits\(true\); \}\)/.test(src));
+        assert.ok(/state\.endgameType = card\.getAttribute\('data-endgame'\);[\s\S]{0,120}persistSessionLimits\(true\)/.test(src),
+            'the Endgame Trigger must be saved when it is picked');
+        // A deliberate single action is never left sitting in the window.
+        for (const click of ["setDurationMode('fixed')", "setDurationMode('range')", "setDurationMode('endless')"]) {
+            const at = src.indexOf(click + '; persistSessionLimits');
+            assert.ok(at >= 0 && src.slice(at, at + 60).includes('persistSessionLimits(true)'),
+                `${click} must be written on the spot, not coalesced`);
+        }
+    });
+
+    it('never seeds the fallback HR pair from this device on a remote page', () => {
+        // ?partner= / ?group_sub= mirror the HOST's limits. The pair
+        // readHrLimits falls back to before the first host reading must stay
+        // the factory 70 / 140 there, not whatever this browser has stored.
+        const guard = src.indexOf('function syncGuardSettings');
+        const guardBody = src.slice(guard, src.indexOf('\n}', guard));
+        assert.ok(!/lastGoodHrLimits/.test(guardBody),
+            'syncGuardSettings runs on every page: it must not seed the fallback pair');
+        const at = src.indexOf('state.lastGoodHrLimits = { minHr: advancedSettings.minHr');
+        assert.ok(at >= 0, 'the fallback pair is seeded nowhere - a host page needs it');
+        const before = src.slice(Math.max(0, at - 900), at);
+        assert.ok(/if \(!isRemotePage\) \{/.test(before),
+            'the seed must sit inside the host-only branch that paints those fields');
+    });
+
+    it('never lets a remote page restore the limits stored in this browser', () => {
+        // A remote page is told the host's HR limits over the wire and
+        // NOTHING about their Target Mode or Endgame Trigger. The timer
+        // sub-label reads state.durationMode, so a partner whose own browser
+        // had Endless stored watched their screen announce Endless Mode
+        // while the wearer ran a Mystery window. The whole restore sits
+        // inside the host-only branch.
+        const at = src.indexOf('function syncParamsUI');
+        const body = src.slice(at, src.indexOf('\n}\n', at));
+        const open = body.indexOf('if (!isRemotePage) {');
+        assert.ok(open >= 0, 'the host-only branch is gone');
+        const close = body.indexOf('\n    }', open);
+        assert.ok(close > open, 'the host-only branch never closes');
+        const hostOnly = body.slice(open, close);
+        for (const restored of ['minHr', 'maxHr', 'paramFixedInput', 'paramMinInput', 'paramMaxInput']) {
+            assert.ok(hostOnly.includes(`getElementById('${restored}')`),
+                `${restored} is restored outside the host-only branch`);
+        }
+        for (const seeded of ['state.durationMode = advancedSettings.durationMode',
+            'state.endgameType = advancedSettings.endgameType',
+            'highlightEndgameCard(state.endgameType)',
+            'state.lastGoodHrLimits = {']) {
+            assert.ok(hostOnly.includes(seeded), `"${seeded}" is not host-only`);
+            assert.equal(body.split(seeded).length - 1, 1, `"${seeded}" also runs outside the branch`);
+        }
+        // And syncGuardSettings, which runs on every page including a remote
+        // one, must not seed them either.
+        const guard = src.indexOf('function syncGuardSettings');
+        const guardBody = src.slice(guard, src.indexOf('\n}', guard));
+        assert.ok(!/state\.durationMode|state\.endgameType/.test(guardBody),
+            'syncGuardSettings runs on a remote page: it must not seed the wearer settings');
+    });
+
+    it('restores them into the page on boot', () => {
+        const at = src.indexOf('function syncParamsUI');
+        assert.ok(at >= 0, 'syncParamsUI not found');
+        const body = src.slice(at, src.indexOf('\n}\n', at));
+        for (const id of ['minHr', 'maxHr', 'paramFixedInput', 'paramMinInput', 'paramMaxInput']) {
+            assert.ok(body.includes(`getElementById('${id}')`), `${id} is not restored on boot`);
+        }
+        assert.ok(/highlightEndgameCard\(/.test(body), 'the endgame trigger is not restored on boot');
+        assert.ok(/isRemotePage/.test(body), 'a remote page must keep the host limits it is shown');
+        assert.ok(src.lastIndexOf('syncParamsUI();') > at, 'syncParamsUI must run at boot');
     });
 });

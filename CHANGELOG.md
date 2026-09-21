@@ -216,6 +216,66 @@ credited by username.
   boot banner is never taken for the device name or version.
 
 ### Session engine and lifecycle
+- The **typed session limits survive a reload**. Resting HR, Climax HR, the
+  Target Mode with its Fixed length and Mystery window, and the Endgame
+  Trigger were the last Session Setup values that lived only in the DOM:
+  every one of them fell back to 70 / 140 / Mystery 25-45 / Climax on the
+  next load. Users on the forum described lowering their ceiling by hand as
+  a session went on, and every one of those corrections was thrown away by
+  the next refresh - the toys came back on a limit the wearer had already
+  decided was too high. They are stored with the rest of Session Setup, so
+  the Backup export carries them and Import restores them.
+- A **stored limit is clamped exactly as a typed one is**, on the way out of
+  storage as well as on the way in: the same `sanitizeHrLimits` and
+  `parseSessionDuration` the inputs already went through. A hand-edited or
+  corrupt store cannot restore a Climax HR outside 30-250 BPM or one at or
+  below the Resting HR - such a pair falls back to the factory 70 / 140.
+  A pair those validators accept is restored exactly as it was typed, narrow
+  bands included: repairing one, in either direction, hands back limits
+  nobody chose, and the minimum ceiling band is enforced where it always
+  was, inside the working-ceiling calculation, which only ever lowers it.
+  A brand-new install still sees the same defaults it always did.
+- A **typed limit is written once per burst of keys, not once per key**, and
+  is flushed the moment the page can go away (pagehide, which a reload fires,
+  and a tab going hidden). Every keystroke used to JSON-encode the whole
+  settings blob - voice phrase banks and learning profile included - into
+  storage. The number still lands in the running engine on the keystroke, so
+  a mid-session correction takes effect exactly as fast as before; only the
+  store write waits, and never past the moment it would be lost.
+- The **stall-pause banner says what the mode you are in will really do**.
+  It was one fixed sentence in the markup - PRIMARY HALTED, CRAWL RESUMES
+  AFTER THE PAUSE - painted whatever was running. On the defaults (Crawl,
+  stall guard on, allow 20 s, pause 8 s) a wearer held at the pullback mark
+  in *Ruin & Leak* watched that promise for 8 seconds and got nothing: the
+  mode's lockout parks the primary at 0% for as long as the pulse sits
+  there, which is the documented premise of the mode. The banner now names
+  the real outcome for the active mode and the "At the ceiling" setting, so
+  neither Ruin & Leak nor Full Stop can promise a crawl that is not coming,
+  and Survival Mode - the other mode that setting does not govern - says its
+  speed comes back rather than a stop it would not honour. The banner is
+  also emptied when it is not engaged, not merely hidden, so the last
+  sentence it painted cannot be shown again for a different mode.
+- A **remote page keeps the built-in session set** and supplies none of it
+  from its own browser. A partner or viewer page (`?partner=` / `?group_sub=`)
+  mirrors the WEARER's session; with these values now stored, a remote page
+  restored them like any other page. The fallback HR pair used before the
+  first host reading arrived came from the partner's OWN store instead of the
+  built-in 70 / 140, and the Target Mode and Endgame Trigger - which cross the
+  data channel in neither direction - were taken from it outright: a partner
+  whose own browser held Endless watched the session clock announce ENDLESS
+  MODE while the wearer ran a Mystery window, and saw their own Endgame
+  Trigger highlighted. The whole restore is now host-only, so a remote page
+  shows exactly what it showed before any of this was remembered. No motor
+  path on a remote page, but none of those numbers were ever theirs to
+  supply.
+- **What is deliberately not remembered:** Global Intensity, Full Stroke, the
+  selected mode or game card, and the Intiface server URL. The first three
+  are cockpit "right now" values, and a fresh page restoring 150% intensity or
+  Ruin & Leak would be a motor-affecting decision nobody made. The Intiface
+  URL is not one of those, and the forum request to remember it is still
+  open - it is a connection address, nothing drives a toy until Connect is
+  pressed - but it is hardware setup rather than a session limit and was left
+  for its own change.
 - Force Orgasm is a boost on the working ceiling and is always cleared by
   STOP and Reset; the typed Climax HR is never rewritten.
 - STOP resets the clock, edge and pause counters after saving history, so
@@ -586,6 +646,19 @@ credited by username.
   throw.
 
 ### Project
+- The README and this file no longer quote how many tests there are. They
+  said "about 290" and "about 330" while the suite was past 460: a number
+  written into a document nobody re-counts is wrong within a week, and a
+  document that is wrong about something checkable is not trusted about
+  anything else. `npm test` prints the real count on its last lines, and
+  `docs.test.js` fails if a fixed number creeps back into either file. It
+  catches the hedged wording this file itself used - the noun before the
+  number, dressed as a snapshot of the day it was written - as well as the
+  plain form, and it says what to do about a hit: a flagged line is a
+  sentence to REPHRASE, not a broken document and not a broken suite. The
+  pattern is deliberately broad, so it will flag an innocent sentence that
+  counts something else too; reword that sentence rather than loosening the
+  guard. (This paragraph is written the way it is for that reason.)
 - Source-grep guards in the test suite fail on a missing anchor instead of
   passing. Slicing app.js between two literals yields the empty string once
   one of them is renamed, and every NEGATIVE assertion made against the
@@ -595,9 +668,11 @@ credited by username.
   Edge Training make is no longer grepped for its arity either: it is a
   named helper that refuses to answer "released" without a pullback mark,
   tested as a property.
-- `npm test` runs the unit tests (about 330 at the time of writing) and a GitHub
-  Actions workflow runs them, plus `node --check` on every module, on every
-  push to `main` and on every pull request.
+- `npm test` runs the unit tests and a GitHub Actions workflow runs them, plus
+  `node --check` on every module, on every push to `main` and on every pull
+  request. The run prints its own count on the last lines; neither this file
+  nor the README quotes a number any more, because both of the numbers they
+  did quote were hundreds out by the time anyone read them.
 - `npm run smoke` (`tools/smoke.js`) drives the real app in headless
   Chromium through every modal and page, runs a full session on a mocked
   Handy API (START / PAUSE / RESUME / STOP / Reset, with the API calls
