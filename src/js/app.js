@@ -4,7 +4,8 @@ import {
     resolveEngineMode,
     gameEdgeReleased,
     clampEdgeHoldPercent,
-    resolveEdgeTriggerHr
+    resolveEdgeTriggerHr,
+    describeEdgeHoldPreview
 } from './engine.js';
 import {
     ORGASM_BOOST_CAP,
@@ -101,6 +102,7 @@ import {
     resolveVoiceCue,
     applyImportedCues,
     describeImport,
+    voiceImportAlert,
     parseVoiceCuesText,
     serializeVoiceCues,
     clampEncourageSeconds
@@ -698,8 +700,9 @@ function updateEngine() {
     // Two heart rates from here on. `sensorHr` is what the monitor measured:
     // every guard, game, counter, the cockpit readout and the session record
     // judge THAT number. `hr` may additionally carry the microphone boost,
-    // which drives the engine's falling tease curve only - never the two
-    // climb games' rising ramps, which read the sensor alone.
+    // which drives the engine's falling tease curve only - never a term that
+    // RISES with arousal (the two climb games' ramps, the milking modes'
+    // secondary), every one of which reads the sensor alone.
     const sensorHr = hr;
     // The boost is frozen with the pulse. Inside the watchdog's hold window
     // the engine keeps the boost measured on the last fresh reading, so an
@@ -2227,17 +2230,14 @@ document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) =
         // are not lost, then let the file win for the cues it carries.
         const live = currentVoiceCues();
         advancedSettings.voiceCues = applyImportedCues(live.cues, parsed.cues);
-        advancedSettings.voiceEncourageSeconds = parsed.encourageSeconds ?? live.encourageSeconds;
+        const nextEncourage = parsed.encourageSeconds ?? live.encourageSeconds;
+        const timerChanged = nextEncourage !== live.encourageSeconds;
+        advancedSettings.voiceEncourageSeconds = nextEncourage;
         renderVoiceCueEditor();
-        // What was really written, not how many keys the file had.
-        const summary = describeImport(parsed.cues);
-        const count = summary.applied.length;
-        const muted = summary.muted.length > 0 ? ` (${summary.muted.length} muted)` : '';
-        if (!persistSettings()) {
-            alert(`Imported ${count} phrase list(s)${muted}, but the browser refused to save them (storage full or unavailable). They are live for this session only.`);
-            return;
-        }
-        alert(`Imported and saved ${count} phrase list(s)${muted}.`);
+        // What was really written, not how many keys the file had: a value
+        // that is not a list of lines keeps the bank, so it is neither
+        // imported nor muted.
+        alert(voiceImportAlert(describeImport(parsed.cues), { saved: persistSettings(), timerChanged }));
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -2432,9 +2432,12 @@ function updateEdgeHoldPreview() {
     // (dual-stim dampening and decay are on by default).
     const max = workingCeiling(limits.minHr, typedMax).maxHr;
     const pct = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
-    const trigger = resolveEdgeTriggerHr(max, pct, limits.minHr);
-    const base = max === typedMax ? `${typedMax}` : `${max}, the working ceiling right now`;
-    preview.textContent = `Pullback at ${trigger} BPM (${pct}% of ${base})`;
+    preview.textContent = describeEdgeHoldPreview({
+        typedMaxHr: typedMax,
+        workingMaxHr: max,
+        minHr: limits.minHr,
+        holdPercent: pct
+    });
 }
 
 document.getElementById('edgeHoldPercentInput')?.addEventListener('input', updateEdgeHoldPreview);

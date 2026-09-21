@@ -35,8 +35,9 @@ credited by username.
   window of zero width, so every 15 s hold for the whole session came back
   NOT YET - KEEP CLIMBING and the game never chose anything at all: climax
   and denial now unlock halfway through the fixed length and grow likelier
-  the nearer it gets. A Mystery roll that happens to land on its own
-  minimum gets the same window instead of the same dead session.
+  the nearer it gets. Only a Fixed length is treated that way: a Mystery
+  roll that happens to land on its own minimum keeps the minimum you typed
+  and ends at it, never halfway through it.
 - The Oracle honours **Soft Landing**. When the target time forces an
   ending it now hands the session to the 45 s tease-down you picked.
   Soft Landing matched neither of the two cases the roll knew, so the
@@ -221,6 +222,14 @@ credited by username.
   the panel promised "Pullback at 147 BPM" for a session that pulled back
   at 131. When the working ceiling differs from the number you typed the
   preview now says so.
+- The same preview stops quoting a percentage that does not produce the BPM
+  beside it. The mark is lifted whenever the percentage would land inside the
+  release band above your Resting HR, and the line still read "Pullback at 94
+  BPM (90% of 95)" - 90% of 95 is 86 - whenever a resting rate sits close
+  under the low Climax HR the README sends prostate users to (Resting 88 /
+  Climax 95). It now says what
+  really happened: "Pullback at 94 BPM - 90% of 95 is 86, lifted to clear your
+  Resting HR (88)".
 - Importing the same settings file twice works (the file input is cleared
   after each import).
 - Stroke zones keep a minimum width; Head Play during warm-up can no longer
@@ -230,6 +239,14 @@ credited by username.
 - Full Stop vs Crawl (10%) at the ceiling is an explicit setting on the
   Guards tab instead of an implicit mode behaviour; Force Orgasm overrides
   both.
+- The Guards tab and the README no longer claim that rule applies in *every*
+  mode. It governs every mode that teases you down, but **Survival Mode** is
+  built the other way round: its speed climbs on its own clock whatever your
+  pulse does, and the run ends when you breach the working ceiling on three
+  consecutive readings, so the primary never parks on the mark. That is the
+  mode working as designed and as its own card describes, so the sentence was
+  wrong rather than the engine - the Guards text, the Survival card and the
+  README now name the exception.
 - Funscript export produces real stroke actions from the recorded speed and
   zone instead of writing the speed percentage as a position.
 - Storage is corruption-safe and trims the oldest history on quota errors;
@@ -360,6 +377,16 @@ credited by username.
   wearer, was holding the gate open. Those two ramps now read the measured
   pulse alone. The tease modes are unchanged: there a louder wearer is still
   treated as closer to the edge, which slows the toys down.
+- Room noise can no longer speed up the INTERNAL toy either. **Prostate
+  Milker**, **Ultimate Milker** and **Ruined Orgasm** cross-fade a rising
+  secondary against the falling primary, and that rising term was reading the
+  boosted pulse: with the wearer's pulse pinned at 100 BPM, a partner talking
+  loudly beside them took the secondary from 26-30 to 52-60 - in the three
+  modes whose secondary channel is a toy inside you. The primary really did
+  ease off, which is what made it look like the promise was kept. Every term
+  that RISES with arousal now reads the pulse your monitor measured, on both
+  channels and in every mode; the falling primary and the stroke-depth
+  contraction still hear the room, because there louder means less motion.
 - The boost is frozen, not dropped, while the signal watchdog is holding a
   reading. The hold window is a fixed 5 s that raising the signal-loss
   timeout does not widen, so a watch or relay app pushing every ~5 s trips
@@ -438,6 +465,17 @@ credited by username.
   so the two buttons gave two answers. Import now writes every bank the file
   mentions, and the alert reports what was really applied (and how many of
   them are mutes) rather than how many keys the file had.
+- **Import phrases** no longer reports a bank as muted when it left that bank
+  alone. A cue set to `null` or to a number in a hand-edited JSON is not a
+  list of lines, so the import keeps the phrases you already had - correct,
+  but the summary counted it as "1 muted" and sent you hunting through 28
+  banks for a silence that was never there. The alert now gives the three
+  answers the import really gave: how many lists were written, how many of
+  those are mutes, and how many entries it could not read and therefore left
+  as they are. A file that writes no bank at all is still honest about the
+  rest of that save: a browser that refused it (storage full or unavailable)
+  is reported, and a build-up timer the file moved is named instead of
+  hidden behind "nothing was changed".
 - A muted cue no longer wipes the dashboard prompt. An emptied bank resolves
   to nothing with voice guidance still on, and that was being treated as
   "voice is off": muting only the build-up encouragement blanked the edge

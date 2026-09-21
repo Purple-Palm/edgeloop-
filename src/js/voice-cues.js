@@ -224,6 +224,14 @@ function linesFrom(value) {
     return [];
 }
 
+// Is this value something an import may WRITE at all? A string or an array is
+// an answer (a list of lines, or - when it sanitises to nothing - a mute).
+// Anything else (null, a number, an object from a hand-edited file) is not an
+// answer, so the bank it names is left exactly as it was.
+export function isWritableCueValue(value) {
+    return typeof value === 'string' || Array.isArray(value);
+}
+
 export function sanitizeCueList(value, fallbackLines = [], maxLines = MAX_PHRASES_PER_CUE) {
     const fallback = linesFrom(fallbackLines).map((line) => sanitizeCueText(line, '')).filter(Boolean);
     const unique = [];
@@ -239,7 +247,7 @@ export function sanitizeCueList(value, fallbackLines = [], maxLines = MAX_PHRASE
     // An emptied box means "say nothing for this cue": a bank the user cleared
     // stays muted. Only an absent (or unusable) value falls back to the
     // factory lines.
-    return (typeof value === 'string' || Array.isArray(value)) ? [] : fallback;
+    return isWritableCueValue(value) ? [] : fallback;
 }
 
 export function mergeVoiceCues(raw) {
@@ -316,17 +324,65 @@ export function applyImportedCues(current, incoming) {
 // The catalog ids an import will really write, and which of them are mutes.
 // The alert used to count the keys in the FILE, which could not be trusted:
 // it over-reported whenever a key was dropped, and it can say nothing about
-// how many banks the file silences.
+// how many banks the file silences. It must ask exactly the question
+// `applyImportedCues` answers, key by key: a cue whose value is not writable
+// (null, a number - hand-edited files do that) keeps the lines the user
+// already had, so it is neither imported nor muted. Reporting it as a mute
+// sent the wearer hunting for a silent bank that was never touched.
 export function describeImport(incoming) {
     const applied = [];
     const muted = [];
-    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return { applied, muted };
+    const skipped = [];
+    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return { applied, muted, skipped };
     for (const cue of VOICE_CUE_CATALOG) {
         if (!Object.prototype.hasOwnProperty.call(incoming, cue.id)) continue;
+        if (!isWritableCueValue(incoming[cue.id])) {
+            skipped.push(cue.id);
+            continue;
+        }
         applied.push(cue.id);
         if (sanitizeCueList(incoming[cue.id], []).length === 0) muted.push(cue.id);
     }
-    return { applied, muted };
+    return { applied, muted, skipped };
+}
+
+// The sentence the wearer reads after an import. It reports the three
+// answers the import actually gave each bank the file names: written,
+// written empty (a mute they chose), and left alone because the value was
+// not a list of lines at all.
+export function voiceImportAlert(
+    { applied = [], muted = [], skipped = [] } = {},
+    { saved = true, timerChanged = false } = {}
+) {
+    const lists = (n) => `${n} phrase list${n === 1 ? '' : 's'}`;
+    const kept = skipped.length > 0
+        ? ` ${lists(skipped.length)} in the file ${skipped.length === 1 ? 'was' : 'were'} not lines of text,`
+            + ` so ${skipped.length === 1 ? 'that bank was' : 'those banks were'} left as ${skipped.length === 1 ? 'it is' : 'they are'}.`
+        : '';
+    if (applied.length === 0) {
+        // A refused save is still reported: this same save also carries the
+        // phrase edits made on screen before the import, and the build-up
+        // timer the file may have moved, so "nothing was changed" would be a
+        // promise the browser did not keep.
+        if (!saved) {
+            return 'No phrase list was imported, and the browser refused to save'
+                + ' (storage full or unavailable), so anything else you changed is'
+                + ` live for this session only.${kept}`;
+        }
+        // A file may carry no usable phrase bank and still move the build-up
+        // timer, which this same save wrote: saying "nothing was changed"
+        // would send the wearer away believing their timer is untouched.
+        if (timerChanged) {
+            return `No phrase list was imported. The build-up timer in the file was applied and saved.${kept}`;
+        }
+        return `Nothing was imported and nothing was changed.${kept}`.trim();
+    }
+    const mutedClause = muted.length > 0 ? ` (${muted.length} muted)` : '';
+    if (!saved) {
+        return `Imported ${lists(applied.length)}${mutedClause}, but the browser refused to save`
+            + ` (storage full or unavailable). The new phrases are live for this session only.${kept}`;
+    }
+    return `Imported and saved ${lists(applied.length)}${mutedClause}.${kept}`;
 }
 
 function presentCueMap(src) {

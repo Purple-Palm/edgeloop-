@@ -16,6 +16,7 @@ import {
     applyImportedCues,
     serializeVoiceCues,
     describeImport,
+    voiceImportAlert,
     clampEncourageSeconds,
     DEFAULT_ENCOURAGE_SECONDS
 } from './voice-cues.js';
@@ -200,8 +201,95 @@ describe('voice cue templates', () => {
         const summary = describeImport({ forceOrgasm: [], edge: ['One.'], notACue: ['x'] });
         assert.deepEqual(summary.applied, ['edge', 'forceOrgasm']);
         assert.deepEqual(summary.muted, ['forceOrgasm']);
-        assert.deepEqual(describeImport(null), { applied: [], muted: [] });
-        assert.deepEqual(describeImport('nope'), { applied: [], muted: [] });
+        assert.deepEqual(summary.skipped, []);
+        assert.deepEqual(describeImport(null), { applied: [], muted: [], skipped: [] });
+        assert.deepEqual(describeImport('nope'), { applied: [], muted: [], skipped: [] });
+    });
+
+    it('never calls a bank muted that the import left alone', () => {
+        // A hand-edited JSON with a cue set to null or a number: the import
+        // keeps the lines the user already had (correct), so the summary must
+        // not send them hunting for a bank that has gone silent.
+        const current = { edge: ['Mine.'], forceOrgasm: ['Now.'], cameEarly: ['Oh.'] };
+        const incoming = { edge: null, forceOrgasm: 7, cameEarly: [] };
+        const after = applyImportedCues(current, incoming);
+        assert.deepEqual(after.edge, ['Mine.'], 'an unusable value leaves the bank untouched');
+        assert.deepEqual(after.forceOrgasm, ['Now.']);
+        assert.deepEqual(after.cameEarly, [], 'an empty list is a real mute');
+
+        const summary = describeImport(incoming);
+        assert.deepEqual(summary.applied, ['cameEarly'], 'only the bank that was really written');
+        assert.deepEqual(summary.muted, ['cameEarly'], 'and only the bank that really went silent');
+        assert.deepEqual(summary.skipped, ['edge', 'forceOrgasm'], 'the banks the file could not write');
+
+        const text = voiceImportAlert(summary);
+        assert.ok(/1 phrase list \(1 muted\)/.test(text), text);
+        assert.ok(/2 phrase lists in the file were not lines of text/.test(text), text);
+        assert.equal(/2 muted/.test(text), false, 'a bank that was left alone is not a mute');
+    });
+
+    it('says nothing was changed when the file wrote nothing', () => {
+        const summary = describeImport({ edge: null });
+        assert.deepEqual(summary.applied, []);
+        const text = voiceImportAlert(summary);
+        assert.ok(/Nothing was imported/.test(text), text);
+        assert.equal(/muted/.test(text), false, text);
+        // The unsaved wording still reports the same three answers.
+        const partial = voiceImportAlert(describeImport({ edge: ['A.'], forceOrgasm: 7 }), { saved: false });
+        assert.ok(/Imported 1 phrase list/.test(partial), partial);
+        assert.ok(/refused to save/.test(partial), partial);
+        assert.ok(/was not lines of text/.test(partial), partial);
+        // The same save carries the phrase edits made on screen before the
+        // import and the build-up timer the file may have moved, so a refused
+        // save must be reported even when the file wrote no bank at all.
+        const none = voiceImportAlert(describeImport({ edge: null }), { saved: false });
+        assert.ok(/refused to save/.test(none), none);
+        assert.equal(/nothing was changed/.test(none), false, none);
+    });
+
+    it('does not claim nothing changed when the file moved the build-up timer', () => {
+        // {"voiceCues":{"edge":null},"voiceEncourageSeconds":60}: no bank is
+        // writable, so nothing is imported - but the same save wrote the new
+        // timer, and the wearer must not be told their settings are untouched.
+        const summary = describeImport({ edge: null });
+        const moved = voiceImportAlert(summary, { saved: true, timerChanged: true });
+        assert.ok(/build-up timer/.test(moved), moved);
+        assert.equal(/nothing was changed/.test(moved), false, moved);
+        const still = voiceImportAlert(summary, { saved: true, timerChanged: false });
+        assert.ok(/Nothing was imported and nothing was changed\./.test(still), still);
+        // A refused save still outranks the timer note: the report of the
+        // failure is the part that must survive.
+        const refused = voiceImportAlert(summary, { saved: false, timerChanged: true });
+        assert.ok(/refused to save/.test(refused), refused);
+    });
+
+    it('the summary asks exactly the question the import answers', () => {
+        // The property, over every shape a file can hand a cue: a bank counts
+        // as imported if and only if applyImportedCues changed what it would
+        // have been, and as muted if and only if it ends up empty.
+        const values = [null, 7, {}, true, undefined, [], '', ['A line.'], 'A line.\n\nB line.', ['  ', '']];
+        for (const value of values) {
+            const current = { edge: ['Existing.'] };
+            const incoming = { edge: value };
+            const after = applyImportedCues(current, incoming);
+            const summary = describeImport(incoming);
+            const untouched = after.edge.length === 1 && after.edge[0] === 'Existing.';
+            const wrote = typeof value === 'string' || Array.isArray(value);
+            assert.equal(
+                summary.applied.includes('edge'),
+                wrote,
+                `applied must match what was written for ${JSON.stringify(value)}`
+            );
+            assert.equal(
+                summary.muted.includes('edge'),
+                after.edge.length === 0,
+                `muted must match the silence for ${JSON.stringify(value)}`
+            );
+            if (!wrote) {
+                assert.ok(untouched, `an unusable value must keep the bank: ${JSON.stringify(value)}`);
+                assert.equal(summary.muted.includes('edge'), false);
+            }
+        }
     });
 
     it('refuses text above the first section instead of speaking it as a phrase', () => {

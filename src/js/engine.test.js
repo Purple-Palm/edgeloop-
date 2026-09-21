@@ -13,6 +13,7 @@ import {
     SHORTENER_TOP_PERCENT,
     clampEdgeHoldPercent,
     resolveEdgeTriggerHr,
+    describeEdgeHoldPreview,
     DEFAULT_EDGE_HOLD_PERCENT,
     MIN_EDGE_HOLD_PERCENT,
     MAX_EDGE_HOLD_PERCENT,
@@ -767,5 +768,252 @@ describe('game-side edge release', () => {
             );
         }
         assert.equal(seen, guarded.length, 'every call site must have been inspected');
+    });
+});
+
+describe('the microphone boost can never raise either channel', () => {
+    // The promise the panel, the README and the engine comment all make to
+    // the wearer: a louder room may only ever ease the toys off. It held for
+    // every FALLING primary, but the milking modes cross-fade a RISING
+    // secondary against that primary, and that term was reading the boosted
+    // pulse: with the pulse pinned at 100 BPM an injected boost took the
+    // secondary from 26-30 to 52-60, so a partner talking next to the wearer
+    // sped up an internal toy. Sweep every mode, every game sub-state and
+    // both ceiling rules, and assert it of BOTH channels.
+    const modeStates = {
+        oracle: { key: 'oracleState', values: ['APPROACH', 'HOLD', 'PURGATORY', 'CLIMAX', 'DENIAL'] },
+        edgetrain: { key: 'trainingState', values: ['climb', 'hold', 'recover', 'finish'] }
+    };
+
+    const sweep = (visit) => {
+        for (const mode of ENGINE_MODES) {
+            const sub = modeStates[mode] || { key: 'unusedState', values: [null] };
+            for (const subState of sub.values) {
+                for (const ceilingBehaviour of ['stop', 'crawl']) {
+                    for (const isEdged of [false, true]) {
+                        for (const orgasmMode of [false, true]) {
+                            for (const sessionStatus of ['RUNNING', 'RAMPDOWN']) {
+                                for (const edgeHoldPercent of [90, 100]) {
+                                    for (const extras of [
+                                        {},
+                                        { warmupMinutes: 5, sessionSeconds: 60 },
+                                        { cadenceBreathing: true, milkingWave: true, sessionSeconds: 7 },
+                                        { stallGuardEngaged: true },
+                                        { intensityValue: 100 },
+                                        { edgeStrokeDepth: 40, ruinHoldSeconds: 3 }
+                                    ]) {
+                                        visit({
+                                            ...running,
+                                            activeMode: mode,
+                                            [sub.key]: subState,
+                                            ceilingBehaviour,
+                                            isEdged,
+                                            orgasmMode,
+                                            sessionStatus,
+                                            edgeHoldPercent,
+                                            ...extras
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    it('sweeps the engine\'s real sub-states, not names it made up', () => {
+        // The table above writes the state names out by hand, so a rename in
+        // engine.js would quietly send every sweep down the default branch
+        // and narrow this whole file's coverage without failing anything.
+        // Anchor it in behaviour: a state with its own branch must NOT look
+        // like an unknown one, and the two that ARE the default branch
+        // (Oracle APPROACH, Edge Training climb) must look exactly like it.
+        const defaultBranch = { oracle: 'APPROACH', edgetrain: 'climb' };
+        for (const [mode, sub] of Object.entries(modeStates)) {
+            const shape = (value) => {
+                const out = calculateEngineOutputs({
+                    ...running,
+                    activeMode: mode,
+                    [sub.key]: value,
+                    hr: 118,
+                    edgeHr: 118
+                });
+                return [
+                    out.primaryPercent, out.secondaryPercent,
+                    out.strokeMinPercent, out.strokeMaxPercent
+                ].join('/');
+            };
+            const unknown = shape('__no_such_state__');
+            for (const value of sub.values) {
+                if (value === defaultBranch[mode]) {
+                    assert.equal(shape(value), unknown, `${mode}/${value} is meant to BE the default branch`);
+                } else {
+                    assert.notEqual(
+                        shape(value),
+                        unknown,
+                        `${mode}/${value} no longer has its own branch in engine.js - if it was renamed,`
+                            + ' rename it here too, or this sweep silently stops covering it'
+                    );
+                }
+            }
+        }
+    });
+
+    it('holds for every mode, every sub-state and every measured pulse', () => {
+        let checked = 0;
+        sweep((base) => {
+            for (const sensorHr of [70, 85, 100, 118, 126, 135, 140]) {
+                // The boost is clamped to the working ceiling in app.js, so
+                // the loop never sees more than that.
+                for (const boost of [1, 5, 8, 20]) {
+                    const quiet = calculateEngineOutputs({ ...base, hr: sensorHr, edgeHr: sensorHr });
+                    const loud = calculateEngineOutputs({
+                        ...base,
+                        hr: Math.min(base.maxHr, sensorHr + boost),
+                        edgeHr: sensorHr
+                    });
+                    const where = `${base.activeMode}/${base.oracleState || base.trainingState || '-'}`
+                        + ` ${base.sessionStatus} ${base.ceilingBehaviour}`
+                        + ` edged=${base.isEdged} orgasm=${base.orgasmMode}`
+                        + ` hr=${sensorHr} +${boost}`;
+                    assert.ok(
+                        loud.primaryPercent <= quiet.primaryPercent,
+                        `${where}: boost raised the primary ${quiet.primaryPercent} -> ${loud.primaryPercent}`
+                    );
+                    assert.ok(
+                        loud.secondaryPercent <= quiet.secondaryPercent,
+                        `${where}: boost raised the secondary ${quiet.secondaryPercent} -> ${loud.secondaryPercent}`
+                    );
+                    // A boost must not invent an edge or release one either.
+                    assert.equal(loud.isEdged, quiet.isEdged, `${where}: boost moved the edge flag`);
+                    assert.equal(loud.newEdgeTriggered, quiet.newEdgeTriggered, `${where}: boost counted an edge`);
+                    checked += 1;
+                }
+            }
+        });
+        assert.ok(checked > 2000, `expected a real sweep, ran ${checked} comparisons`);
+    });
+
+    it('still eases the milking secondary off, and only off', () => {
+        // The measured regression, pinned: pulse 100, Prostate Milker.
+        const base = { ...running, activeMode: 'milker', hr: 100, edgeHr: 100, isEdged: false };
+        const quiet = calculateEngineOutputs(base);
+        const loud = calculateEngineOutputs({ ...base, hr: 120 });
+        assert.equal(loud.secondaryPercent, quiet.secondaryPercent, 'the rising secondary reads the sensor alone');
+        assert.ok(loud.primaryPercent < quiet.primaryPercent, 'the falling primary still hears the room');
+        // The depth contraction keeps reading the boosted pulse: less travel.
+        const deep = { ...base, edgeStrokeDepth: 40 };
+        const deepQuiet = calculateEngineOutputs(deep);
+        const deepLoud = calculateEngineOutputs({ ...deep, hr: 120 });
+        assert.ok(deepLoud.strokeMaxPercent < deepQuiet.strokeMaxPercent, 'the boost still shortens the stroke');
+    });
+
+    it('a rising secondary on the measured pulse is not frozen', () => {
+        // Easing off must not mean "deaf": the cross-fade still follows the
+        // wearer's own pulse all the way up.
+        const low = calculateEngineOutputs({ ...running, activeMode: 'milker', hr: 80, edgeHr: 80 });
+        const high = calculateEngineOutputs({ ...running, activeMode: 'milker', hr: 130, edgeHr: 130 });
+        assert.ok(high.secondaryPercent > low.secondaryPercent);
+    });
+});
+
+describe('the Guards pullback preview', () => {
+    it('quotes the percentage only while the percentage is what produced the mark', () => {
+        assert.equal(
+            describeEdgeHoldPreview({ typedMaxHr: 140, workingMaxHr: 140, minHr: 70, holdPercent: 100 }),
+            'Pullback at 140 BPM (100% of 140)'
+        );
+        assert.equal(
+            describeEdgeHoldPreview({ typedMaxHr: 140, workingMaxHr: 125, minHr: 70, holdPercent: 95 }),
+            'Pullback at 119 BPM (95% of 125, the working ceiling right now)'
+        );
+    });
+
+    it('says what really happened when the resting-rate floor lifts the mark', () => {
+        // A low prostate ceiling of the kind the README sends you to
+        // (Climax 92-95) with a resting rate close under it: Resting 88,
+        // Climax 95, Pullback 90%. The mark is lifted to 94 to leave the
+        // 5 BPM release band, and 90% of 95 is 86 - the old line printed
+        // both numbers side by side and one of them was fiction.
+        const text = describeEdgeHoldPreview({ typedMaxHr: 95, workingMaxHr: 95, minHr: 88, holdPercent: 90 });
+        assert.equal(text, 'Pullback at 94 BPM - 90% of 95 is 86, lifted to clear your Resting HR (88)');
+        assert.equal(resolveEdgeTriggerHr(95, 90, 88), 94);
+    });
+
+    it('never prints a percentage that does not produce the BPM beside it', () => {
+        // The property, over every pair the inputs allow: if the line reads
+        // "N BPM (P% of M)" then P% of M must really be N.
+        let lifted = 0;
+        for (let minHr = 40; minHr <= 120; minHr += 4) {
+            for (let maxHr = minHr + 1; maxHr <= 200; maxHr += 3) {
+                for (let pct = MIN_EDGE_HOLD_PERCENT; pct <= MAX_EDGE_HOLD_PERCENT; pct += 1) {
+                    const text = describeEdgeHoldPreview({
+                        typedMaxHr: maxHr, workingMaxHr: maxHr, minHr, holdPercent: pct
+                    });
+                    const trigger = resolveEdgeTriggerHr(maxHr, pct, minHr);
+                    assert.ok(text.startsWith(`Pullback at ${trigger} BPM`), text);
+                    const quoted = text.match(/\((\d+)% of (\d+)\)$/);
+                    if (quoted) {
+                        assert.equal(
+                            Math.min(maxHr, Math.max(1, Math.round(Number(quoted[2]) * (Number(quoted[1]) / 100)))),
+                            trigger,
+                            `the quoted percentage must produce the mark: ${text}`
+                        );
+                    } else {
+                        lifted += 1;
+                        assert.ok(/lifted to clear your Resting HR/.test(text), text);
+                        assert.ok(text.includes(`${pct}% of ${maxHr} is `), text);
+                    }
+                }
+            }
+        }
+        assert.ok(lifted > 0, 'the sweep must have covered the lifted case');
+    });
+
+    it('does not fall over without usable limits', () => {
+        const text = describeEdgeHoldPreview({ typedMaxHr: NaN, workingMaxHr: NaN, minHr: NaN, holdPercent: 95 });
+        assert.equal(typeof text, 'string');
+        assert.ok(text.length > 0);
+    });
+});
+
+describe('Survival Mode is the documented exception to the ceiling rule', () => {
+    it('keeps climbing whatever the At-the-ceiling setting says', () => {
+        // Deliberate and self-terminating: the run ends on a breach, which is
+        // why the Guards text, the mode card and the README name Survival as
+        // the one mode Full Stop / Crawl does not govern.
+        for (const ceilingBehaviour of ['stop', 'crawl']) {
+            const onTheMark = calculateEngineOutputs({
+                ...running,
+                activeMode: 'survival',
+                survivalSpeedFloor: 61,
+                hr: 140,
+                isEdged: true,
+                ceilingBehaviour
+            });
+            assert.equal(onTheMark.primaryPercent, 61, `survival ignores ${ceilingBehaviour} by design`);
+        }
+    });
+
+    it('the Guards text, the mode card and the README all say so', () => {
+        const read = (name) => readFileSync(new URL(`../../${name}`, import.meta.url), 'utf8');
+        const guards = read('index.html');
+        const readme = read('README.md');
+        const claims = [
+            ['index.html Guards text', guards.match(/Crawl<\/strong> keeps a 10% micro-motion[\s\S]*?<\/p>/)],
+            ['README Guards bullet', readme.match(/\*Crawl\* keeps a 10% micro-motion[^\n]*/)]
+        ];
+        for (const [where, match] of claims) {
+            assert.ok(match, `${where}: anchor missing, the guard would be vacuous`);
+            assert.ok(
+                /Survival Mode/.test(match[0]),
+                `${where} claims the ceiling rule applies everywhere without naming Survival: ${match[0]}`
+            );
+        }
+        const card = guards.match(/Speed steadily accelerates[^<]*/);
+        assert.ok(card, 'Survival mode card anchor missing');
+        assert.ok(/At the ceiling/.test(card[0]), `the Survival card must say the rule does not govern it: ${card[0]}`);
     });
 });

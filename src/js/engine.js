@@ -54,6 +54,30 @@ export function resolveEdgeTriggerHr(maxHr, holdPercent = DEFAULT_EDGE_HOLD_PERC
     return Math.max(capped, lowest);
 }
 
+// The Guards preview line. The pullback mark is NOT always the percentage
+// of the ceiling: `resolveEdgeTriggerHr` lifts it whenever that percentage
+// would land inside the release band above the resting rate, and a preview
+// that still quoted the percentage described a number it was no longer
+// producing ("Pullback at 94 BPM (90% of 95)" for a Resting 88 / Climax 95
+// pair, where 90% of 95 is 86 - a resting rate sitting close under the low
+// Climax HR the README sends prostate users to). It now says what actually
+// happened instead.
+export function describeEdgeHoldPreview({ typedMaxHr, workingMaxHr, minHr, holdPercent } = {}) {
+    const pct = clampEdgeHoldPercent(holdPercent, DEFAULT_EDGE_HOLD_PERCENT);
+    const max = Number.isFinite(workingMaxHr) ? workingMaxHr : typedMaxHr;
+    if (!Number.isFinite(max)) return 'Pullback mark: type a Resting and a Climax HR first.';
+    const trigger = resolveEdgeTriggerHr(max, pct, minHr);
+    const base = max === typedMaxHr ? `${typedMaxHr}` : `${max}, the working ceiling right now`;
+    // The mark the percentage alone would give, before the resting-rate floor.
+    const fromPercent = Math.min(max, Math.max(1, Math.round(max * (pct / 100))));
+    if (trigger === fromPercent) {
+        return `Pullback at ${trigger} BPM (${pct}% of ${base})`;
+    }
+    const baseMid = max === typedMaxHr ? `${typedMaxHr}` : `${max}, the working ceiling right now,`;
+    return `Pullback at ${trigger} BPM - ${pct}% of ${baseMid} is ${fromPercent}, `
+        + `lifted to clear your Resting HR (${minHr})`;
+}
+
 export function edgeReleaseHr(maxHr, triggerHr) {
     if (!Number.isFinite(maxHr)) return maxHr;
     const top = Number.isFinite(triggerHr) ? Math.min(maxHr, triggerHr) : maxHr;
@@ -125,8 +149,8 @@ export function calculateEngineOutputs({
     // shares it (`strokeMax` everywhere, plus `strokeMin` in Glans Protector
     // and Head Play): more progress there means less motion, so the boost can
     // only ever back the toys off. The edge flag, every guard, game and
-    // counter, and the two climb games' rising ramps all judge `edgeHr`, the
-    // pulse that was actually measured.
+    // counter, the two climb games' rising ramps and every RISING secondary
+    // (milker) term all judge `edgeHr`, the pulse that was actually measured.
     edgeHr,
     minHr,
     maxHr,
@@ -207,12 +231,15 @@ export function calculateEngineOutputs({
     const span = Math.max(1, triggerHr - minHr);
     const rawProgress = clamp((hr - minHr) / span, 0, 1);
     const progress = Math.pow(rawProgress, gammaSafe);
-    // The same curve on the MEASURED pulse. Every tease mode maps progress
-    // onto a falling speed, so the boost can only ever back the motors off
-    // there. The two climb games invert it (`48 + progress * 52`), where the
-    // boost would instead drive the primary UP - to 100% for the last BPM of
-    // the approach, in the exact window the wearer is closest to climax, off
-    // nothing but room noise. Those ramps read the sensor alone.
+    // The same curve on the MEASURED pulse, for every term that RISES with
+    // progress. Each tease mode maps progress onto a falling primary, so the
+    // boost can only ever back that channel off. But the climb games invert
+    // it (`48 + progress * 52`), and the milking modes cross-fade a rising
+    // secondary against that falling primary (`20 + progress * 80`): fed the
+    // boosted pulse, both drive a motor UP on nothing but room noise - the
+    // primary to 100% for the last BPM of the approach, the internal toy from
+    // a measured 26-30 to 52-60. Every rising term reads the sensor alone, so
+    // the microphone can only ever ease the toys off, on either channel.
     const sensorRawProgress = clamp((edgeSource - minHr) / span, 0, 1);
     const climbProgress = Math.pow(sensorRawProgress, gammaSafe);
 
@@ -274,7 +301,7 @@ export function calculateEngineOutputs({
             secondaryPercent = 100;
         } else {
             primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (progress * 80));
+            secondaryPercent = Math.round(20 + (climbProgress * 80));
         }
         strokeMaxPercent = Math.round(100 - (progress * depthContractAmount));
     } else if (mode === 'shortener') {
@@ -294,7 +321,7 @@ export function calculateEngineOutputs({
             strokeMaxPercent = Math.max(25, depthSafe);
         } else {
             primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (progress * 80));
+            secondaryPercent = Math.round(20 + (climbProgress * 80));
             strokeMaxPercent = Math.max(25, Math.round(100 - (progress * depthContractAmount)));
         }
     } else if (mode === 'ruin') {
@@ -304,7 +331,7 @@ export function calculateEngineOutputs({
             strokeMaxPercent = 25;
         } else {
             primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (progress * 60));
+            secondaryPercent = Math.round(20 + (climbProgress * 60));
         }
     } else {
         applyClassicTease();
