@@ -156,22 +156,16 @@ credited by username.
   margin is The Handy's alone: a T-Code or Intiface linear axis takes a
   wider zone as a longer, slower stroke, not a faster one, so those keep the
   travel envelope unchanged.
-- A Handy that stops its own slider is named instead of going quiet. While a
-  session is driving it, the 10 s connectivity poll also asks `GET
-  /hamp/state`; a device that reports STOPPED twice in a row while it is
-  being told to move has stopped itself, so the session pauses, every toy is
-  stopped and the banner says what happened and which setting to change,
-  rather than leaving a dead toy and no explanation. Two reads, not one, so
-  a stop that landed while the poll was in flight cannot trigger it, and any
-  reply the API v2 spec does not document is ignored rather than treated as
-  a fault. Resuming into a device that is still locked out is reported
-  again rather than met with silence. The state read is an optional probe:
-  a device that refuses it three times over (a firmware-4 compatibility
-  shim that does not serve it) is not asked again for the rest of the
-  connection, and its refusals never reach the status line - nobody should
-  be shown an error for a call they did not ask for. API v2 has exactly one
-  HAMP error code, so a device-side fault arriving as that error is also
-  explained now instead of showing only "Unspecified HAMP error".
+- A motion command the device refuses is explained instead of being left as
+  "Unspecified HAMP error". API v2 has exactly one code in that band, so a
+  refusal can never name its own cause; the Handy modal now adds what the
+  firmware does about a slider it reads as blocked, and which two settings -
+  the travel envelope and the end-stop margin - are the ones to change. Said
+  once per connection, because it is the same news every tick afterwards.
+  It only informs: EdgeLoop never concludes a lockout by itself and this
+  pauses nothing. Deciding when to give up on a device is still the job of
+  the offline detection - consecutive failed commands and the `/connected`
+  poll - and of the stops it issues.
 - The device tells us when it did not take the stroke range we sent - `PUT
   /slide` answers with a rounded-up or rounded-down result code - and that
   is now read back and shown in the Handy modal once per connection, instead
