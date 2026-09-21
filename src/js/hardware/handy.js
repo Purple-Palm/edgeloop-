@@ -9,8 +9,10 @@
 //      key that stop uses, so Disconnect or a reconnect can never orphan a
 //      moving device.
 //   2. Never exceed the user's hardware envelope; the stroke range sent to
-//      PUT /slide is always normalised through handy-protocol.js, and the
-//      range is confirmed by the API before the motor is started.
+//      PUT /slide is always normalised through handy-protocol.js, then inset
+//      from the mechanical ends by the end-stop margin (a subset of the
+//      normalised range, so the envelope still bounds it), and the range is
+//      confirmed by the API before the motor is started.
 //   3. Stay under the API rate limit: velocity is throttled to one call per
 //      400 ms and the slide range to one call per second unless it changed.
 //
@@ -20,8 +22,13 @@
 import {
     HANDY_API_BASE,
     HANDY_MODE,
+    HANDY_DEFAULT_END_MARGIN,
+    applyEndMargin,
     classifyHandyResponse,
     clampVelocity,
+    describeDeviceStop,
+    describeSlideAdjustment,
+    isHampModeError,
     normalizeSlideRange,
     parseBatteryLevel,
     describeHandyInfo
@@ -69,6 +76,10 @@ let handyLastStrokeSend = 0;
 let handyLastStrokeSent = { min: -1, max: -1 };
 let handyLastVelocitySent = -1;
 let handyPendingVelocity = 0;
+// One notice per connection each: the device's own HAMP error band, and a
+// PUT /slide the device rounded to numbers of its own.
+let hampFaultNotified = false;
+let slideAdjustNotified = false;
 
 // Every start/stop bumps this. A start promise that resolves after a later
 // command sees a different generation and must not touch the running flag.
@@ -96,6 +107,7 @@ const handlers = {
     onError: null,
     onOffline: null,
     onStopUnconfirmed: null,
+    onNotice: null,
     isSessionActive: null
 };
 
@@ -103,11 +115,13 @@ const handlers = {
 //   onError(message | null)     -> non-null: show the API error; null: the failing call succeeded again
 //   onOffline(reason)           -> the device stopped answering; motors must be treated as stopped
 //   onStopUnconfirmed(message)  -> a stop the device may have needed was never confirmed by the API
+//   onNotice(message)           -> the device said something worth reading; not an error, not a fault
 //   isSessionActive()           -> true while a session is RUNNING or RAMPDOWN
-export function setHandyHandlers({ onError, onOffline, onStopUnconfirmed, isSessionActive } = {}) {
+export function setHandyHandlers({ onError, onOffline, onStopUnconfirmed, onNotice, isSessionActive } = {}) {
     if (onError !== undefined) handlers.onError = onError;
     if (onOffline !== undefined) handlers.onOffline = onOffline;
     if (onStopUnconfirmed !== undefined) handlers.onStopUnconfirmed = onStopUnconfirmed;
+    if (onNotice !== undefined) handlers.onNotice = onNotice;
     if (isSessionActive !== undefined) handlers.isSessionActive = isSessionActive;
 }
 
@@ -126,6 +140,12 @@ export function isHandyMoving() {
 // True while the driver cannot vouch for the device being stopped.
 export function isHandyMotionUnknown() {
     return handyMotionUnknown;
+}
+
+// Every "once per connection" latch, cleared when the link changes.
+function resetDeviceNotices() {
+    hampFaultNotified = false;
+    slideAdjustNotified = false;
 }
 
 function callHandler(name, ...args) {
@@ -200,6 +220,9 @@ async function handyRequest(path, { method = 'GET', body = undefined, key = hand
     const verdict = classifyHandyResponse(res.ok, res.status, data, path);
     if (!verdict.ok) {
         noteFailure(path, verdict.message, countFailure, tick);
+        // Every call the driver makes is one the session asked for, so a HAMP
+        // refusal of it is worth explaining to the wearer.
+        noteHampFault(verdict.code);
         throw new Error(verdict.message);
     }
     if (countFailure) consecutiveDispatchFailures = 0;
@@ -217,6 +240,18 @@ function noteFailure(path, message, countFailure, tick) {
     if (handyConnected && consecutiveDispatchFailures >= OFFLINE_DISPATCH_FAILURES) {
         markOffline(`The Handy stopped responding (${consecutiveDispatchFailures} failed commands).`);
     }
+}
+
+// API v2 has exactly one HAMP error code, ERROR(3000) "Unspecified HAMP
+// error", so a slider the firmware has locked out arrives - if it arrives at
+// all - as that and nothing else. We cannot claim which fault it was, only
+// say what the device does and what the wearer can change. Once per
+// connection: a device that keeps refusing would otherwise repeat it every
+// tick, and the failure itself is already on the status line.
+function noteHampFault(code) {
+    if (!isHampModeError(code) || hampFaultNotified) return;
+    hampFaultNotified = true;
+    callHandler('onNotice', describeDeviceStop(`The Handy refused a motion command (HAMP error ${code}).`));
 }
 
 // The retry loop behind every verified stop: PUT /hamp/stop for `key`, up
@@ -406,6 +441,7 @@ export async function connectHandy(key) {
     handyLastVelocitySent = -1;
     handyLastSend = 0;
     handyLastStrokeSend = 0;
+    resetDeviceNotices();
     startOfflinePolling();
 
     return {
@@ -435,6 +471,7 @@ export function disconnectHandy() {
     handyInfo = null;
     handyLastStrokeSent = { min: -1, max: -1 };
     handyLastVelocitySent = -1;
+    resetDeviceNotices();
     if (!wasConnected || !key) return Promise.resolve(true);
     return stopForeignDevice(key);
 }
@@ -551,7 +588,16 @@ function sendVelocity(velocity) {
 function sendSlide(range) {
     handyLastStrokeSent = { min: range.min, max: range.max };
     return handyRequest('/slide', { method: 'PUT', body: { min: range.min, max: range.max } })
-        .then(() => true)
+        .then((body) => {
+            // The device reports when it did not take our numbers. Said once
+            // per connection: it is the same news every tick afterwards.
+            const adjusted = describeSlideAdjustment(body, range);
+            if (adjusted && !slideAdjustNotified) {
+                slideAdjustNotified = true;
+                callHandler('onNotice', adjusted);
+            }
+            return true;
+        })
         .catch(() => {
             handyLastStrokeSent = { min: -1, max: -1 };
             return false;
@@ -562,7 +608,10 @@ function sendSlide(range) {
 // that app.js has ALREADY mapped into the hardware envelope (engine.js does
 // the mapping); the envelope arguments are used only to widen a too-narrow
 // range in the right direction without leaving the user's bounds.
-export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false, envMin = 0, envMax = 100) {
+// `endMargin` is the wearer's end-stop margin in percent of travel (0 = off):
+// it can only inset the normalised range, never widen it, so the envelope
+// still bounds everything that reaches the device.
+export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false, envMin = 0, envMax = 100, endMargin = HANDY_DEFAULT_END_MARGIN) {
     if (!handyConnected || !handyKey) return;
     const now = Date.now();
     if (!force && (now - handyLastSend < VELOCITY_THROTTLE_MS)) return;
@@ -582,7 +631,7 @@ export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false,
     // A reconnect is stopping this device before replacing it: no motion.
     if (handySwitching) return;
 
-    const range = normalizeSlideRange(strokeMin, strokeMax, envMin, envMax);
+    const range = applyEndMargin(normalizeSlideRange(strokeMin, strokeMax, envMin, envMax), endMargin);
     const rangeChanged = range.min !== handyLastStrokeSent.min || range.max !== handyLastStrokeSent.max;
     let rangeConfirmed = Promise.resolve(true);
     if (force || rangeChanged || (now - handyLastStrokeSend > STROKE_THROTTLE_MS)) {

@@ -19,6 +19,25 @@ export const HANDY_RESULT_ERROR = -1;
 // jams the sleeve in place and gives the user no stroke at all.
 export const HANDY_MIN_SLIDE_GAP = 10;
 
+// How far (in percent of travel) the driver keeps the commanded stroke away
+// from the mechanical ends at 0 and 100.
+//
+// The Handy's firmware stops the slider when it decides the carriage is
+// blocked (ERROR_SLIDER_BLOCKED / the slider_blocked event in API v3), and a
+// carriage thrown into its own end stop looks exactly like a blocked one.
+// Forum user X333 hit that lockout on a Handy 2 and worked around it by
+// typing guards either side of 0 and 100 by hand.
+//
+// 5% is 5.5 mm on the 110 mm Handy 1 slider and 6.25 mm on the 125 mm Handy 2
+// Pro, so it is never smaller than the 5 mm the firmware's own documented end
+// zone (x_end_zone_size, API v3 SliderSettings) reserves for slowing down.
+// There is no vendor statement of a safe margin, so this is the smallest
+// number derived from a published vendor constant rather than invented. It is
+// a default, not a law: the Handy panel takes 0-10 and 0 sends the range
+// exactly as the engine asked for it.
+export const HANDY_DEFAULT_END_MARGIN = 5;
+export const HANDY_MAX_END_MARGIN = 10;
+
 function toInt(value, fallback) {
     if (value === '' || value === null || value === undefined) return fallback;
     const n = Number(value);
@@ -77,6 +96,68 @@ export function normalizeEnvelope(min, max, changed = 'max', minGap = HANDY_MIN_
 
 export function clampVelocity(velocity) {
     return clampPercent(velocity, 0);
+}
+
+export function clampEndMargin(value, fallback = HANDY_DEFAULT_END_MARGIN) {
+    const n = toInt(value, fallback);
+    return Math.max(0, Math.min(HANDY_MAX_END_MARGIN, n));
+}
+
+// Inset an already-normalised slide range away from 0 and 100 by `margin`.
+//
+// The result is ALWAYS a subset of the range it was handed, which is what
+// makes it safe: the input is already inside the user's hardware envelope, so
+// the envelope can never be exceeded, the zone can never invert, and the
+// stroke can never come back wider than it went in. The margin also yields
+// rather than shrink a stroke below `minGap` (or below the width it already
+// had, when that is narrower) - a margin must never take the wearer's stroke
+// away, only move it off the ends.
+export function applyEndMargin(range, margin = HANDY_DEFAULT_END_MARGIN, minGap = HANDY_MIN_SLIDE_GAP) {
+    let lo0 = clampPercent(range ? range.min : 0, 0);
+    let hi0 = clampPercent(range ? range.max : 100, 100);
+    if (lo0 > hi0) [lo0, hi0] = [hi0, lo0];
+    const m = clampEndMargin(margin);
+    if (m === 0) return { min: lo0, max: hi0 };
+
+    const keep = Math.min(Math.max(0, toInt(minGap, HANDY_MIN_SLIDE_GAP)), hi0 - lo0);
+    let lo = Math.min(hi0, Math.max(lo0, m));
+    let hi = Math.max(lo0, Math.min(hi0, 100 - m));
+    if (hi < lo) return { min: lo0, max: hi0 };
+    if (hi - lo < keep) lo = Math.max(lo0, hi - keep);
+    if (hi - lo < keep) hi = Math.min(hi0, lo + keep);
+    return { min: lo, max: hi };
+}
+
+// PUT /slide answers with a SlideResult: ACCEPTED(0), ACCEPTED_ROUNDED_DOWN(1)
+// or ACCEPTED_ROUNDED_UP(2). A 1 or a 2 is the only way the device ever tells
+// us it did not take the numbers we sent (the spec names a MIN_ALLOWED stroke
+// width but never gives its value). Returns a sentence, or null when the
+// device took the range as sent.
+export function describeSlideAdjustment(body, range = null) {
+    if (!body || typeof body !== 'object') return null;
+    const n = Number(body.result);
+    if (n !== 1 && n !== 2) return null;
+    const asked = range ? ` EdgeLoop asked for ${clampPercent(range.min, 0)}-${clampPercent(range.max, 100)}%.` : '';
+    const dir = n === 1 ? 'rounded down' : 'rounded up';
+    return `The Handy ${dir} the stroke range it was sent to one its own slider settings allow.${asked}`;
+}
+
+// True for the HAMP error band (3000-3999). API v2 has exactly one code in it,
+// ERROR(3000) "Unspecified HAMP error", so a HAMP fault - including a slider
+// the firmware has locked out - can only ever arrive as that.
+export function isHampModeError(code) {
+    const n = Number(code);
+    return Number.isFinite(n) && n >= 3000 && n <= 3999;
+}
+
+// The wearer-facing sentence for a device that refused a motion command.
+// Over API v2 we can never name slider_blocked outright - the whole HAMP
+// error set is one unspecified code - so this says what the device does and
+// which setting to change, and claims nothing more. EdgeLoop never concludes
+// a lockout by itself: this explains a refusal the device sent us.
+export function describeDeviceStop(cause = '') {
+    const lead = cause ? `${String(cause).trim()} ` : '';
+    return `${lead}The Handy's firmware stops the slider when it reads as blocked, which includes being driven hard into the ends of its travel. Check the sleeve and the rails for an obstruction, then narrow the Travel Envelope or raise the End-stop margin in the Handy panel.`;
 }
 
 // Classify one API reply. `body` is the parsed JSON (or null when the body was

@@ -38,7 +38,7 @@ import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting }
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
-import { normalizeEnvelope } from './hardware/handy-protocol.js';
+import { normalizeEnvelope, applyEndMargin, clampEndMargin } from './hardware/handy-protocol.js';
 import {
     connectIntifaceServer,
     disconnectIntiface,
@@ -170,6 +170,7 @@ function syncGuardSettings() {
     advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
     advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
     advancedSettings.trainEdges = clampTrainEdges(advancedSettings.trainEdges);
+    advancedSettings.handyEndMargin = clampEndMargin(advancedSettings.handyEndMargin);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
     advancedSettings.micBoostMaxBpm = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
@@ -576,6 +577,45 @@ function updateHwEnvelopeDisplay() {
         const el = document.getElementById(id);
         if (el) el.textContent = `Bounds: ${env.min}% - ${env.max}%`;
     });
+    updateHandySlideDisplay();
+}
+
+// What a full-length stroke actually reaches The Handy as, once the end-stop
+// margin has been applied. The wearer can see what the margin costs them
+// before they decide what to type into it. Handy only; the T-Code and
+// Intiface axes get the envelope unchanged.
+function updateHandySlideDisplay() {
+    const el = document.getElementById('handySlideDisplay');
+    if (!el) return;
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    const margin = clampEndMargin(advancedSettings.handyEndMargin);
+    const sent = applyEndMargin({ min: env.min, max: env.max }, margin);
+    // The margin yields rather than shrink a stroke below its minimum width,
+    // so an envelope only just that wide and sitting on an end keeps the end.
+    // That is the one case where the number above does nothing, and the
+    // wearer should not have to infer it by reading the two numbers back.
+    const stillOnEnd = margin > 0 && (sent.min === 0 || sent.max === 100);
+    // Only a FULL-LENGTH stroke is described here: this is the envelope with
+    // the margin applied, and a warm-up tick or any mode that narrows the zone
+    // sends less than this. Saying "sent to the device" flatly would be false
+    // for most of a session, and a wearer reading this row is usually reading
+    // it because their device did something they did not expect.
+    el.textContent = `A full-length stroke reaches the device as ${sent.min}% - ${sent.max}%`
+        + (stillOnEnd ? ' - this Travel Envelope is too narrow for the margin to move the stroke off the end.' : '');
+}
+
+// Validate the typed end-stop margin (0-10; 0 sends the range untouched) and
+// persist it. Same shape as the envelope inputs: while typing, a half-typed
+// number is left alone; on commit the corrected value is written back.
+function applyHandyEndMarginInput(commit = false) {
+    const el = document.getElementById('handyEndMarginInput');
+    if (!el) return;
+    const margin = clampEndMargin(el.value === '' ? advancedSettings.handyEndMargin : el.value);
+    advancedSettings.handyEndMargin = margin;
+    if (commit && String(el.value) !== String(margin)) el.value = margin;
+    persistSettings();
+    updateHandySlideDisplay();
+    updateEngine();
 }
 
 // Normalise the persisted envelope and push it into every modal input. Used
@@ -587,6 +627,12 @@ function syncHwEnvelopeInputs() {
     advancedSettings.handyHwMax = env.max;
     hwEnvelopeInputs('min').forEach((el) => { el.value = env.min; });
     hwEnvelopeInputs('max').forEach((el) => { el.value = env.max; });
+    // The end-stop margin sits in the same panel and is restored the same
+    // way, so an imported file can never leave the input showing one number
+    // while the driver uses another.
+    advancedSettings.handyEndMargin = clampEndMargin(advancedSettings.handyEndMargin);
+    const marginInput = document.getElementById('handyEndMarginInput');
+    if (marginInput) marginInput.value = advancedSettings.handyEndMargin;
     updateHwEnvelopeDisplay();
 }
 
@@ -633,6 +679,14 @@ function initHandyRoleUI() {
             safeSet('handy_max_cap', String(state.handyMaxCap));
             updateEngine();
         });
+    }
+
+    // The value itself is painted by syncHwEnvelopeInputs (below, and again
+    // after every settings import).
+    const marginInput = document.getElementById('handyEndMarginInput');
+    if (marginInput) {
+        marginInput.addEventListener('input', () => applyHandyEndMarginInput(false));
+        marginInput.addEventListener('change', () => applyHandyEndMarginInput(true));
     }
 
     // Envelope inputs live in the Handy AND the TCode modal, all bound to the
@@ -918,7 +972,12 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
 
     const range = effectiveStrokeRange(strokeMin, strokeMax);
 
-    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max);
+    // The end-stop margin is The Handy's alone: it is a property of that
+    // carriage and its firmware, not of the session, so it is applied in the
+    // driver and the funscript export still records what the engine asked
+    // for. A T-Code or Intiface linear axis takes a wider zone as a longer,
+    // slower stroke rather than a faster one, so they keep the envelope as is.
+    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin);
     // Intiface linear axes run on their own per-leg timers; this call only
     // updates the planner inputs (and, with force, issues StopAllDevices).
     dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force);
@@ -2912,6 +2971,11 @@ setHandyHandlers({
         document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
         // Pauses the session and issues a stop to every other toy.
         triggerDisconnectAlert(reason || 'The Handy went offline. Motors paused for safety.');
+    },
+    // Something the device told us that is worth reading and is not a fault.
+    onNotice: (message) => {
+        if (!handyConnected || !message) return;
+        setHandyStatus(message, 'busy');
     },
     // Not gated on handyConnected: the Disconnect and offline paths drop the
     // link before their stop resolves, and an unconfirmed stop there is the

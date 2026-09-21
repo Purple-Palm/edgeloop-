@@ -561,6 +561,19 @@
                 <input id="hwMaxInput" type="number" min="10" max="100" value="100" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
               </div>
             </div>
+            <div class="pt-2 mt-1 border-t border-slate-800 space-y-1">
+              <div class="flex justify-between items-center gap-2">
+                <label for="handyEndMarginInput" class="text-[9px] text-slate-400 font-semibold">End-Stop Margin % (The Handy only):</label>
+                <input id="handyEndMarginInput" type="number" min="0" max="10" value="5" class="w-14 bg-slate-900 border border-slate-700 rounded-lg px-2 py-0.5 font-mono text-xs text-center text-slate-200 outline-none">
+              </div>
+              <p class="text-[9px] text-slate-400 leading-snug">
+                Keeps the carriage off the mechanical ends of the slider. The Handy's firmware stops the
+                slider when it reads as blocked, and a carriage driven hard into its end stop can read
+                exactly like that. Only strokes that reach within this margin of 0% or 100% are moved;
+                a narrower Travel Envelope is sent untouched, and <strong>0 sends the full range</strong>.
+              </p>
+              <span id="handySlideDisplay" class="font-mono text-[10px] font-bold text-teal-400 block">A full-length stroke reaches the device as 5% - 95%</span>
+            </div>
           </div>
         </div>
 

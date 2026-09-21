@@ -26,6 +26,7 @@ let routes = {};
 let errors = [];
 let offline = [];
 let unconfirmed = [];
+let notices = [];
 let sessionActive = true;
 
 function jsonResponse(body, status = 200) {
@@ -87,6 +88,7 @@ describe('handy driver', () => {
         errors = [];
         offline = [];
         unconfirmed = [];
+        notices = [];
         sessionActive = true;
         // Short backoffs keep the retry tests fast; the attempt counts are unchanged.
         HANDY_TIMINGS.requestTimeoutMs = 6000;
@@ -97,6 +99,7 @@ describe('handy driver', () => {
             onError: (m) => errors.push(m),
             onOffline: (r) => offline.push(r),
             onStopUnconfirmed: (m) => unconfirmed.push(m),
+            onNotice: (m) => notices.push(m),
             isSessionActive: () => sessionActive
         });
     });
@@ -614,5 +617,70 @@ describe('handy driver', () => {
         dispatchHandy(80, 10, 90, true, 0, 100);
         await tick(5);
         assert.equal(errors[errors.length - 1], null, 'cleared once velocity succeeds again');
+    });
+    // The report this came from: X333's Handy 2 hit its own safety lockout
+    // "as soon as warmup is over", once our /slide fix meant the full 0-100
+    // range reached the device for the first time. The driver now keeps the
+    // carriage off the mechanical ends unless the wearer says otherwise.
+    it('keeps the stroke off the mechanical ends by default', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.deepEqual(sent('/slide')[0].body, { min: 5, max: 95 });
+    });
+
+    it('sends the full range when the margin is 0', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100, 0);
+        await tick(5);
+        assert.deepEqual(sent('/slide')[0].body, { min: 0, max: 100 });
+    });
+
+    it('does not touch a range that already clears the ends', async () => {
+        // Anyone who typed their own guards sees exactly what they typed.
+        await connectOk();
+        dispatchHandy(50, 15, 85, true, 15, 85, 5);
+        await tick(5);
+        assert.deepEqual(sent('/slide')[0].body, { min: 15, max: 85 });
+    });
+
+    it('never leaves the envelope or the minimum stroke with a margin applied', async () => {
+        await connectOk();
+        // A tip-only zone at the top of a full envelope, at the widest margin.
+        dispatchHandy(50, 95, 100, true, 0, 100, 10);
+        await tick(5);
+        const body = sent('/slide')[0].body;
+        assert.ok(body.min >= 0 && body.max <= 100);
+        assert.ok(body.max - body.min >= 10, `stroke was ${body.min}-${body.max}`);
+        // A narrow envelope: the margin yields rather than shrink the stroke.
+        dispatchHandy(50, 0, 100, true, 0, 10, 10);
+        await tick(5);
+        assert.deepEqual(sent('/slide')[1].body, { min: 0, max: 10 });
+    });
+
+    it('passes on a range the device rounded to its own limits, once', async () => {
+        await connectOk();
+        routes['PUT /slide'] = jsonResponse({ result: 1 });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(notices.length, 1);
+        assert.match(notices[0], /rounded down/);
+        assert.match(notices[0], /5-95%/);
+        dispatchHandy(50, 10, 90, true, 0, 100);
+        await tick(5);
+        assert.equal(notices.length, 1, 'the same news every tick is not news');
+    });
+
+    it('names a HAMP fault instead of leaving a dead toy unexplained', async () => {
+        await connectOk();
+        routes['PUT /hamp/velocity'] = jsonResponse({ error: { code: 3000, message: 'HampError' } });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(notices.length, 1);
+        assert.match(notices[0], /HAMP error 3000/);
+        assert.match(notices[0], /obstruction/i);
+        // Explaining a refusal is all it does: the existing offline counter
+        // is still the only thing that decides when to give up on the link.
+        assert.equal(offline.length, 0);
     });
 });

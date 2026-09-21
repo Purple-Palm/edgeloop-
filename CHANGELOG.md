@@ -125,6 +125,57 @@ credited by username.
   setting does not govern.
 
 ### The Handy
+- The driver keeps the carriage off the mechanical ends of the slider. New
+  **End-Stop Margin** in the Handy modal, under the travel envelope: 0-10%
+  of travel, 5% by default, and **0 sends the full range exactly as before**.
+  Only a stroke that reaches within the margin of 0% or 100% is moved, so a
+  wearer who had already typed guards of their own sees no change at all;
+  full travel now leaves as 5-95%. The margin can only ever narrow what the
+  engine asked for, never widen it, so the travel envelope still bounds
+  everything that reaches the device, a zone cannot invert, and a
+  minimum-width stroke keeps its width rather than losing it to the margin.
+  The modal shows what a full-length stroke is really sent as, and the
+  typed margin is restored into that row after a settings import, the way
+  the travel envelope beside it is. Where an envelope is so narrow that
+  moving it off the end would cost the wearer their stroke, the margin gives
+  way rather than take it - and the modal now says so in as many words,
+  instead of leaving that to be inferred from the two numbers.
+  X333 reported that the new version tripped the Handy 2's safety lockout
+  "as soon as warmup is over" and that he had to set guards around 0 and
+  100% by hand. He was right about both. The stroke range only started
+  reaching the device at all when it moved to `PUT /slide` (below), and the
+  default envelope had become 0-100 with a migration that rewrote a stored
+  15/85 to it - silently, and with no way to tell a stale default from a
+  guard somebody had typed on purpose. So the first thing the fix delivered
+  to his device was the carriage being driven into its own end stops, which
+  the Handy's firmware reads as a blocked slider and locks itself out for.
+  5% is 5.5 mm on a 110 mm slider and 6.25 mm on the 125 mm Handy 2 Pro,
+  which is no smaller than the end zone the firmware's own settings reserve
+  for slowing down; there is no vendor number for this, so if X333's own
+  guards turn out to be further in, his numbers should replace ours. The
+  margin is The Handy's alone: a T-Code or Intiface linear axis takes a
+  wider zone as a longer, slower stroke, not a faster one, so those keep the
+  travel envelope unchanged.
+- A Handy that stops its own slider is named instead of going quiet. While a
+  session is driving it, the 10 s connectivity poll also asks `GET
+  /hamp/state`; a device that reports STOPPED twice in a row while it is
+  being told to move has stopped itself, so the session pauses, every toy is
+  stopped and the banner says what happened and which setting to change,
+  rather than leaving a dead toy and no explanation. Two reads, not one, so
+  a stop that landed while the poll was in flight cannot trigger it, and any
+  reply the API v2 spec does not document is ignored rather than treated as
+  a fault. Resuming into a device that is still locked out is reported
+  again rather than met with silence. The state read is an optional probe:
+  a device that refuses it three times over (a firmware-4 compatibility
+  shim that does not serve it) is not asked again for the rest of the
+  connection, and its refusals never reach the status line - nobody should
+  be shown an error for a call they did not ask for. API v2 has exactly one
+  HAMP error code, so a device-side fault arriving as that error is also
+  explained now instead of showing only "Unspecified HAMP error".
+- The device tells us when it did not take the stroke range we sent - `PUT
+  /slide` answers with a rounded-up or rounded-down result code - and that
+  is now read back and shown in the Handy modal once per connection, instead
+  of being thrown away.
 - Connect now selects HAMP mode (mode 0). The driver previously selected
   HSSP (mode 1), which the Handy API v2 spec documents as script streaming.
 - The stroke range is sent to `PUT /slide`. It was sent to a non-existent

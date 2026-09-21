@@ -2,6 +2,7 @@
 // boot must survive that with defaults rather than a blank page, so every
 // read goes through storage.js.
 import { safeGet } from './storage.js';
+import { HANDY_DEFAULT_END_MARGIN } from './hardware/handy-protocol.js';
 
 export const state = {
     sessionStatus: 'IDLE',
@@ -147,6 +148,13 @@ export const advancedSettings = {
     handyHwMax: 100,
     // Fresh installs need no legacy 15/85 envelope migration (see app.js).
     envelopeMigrated: true,
+    // How far The Handy's driver keeps the stroke off the mechanical ends at
+    // 0 and 100 (percent of travel, 0-10; 0 sends the range untouched). The
+    // Handy 2 firmware can read a carriage driven into its end stop as a
+    // blocked slider and lock itself out. Handy only: the T-Code and Intiface
+    // linear axes are servo position targets and never gain carriage speed
+    // from a wider zone, so they share the envelope but not this.
+    handyEndMargin: HANDY_DEFAULT_END_MARGIN,
     stallGuard: true,
     stallGuardSeconds: 20,
     stallPauseSeconds: 8,
