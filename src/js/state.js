@@ -9,6 +9,10 @@ export const state = {
     chosenTargetSeconds: 0,
     durationMinSeconds: 0,
     durationMaxSeconds: 0,
+    // Was the running session started on a FIXED length? Snapshotted at
+    // START, because durationMode can change under a running session and a
+    // Mystery window typed 30-30 is numerically identical to a Fixed 30.
+    durationFixed: false,
     durationMode: 'range',
     endgameType: 'orgasm',
     rampdownSecondsLeft: 45,

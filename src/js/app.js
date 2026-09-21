@@ -5,7 +5,8 @@ import {
     gameEdgeReleased,
     clampEdgeHoldPercent,
     resolveEdgeTriggerHr,
-    describeEdgeHoldPreview
+    describeEdgeHoldPreview,
+    micBoostReachesMotors
 } from './engine.js';
 import {
     ORGASM_BOOST_CAP,
@@ -21,7 +22,9 @@ import {
     isSurvivalDefeated,
     clampStallGuardSeconds,
     clampStallPauseSeconds,
-    tickStallGuard
+    tickStallGuard,
+    endgameKeepsOrgasmLatch,
+    describeGameNotice
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
@@ -724,8 +727,14 @@ function updateEngine() {
     // and the badge shows THAT, so it can never claim a push the engine is
     // not making: the big BPM number no longer moves with the boost, which
     // leaves the badge as the only signal the wearer has.
-    const micApplied = Number.isFinite(hr) && Number.isFinite(sensorHr) ? hr - sensorHr : 0;
-    state.micApplied = micApplied > 0 ? micApplied : 0;
+    // ...and only in a mode that feeds the boosted pulse to a motor at all:
+    // the Oracle and Edge Training compute both channels from the MEASURED
+    // pulse, so the boost reaches nothing there and a MIC +N badge sent the
+    // wearer off to adjust a gate and a cap that change nothing.
+    const micReaches = micBoostReachesMotors(state.activeMode, { edgeStrokeDepth: advancedSettings.edgeStrokeDepth });
+    const micRaw = Number.isFinite(hr) && Number.isFinite(sensorHr) ? hr - sensorHr : 0;
+    const micApplied = micReaches && micRaw > 0 ? micRaw : 0;
+    state.micApplied = micApplied;
     const micBadge = document.getElementById('micActiveBadge');
     const micBadgeLive = Boolean(state.micAnalyser) && (Boolean(advancedSettings.micEnabled) || state.isTestingMic);
     if (micBadge && micBadgeLive) {
@@ -966,39 +975,23 @@ function updateWarmupBadge() {
 function updateGameNotice() {
     const notice = document.getElementById('gameNotice');
     if (!notice) return;
-    let text = '';
-    if (state.activeMode === 'oracle' && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
-        if (state.oracleState === 'HOLD') text = `THE ORACLE: HOLDING ${state.oracleTimer}s — FATE PENDING`;
-        else if (state.oracleState === 'CLIMAX') text = 'THE ORACLE: CLIMAX';
-        else if (state.oracleState === 'DENIAL') text = 'THE ORACLE: DENIAL';
-        else if (state.oracleState === 'RAMPDOWN') text = 'THE ORACLE: SOFT LANDING';
-        else if (state.oracleState === 'PURGATORY') {
-            const timing = oracleTiming({
-                sessionSeconds: state.sessionSeconds,
-                minSeconds: state.durationMinSeconds,
-                maxSeconds: state.durationMaxSeconds,
-                targetSeconds: state.chosenTargetSeconds
-            });
-            text = timing.canEnd ? 'THE ORACLE: PURGATORY' : 'THE ORACLE: NOT YET — KEEP CLIMBING';
-        }
-        else text = 'THE ORACLE: APPROACHING THE CEILING';
-    } else if (state.activeMode === 'survival' && state.sessionStatus === 'RUNNING') {
-        text = `SURVIVAL: FLOOR ${Math.round(state.survivalSpeedFloor)}% — STAY UNDER YOUR LIMIT`;
-    } else if (state.activeMode === 'edgetrain' && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN')) {
-        const need = clampTrainEdges(advancedSettings.trainEdges);
-        const done = state.trainEdgesDone || 0;
-        const holdGoal = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
-        if (state.trainState === 'hold') {
-            const left = Math.max(0, holdGoal - (state.trainHoldSeconds || 0));
-            text = `EDGE TRAINING: HOLD ${left}s — ${done}/${need} EDGES`;
-        } else if (state.trainState === 'recover') {
-            text = `EDGE TRAINING: RECOVER — ${done}/${need} EDGES`;
-        } else if (state.trainState === 'finish') {
-            text = 'EDGE TRAINING: COMPLETE — COME';
-        } else {
-            text = `EDGE TRAINING: CLIMB — ${done}/${need} EDGES`;
-        }
-    }
+    const text = describeGameNotice({
+        activeMode: state.activeMode,
+        sessionStatus: state.sessionStatus,
+        oracleState: state.oracleState,
+        oracleTimer: state.oracleTimer,
+        trainState: state.trainState,
+        trainHoldSeconds: state.trainHoldSeconds,
+        trainEdgesDone: state.trainEdgesDone,
+        trainHoldGoal: advancedSettings.trainHoldSeconds,
+        trainEdgesGoal: advancedSettings.trainEdges,
+        survivalSpeedFloor: state.survivalSpeedFloor,
+        sessionSeconds: state.sessionSeconds,
+        minSeconds: state.durationMinSeconds,
+        maxSeconds: state.durationMaxSeconds,
+        targetSeconds: state.chosenTargetSeconds,
+        fixedLength: state.durationFixed
+    });
     notice.textContent = text || 'GAME MODE ACTIVE';
     notice.classList.toggle('hidden', !text);
 }
@@ -1026,6 +1019,12 @@ function pickSessionTargetSeconds() {
     state.durationFallback = !parsed.valid;
     state.durationMinSeconds = parsed.minSeconds || 0;
     state.durationMaxSeconds = parsed.maxSeconds || 0;
+    // Snapshotted at START: a Fixed length and a Mystery window typed with
+    // the same number in both boxes hand out identical seconds, and only a
+    // Fixed one opens the Oracle's window halfway. state.durationMode is
+    // live and would change under a running session if the wearer tapped
+    // another duration card.
+    state.durationFixed = Boolean(parsed.fixedLength);
     return parsed.targetSeconds;
 }
 
@@ -1037,6 +1036,7 @@ function resetSessionCounters() {
     state.chosenTargetSeconds = 0;
     state.durationMinSeconds = 0;
     state.durationMaxSeconds = 0;
+    state.durationFixed = false;
     state.edges = 0;
     state.pauses = 0;
     state.peakHr = Number.isFinite(state.hrCurrent) ? state.hrCurrent : 70;
@@ -1175,7 +1175,8 @@ function tickSessionGuardsAndGames() {
                     sessionSeconds: state.sessionSeconds,
                     minSeconds: state.durationMinSeconds,
                     maxSeconds: state.durationMaxSeconds,
-                    targetSeconds: state.chosenTargetSeconds
+                    targetSeconds: state.chosenTargetSeconds,
+                    fixedLength: state.durationFixed
                 });
                 const fate = rollOracleFate(timing, { endgameType: state.endgameType });
                 if (fate === 'CLIMAX') {
@@ -1525,6 +1526,14 @@ setInterval(() => {
 }, 1000);
 
 function handleTargetTimeReached() {
+    // A latched Force Orgasm does not survive an ending that is not an
+    // orgasm. The engine floors the primary at 85% and pins the secondary at
+    // 100% while it is on, so a Soft Landing reached with the latch still
+    // set - the wearer tapped it during an Oracle hold, and the roll or the
+    // timer then chose the tease-down - ran the gentlest ending in the app
+    // at full speed for all 45 s. Denied stops the session, which clears it
+    // anyway; the Orgasm endgame IS the latch and keeps it.
+    if (!endgameKeepsOrgasmLatch(state.endgameType)) setOrgasmMode(false);
     if (state.endgameType === 'orgasm') {
         if (!state.orgasmMode && orgasmBtn) orgasmBtn.click();
     } else if (state.endgameType === 'rampdown') {

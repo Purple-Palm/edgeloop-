@@ -84,6 +84,25 @@ credited by username.
   which is more motion than the Crawl some people avoid on purpose, for
   the full 5-90 s and on every edge of the set. The secondary channel is
   unchanged, and Force Orgasm still overrides both.
+- A **Soft Landing** is never run at full speed. Tap Force Orgasm during an
+  Oracle hold, then arrive at a Soft Landing ending - the Oracle's own roll
+  or the session timer - and the overdrive was still latched: the engine
+  floors the primary at 85% and pins the secondary at 100% for as long as it
+  is on, so the gentlest ending in the app teased you down at 85-100% for
+  all 45 s. Arriving at a Soft Landing now clears the latch first, in every
+  mode. Denied already stopped the session, and the Orgasm ending IS the
+  latch, so both are unchanged.
+- **The Oracle** honours a Mystery minimum however you typed it. A Mystery
+  with the same number in both boxes (30-30) hands out exactly the numbers a
+  Fixed 30 does and was read as one, so climax - which arms Force Orgasm -
+  and denial unlocked at 15 minutes, half the minimum you typed. Only the
+  Fixed card opens the window halfway now; a Mystery minimum is a promise at
+  any spread, including none.
+- The game banner no longer says a game is still running during a **Soft
+  Landing**. The session timer can hand any game to the 45 s tease-down, and
+  it leaves the game state exactly where it stood: for the whole tease-down
+  the cockpit told you the Oracle was still deciding, or the training still
+  climbing, while neither was true. Every game reads SOFT LANDING there now.
 
 ### The Handy
 - Connect now selects HAMP mode (mode 0). The driver previously selected
@@ -245,8 +264,25 @@ credited by username.
   pulse does, and the run ends when you breach the working ceiling on three
   consecutive readings, so the primary never parks on the mark. That is the
   mode working as designed and as its own card describes, so the sentence was
-  wrong rather than the engine - the Guards text, the Survival card and the
-  README now name the exception.
+  wrong rather than the engine. **Ruin & Leak** turned out to be a second
+  exception the wording missed: its 18 s lockout cuts the primary dead
+  whichever you picked, because cutting penile input cold while the secondary
+  surges is the whole mode. The Guards text, both mode cards and the README
+  now name both, and neither mode's behaviour changed.
+- Cancelling Force Orgasm no longer surges the toys. The tap dispatched
+  100% on both channels and so did the next second's tick - one to two
+  seconds at full speed for someone who had just said no. An Oracle climax
+  and a finished Edge Training set only run flat out while the overdrive is
+  on, so the engine settles on the climb the moment it is cancelled, which
+  is the state the game hands itself back to anyway.
+- Cancelling Force Orgasm no longer counts a phantom edge. The overdrive
+  raises the working ceiling 1 BPM per second and the pullback mark climbs
+  with it, so after a few seconds a pulse parked ON the mark looked as if it
+  had come down: the tick after the cancel read it as a brand-new edge - +1
+  on the counter, the edge cue spoken, a connected rotator reversed and
+  Adaptive Ceiling Decay walking your working ceiling down. The edge flag is
+  frozen while Force Orgasm runs and judged against your real ceiling again
+  the moment it stops.
 - Funscript export produces real stroke actions from the recorded speed and
   zone instead of writing the speed percentage as a position.
 - Storage is corruption-safe and trims the oldest history on quota errors;
@@ -501,6 +537,18 @@ credited by username.
   drawn for a mark ABOVE the typed Climax HR, so with the pullback capped
   at 100% it had stopped appearing at all: a 95% pullback showed the badge
   and no line.
+- The cockpit shows **MIC LISTEN**, not MIC +N, in The Oracle and Edge
+  Training. Both games compute their speeds from the pulse your monitor
+  measured, so the boost reaches no motor there at all, and a badge
+  promising a push sent you off to adjust the noise gate and the cap with
+  nothing to show for it. The badge reports only a boost that is really
+  reaching the toys in the mode you are in.
+- A phrase file whose FIRST line starts with a token imports again. The
+  importer decided "this is JSON" on a leading `{`, so a bank that begins
+  with `{hr} BPM. Hold, don't finish.` - a factory line, and exactly the
+  tokens the editor tells you to use - was refused as broken JSON and you
+  lost every phrase in the file. A token is now told apart from the start of
+  a JSON document, and a real export still imports as one.
 - Copy-link buttons fall back to a hidden field and `execCommand('copy')`
   when the Clipboard API is unavailable (plain `http://` hosting) and never
   throw.

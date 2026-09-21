@@ -349,6 +349,44 @@ describe('voice cue templates', () => {
         assert.deepEqual(good.cues.edge, ['Hold.']);
     });
 
+    it('a phrase file whose FIRST line is a token is still a phrase file', () => {
+        // The shape decision was `trimmed.startsWith('{')`, so a headerless
+        // bank whose first line happened to open with a token was handed to
+        // JSON.parse and refused as broken JSON - `{hr} BPM. Hold, don't
+        // finish.` is a factory line and the editor tells the wearer to use
+        // exactly those tokens, so it cost them the whole import.
+        const first = parseVoiceCuesText("{hr} BPM. Hold, don't finish.\nStay right there.\n");
+        assert.equal(first.error, null, 'a leading token is not the start of a JSON document');
+        assert.deepEqual(first.cues.encourage, ["{hr} BPM. Hold, don't finish.", 'Stay right there.']);
+
+        // Under a section header too.
+        const sectioned = parseVoiceCuesText('{edges} edges.\n# edge\n{hr} BPM. Hold.\n');
+        assert.equal(sectioned.error, 'preamble', 'text above the first section is still held back');
+        const headed = parseVoiceCuesText('# edge\n{hr} BPM. Hold.\n');
+        assert.equal(headed.error, null);
+        assert.deepEqual(headed.cues.edge, ['{hr} BPM. Hold.']);
+
+        // Every documented token opens a phrase safely.
+        for (const token of ['hr', 'maxHr', 'minHr', 'edges', 'minutes', 'done', 'need', 'hold']) {
+            const out = parseVoiceCuesText(`{${token}} and on we go.\n`);
+            assert.equal(out.error, null, `a phrase opening with {${token}} must not be read as JSON`);
+            assert.deepEqual(out.cues.encourage, [`{${token}} and on we go.`]);
+        }
+
+        // A real export is still read as JSON, in both shapes.
+        const flat = parseVoiceCuesText('{"voiceCues":{"edge":["A."]}}');
+        assert.equal(flat.error, null);
+        assert.deepEqual(flat.cues.edge, ['A.']);
+        const pretty = parseVoiceCuesText('{\n  "voiceCues": { "edge": ["A."] }\n}\n');
+        assert.equal(pretty.error, null);
+        assert.deepEqual(pretty.cues.edge, ['A.']);
+        // ...and broken JSON is still reported as broken JSON, not filed as a
+        // 140-character phrase to read aloud.
+        const broken = parseVoiceCuesText('{"voiceCues":{"edge":["A."]');
+        assert.equal(broken.error, 'json');
+        assert.deepEqual(broken.cues, {});
+    });
+
     it('clamps the encouragement interval', () => {
         assert.equal(clampEncourageSeconds(-3), 0);
         assert.equal(clampEncourageSeconds(999), 180);

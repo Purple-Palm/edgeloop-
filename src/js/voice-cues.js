@@ -395,10 +395,12 @@ function presentCueMap(src) {
     return incoming;
 }
 
-// Does this line open a JSON document rather than a phrase? `{` alone (the
+// Does this text open a JSON document rather than a phrase? `{` alone (the
 // first line of a pretty-printed export) and `{"voiceCues": ...` both do; a
 // line that begins with an interpolation token - the same `\{([a-zA-Z]+)\}`
-// shape resolveCueTemplate substitutes - does not.
+// shape resolveCueTemplate substitutes - does not. Both the top-level shape
+// decision and the headerless preamble check ask this, so a phrase file and
+// a JSON export are told apart by one rule in one place.
 function opensJsonDocument(line) {
     return line.startsWith('{') && !/^\{[a-zA-Z]+\}/.test(line);
 }
@@ -424,7 +426,13 @@ export function parseVoiceCuesText(raw) {
     const body = allLines.slice(firstIdx).join('\n');
 
     const trimmed = body.trim();
-    if (trimmed.startsWith('{')) {
+    // The SAME question the headerless path below asks, and for the same
+    // reason: a phrase may legitimately begin with an interpolation token.
+    // `{hr} BPM. Hold, don't finish.` is a factory line, the tokens are
+    // exactly what the editor tells the wearer to use, and a plain
+    // `startsWith('{')` handed that file to JSON.parse and refused the whole
+    // import as broken JSON if it happened to be the first phrase.
+    if (opensJsonDocument(trimmed)) {
         try {
             const parsed = JSON.parse(trimmed);
             const map = extractCueMap(parsed);

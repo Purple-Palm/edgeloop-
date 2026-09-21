@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
     MIN_CEILING_GAP,
     ORGASM_BOOST_CAP,
@@ -20,6 +21,8 @@ import {
     MAX_TRAIN_EDGES,
     countSurvivalBreach,
     isSurvivalDefeated,
+    endgameKeepsOrgasmLatch,
+    describeGameNotice,
     MIN_STALL_GUARD_SECONDS,
     MAX_STALL_GUARD_SECONDS,
     DEFAULT_STALL_GUARD_SECONDS,
@@ -141,7 +144,7 @@ describe('computeEffectiveCeiling', () => {
 describe('parseSessionDuration', () => {
     it('endless is always zero', () => {
         assert.deepEqual(parseSessionDuration({ mode: 'endless' }), {
-            targetSeconds: 0, minSeconds: 0, maxSeconds: 0, valid: true, invalid: []
+            targetSeconds: 0, minSeconds: 0, maxSeconds: 0, fixedLength: false, valid: true, invalid: []
         });
     });
 
@@ -150,6 +153,27 @@ describe('parseSessionDuration', () => {
         assert.equal(out.targetSeconds, 1800);
         assert.equal(out.minSeconds, 1800);
         assert.equal(out.maxSeconds, 1800);
+        assert.equal(out.fixedLength, true);
+    });
+
+    it('only a Fixed length reports fixedLength, however the range was typed', () => {
+        // The seconds alone cannot tell a Fixed 30 from a Mystery typed 30-30,
+        // and the Oracle treats the two completely differently. This flag is
+        // the only thing that carries the difference.
+        const fixed = parseSessionDuration({ mode: 'fixed', fixedMinutes: '30' });
+        const collapsed = parseSessionDuration({ mode: 'range', minMinutes: '30', maxMinutes: '30' });
+        assert.equal(collapsed.targetSeconds, fixed.targetSeconds);
+        assert.equal(collapsed.minSeconds, fixed.minSeconds);
+        assert.equal(collapsed.maxSeconds, fixed.maxSeconds);
+        assert.equal(collapsed.fixedLength, false, 'a Mystery is never a Fixed length');
+        for (const spread of [['30', '60'], ['5', '5'], ['90', '90']]) {
+            const out = parseSessionDuration({
+                mode: 'range', minMinutes: spread[0], maxMinutes: spread[1], random: () => 0
+            });
+            assert.equal(out.fixedLength, false);
+        }
+        assert.equal(parseSessionDuration({ mode: 'endless' }).fixedLength, false);
+        assert.equal(parseSessionDuration({ mode: 'fixed', fixedMinutes: 'abc' }).fixedLength, false);
     });
 
     it('fixed rejects zero, negative and non-numeric values', () => {
@@ -220,7 +244,9 @@ describe('oracle timing and fate', () => {
         // Fixed hands min === max === target, which used to leave a
         // zero-width window: every hold of the whole session was PURGATORY
         // and the game never chose anything.
-        const fixed = (t) => oracleTiming({ sessionSeconds: t, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800 });
+        const fixed = (t) => oracleTiming({
+            sessionSeconds: t, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800, fixedLength: true
+        });
         const early = fixed(5 * 60);
         assert.equal(early.canEnd, false);
         assert.equal(rollOracleFate(early, { random: () => 0.99 }), 'PURGATORY');
@@ -258,9 +284,58 @@ describe('oracle timing and fate', () => {
         assert.equal(half.canEnd, false, 'never at half the minimum the wearer typed');
 
         // A Fixed length keeps its documented halfway ramp.
-        const fixedRun = oracleTiming({ sessionSeconds: 901, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800 });
+        const fixedRun = oracleTiming({
+            sessionSeconds: 901, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800, fixedLength: true
+        });
         assert.equal(fixedRun.openAt, 900);
         assert.equal(fixedRun.canEnd, true);
+    });
+
+    it('a Mystery typed with one number in both boxes still honours that minimum', () => {
+        // 30-30 hands out exactly the seconds a Fixed 30 does, and the old
+        // rule read the numbers alone: it unlocked climax - which arms Force
+        // Orgasm - and denial at 15 minutes, half the minimum the wearer
+        // typed. A Mystery minimum is a promise whatever the spread.
+        const mystery = (t) => oracleTiming({
+            sessionSeconds: t, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800
+        });
+        const half = mystery(901);
+        assert.equal(half.openAt, 1800, 'never halfway through a typed Mystery minimum');
+        assert.equal(half.canEnd, false);
+        assert.equal(rollOracleFate(half, { random: () => 0.99 }), 'PURGATORY');
+
+        const due = mystery(1800);
+        assert.equal(due.canEnd, true);
+        assert.equal(due.mustEnd, true, 'and it ends there, the way the target says');
+        assert.equal(rollOracleFate(due, { random: () => 0.9, endgameType: 'rampdown' }), 'RAMPDOWN');
+
+        // The same numbers typed as a FIXED length keep the halfway ramp.
+        const fixed = oracleTiming({
+            sessionSeconds: 901, minSeconds: 1800, maxSeconds: 1800, targetSeconds: 1800, fixedLength: true
+        });
+        assert.equal(fixed.openAt, 900);
+        assert.equal(fixed.canEnd, true);
+    });
+
+    it('end to end: only the Fixed card opens the window halfway', () => {
+        // The two parses that produce identical seconds, fed straight into
+        // the timing the way app.js feeds them.
+        const at = (parsed, t) => oracleTiming({
+            sessionSeconds: t,
+            minSeconds: parsed.minSeconds,
+            maxSeconds: parsed.maxSeconds,
+            targetSeconds: parsed.targetSeconds,
+            fixedLength: parsed.fixedLength
+        });
+        const fixed = parseSessionDuration({ mode: 'fixed', fixedMinutes: '30' });
+        const mystery = parseSessionDuration({ mode: 'range', minMinutes: '30', maxMinutes: '30' });
+        assert.equal(at(fixed, 901).canEnd, true);
+        assert.equal(at(mystery, 901).canEnd, false);
+        assert.equal(at(mystery, 1800).mustEnd, true);
+        // A wide Mystery is unchanged by any of this.
+        const wide = parseSessionDuration({ mode: 'range', minMinutes: '30', maxMinutes: '60', random: () => 0.5 });
+        assert.equal(at(wide, 1799).canEnd, false);
+        assert.equal(at(wide, 1800).canEnd, true);
     });
 
     it('later holds inside the window are likelier to end the session', () => {
@@ -499,5 +574,98 @@ describe('edge training', () => {
         assert.equal(t.justDropped, true);
         assert.equal(t.edgesDone, 0);
         assert.equal(t.state, 'recover');
+    });
+});
+
+describe('the endgame and a latched Force Orgasm', () => {
+    it('only the Orgasm ending keeps the latch', () => {
+        assert.equal(endgameKeepsOrgasmLatch('orgasm'), true);
+        assert.equal(endgameKeepsOrgasmLatch('rampdown'), false, 'a Soft Landing is not run at 85-100%');
+        assert.equal(endgameKeepsOrgasmLatch('denial'), false);
+        for (const junk of ['', null, undefined, 'mystery-meat']) {
+            assert.equal(endgameKeepsOrgasmLatch(junk), false, `an unknown ending must not keep the latch`);
+        }
+    });
+
+    it('app.js clears the latch before it runs a Soft Landing', () => {
+        // The helper is worthless unless the cockpit asks it on the way in:
+        // Force Orgasm floors the primary at 85% and pins the secondary at
+        // 100% for as long as it is latched, so a Soft Landing reached with
+        // it still on ran the gentlest ending in the app flat out for 45 s.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const fn = src.match(/function handleTargetTimeReached\(\)[\s\S]*?\n}/);
+        assert.ok(fn, 'handleTargetTimeReached anchor moved');
+        assert.ok(
+            /endgameKeepsOrgasmLatch\(/.test(fn[0]),
+            `the endgame must decide what happens to the latch: ${fn[0]}`
+        );
+        assert.ok(/setOrgasmMode\(false\)/.test(fn[0]), 'and actually clear it');
+        const clear = fn[0].indexOf('setOrgasmMode(false)');
+        const ramp = fn[0].indexOf("'rampdown'");
+        assert.ok(clear >= 0 && ramp >= 0 && clear < ramp, 'the latch must be cleared before the rampdown starts');
+    });
+});
+
+describe('the cockpit game banner', () => {
+    const oracle = { activeMode: 'oracle', sessionStatus: 'RUNNING' };
+    const train = { activeMode: 'edgetrain', sessionStatus: 'RUNNING' };
+
+    it('says nothing outside a game or outside a live session', () => {
+        assert.equal(describeGameNotice({ activeMode: 'classic', sessionStatus: 'RUNNING' }), '');
+        assert.equal(describeGameNotice({ ...oracle, sessionStatus: 'PAUSED' }), '');
+        assert.equal(describeGameNotice({ ...oracle, sessionStatus: 'IDLE' }), '');
+        assert.equal(describeGameNotice(), '');
+    });
+
+    it('reports the Oracle state it is really in', () => {
+        assert.match(describeGameNotice({ ...oracle, oracleState: 'HOLD', oracleTimer: 9 }), /HOLDING 9s/);
+        assert.match(describeGameNotice({ ...oracle, oracleState: 'CLIMAX' }), /CLIMAX/);
+        assert.match(describeGameNotice({ ...oracle, oracleState: 'DENIAL' }), /DENIAL/);
+        assert.match(describeGameNotice({ ...oracle, oracleState: 'APPROACH' }), /APPROACHING THE CEILING/);
+        const locked = describeGameNotice({
+            ...oracle, oracleState: 'PURGATORY', sessionSeconds: 60, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 1800
+        });
+        assert.match(locked, /NOT YET/);
+        const open = describeGameNotice({
+            ...oracle, oracleState: 'PURGATORY', sessionSeconds: 2000, minSeconds: 1800, maxSeconds: 3600, targetSeconds: 2400
+        });
+        assert.match(open, /PURGATORY/);
+    });
+
+    it('reports the training set it is really in', () => {
+        assert.equal(
+            describeGameNotice({ ...train, trainState: 'hold', trainHoldSeconds: 4, trainHoldGoal: 15, trainEdgesDone: 2, trainEdgesGoal: 5 }),
+            'EDGE TRAINING: HOLD 11s — 2/5 EDGES'
+        );
+        assert.match(describeGameNotice({ ...train, trainState: 'recover', trainEdgesDone: 2, trainEdgesGoal: 5 }), /RECOVER — 2\/5/);
+        assert.match(describeGameNotice({ ...train, trainState: 'finish' }), /COMPLETE/);
+        assert.match(describeGameNotice({ ...train, trainState: 'climb', trainEdgesGoal: 5 }), /CLIMB — 0\/5/);
+        assert.match(
+            describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4 }),
+            /SURVIVAL: FLOOR 42%/
+        );
+    });
+
+    it('never claims a game is still running during a Soft Landing', () => {
+        // The session timer can hand ANY game to the 45 s tease-down, and it
+        // leaves the game state exactly where it stood: the banner told the
+        // wearer the Oracle was still deciding, or the training still
+        // climbing, for the whole tease-down, while neither was true.
+        const landings = [
+            { ...oracle, sessionStatus: 'RAMPDOWN', oracleState: 'APPROACH' },
+            { ...oracle, sessionStatus: 'RAMPDOWN', oracleState: 'HOLD', oracleTimer: 7 },
+            { ...oracle, sessionStatus: 'RAMPDOWN', oracleState: 'PURGATORY' },
+            { ...oracle, sessionStatus: 'RAMPDOWN', oracleState: 'RAMPDOWN' },
+            { ...train, sessionStatus: 'RAMPDOWN', trainState: 'climb', trainEdgesGoal: 5 },
+            { ...train, sessionStatus: 'RAMPDOWN', trainState: 'hold', trainHoldSeconds: 3 },
+            { activeMode: 'survival', sessionStatus: 'RAMPDOWN', survivalSpeedFloor: 42 }
+        ];
+        for (const landing of landings) {
+            const text = describeGameNotice(landing);
+            assert.match(text, /SOFT LANDING/, `${landing.activeMode}/${landing.oracleState || landing.trainState}`);
+            for (const lie of [/HOLDING/, /APPROACHING/, /PURGATORY/, /NOT YET/, /CLIMB/, /RECOVER/, /STAY UNDER/]) {
+                assert.ok(!lie.test(text), `the banner still claims the game is running: ${text}`);
+            }
+        }
     });
 });

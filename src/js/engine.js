@@ -105,6 +105,23 @@ export function resolveEngineMode(mode) {
     return ENGINE_MODES.includes(mode) ? mode : 'classic';
 }
 
+// Does the microphone boost reach a motor in this mode? The boost rides on
+// `hr`, which drives the falling tease curve and the stroke-depth
+// contraction that shares it; every term that RISES with arousal reads the
+// measured pulse (`edgeHr`) instead. The two climb games compute BOTH
+// channels from the measured pulse and fix their stroke zone per game state,
+// so there the boosted pulse reaches nothing at all and a cockpit badge
+// promising "MIC +N" promises a push nothing is making - the wearer goes off
+// and adjusts the gate and the cap, and nothing changes. Survival runs its
+// speeds off its own clock and lets the boost contract the stroke zone only,
+// which is a no-op at full depth.
+export function micBoostReachesMotors(activeMode, { edgeStrokeDepth = 100 } = {}) {
+    const mode = resolveEngineMode(activeMode);
+    if (mode === 'oracle' || mode === 'edgetrain') return false;
+    if (mode === 'survival') return clamp(finiteOr(Number(edgeStrokeDepth), 100), 0, 100) < 100;
+    return true;
+}
+
 export function hasReleasedEdge(hr, maxHr, triggerHr) {
     const release = edgeReleaseHr(maxHr, triggerHr);
     return Number.isFinite(hr) && Number.isFinite(release) && hr < release;
@@ -216,12 +233,22 @@ export function calculateEngineOutputs({
     const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent, minHr);
     const edgeSource = Number.isFinite(edgeHr) ? edgeHr : hr;
 
+    // Force Orgasm FREEZES the edge flag; it never clears it. The overdrive
+    // raises the working ceiling 1 BPM per second, and the pullback mark
+    // rides up with it, so after a few seconds a pulse parked ON the mark
+    // sits below the release band of a ceiling that only moved because the
+    // wearer armed the button. Releasing the edge on that evidence counted a
+    // phantom edge the moment they cancelled - the counter, the edge cue, a
+    // rotator reversal and Adaptive Ceiling Decay - while the pulse had
+    // never left the mark. New edges were already suppressed here; releases
+    // are too, so the flag stays whatever the pulse last really said and the
+    // first tick after a cancel judges it against the real ceiling again.
     if (edgeSource >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
             newEdgeTriggered = true;
             nextIsEdged = true;
         }
-    } else if (hasReleasedEdge(edgeSource, maxHr, triggerHr)) {
+    } else if (!orgasmMode && hasReleasedEdge(edgeSource, maxHr, triggerHr)) {
         nextIsEdged = false;
     }
 
@@ -325,6 +352,11 @@ export function calculateEngineOutputs({
             strokeMaxPercent = Math.max(25, Math.round(100 - (progress * depthContractAmount)));
         }
     } else if (mode === 'ruin') {
+        // Ruin & Leak cuts penile input COLD for its 18 s lockout while the
+        // secondary surges: that dead halt IS the mode, so it is a full stop
+        // whichever "At the ceiling" rule the wearer picked. Survival Mode is
+        // the other mode the setting does not govern. The Guards tab, both
+        // mode cards and the README name both exceptions.
         if ((nextIsEdged || ruinHoldSeconds > 0) && !orgasmMode) {
             primaryPercent = 0;
             secondaryPercent = 100;
@@ -430,13 +462,6 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             out.secondary = 55;
             out.strokeMax = 70;
             break;
-        case 'CLIMAX':
-            // Reached only with Force Orgasm off (app.js switches it on with
-            // the roll): the wearer cancelled it, so the climax is withdrawn
-            // and the ceiling rule (Full Stop / Crawl) applies like anywhere.
-            out.primary = nextIsEdged ? crawlPercent : 100;
-            out.secondary = nextIsEdged ? crawlPercent : 100;
-            break;
         case 'DENIAL':
             out.primary = 0;
             out.secondary = 0;
@@ -449,6 +474,14 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             out.strokeMax = 80;
             break;
         }
+        // CLIMAX is reached with Force Orgasm ON (app.js arms it with the
+        // roll), and that is handled above, so the only way into this branch
+        // is the wearer cancelling. The climax is withdrawn and app.js hands
+        // the game back to APPROACH on the very next tick; running 100/100
+        // until it did surged both channels to full speed for a second or
+        // two on someone who had just said no. A withdrawn climax IS the
+        // approach, so it settles there immediately.
+        case 'CLIMAX':
         case 'APPROACH':
         default: {
             const pull = Math.round(48 + progress * 52);
@@ -467,11 +500,13 @@ function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlP
         out.secondary = 100;
         return out;
     }
-    if (trainingState === 'finish') {
-        out.primary = nextIsEdged ? crawlPercent : 100;
-        out.secondary = nextIsEdged ? crawlPercent : 100;
-        return out;
-    }
+    // 'finish' is the completed set, and app.js arms Force Orgasm with it
+    // (handled above), so reaching it here means the wearer cancelled.
+    // tickEdgeTraining hands the game back to the climb on the next tick;
+    // running 100/100 until it did surged both channels to full speed for a
+    // second or two on someone who had just said no. The switch below sends
+    // 'finish' down the climb branch, so the cancel settles immediately.
+    //
     // A training hold is a hold AT the pullback mark, so the wearer's
     // ceiling rule decides the primary there exactly as it does in every
     // other mode: Full Stop parks it at 0%, Crawl keeps the micro-motion.

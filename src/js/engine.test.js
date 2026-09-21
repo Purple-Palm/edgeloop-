@@ -17,7 +17,8 @@ import {
     DEFAULT_EDGE_HOLD_PERCENT,
     MIN_EDGE_HOLD_PERCENT,
     MAX_EDGE_HOLD_PERCENT,
-    gameEdgeReleased
+    gameEdgeReleased,
+    micBoostReachesMotors
 } from './engine.js';
 
 const running = {
@@ -274,16 +275,74 @@ describe('engine modes', () => {
         assert.equal(loud.primaryPercent, 0);
     });
 
-    it('oracle climax with Force Orgasm cancelled obeys the ceiling rule', () => {
-        const base = { ...running, activeMode: 'oracle', oracleState: 'CLIMAX', orgasmMode: false, isEdged: true, hr: 170 };
-        const stop = calculateEngineOutputs({ ...base, ceilingBehaviour: 'stop' });
-        assert.equal(stop.primaryPercent, 0);
-        assert.equal(stop.secondaryPercent, 0);
-        const crawl = calculateEngineOutputs({ ...base, ceilingBehaviour: 'crawl' });
-        assert.equal(crawl.primaryPercent, CRAWL_PERCENT);
-        assert.equal(crawl.secondaryPercent, CRAWL_PERCENT);
-        const below = calculateEngineOutputs({ ...base, isEdged: false, hr: 100 });
-        assert.equal(below.primaryPercent, 100);
+    it('a cancelled Force Orgasm settles at once instead of surging to 100%', () => {
+        // Oracle CLIMAX and Edge Training 'finish' are only ever entered with
+        // Force Orgasm ON (app.js arms it with the roll and with the finished
+        // set), so reaching either with it OFF means the wearer cancelled.
+        // app.js hands the game back to the climb on the NEXT tick, and the
+        // engine used to run 100/100 until it did: the click dispatched
+        // 100/100 and so did the tick after it, one to two seconds of both
+        // channels at full speed for someone who had just said no.
+        const below = { ...running, orgasmMode: false, isEdged: false, hr: 100, edgeHr: 100 };
+        const withdrawn = calculateEngineOutputs({ ...below, activeMode: 'oracle', oracleState: 'CLIMAX' });
+        const approach = calculateEngineOutputs({ ...below, activeMode: 'oracle', oracleState: 'APPROACH' });
+        assert.equal(withdrawn.primaryPercent, approach.primaryPercent, 'a withdrawn climax IS the approach');
+        assert.equal(withdrawn.secondaryPercent, approach.secondaryPercent);
+        assert.ok(withdrawn.primaryPercent < 100, 'a withdrawn climax must not surge to 100%');
+
+        const cancelled = calculateEngineOutputs({ ...below, activeMode: 'edgetrain', trainingState: 'finish' });
+        const climb = calculateEngineOutputs({ ...below, activeMode: 'edgetrain', trainingState: 'climb' });
+        assert.equal(cancelled.primaryPercent, climb.primaryPercent, 'a cancelled finish IS the climb');
+        assert.equal(cancelled.secondaryPercent, climb.secondaryPercent);
+        assert.ok(cancelled.primaryPercent < 100, 'a cancelled finish must not surge to 100%');
+
+        // On the mark the ceiling rule still governs the primary in both.
+        const atMark = { ...running, orgasmMode: false, isEdged: true, hr: 140, edgeHr: 140 };
+        for (const probe of [
+            { activeMode: 'oracle', oracleState: 'CLIMAX' },
+            { activeMode: 'edgetrain', trainingState: 'finish' }
+        ]) {
+            const where = probe.oracleState || probe.trainingState;
+            const stop = calculateEngineOutputs({ ...atMark, ...probe, ceilingBehaviour: 'stop' });
+            assert.equal(stop.primaryPercent, 0, `${where} must park the primary with Full Stop`);
+            const crawl = calculateEngineOutputs({ ...atMark, ...probe, ceilingBehaviour: 'crawl' });
+            assert.equal(crawl.primaryPercent, CRAWL_PERCENT, `${where} must crawl with Crawl`);
+        }
+
+        // Force Orgasm itself is untouched: while it is ON both run flat out.
+        for (const probe of [
+            { activeMode: 'oracle', oracleState: 'CLIMAX' },
+            { activeMode: 'edgetrain', trainingState: 'finish' }
+        ]) {
+            const forcing = calculateEngineOutputs({ ...below, ...probe, orgasmMode: true });
+            assert.ok(forcing.primaryPercent >= 85);
+            assert.equal(forcing.secondaryPercent, 100);
+        }
+    });
+
+    it('Force Orgasm freezes the edge flag instead of releasing it', () => {
+        // The overdrive raises the working ceiling 1 BPM per second, so the
+        // pullback mark climbs away from a pulse that never moved. Releasing
+        // the edge on that evidence meant the tick after the cancel counted a
+        // brand-new edge: the counter, the spoken cue, a rotator reversal and
+        // Adaptive Ceiling Decay, all for an edge that never ended.
+        const edged = { ...running, activeMode: 'classic', isEdged: true, hr: 140, edgeHr: 140 };
+        const forcing = calculateEngineOutputs({ ...edged, orgasmMode: true, maxHr: 160 });
+        assert.equal(forcing.isEdged, true, 'an inflated ceiling is not the pulse coming down');
+        assert.equal(forcing.newEdgeTriggered, false);
+
+        // The tick after the cancel, judged against the real ceiling again.
+        const cancelled = calculateEngineOutputs({ ...edged, isEdged: forcing.isEdged, orgasmMode: false });
+        assert.equal(cancelled.newEdgeTriggered, false, 'cancelling must not invent an edge');
+        assert.equal(cancelled.isEdged, true);
+
+        // A pulse that really did come down still releases, on that same tick.
+        const recovered = calculateEngineOutputs({ ...edged, orgasmMode: false, hr: 110, edgeHr: 110 });
+        assert.equal(recovered.isEdged, false);
+        // And the freeze cannot arm a new edge while the orgasm runs either.
+        const climbing = calculateEngineOutputs({ ...edged, isEdged: false, orgasmMode: true, maxHr: 160 });
+        assert.equal(climbing.isEdged, false);
+        assert.equal(climbing.newEdgeTriggered, false);
     });
 
     it('survival uses the accelerating floor', () => {
@@ -830,7 +889,11 @@ describe('the microphone boost can never raise either channel', () => {
         // Anchor it in behaviour: a state with its own branch must NOT look
         // like an unknown one, and the two that ARE the default branch
         // (Oracle APPROACH, Edge Training climb) must look exactly like it.
-        const defaultBranch = { oracle: 'APPROACH', edgetrain: 'climb' };
+        // CLIMAX and 'finish' are deliberately the SAME branch as the climb:
+        // both are only ever entered with Force Orgasm on (handled before the
+        // switch), so the only way into them here is a cancel, and a cancel
+        // settles on the state app.js is about to move the game to.
+        const defaultBranch = { oracle: ['APPROACH', 'CLIMAX'], edgetrain: ['climb', 'finish'] };
         for (const [mode, sub] of Object.entries(modeStates)) {
             const shape = (value) => {
                 const out = calculateEngineOutputs({
@@ -847,7 +910,7 @@ describe('the microphone boost can never raise either channel', () => {
             };
             const unknown = shape('__no_such_state__');
             for (const value of sub.values) {
-                if (value === defaultBranch[mode]) {
+                if (defaultBranch[mode].includes(value)) {
                     assert.equal(shape(value), unknown, `${mode}/${value} is meant to BE the default branch`);
                 } else {
                     assert.notEqual(
@@ -979,11 +1042,11 @@ describe('the Guards pullback preview', () => {
     });
 });
 
-describe('Survival Mode is the documented exception to the ceiling rule', () => {
+describe('Survival Mode and Ruin & Leak are the documented exceptions to the ceiling rule', () => {
     it('keeps climbing whatever the At-the-ceiling setting says', () => {
         // Deliberate and self-terminating: the run ends on a breach, which is
         // why the Guards text, the mode card and the README name Survival as
-        // the one mode Full Stop / Crawl does not govern.
+        // one of the two modes Full Stop / Crawl does not govern.
         for (const ceilingBehaviour of ['stop', 'crawl']) {
             const onTheMark = calculateEngineOutputs({
                 ...running,
@@ -997,7 +1060,28 @@ describe('Survival Mode is the documented exception to the ceiling rule', () => 
         }
     });
 
-    it('the Guards text, the mode card and the README all say so', () => {
+    it('Ruin & Leak halts the primary dead whatever the setting says', () => {
+        // Ruin's premise is cutting penile input cold while the secondary
+        // surges, so its 18 s lockout is a full stop on Crawl too. That is
+        // the second exception, and the wording that called Survival the ONLY
+        // one was ours - it has to name both or the code has to change.
+        for (const ceilingBehaviour of ['stop', 'crawl']) {
+            const onTheMark = calculateEngineOutputs({
+                ...running, activeMode: 'ruin', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour
+            });
+            assert.equal(onTheMark.primaryPercent, 0, `ruin ignores ${ceilingBehaviour} on the mark by design`);
+            assert.ok(onTheMark.secondaryPercent > 0, 'the secondary surges while the primary is dead');
+            // And for the whole lockout, with the pulse long back down.
+            const lockout = calculateEngineOutputs({
+                ...running, activeMode: 'ruin', hr: 100, edgeHr: 100, isEdged: false,
+                ruinHoldSeconds: 12, ceilingBehaviour
+            });
+            assert.equal(lockout.primaryPercent, 0, `ruin's lockout ignores ${ceilingBehaviour} by design`);
+            assert.ok(lockout.secondaryPercent > 0);
+        }
+    });
+
+    it('the Guards text, both mode cards and the README name BOTH exceptions', () => {
         const read = (name) => readFileSync(new URL(`../../${name}`, import.meta.url), 'utf8');
         const guards = read('index.html');
         const readme = read('README.md');
@@ -1011,9 +1095,98 @@ describe('Survival Mode is the documented exception to the ceiling rule', () => 
                 /Survival Mode/.test(match[0]),
                 `${where} claims the ceiling rule applies everywhere without naming Survival: ${match[0]}`
             );
+            assert.ok(
+                /Ruin &(amp;)? Leak/.test(match[0]),
+                `${where} must name Ruin & Leak too - its lockout ignores the setting: ${match[0]}`
+            );
+            assert.ok(
+                !/The exception is/.test(match[0]),
+                `${where} still calls one mode THE exception: ${match[0]}`
+            );
         }
-        const card = guards.match(/Speed steadily accelerates[^<]*/);
-        assert.ok(card, 'Survival mode card anchor missing');
-        assert.ok(/At the ceiling/.test(card[0]), `the Survival card must say the rule does not govern it: ${card[0]}`);
+        const survivalCard = guards.match(/Speed steadily accelerates[^<]*/);
+        assert.ok(survivalCard, 'Survival mode card anchor missing');
+        assert.ok(
+            /At the ceiling/.test(survivalCard[0]),
+            `the Survival card must say the rule does not govern it: ${survivalCard[0]}`
+        );
+        const ruinCard = guards.match(/Immediate 0% halt[^<]*/);
+        assert.ok(ruinCard, 'Ruin & Leak mode card anchor missing');
+        assert.ok(
+            /At the ceiling/.test(ruinCard[0]),
+            `the Ruin & Leak card must say the rule does not govern it either: ${ruinCard[0]}`
+        );
+    });
+});
+
+describe('the MIC badge only promises a push that reaches a motor', () => {
+    it('names the modes the boosted pulse can reach', () => {
+        for (const mode of ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin']) {
+            assert.equal(micBoostReachesMotors(mode), true, `${mode} teases down on the boosted pulse`);
+        }
+        assert.equal(micBoostReachesMotors('oracle'), false);
+        assert.equal(micBoostReachesMotors('edgetrain'), false);
+        // Survival's speeds run off its own clock; the boost can only shorten
+        // the stroke zone, and at full depth there is no contraction at all.
+        assert.equal(micBoostReachesMotors('survival', { edgeStrokeDepth: 100 }), false);
+        assert.equal(micBoostReachesMotors('survival', { edgeStrokeDepth: 40 }), true);
+        assert.equal(micBoostReachesMotors('not-a-mode'), true, 'unknown modes are classic');
+    });
+
+    it('a mode it calls blind really does ignore the boost, in every sub-state', () => {
+        // The cockpit badge is only honest if this list is the list the
+        // engine computes from, so take the answer from the engine itself:
+        // where the helper says nothing is reached, the outputs must be
+        // identical with and without a boost.
+        const probes = [
+            { activeMode: 'oracle', oracleState: 'APPROACH' },
+            { activeMode: 'oracle', oracleState: 'HOLD' },
+            { activeMode: 'oracle', oracleState: 'PURGATORY' },
+            { activeMode: 'oracle', oracleState: 'DENIAL' },
+            { activeMode: 'edgetrain', trainingState: 'climb' },
+            { activeMode: 'edgetrain', trainingState: 'hold' },
+            { activeMode: 'edgetrain', trainingState: 'recover' },
+            { activeMode: 'survival' }
+        ];
+        let checked = 0;
+        for (const probe of probes) {
+            assert.equal(
+                micBoostReachesMotors(probe.activeMode, { edgeStrokeDepth: 100 }),
+                false,
+                `${probe.activeMode} is meant to be one of the blind modes`
+            );
+            for (const sensorHr of [80, 100, 120, 135, 140]) {
+                for (const isEdged of [false, true]) {
+                    const base = { ...running, ...probe, edgeStrokeDepth: 100, isEdged, edgeHr: sensorHr };
+                    const quiet = calculateEngineOutputs({ ...base, hr: sensorHr });
+                    const loud = calculateEngineOutputs({ ...base, hr: Math.min(base.maxHr, sensorHr + 8) });
+                    assert.deepEqual(
+                        [loud.primaryPercent, loud.secondaryPercent, loud.strokeMinPercent, loud.strokeMaxPercent],
+                        [quiet.primaryPercent, quiet.secondaryPercent, quiet.strokeMinPercent, quiet.strokeMaxPercent],
+                        `${probe.activeMode}/${probe.oracleState || probe.trainingState || '-'} at ${sensorHr}`
+                            + ' is called blind but the boost moved its output'
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert.ok(checked > 0);
+        // A mode it does NOT call blind must really use the boosted pulse.
+        const teaseQuiet = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 120, edgeHr: 120 });
+        const teaseLoud = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 128, edgeHr: 120 });
+        assert.ok(teaseLoud.primaryPercent < teaseQuiet.primaryPercent, 'a tease mode must feel the boost');
+    });
+
+    it('app.js gates the badge on that helper', () => {
+        // The badge text is written in app.js; the helper is worthless if the
+        // cockpit does not ask it before promising MIC +N.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        assert.ok(/micBoostReachesMotors\(/.test(src), 'app.js must ask which modes the boost reaches');
+        const badge = src.match(/const micApplied = [^;]*;/);
+        assert.ok(badge, 'the badge value anchor moved');
+        assert.ok(
+            /micReaches/.test(badge[0]),
+            `the badge must report nothing in a blind mode: ${badge[0]}`
+        );
     });
 });

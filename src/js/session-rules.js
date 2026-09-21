@@ -142,7 +142,14 @@ export function computeEffectiveCeiling({
 // endless (targetSeconds 0) so the caller can flag the field instead of
 // silently running forever.
 function emptyDuration(invalid = []) {
-    return { targetSeconds: 0, minSeconds: 0, maxSeconds: 0, valid: invalid.length === 0, invalid };
+    return {
+        targetSeconds: 0,
+        minSeconds: 0,
+        maxSeconds: 0,
+        fixedLength: false,
+        valid: invalid.length === 0,
+        invalid
+    };
 }
 
 export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinutes, random = Math.random }) {
@@ -157,7 +164,18 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
         const mins = toMinutes(fixedMinutes);
         if (mins === null) return { ...emptyDuration(['fixed']), valid: false };
         const seconds = mins * 60;
-        return { targetSeconds: seconds, minSeconds: seconds, maxSeconds: seconds, valid: true, invalid: [] };
+        // `fixedLength` is the ONLY thing that tells a Fixed length from a
+        // Mystery window the wearer typed with the same number in both boxes:
+        // both hand out min === max === target, and the Oracle treats the two
+        // completely differently (see oracleTiming).
+        return {
+            targetSeconds: seconds,
+            minSeconds: seconds,
+            maxSeconds: seconds,
+            fixedLength: true,
+            valid: true,
+            invalid: []
+        };
     }
 
     const lo = toMinutes(minMinutes);
@@ -174,6 +192,7 @@ export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinute
         targetSeconds: mins * 60,
         minSeconds: lo * 60,
         maxSeconds: hi * 60,
+        fixedLength: false,
         valid: true,
         invalid: []
     };
@@ -191,7 +210,8 @@ export function oracleTiming({
     sessionSeconds = 0,
     minSeconds = 0,
     maxSeconds = 0,
-    targetSeconds = 0
+    targetSeconds = 0,
+    fixedLength = false
 } = {}) {
     const t = Math.max(0, Number(sessionSeconds) || 0);
     const min = Math.max(0, Number(minSeconds) || 0);
@@ -210,7 +230,14 @@ export function oracleTiming({
     // see would unlock climax and denial at half the time they asked for.
     // Such a session simply has canEnd false until the minimum and mustEnd
     // true at it.
-    const fixedWindow = min >= closeAt && min >= max;
+    //
+    // A Mystery typed with the same number in both boxes (30-30) hands out
+    // exactly the numbers a Fixed length does, so the numbers alone cannot
+    // tell them apart: 30-30 was read as Fixed and unlocked climax - which
+    // arms Force Orgasm - and denial at 15 minutes, half the minimum that was
+    // typed. The caller says which kind it is, and the default is the Mystery
+    // rule, because that is the one that waits.
+    const fixedWindow = Boolean(fixedLength) && min >= closeAt && min >= max;
     const openAt = closeAt > 0 && fixedWindow
         ? Math.floor(closeAt * ORACLE_MIN_WINDOW_SHARE)
         : min;
@@ -422,4 +449,79 @@ export function tickEdgeTraining(
         return { ...idle, state: 'hold', holdSeconds: 1, edgesDone: done, justHold: true };
     }
     return { ...idle, state: 'climb', holdSeconds: 0, edgesDone: done };
+}
+
+// What arriving at the endgame does to a latched Force Orgasm. The latch is
+// armed earlier in the session, by the wearer or by an Oracle climax roll,
+// and the engine's orgasm override floors the primary at 85% and pins the
+// secondary at 100% for as long as it is on. Only the Orgasm endgame keeps
+// it, because that ending IS the latch: a Soft Landing is a 45 s tease-down
+// and would otherwise run at full speed from its first second to its last,
+// and Denied stops the session (which clears the latch anyway).
+export function endgameKeepsOrgasmLatch(endgameType) {
+    return endgameType === 'orgasm';
+}
+
+// The cockpit's game banner, as pure text: the caller paints what comes back
+// and hides the banner on ''. It is only ever a report of the state the
+// session is really in - a banner that says the Oracle is still deciding, or
+// that the training is still climbing, while the session is teasing down to
+// a stop is worse than no banner at all.
+export function describeGameNotice({
+    activeMode,
+    sessionStatus,
+    oracleState = 'IDLE',
+    oracleTimer = 0,
+    trainState = 'climb',
+    trainHoldSeconds = 0,
+    trainEdgesDone = 0,
+    trainHoldGoal,
+    trainEdgesGoal,
+    survivalSpeedFloor = 0,
+    sessionSeconds = 0,
+    minSeconds = 0,
+    maxSeconds = 0,
+    targetSeconds = 0,
+    fixedLength = false
+} = {}) {
+    const isGame = activeMode === 'oracle' || activeMode === 'survival' || activeMode === 'edgetrain';
+    const live = sessionStatus === 'RUNNING' || sessionStatus === 'RAMPDOWN';
+    if (!isGame || !live) return '';
+
+    // A Soft Landing ends the game whichever way it was reached: the Oracle's
+    // own roll sets oracleState to RAMPDOWN, but the session timer can hand
+    // ANY game to the same tease-down and leaves the game state exactly where
+    // it stood. Nothing is still deciding and nothing is still climbing for
+    // those 45 s, so the banner says what is really happening instead.
+    if (sessionStatus === 'RAMPDOWN') {
+        return activeMode === 'oracle' ? 'THE ORACLE: SOFT LANDING' : 'SOFT LANDING: TEASING DOWN';
+    }
+
+    if (activeMode === 'oracle') {
+        if (oracleState === 'HOLD') return `THE ORACLE: HOLDING ${oracleTimer}s — FATE PENDING`;
+        if (oracleState === 'CLIMAX') return 'THE ORACLE: CLIMAX';
+        if (oracleState === 'DENIAL') return 'THE ORACLE: DENIAL';
+        if (oracleState === 'RAMPDOWN') return 'THE ORACLE: SOFT LANDING';
+        if (oracleState === 'PURGATORY') {
+            const timing = oracleTiming({ sessionSeconds, minSeconds, maxSeconds, targetSeconds, fixedLength });
+            return timing.canEnd ? 'THE ORACLE: PURGATORY' : 'THE ORACLE: NOT YET — KEEP CLIMBING';
+        }
+        return 'THE ORACLE: APPROACHING THE CEILING';
+    }
+
+    if (activeMode === 'survival') {
+        const floor = Math.round(Number.isFinite(survivalSpeedFloor) ? survivalSpeedFloor : 0);
+        return `SURVIVAL: FLOOR ${floor}% — STAY UNDER YOUR LIMIT`;
+    }
+
+    const need = clampTrainEdges(trainEdgesGoal);
+    const done = Math.max(0, Number.isFinite(trainEdgesDone) ? Math.round(trainEdgesDone) : 0);
+    if (trainState === 'hold') {
+        const holdGoal = clampTrainHoldSeconds(trainHoldGoal);
+        const held = Math.max(0, Number.isFinite(trainHoldSeconds) ? Math.round(trainHoldSeconds) : 0);
+        return `EDGE TRAINING: HOLD ${Math.max(0, holdGoal - held)}s — ${done}/${need} EDGES`;
+    }
+    if (trainState === 'recover') return `EDGE TRAINING: RECOVER — ${done}/${need} EDGES`;
+    if (trainState === 'finish') return 'EDGE TRAINING: COMPLETE — COME';
+    return `EDGE TRAINING: CLIMB — ${done}/${need} EDGES`;
 }
