@@ -157,12 +157,18 @@ function emptyDuration(invalid = []) {
     };
 }
 
+// A "Fixed" session longer than a day is the Endless mode with extra steps.
+// A length outside the window is REFUSED here rather than clamped, so both
+// a typed one and a stored one fall back to the factory length - the same
+// answer, whichever way the number arrived.
+export const MAX_SESSION_MINUTES = 1440;
+
 export function parseSessionDuration({ mode, fixedMinutes, minMinutes, maxMinutes, random = Math.random }) {
     if (mode === 'endless') return emptyDuration();
 
     const toMinutes = (value) => {
         const n = toInt(value);
-        return n !== null && n > 0 ? n : null;
+        return n !== null && n > 0 && n <= MAX_SESSION_MINUTES ? n : null;
     };
 
     if (mode === 'fixed') {

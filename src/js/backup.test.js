@@ -35,6 +35,9 @@ import {
     NOTE_KEY_UNUSABLE
 } from './backup.js';
 import { advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
+import { sanitizeSetting } from './settings-schema.js';
+import { sanitizeSessionLimits } from './session-rules.js';
+import { normalizeEnvelope } from './hardware/handy-protocol.js';
 
 const KEY = 'AUDITKEY-9f3c21';
 
@@ -315,7 +318,13 @@ describe('an older file still imports', () => {
         assert.equal(read.ok, true);
         assert.equal(read.legacy, true);
         assert.equal(read.version, LEGACY_VERSION);
-        assert.deepEqual(read.settings, legacy);
+        // `requested` is the file as written; `settings` is what this app
+        // will take, each value through the same sanitizer a typed one gets
+        // (mergeVoiceCues fills in the banks the file did not mention).
+        assert.deepEqual(read.requested, legacy);
+        assert.equal(read.settings.minHr, 66);
+        assert.equal(read.settings.maxHr, 96);
+        assert.deepEqual(read.settings.voiceCues.edge, ['hold']);
         assert.equal(read.keyPresent, false);
         assert.equal(read.keyDeclaredAbsent, false, 'an old file has no opinion about the key');
         assert.deepEqual(read.handy, { role: null, maxCap: null });
@@ -380,10 +389,11 @@ describe('a hand-edited or hostile file cannot do harm', () => {
     });
 
     it('cannot invert a travel envelope or raise a ceiling on its own', () => {
-        // Nothing here re-shapes the numbers: settings values pass through
-        // untouched and app.js clamps them with the same sanitizers a typed
-        // value goes through. What this module guarantees is that no value
-        // it OWNS can come back unsafe.
+        // Every value is bounded on the way through, per field, by the same
+        // sanitizer a typed one gets. The three PAIRS - the HR limits, the
+        // duration window, the travel envelope - are reconciled against each
+        // other afterwards by their owners (see CROSS_FIELD_OWNERS), because
+        // only they can see both halves.
         const read = readBackup({
             format: BACKUP_FORMAT,
             version: BACKUP_VERSION,
@@ -393,7 +403,18 @@ describe('a hand-edited or hostile file cannot do harm', () => {
         });
         assert.equal(read.handy.maxCap, 100);
         assert.equal(read.devices.intiface.d.axes['scalar:0'].maxCap, 100);
-        assert.deepEqual(read.settings, { handyHwMin: 900, handyHwMax: -4, maxHr: 9999 });
+        // The three PAIRS are handed to their owners as written, because
+        // only an owner that sees both halves can tell "clamp this end"
+        // from "this pair is nonsense, use the factory one".
+        assert.equal(read.settings.maxHr, 9999);
+        assert.deepEqual(
+            (({ minHr, maxHr }) => ({ minHr, maxHr }))(sanitizeSessionLimits(read.settings)),
+            { minHr: 70, maxHr: 140 },
+            'and the owner refuses the pair rather than keeping a 9999 end'
+        );
+        const envelope = normalizeEnvelope(read.settings.handyHwMin, read.settings.handyHwMax);
+        assert.ok(envelope.min >= 0 && envelope.max <= 100 && envelope.min < envelope.max, JSON.stringify(envelope));
+        assert.deepEqual(read.requested, { handyHwMin: 900, handyHwMax: -4, maxHr: 9999 }, 'what the file asked for is kept verbatim for the count');
     });
 
     it('drops the file fields from a live settings store that an old import polluted', () => {
@@ -411,7 +432,10 @@ describe('the import says what it did', () => {
     it('names everything it restored', () => {
         const text = describeBackupImport(full, { hadExistingKey: false });
         assert.match(text, /5 Session Setup values/);
-        assert.match(text, /the Handy channel role and speed cap/);
+        // named with their values, so the reader does not have to open the
+        // Handy panel to find out what the cap now is
+        assert.match(text, /the Handy channel role \(now secondary\)/);
+        assert.match(text, /the Handy speed cap \(now 65%\)/);
         assert.match(text, /1 Intiface device map/);
         assert.match(text, /1 T-Code device map/);
     });
@@ -558,11 +582,16 @@ describe('the learning profile is clamped like every other restored value', () =
         assert.equal(sanitizeLearningProfile({ breakthroughEvents: 1e9 }).breakthroughEvents, 9999);
     });
 
-    it('drops an unreadable profile so the one in this browser survives', () => {
-        assert.equal(sanitizeLearningProfile('yes'), null);
-        assert.equal(sanitizeLearningProfile([1]), null);
+    it('an unreadable profile becomes the zeroed one a fresh install has', () => {
+        // Not dropped: a file that carries a profile field is asking for a
+        // profile, and the only profile with no information in it is the
+        // one a fresh install has.
+        assert.deepEqual(sanitizeLearningProfile('yes'), { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null });
+        assert.deepEqual(sanitizeLearningProfile([1]), { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null });
         const read = readBackup({ minHr: 70, learningProfile: 'yes' });
-        assert.equal('learningProfile' in read.settings, false);
+        assert.deepEqual(read.settings.learningProfile, { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null });
+        // and the file's own words are kept, so the count can see it changed
+        assert.equal(read.requested.learningProfile, 'yes');
     });
 
     it('clamps the profile that arrives inside a file', () => {
@@ -707,7 +736,7 @@ describe('the second round of findings', () => {
     it('names the flags, and does not say "settings imported" over no settings', () => {
         const flagsOnly = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, flags: { ageVerified: true, wizardSeen: true } });
         const text = describeBackupImport(flagsOnly, {});
-        assert.match(text, /age \/ wizard flags/);
+        assert.match(text, /your age confirmation and whether you have seen the setup guide/);
         assert.ok(!/Settings imported: 0/.test(text));
         const keyOnly = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, handyConnectionKey: 'KEY-1' });
         assert.match(describeBackupImport(keyOnly, {}), /Nothing in this file changed a setting here/);
@@ -749,10 +778,13 @@ describe('the second round of findings', () => {
         assert.ok(!/connection key was restored/.test(text), 'the key cannot be both refused and restored');
         const roleRefused = describeBackupImport(readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, handy: { role: 'off', maxCap: 40 } }), { unsaved: ['role'] });
         assert.match(roleRefused, /REFUSED TO SAVE the Handy channel role/);
-        assert.match(roleRefused, /Settings imported: the Handy speed cap\./, 'the cap did save, so the cap alone is what was restored');
-        assert.ok(!/channel role and speed cap/.test(roleRefused));
-        // an id this version does not know is ignored rather than printed raw
-        assert.ok(!/REFUSED/.test(describeBackupImport(read, { unsaved: ['nonsense'] })));
+        assert.match(roleRefused, /Settings imported: the Handy speed cap \(now 40%\)\./, 'the cap did save, so the cap alone is what was restored');
+        assert.ok(!/channel role \(now/.test(roleRefused));
+        // an id this version does not know is still a refusal: dropping it
+        // would turn a failed write into a silently positive report
+        const unnamed = describeBackupImport(read, { unsaved: ['nonsense'] });
+        assert.match(unnamed, /REFUSED TO SAVE one more part of this restore/);
+        assert.match(describeBackupImport(read, { unsaved: ['nonsense', 'alsoNonsense'] }), /2 more parts of this restore/);
     });
 
     it('says when the device-map limit displaced maps that were already here', () => {
@@ -790,15 +822,25 @@ describe('app.js keeps its side of the second round', () => {
     });
 
     it('counts what the store kept, not what the file offered', () => {
-        assert.match(src, /const settingsStored = countStoredSettings\(result\.settings\) - result\.clampedSettingKeys\.length;/);
-        const order = src.indexOf('syncGuardSettings();', src.indexOf('readBackup(parsed)'));
-        assert.ok(order >= 0 && order < src.indexOf('countStoredSettings(result.settings)'), 'count after the clamps, not before');
+        assert.match(src, /const settingsStored = countStoredSettings\(result\.requested\);/);
+        // The comparison is against what the file ASKED for, so it has to
+        // run after the store has been clamped, not before.
+        const importer = src.slice(src.indexOf("getElementById('importConfigFile')"));
+        const clamp = importer.indexOf('syncGuardSettings();');
+        const count = importer.indexOf('countStoredSettings(result.requested)');
+        assert.ok(clamp >= 0 && count > clamp, 'count after the clamps, not before');
     });
 
-    it('coerces the settings a control can only write one way', () => {
-        assert.match(src, /advancedSettings\.ceilingBehaviour = advancedSettings\.ceilingBehaviour === 'stop' \? 'stop' : 'crawl';/);
-        assert.match(src, /for \(const name of BOOLEAN_SETTINGS\)/);
-        assert.ok(/BOOLEAN_SETTINGS = SETTING_KEYS\.filter/.test(src));
+    it('runs every settings value through the schema, and nothing else', () => {
+        // Behaviour, not spelling: a source match passes just as happily
+        // over a line that no longer does anything (proven - two guards in
+        // this file survived their implementation being gutted).
+        assert.equal(sanitizeSetting('ceilingBehaviour', 'melt'), 'crawl');
+        assert.equal(sanitizeSetting('ceilingBehaviour', 'stop'), 'stop');
+        assert.equal(sanitizeSetting('stallGuard', 'no'), true, 'junk falls back to the factory value, which is ON');
+        assert.equal(sanitizeSetting('voiceURI', 42), '');
+        // and app.js must call it rather than clamping fields by hand
+        assert.match(src, /const corrected = applySettingSchema\(advancedSettings\);/);
     });
 
     it('leaves both file imports reachable from the keyboard', () => {
@@ -823,19 +865,21 @@ describe('app.js keeps its side of the second round', () => {
 
 describe('the third round: what the fixes themselves broke', () => {
     it('an unrecognised boolean falls back to the factory value, not to false', () => {
-        // The fix that coerced booleans coerced them to `false`, which is
-        // the OPPOSITE of the factory value for every setting that ships
-        // on - the stall guard among them, the watchdog that halts the
-        // primary after too long at the edge. It was switched off by a
-        // hand-edited file and reported as "the safe default".
-        const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-        const block = APP.slice(APP.indexOf('for (const name of BOOLEAN_SETTINGS)'), APP.indexOf('advancedSettings.voiceCues = mergeVoiceCues'));
-        assert.match(block, /SETTING_DEFAULTS\[name\]/, 'the fallback has to be the factory value');
-        assert.match(block, /value === false \|\| value === 'false' \? false/, 'a real false must still be false');
-        // the settings that ship ON are the ones the old fallback inverted
-        const onByDefault = SETTING_KEYS.filter((name) => SETTING_DEFAULTS[name] === true);
-        assert.ok(onByDefault.includes('stallGuard'), 'the stall guard ships on');
-        assert.ok(onByDefault.length >= 5, `expected several on-by-default toggles, found ${onByDefault.length}`);
+        // Coercing to `false` is the OPPOSITE of the factory value for every
+        // setting that ships on - the stall guard among them, the watchdog
+        // that halts the primary after too long at the edge. It was switched
+        // off by a hand-edited file and reported as "the safe default".
+        const booleans = SETTING_KEYS.filter((name) => typeof SETTING_DEFAULTS[name] === 'boolean');
+        assert.ok(booleans.includes('stallGuard') && SETTING_DEFAULTS.stallGuard === true, 'the stall guard ships on');
+        for (const name of booleans) {
+            for (const junk of [1, 0, 2, -1, 'yes', 'no', 'TRUE', 'False', 'on', '1', '', null, [], {}, undefined]) {
+                assert.equal(sanitizeSetting(name, junk), SETTING_DEFAULTS[name], `${name} <- ${JSON.stringify(junk)}`);
+            }
+            assert.equal(sanitizeSetting(name, true), true);
+            assert.equal(sanitizeSetting(name, false), false);
+            assert.equal(sanitizeSetting(name, 'true'), true);
+            assert.equal(sanitizeSetting(name, 'false'), false, 'the string a JSON round-trip of a checkbox can produce');
+        }
     });
 
     it('the role write is verified, so it is the eighth checked write and not the one hole', () => {
@@ -855,7 +899,10 @@ describe('the third round: what the fixes themselves broke', () => {
         // Either half of the test alone gets a real file wrong.
         const pollutedLegacy = readBackup({ minHr: 62, maxHr: 158, format: BACKUP_FORMAT });
         assert.equal(pollutedLegacy.ok, true, 'a legacy blob that picked up a stray format field still imports');
-        assert.equal(pollutedLegacy.legacy, true);
+        // It carries a marker, so it is not described as marker-less; what
+        // matters is that its settings are read from where they actually are.
+        assert.equal(pollutedLegacy.legacy, false);
+        assert.equal(readBackup({ minHr: 62, maxHr: 158 }).legacy, true, 'a blob with no marker at all is still legacy');
         assert.equal(pollutedLegacy.settings.minHr, 62);
 
         const declaredByVersion = readBackup({ version: 2, settings: 'oops', handy: { role: 'off', maxCap: 20 }, flags: { ageVerified: true, wizardSeen: false } });
@@ -869,17 +916,23 @@ describe('the third round: what the fixes themselves broke', () => {
         // and the ordinary shapes are unchanged
         assert.equal(readBackup(buildBackup(STORES, { now: NOW })).legacy, false);
         assert.equal(readBackup({ minHr: 70 }).legacy, true);
-        assert.equal(readBackup({ minHr: 61, version: 2 }).legacy, true, 'a stray version field alone is not an envelope either');
+        assert.equal(readBackup({ minHr: 61, version: 2 }).settings.minHr, 61, 'a stray version field does not hide the settings');
         assert.equal(readBackup({ format: BACKUP_FORMAT, version: '2', settings: { minHr: 61 } }).version, 2, 'a version written as a string still reads as 2');
     });
 
-    it('what readBackup clamped itself is not reported as a clean restore', () => {
+    it('a corrected value is visible as corrected, and key order is not a correction', () => {
         const read = readBackup({ minHr: 70, learningProfile: { breakthroughEvents: 99999, suggestedMaxHrOffset: 500, lastBreakthroughHr: 9 } });
-        assert.deepEqual(read.clampedSettingKeys, ['learningProfile']);
         assert.deepEqual(read.settings.learningProfile, { breakthroughEvents: 9999, suggestedMaxHrOffset: MAX_LEARNED_OFFSET_BPM, lastBreakthroughHr: null });
-        // a profile that needed no correction is not flagged
-        assert.deepEqual(readBackup({ minHr: 70, learningProfile: { breakthroughEvents: 3, suggestedMaxHrOffset: 9, lastBreakthroughHr: 141 } }).clampedSettingKeys, []);
-        assert.deepEqual(readBackup({ minHr: 70 }).clampedSettingKeys, []);
+        // The count compares the store against `requested`, so what the app
+        // corrected differs and is reported as corrected - with no second
+        // list to keep in step.
+        assert.deepEqual(read.requested.learningProfile, { breakthroughEvents: 99999, suggestedMaxHrOffset: 500, lastBreakthroughHr: 9 });
+        // A backup re-serialised by any tool (jq -S) carries the same values
+        // in another key order. That is not a correction, and the count says
+        // so - app.js compares canonically.
+        const sorted = { lastBreakthroughHr: 141, breakthroughEvents: 3, suggestedMaxHrOffset: 9 };
+        const readSorted = readBackup({ minHr: 70, learningProfile: sorted });
+        assert.deepEqual(readSorted.settings.learningProfile, { breakthroughEvents: 3, suggestedMaxHrOffset: 9, lastBreakthroughHr: 141 });
     });
 
     it('says a refused value came back at the nearest the app takes, not at the default', () => {
@@ -906,6 +959,95 @@ describe('the third round: what the fixes themselves broke', () => {
         assert.match(handler, /try \{\s*a\.click\(\);/);
         assert.match(handler, /The download did not start, so nothing was written/);
         assert.match(handler, /\} finally \{\s*URL\.revokeObjectURL\(url\);/);
+    });
+});
+
+describe('the fourth round: the message read as a whole', () => {
+    // Every earlier message test greps for one line. Nothing asserted that
+    // the lines agree with each other - and three of them did not.
+    const CONTRADICTIONS = [
+        [/Nothing in this file changed a setting here/, /outside what this app accepts/],
+        [/Nothing in this file changed a setting here/, /REFUSED TO SAVE/],
+        [/carried no Session Setup values/, /Session Setup block in this file is damaged/],
+        [/connection key was restored/, /REFUSED TO SAVE your Handy connection key/],
+        [/Settings imported: the Handy channel role/, /REFUSED TO SAVE the Handy channel role/],
+        [/Settings imported: the Handy speed cap/, /REFUSED TO SAVE the Handy speed cap/]
+    ];
+    const FILES = {
+        'a normal backup': [buildBackup(STORES, { includeKey: true, now: NOW }), {}],
+        'an older blob': [{ minHr: 66, maxHr: 158 }, {}],
+        'a newer version': [{ format: BACKUP_FORMAT, version: 9, settings: { minHr: 66 } }, {}],
+        'all values out of range': [{ stallGuardSeconds: 9999, trainEdges: 999, decayFloor: 5 }, { settingsStored: 0, settingsChanged: true }],
+        'a damaged block': [{ format: BACKUP_FORMAT, version: 2, settings: 'oops', handy: { role: 'off', maxCap: 40 } }, {}],
+        'flags only': [{ format: BACKUP_FORMAT, version: 2, settings: {}, flags: { ageVerified: true, wizardSeen: true } }, {}],
+        'key only': [{ format: BACKUP_FORMAT, version: 2, settings: {}, handyConnectionKey: 'K-1' }, {}],
+        'a key that replaces one': [{ minHr: 70, handyConnectionKey: 'K-2' }, { hadExistingKey: true, keyReplaced: true }],
+        'nothing saved at all': [buildBackup(STORES, { includeKey: true, now: NOW }), { unsaved: ['settings', 'key', 'role', 'cap', 'intiface', 'tcode', 'flags'], settingsChanged: true }],
+        'settings refused, file had none': [{ format: BACKUP_FORMAT, version: 2, settings: {}, handy: { role: 'off' } }, { unsaved: ['settings'] }],
+        'a foreign file': [{ someOtherApp: true }, {}],
+        'device maps displaced': [{ format: BACKUP_FORMAT, version: 2, settings: { minHr: 70 }, devices: { intiface: { a: { axes: {}, savedAt: 1 } } } }, { droppedDeviceMaps: 3 }],
+        'a file this app corrected in part': [{ minHr: 66, stallGuardSeconds: 9999 }, { settingsStored: 1, settingsChanged: true }],
+        'unreadable profile': [{ minHr: 70, learningProfile: 'yes' }, { settingsStored: 1, settingsChanged: true }],
+        'a hostile key': [{ minHr: 70, handyConnectionKey: 'has a space' }, { hadExistingKey: true }]
+    };
+
+    for (const [label, [file, context]] of Object.entries(FILES)) {
+        it(`reads coherently: ${label}`, () => {
+            const text = describeBackupImport(readBackup(file), context);
+            for (const [a, b] of CONTRADICTIONS) {
+                assert.ok(!(a.test(text) && b.test(text)),
+                    `these two lines cannot both be true:\n${a}\n${b}\n---\n${text}`);
+            }
+            // no placeholder, no raw id, no empty list, no double space
+            assert.ok(!/undefined|NaN|\[object|null/.test(text), text);
+            assert.ok(!/REFUSED TO SAVE \./.test(text), text);
+            assert.ok(!/ {2}/.test(text), text);
+            assert.ok(text.trim().length > 0);
+            // every paragraph is a sentence
+            for (const para of text.split('\n\n')) {
+                assert.match(para.trim(), /[.!]$/, `paragraph does not end in a full stop: ${para}`);
+            }
+        });
+    }
+
+    it('says something changed only when something changed', () => {
+        const read = readBackup({ stallGuardSeconds: 9999 });
+        assert.match(describeBackupImport(read, { settingsStored: 0, settingsChanged: true }),
+            /No value in this file could be used exactly as written, but it did change settings here/);
+        assert.match(describeBackupImport(read, { settingsStored: 0, settingsChanged: false }),
+            /Nothing in this file changed a setting here/);
+    });
+
+    it('does not tell a user their Session Setup is untouched over a damaged block', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: 2, settings: 'oops', flags: { ageVerified: true } });
+        const text = describeBackupImport(read, {});
+        assert.match(text, /damaged/);
+        assert.ok(!/carried no Session Setup values/.test(text));
+    });
+});
+
+describe('the fourth round: an import is not something to do mid-session', () => {
+    const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+
+    it('refuses while a session is running, before the file is even read', () => {
+        const handler = src.slice(src.indexOf("getElementById('importConfigFile')"));
+        const guard = handler.indexOf("state.sessionStatus !== 'IDLE'");
+        const read = handler.indexOf('readAsText');
+        assert.ok(guard >= 0, 'a restore reaches the motors on the tick it happens');
+        assert.ok(guard < read, 'and the refusal has to come before the file is read');
+        assert.match(handler.slice(guard, guard + 700), /Stop the session first/);
+    });
+
+    it('clears the picker so the same file can be imported once the session ends', () => {
+        const handler = src.slice(src.indexOf("getElementById('importConfigFile')"));
+        const guard = handler.indexOf("state.sessionStatus !== 'IDLE'");
+        assert.match(handler.slice(guard, guard + 700), /e\.target\.value = '';/);
+    });
+
+    it('only the migration a store has never seen may run', () => {
+        // A file can carry `envelopeMigrated: false`; re-running the 15/85
+        // migration on it wipes the envelope the user just restored.
+        assert.match(src, /hasOwnProperty\.call\(parsed, 'envelopeMigrated'\)/);
     });
 });
 

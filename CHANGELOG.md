@@ -380,6 +380,36 @@ credited by username.
   flags without a word.
 - An export whose download never starts says so instead of leaving
   "Exported ..." on screen, and releases the object URL either way.
+- **Every Session Setup field has a sanitizer now, and a field with none
+  fails the test suite.** The allow-list added above answered "is this a
+  name this build wrote?" and nothing else; the values were clamped by
+  whichever sync function happened to own them, and six fields were owned
+  by nobody. `gammaCurve` was the sharp one. It has no control anywhere in
+  the app, it is read straight into the engine as the exponent on the
+  progress term that drives BOTH channels, and nothing clamped it: a
+  one-field imported file could set it to 200, and with `pow(progress, 200)`
+  collapsing to zero the engine stops backing off as the pulse climbs.
+  Measured in a live session, both channels went from 48% to 100% at 120
+  BPM against a typed ceiling of 140, and the import called it "1 Session
+  Setup value". The two fields with no control at all are pinned to their
+  factory value, and the test that pins them fails the day either one gets
+  a control, so the pin can never quietly outlive its reason.
+- Where a value only makes sense beside another one - the Resting/Climax
+  pair, the session length, the travel envelope - the rule that owns the
+  pair decides, and nothing clamps the halves before it. Clamping first
+  turns "this pair is nonsense, use the factory one" into "both ends are
+  in range now, keep them": a file asking for a Climax HR of 9999 would
+  have restored 250 instead of the factory 140, and a stored length of -3
+  would have become a one-minute session instead of the factory 30.
+- **A restore is refused while a session is running.** It writes the speed
+  cap, sets the channel role and rewrites the stroke range, and those reach
+  the toys on the tick the file is read - picking the file is the commit,
+  with no preview and no undo. Restoring your own legitimate backup
+  mid-session took a 20% speed cap to 100% between one tick and the next.
+- A restored value is named with its value: "the Handy speed cap (now 55%)"
+  rather than "the Handy speed cap", which left the reader opening the
+  Handy panel to find out what it now is - and a cap silently back at 100%
+  is where this whole entry started.
 - A restored learning profile now repaints the panel that describes it.
   The engine was handed the imported offset immediately, while Session Setup
   went on saying "Zero breakthrough events recorded. Typed Climax HR is used

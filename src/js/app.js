@@ -31,6 +31,7 @@ import {
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
+import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
@@ -125,7 +126,11 @@ const storedSettings = safeParse('edgeloop_advanced_settings', null);
 if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(storedSettings)) {
     const parsed = storedSettings;
     let migrated = false;
-    if (!parsed.envelopeMigrated) {
+    // Only a store that has never seen the migration runs it. A file can
+    // carry `envelopeMigrated: false`, and re-running the migration on that
+    // would wipe a 15/85 envelope the user had just restored - then write
+    // the flag back and do it again to the next file.
+    if (!Object.prototype.hasOwnProperty.call(parsed, 'envelopeMigrated')) {
         if (parsed.handyHwMin === 15 && parsed.handyHwMax === 85) {
             parsed.handyHwMin = 0;
             parsed.handyHwMax = 100;
@@ -158,53 +163,39 @@ if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(store
 // are re-applied after load, apply and import.
 const hrWatchdog = createHrWatchdog();
 function syncWatchdogSettings() {
-    advancedSettings.hrStaleSeconds = clampStaleSeconds(advancedSettings.hrStaleSeconds);
-    advancedSettings.hrAutoResume = advancedSettings.hrAutoResume !== false;
+    // The two values themselves are bounded by the schema (the single place
+    // every Session Setup field is checked); this only hands them to the
+    // watchdog. It used to coerce them itself with `!== false`, which read
+    // the string 'false' from a hand-edited file as TRUE and auto-resumed a
+    // session the watchdog had paused.
+    applySettingSchema(advancedSettings);
     hrWatchdog.configure({
         staleMs: advancedSettings.hrStaleSeconds * 1000,
         autoResume: advancedSettings.hrAutoResume
     });
 }
-// Stall hold (3-120 s), stall pause (2-60 s), edge hold percent (90-100)
-// and the mic gate are clamped wherever they enter: load, Apply and import.
-// The settings whose factory value is a boolean; a toggle can write nothing
-// else. Taken from the frozen defaults so adding a toggle needs no list.
-const BOOLEAN_SETTINGS = SETTING_KEYS.filter((name) => typeof SETTING_DEFAULTS[name] === 'boolean');
-
+// Every Session Setup field, checked the same way wherever it enters -
+// typed, loaded from storage on boot, or restored from a file. One
+// sanitizer per field lives in settings-schema.js, and a field with no
+// sanitizer is a failing test rather than a value nothing bounds: that was
+// how `gammaCurve`, which has no control at all and is read straight into
+// the engine, could be set to 200 by a one-field imported file and stop the
+// engine backing off as the pulse climbed.
 function syncGuardSettings() {
-    advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
-    advancedSettings.stallPauseSeconds = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
-    advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(advancedSettings.edgeHoldPercent);
-    advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
-    advancedSettings.trainEdges = clampTrainEdges(advancedSettings.trainEdges);
-    advancedSettings.handyEndMargin = clampEndMargin(advancedSettings.handyEndMargin);
-    advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
-    advancedSettings.micBoostMaxBpm = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
-    // A select can only hold one of its options and a toggle can only hold
-    // true or false, so a stored or imported `ceilingBehaviour: 'melt'` or
-    // `stallGuard: 'no'` is a value no control could have produced: the
-    // panel would show one thing, the store another, and the next export
-    // would carry the impossible one forward. Coerced here, where every
-    // other "a typed value is clamped, so a stored one is too" rule lives.
-    advancedSettings.ceilingBehaviour = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
-    for (const name of BOOLEAN_SETTINGS) {
-        const value = advancedSettings[name];
-        // Falling back to `false` would be falling back to the OPPOSITE of
-        // the factory value for every setting that ships on - the stall
-        // guard among them, which is the watchdog that halts the primary
-        // after too long at the edge. A value nobody can type is a value
-        // with no information in it, so the factory one is what replaces it.
-        advancedSettings[name] = value === true || value === 'true' ? true
-            : value === false || value === 'false' ? false
-            : SETTING_DEFAULTS[name];
+    const corrected = applySettingSchema(advancedSettings);
+    // The cross-field rules run after the per-field pass: the HR pair, the
+    // duration window and the Endgame Trigger depend on each other, and a
+    // stored pair is reconciled exactly as a typed one is - a hand-edited
+    // store cannot raise the ceiling.
+    const limits = sanitizeSessionLimits(advancedSettings);
+    for (const [name, value] of Object.entries(limits)) {
+        if (JSON.stringify(advancedSettings[name]) !== JSON.stringify(value) && !corrected.includes(name)) {
+            corrected.push(name);
+        }
+        advancedSettings[name] = value;
     }
-    if (typeof advancedSettings.voiceURI !== 'string') advancedSettings.voiceURI = SETTING_DEFAULTS.voiceURI;
-    advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
-    advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
-    // The typed HR limits, the duration window and the Endgame Trigger are
-    // stored like every other setting, and a stored one is clamped exactly
-    // as a typed one is: a hand-edited store cannot raise the ceiling.
-    Object.assign(advancedSettings, sanitizeSessionLimits(advancedSettings));
+    // What the pass had to change, for the import to report honestly.
+    return corrected;
 }
 syncWatchdogSettings();
 syncGuardSettings();
@@ -2849,6 +2840,18 @@ function applyImportedBackup(result) {
 // once the app's own clamps have run. A pair like minHr 5 / maxHr 9999 is
 // refused by sanitizeSessionLimits and comes back at the factory numbers,
 // and "2 values imported" over two defaults is a count of nothing.
+// Key order is not a difference: a backup re-serialised by any tool (jq -S,
+// json.dump(sort_keys=True)) has the same values in another order, and
+// reporting that as "outside what this app accepts" would be nonsense.
+function canonical(value) {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+        return Object.keys(value).sort().reduce((out, key) => { out[key] = canonical(value[key]); return out; }, {});
+    }
+    return value;
+}
+const sameValue = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+
 function countStoredSettings(fileSettings) {
     let kept = 0;
     for (const [name, value] of Object.entries(fileSettings)) {
@@ -2859,11 +2862,15 @@ function countStoredSettings(fileSettings) {
             // restored nothing; `[].every()` is true, so it has to be
             // rejected before the comparison, not by it.
             if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+            const banks = Object.keys(value);
+            // `[].every()` is true, so an empty cue object would count as a
+            // restored value while restoring nothing.
+            if (!banks.length) continue;
             const live = advancedSettings.voiceCues || {};
-            if (Object.keys(value).every((bank) => JSON.stringify(live[bank]) === JSON.stringify(value[bank]))) kept += 1;
+            if (banks.every((bank) => sameValue(live[bank], value[bank]))) kept += 1;
             continue;
         }
-        if (JSON.stringify(advancedSettings[name]) === JSON.stringify(value)) kept += 1;
+        if (sameValue(advancedSettings[name], value)) kept += 1;
     }
     return kept;
 }
@@ -2871,6 +2878,17 @@ function countStoredSettings(fileSettings) {
 document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // A restore reaches the motors: it writes the Handy speed cap, sets the
+    // channel role, rewrites the stroke envelope and ticks the engine on the
+    // same pass. Picking the file is the commit - there is no preview and no
+    // undo - so it is not something to do to a session in progress. Measured
+    // before this guard: importing a legitimate backup at 120 BPM took both
+    // channels from 48% to 100% between one tick and the next.
+    if (state.sessionStatus !== 'IDLE') {
+        alert('Stop the session first. Restoring a backup changes the Handy speed cap, the channel roles and the stroke range, and those reach the toys the moment the file is read - not something to do mid-session.');
+        e.target.value = '';
+        return;
+    }
     const reader = new FileReader();
     // A file that vanishes or loses its permission between the pick and the
     // read fires `error`, not `load`. Without this the button does nothing
@@ -2898,15 +2916,21 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             // and ride along in every future export. Clear those names out
             // before merging, and never let the file add one back.
             pruneReservedKeys(advancedSettings);
+            // What the store held before the merge, so the message can say
+            // whether anything actually changed rather than inferring it
+            // from how many values came through untouched.
+            const settingsBefore = JSON.stringify(advancedSettings);
             Object.assign(advancedSettings, result.settings);
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
             syncGuardSettings();
             // Counted after the clamps, before the write, so the number the
             // user reads is the number that is actually in the store.
-            // result.settings is what readBackup already clamped, so a
-            // field it corrected would compare equal and read as untouched.
-            const settingsStored = countStoredSettings(result.settings) - result.clampedSettingKeys.length;
+            // One comparison: what the file ASKED for against what the
+            // store ended up with. A value the app corrected does not match
+            // and is reported as corrected, with no second list to keep in
+            // step with this one.
+            const settingsStored = countStoredSettings(result.requested);
             // Refusals are reported by part name (see RESTORE_PARTS), so the
             // message cannot name a part as lost and as restored at once.
             const unsaved = persistSettings() ? [] : ['settings'];
@@ -2921,6 +2945,12 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
                 hadExistingKey,
                 keyReplaced,
                 settingsStored,
+                settingsChanged: JSON.stringify(advancedSettings) !== settingsBefore,
+                // The numbers themselves, so "the Handy speed cap" does not
+                // leave the reader opening the Handy panel to find out what
+                // it now is.
+                handyCap: result.handy.maxCap,
+                handyRole: result.handy.role,
                 droppedDeviceMaps: applied.droppedDeviceMaps,
                 unsaved: [...unsaved, ...applied.unsaved]
             }));

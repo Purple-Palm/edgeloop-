@@ -39,6 +39,12 @@
 // reads back the names it knows, so a file can no more inject a field into
 // the settings store than a polluted store can carry one out.
 import { SETTING_KEYS } from './state.js';
+// Every Session Setup value is bounded by the schema - on this path and on
+// every other - and the learning profile is one of its entries. It is
+// re-exported here because this module's own tests and callers reach for it
+// alongside the rest of the file's shaping.
+import { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM, SETTING_SANITIZERS } from './settings-schema.js';
+export { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM };
 
 export const BACKUP_FORMAT = 'edgeloop-backup';
 
@@ -59,13 +65,6 @@ export const MAX_SAVED_DEVICES = 32;
 export const MAX_AXES_PER_DEVICE = 64;
 export const MAX_DEVICE_KEY_LENGTH = 200;
 export const MAX_DEVICE_NAME_LENGTH = 120;
-
-// Bounds for the learning profile carried inside the settings object. The
-// offset cap mirrors the one the "I came early" button enforces; the HR pair
-// is the same plausibility window a typed limit gets.
-export const MAX_LEARNED_OFFSET_BPM = 30;
-const MIN_PLAUSIBLE_HR = 30;
-const MAX_PLAUSIBLE_HR = 250;
 
 export const AXIS_ROLES = ['primary', 'secondary', 'off'];
 export const HANDY_ROLES = ['primary', 'secondary', 'off'];
@@ -267,36 +266,31 @@ export function pruneReservedKeys(settings) {
 // the factory list; tests pass their own. Returns the kept object and the
 // names dropped, because an import that silently ate two fields is the same
 // kind of quiet as the export that silently left the key out.
+function normalizeAllowed(allowed) {
+    return allowed instanceof Set ? allowed : new Set(allowed || []);
+}
+
 export function filterSettings(raw, allowed = SETTING_KEYS) {
-    const keep = allowed instanceof Set ? allowed : new Set(allowed || []);
+    const keep = normalizeAllowed(allowed);
     const settings = {};
+    const requested = {};
     const unknown = [];
     const retired = [];
-    if (!isPlainObject(raw)) return { settings, unknown, retired };
+    if (!isPlainObject(raw)) return { settings, requested, unknown, retired };
     for (const [name, value] of Object.entries(raw)) {
         if (RESERVED_SETTING_KEYS.includes(name)) continue;
         if (RETIRED_SETTING_KEYS.includes(name)) { retired.push(name); continue; }
         if (!keep.has(name)) { unknown.push(name); continue; }
-        settings[name] = value;
+        // `requested` is what the file asked for, kept as it was written;
+        // `settings` is what this app will take. Comparing the store against
+        // `requested` afterwards is how an import knows - in one comparison,
+        // with no second list to keep in step - which values came back as
+        // written and which the app had to correct.
+        requested[name] = value;
+        const sanitize = SETTING_SANITIZERS[name];
+        settings[name] = sanitize ? sanitize(value) : value;
     }
-    return { settings, unknown, retired };
-}
-
-// The learning profile is the one setting the engine reads as a structure
-// rather than a number, and the only one an import shows back to the user in
-// words. Clamp it to the same bounds the "I came early" button can produce
-// (offset 0-30 BPM, never negative - a negative one would RAISE the working
-// ceiling), or return null so the profile already in this browser is kept.
-export function sanitizeLearningProfile(raw) {
-    if (!isPlainObject(raw)) return null;
-    const events = Number(raw.breakthroughEvents);
-    const offset = Number(raw.suggestedMaxHrOffset);
-    const last = Number(raw.lastBreakthroughHr);
-    return {
-        breakthroughEvents: Number.isFinite(events) ? Math.max(0, Math.min(9999, Math.round(events))) : 0,
-        suggestedMaxHrOffset: Number.isFinite(offset) ? Math.max(0, Math.min(MAX_LEARNED_OFFSET_BPM, Math.round(offset))) : 0,
-        lastBreakthroughHr: Number.isFinite(last) && last >= MIN_PLAUSIBLE_HR && last <= MAX_PLAUSIBLE_HR ? Math.round(last) : null
-    };
+    return { settings, requested, unknown, retired };
 }
 
 // ---- writing ------------------------------------------------------------------
@@ -409,52 +403,35 @@ export function readBackup(parsed, options = {}) {
         };
     }
 
-    // A versioned file is one that SAYS so. Everything else is read as the
-    // bare advancedSettings blob older builds wrote, which stays importable.
-    // The marker alone decides: a file whose settings block is missing or
-    // corrupt is still that file, and demoting it to the legacy path would
-    // drop its role, caps, device maps and flags without a word - while
-    // telling the user it "has no version marker", which it plainly has.
+    // WHERE ARE THE SETTINGS? That is the only question worth asking here,
+    // and asking it directly is what two rounds of marker-word heuristics
+    // kept getting wrong. A top level carrying real setting names IS the
+    // settings object - only the bare blob older builds wrote looks like
+    // that - whatever stray `format` or `version` field an older import
+    // merged into it along the way. Otherwise the nested block is the
+    // settings, readable or not. Nothing about the decision depends on
+    // which marker words happen to be present, so no combination of them
+    // can send a file down the wrong path and drop what it carried.
     const versionNumber = Number(parsed.version);
-    // Two things have to be true. The file has to SAY it is a backup, and
-    // it has to have the shape of one. Either test alone gets a real file
-    // wrong: on the declaration alone, a legacy blob that picked up a
-    // stray `format` field from the old Object.assign import (exactly the
-    // pollution this change exists to stop) is read as an envelope and its
-    // settings vanish; on the settings block alone, a declared backup whose
-    // settings block is damaged is demoted to legacy and silently loses its
-    // role, caps, device maps and flags.
     const declaresItself = parsed.format === BACKUP_FORMAT || Number.isFinite(versionNumber);
-    const hasEnvelopeBody = ['settings', 'handy', 'devices', 'flags'].some((name) => parsed[name] !== undefined)
-        || parsed.handyConnectionKeyIncluded !== undefined;
-    const enveloped = declaresItself && hasEnvelopeBody;
-    const version = enveloped && Number.isFinite(versionNumber) ? Math.round(versionNumber) : (enveloped ? BACKUP_VERSION : LEGACY_VERSION);
-    // Declared as a backup, but the settings block is not readable.
-    const settingsUnreadable = enveloped && parsed.settings !== undefined && !isPlainObject(parsed.settings);
+    const nested = isPlainObject(parsed.settings) ? parsed.settings : null;
+    const allowedNames = normalizeAllowed(options.allowedSettingKeys || SETTING_KEYS);
+    const settingsAtTopLevel = Object.keys(parsed)
+        .some((name) => allowedNames.has(name) && !RESERVED_SETTING_KEYS.includes(name));
 
-    const rawSettings = enveloped ? (isPlainObject(parsed.settings) ? parsed.settings : {}) : parsed;
-    const { settings, unknown: unknownSettingKeys, retired: retiredSettingKeys } = filterSettings(
-        rawSettings,
-        options.allowedSettingKeys || SETTING_KEYS
-    );
-    // The profile is a structure, so it is clamped here rather than by the
-    // numeric sanitizers the rest of the settings pass through on the way in.
-    // An unreadable one is dropped, which leaves this browser's own profile
-    // in place - the same rule the connection key follows.
-    // Fields this module corrected itself. The caller counts what survived
-    // by comparing the store against `settings`, and a field corrected here
-    // would compare equal and read as a clean restore.
-    const clampedSettingKeys = [];
-    if (Object.prototype.hasOwnProperty.call(settings, 'learningProfile')) {
-        const before = JSON.stringify(settings.learningProfile);
-        const profile = sanitizeLearningProfile(settings.learningProfile);
-        if (profile) {
-            settings.learningProfile = profile;
-            if (JSON.stringify(profile) !== before) clampedSettingKeys.push('learningProfile');
-        } else {
-            delete settings.learningProfile;
-        }
-    }
+    const version = declaresItself && Number.isFinite(versionNumber) ? Math.round(versionNumber) : (declaresItself ? BACKUP_VERSION : LEGACY_VERSION);
+    // "An older, settings-only backup" is a statement about the marker, so
+    // the marker is what decides it.
+    const legacy = !declaresItself;
+    // A settings block that is there and unreadable, as opposed to a file
+    // that simply has none.
+    const settingsUnreadable = !settingsAtTopLevel && parsed.settings !== undefined && nested === null;
+
+    // With no settings anywhere, the top level is still read: it is where
+    // a file from some other app has its fields, and naming how many of
+    // them this version did not recognise is the useful thing to say.
+    const rawSettings = settingsAtTopLevel ? parsed : (nested || parsed);
+    const { settings, requested, unknown: unknownSettingKeys, retired: retiredSettingKeys } = filterSettings(rawSettings, allowedNames);
 
     // The key is read from the top level in BOTH shapes. In a legacy file it
     // can only be there because an older import merged it into the settings
@@ -469,19 +446,21 @@ export function readBackup(parsed, options = {}) {
         || (typeof rawKey === 'string' && rawKey.trim() === '');
     const keyRejected = !keyBlank && handyConnectionKey === null;
 
-    const handySource = enveloped && isPlainObject(parsed.handy) ? parsed.handy : {};
+    // No gate: `handy`, `devices` and `flags` are never setting names, so a
+    // file that carries one means it, whatever shape the rest of it is in.
+    const handySource = isPlainObject(parsed.handy) ? parsed.handy : {};
     const handy = {
         role: sanitizeHandyRole(handySource.role),
         maxCap: sanitizeMaxCap(handySource.maxCap)
     };
 
-    const deviceSource = enveloped && isPlainObject(parsed.devices) ? parsed.devices : {};
+    const deviceSource = isPlainObject(parsed.devices) ? parsed.devices : {};
     const devices = {
         intiface: sanitizeDeviceMap(deviceSource.intiface, { extras: true }),
         tcode: sanitizeDeviceMap(deviceSource.tcode, { extras: false })
     };
 
-    const flagSource = enveloped && isPlainObject(parsed.flags) ? parsed.flags : {};
+    const flagSource = isPlainObject(parsed.flags) ? parsed.flags : {};
     const flags = {
         ageVerified: flagSource.ageVerified === true,
         wizardSeen: flagSource.wizardSeen === true
@@ -508,10 +487,10 @@ export function readBackup(parsed, options = {}) {
     return {
         ok: true,
         version,
-        legacy: !enveloped,
+        legacy,
         futureVersion: version > BACKUP_VERSION,
         settings,
-        clampedSettingKeys,
+        requested,
         unknownSettingKeys,
         retiredSettingKeys,
         settingsUnreadable,
@@ -523,7 +502,7 @@ export function readBackup(parsed, options = {}) {
         keyRejected,
         // The file explicitly said it left the key out (as opposed to being
         // too old to have an opinion).
-        keyDeclaredAbsent: enveloped && parsed.handyConnectionKeyIncluded === false
+        keyDeclaredAbsent: parsed.handyConnectionKeyIncluded === false
     };
 }
 
@@ -556,7 +535,12 @@ export function describeBackupImport(result, context = {}) {
     }
     // Parts the browser refused to save. They are named as lost, once,
     // and never also named as restored.
-    const refused = new Set((Array.isArray(context.unsaved) ? context.unsaved : []).filter((id) => RESTORE_PARTS[id]));
+    const unsavedIds = Array.isArray(context.unsaved) ? context.unsaved.filter(Boolean) : [];
+    const refused = new Set(unsavedIds.filter((id) => RESTORE_PARTS[id]));
+    // A name this version does not know is still a refusal. Dropping it
+    // would turn a failed write into a silently positive report, which is
+    // the failure this whole message exists to prevent.
+    const refusedUnnamed = unsavedIds.filter((id) => !RESTORE_PARTS[id]).length;
     const restored = [];
     // What the file offered, and what was still there after the app's own
     // clamps had their say. `stored` is supplied by the caller, which is the
@@ -567,18 +551,26 @@ export function describeBackupImport(result, context = {}) {
     const offered = Object.keys(result.settings).length;
     const settingsCount = Number.isFinite(context.settingsStored) ? Math.min(context.settingsStored, offered) : offered;
     if (settingsCount && !refused.has('settings')) restored.push(`${settingsCount} Session Setup value${settingsCount === 1 ? '' : 's'}`);
+    // Named with their values: "the Handy speed cap" alone left the reader
+    // opening the Handy panel to find out what it now is, and the whole
+    // report started with a cap silently back at 100%. They are separate
+    // list items because two items that each contain "and" read as a
+    // run-on once joinList puts a third "and" between them.
     const roleIn = Boolean(result.handy.role) && !refused.has('role');
     const capIn = result.handy.maxCap !== null && !refused.has('cap');
-    if (roleIn && capIn) restored.push('the Handy channel role and speed cap');
-    else if (roleIn) restored.push('the Handy channel role');
-    else if (capIn) restored.push('the Handy speed cap');
+    if (roleIn) restored.push(`the Handy channel role (now ${result.handy.role})`);
+    if (capIn) restored.push(`the Handy speed cap (now ${result.handy.maxCap}%)`);
     const intiface = refused.has('intiface') ? 0 : Object.keys(result.devices.intiface).length;
     if (intiface) restored.push(`${intiface} Intiface device map${intiface === 1 ? '' : 's'}`);
     const tcode = refused.has('tcode') ? 0 : Object.keys(result.devices.tcode).length;
     if (tcode) restored.push(`${tcode} T-Code device map${tcode === 1 ? '' : 's'}`);
     // The flags are restored too, so they are named too. "Settings imported"
     // over a file that only carried a flag was a sentence about nothing.
-    if ((result.flags.ageVerified || result.flags.wizardSeen) && !refused.has('flags')) restored.push('the age / wizard flags');
+    // "the age / wizard flags" is what the code calls them; a reader has no
+    // concept called a wizard flag.
+    if ((result.flags.ageVerified || result.flags.wizardSeen) && !refused.has('flags')) {
+        restored.push('your age confirmation and whether you have seen the setup guide');
+    }
 
     const lines = [];
     // A refused write comes first: it changes what every line below means.
@@ -587,16 +579,27 @@ export function describeBackupImport(result, context = {}) {
     // session history is what fills it. Saying "restored" over a store that
     // refused the write would promise a restore that a reload undoes.
     const unsaved = [...refused].map((id) => RESTORE_PARTS[id]);
+    if (refusedUnnamed) unsaved.push(refusedUnnamed === 1 ? 'one more part of this restore' : `${refusedUnnamed} more parts of this restore`);
     if (unsaved.length) {
         lines.push(`THIS BROWSER REFUSED TO SAVE ${joinList(unsaved)}. It is in use right now, but a reload will lose it - the store is full or unavailable (private mode, or blocked site data). Free some space, or delete old sessions from History, and import again.`);
     }
 
     if (restored.length) lines.push(`Settings imported: ${joinList(restored)}.`);
-    else lines.push('Nothing in this file changed a setting here.');
+    else if (context.settingsChanged === true) {
+        // It changed things; it just took none of them as written. Saying
+        // "nothing changed" here was false in three ordinary cases - among
+        // them a file that pushed the stall guard from 20 s to its 120 s
+        // maximum while the first line said nothing had happened.
+        lines.push('No value in this file could be used exactly as written, but it did change settings here - see below.');
+    } else if (!refused.has('settings')) {
+        lines.push('Nothing in this file changed a setting here.');
+    }
     // Said whenever Session Setup is untouched, even if something else came
-    // back: "Settings imported: the age / wizard flags" is true but leaves
+    // back: "Settings imported: your age confirmation" is true but leaves
     // the obvious question - what happened to my settings? - unanswered.
-    if (!settingsCount && !offered && restored.length && !refused.has('settings')) {
+    // Not said over a damaged block, which is a different claim, nor over a
+    // refused write, which the first line has already explained.
+    if (!settingsCount && !offered && restored.length && !refused.has('settings') && !result.settingsUnreadable) {
         lines.push('This file carried no Session Setup values, so nothing in Session Setup changed.');
     }
 

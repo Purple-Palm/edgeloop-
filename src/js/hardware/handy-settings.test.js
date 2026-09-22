@@ -6,6 +6,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { sanitizeSetting } from '../settings-schema.js';
+import { HANDY_DEFAULT_END_MARGIN } from './handy-protocol.js';
 
 const APP = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
 const STATE = readFileSync(new URL('../state.js', import.meta.url), 'utf8');
@@ -25,8 +27,16 @@ describe('the end-stop margin is settled like every other setting', () => {
     });
 
     it('is clamped wherever it enters: load, Apply and Import', () => {
-        assert.match(bodyOf('syncGuardSettings'), /handyEndMargin = clampEndMargin\(/,
-            'a hand-edited or imported margin must be clamped like every other number');
+        // The clamp is one entry in the settings schema, which syncGuardSettings
+        // runs over every field on load, on Apply and on import. Asserted by
+        // behaviour rather than by the spelling of a line in app.js: a source
+        // match passes just as happily over a line that no longer does anything.
+        assert.equal(sanitizeSetting('handyEndMargin', 99), 10);
+        assert.equal(sanitizeSetting('handyEndMargin', -3), 0);
+        assert.equal(sanitizeSetting('handyEndMargin', 'wide'), HANDY_DEFAULT_END_MARGIN);
+        assert.equal(sanitizeSetting('handyEndMargin', 7), 7);
+        assert.match(bodyOf('syncGuardSettings'), /applySettingSchema\(advancedSettings\)/,
+            'and syncGuardSettings has to be the place that runs it');
     });
 
     // The defect this guard exists for: syncHwEnvelopeInputs is the function
