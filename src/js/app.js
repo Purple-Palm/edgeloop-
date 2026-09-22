@@ -30,6 +30,7 @@ import {
     sanitizeSessionLimits
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
+import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, pruneReservedKeys } from './backup.js';
 import { createWriteCoalescer } from './write-coalescer.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
@@ -59,7 +60,8 @@ import {
     intifaceDevices,
     DEFAULT_INTIFACE_URL,
     ALTERNATE_SECONDS_MIN,
-    ALTERNATE_SECONDS_MAX
+    ALTERNATE_SECONDS_MAX,
+    INTIFACE_STORAGE_KEY
 } from './hardware/intiface.js';
 import {
     connectTCode,
@@ -76,7 +78,8 @@ import {
     getTCodeStatus,
     getTCodeDevice,
     countAssignedTCodeAxes,
-    tcodeHasRole
+    tcodeHasRole,
+    TCODE_STORAGE_KEY
 } from './hardware/tcode.js';
 import { describeSerialSupport } from './hardware/tcode-protocol.js';
 import {
@@ -2706,39 +2709,117 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     syncTelemetry();
 });
 
-// Export & Import Settings
+// Export & Import Settings. The file shape, every clamp on the way in and
+// every sentence the user reads live in backup.js; this side only reads the
+// stores, offers the file and routes each restored piece home.
+function paintExportNotice(notice) {
+    const el = document.getElementById('exportKeyNotice');
+    if (!el) return;
+    el.textContent = notice.message;
+    el.className = `text-[9px] leading-snug ${notice.tone === 'warn' ? 'text-rose-300' : 'text-slate-400'}`;
+}
+
 document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
     // The panel promises the phrase lists, so export what the Audio & Mic tab
     // currently shows (a backup is a copy, so this commits nothing).
     const live = currentVoiceCues();
-    const data = JSON.stringify({ ...advancedSettings, voiceCues: live.cues, voiceEncourageSeconds: live.encourageSeconds }, null, 2);
-    const blob = new Blob([data], { type: 'application/json' });
+    const includeKey = document.getElementById('exportIncludeKey')?.checked === true;
+    const savedKey = safeGet('handy_connection_key', '') || '';
+    const file = buildBackup({
+        settings: { ...advancedSettings, voiceCues: live.cues, voiceEncourageSeconds: live.encourageSeconds },
+        handyRole: state.handyRole,
+        handyMaxCap: state.handyMaxCap,
+        handyConnectionKey: savedKey,
+        intifaceDevices: safeParse(INTIFACE_STORAGE_KEY, {}),
+        tcodeDevices: safeParse(TCODE_STORAGE_KEY, {}),
+        ageVerified: safeGet('edgeloop_age_verified') === 'true',
+        wizardSeen: safeGet('edgeloop_wizard_seen') === 'true'
+    }, { includeKey });
+    const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'edgeloop_settings.json';
+    a.download = backupFilename(file);
     a.click();
     URL.revokeObjectURL(url);
+    paintExportNotice(describeBackupExport(file, { requestedKey: includeKey, hasSavedKey: savedKey.trim().length > 0 }));
 });
+
+// Everything an import restores that does not live in advancedSettings. A
+// file that carries no key never clears the one saved here: restoring
+// settings on a paired machine must not break that pairing. Nothing here
+// connects anything - that stays behind the user's own click.
+function applyImportedBackup(result) {
+    if (result.keyPresent) {
+        safeSet('handy_connection_key', result.handyConnectionKey);
+        const input = document.getElementById('modalHandyInput');
+        if (input) input.value = result.handyConnectionKey;
+    }
+    if (result.handy.role) {
+        // The role buttons own the badge and the button painting, so the
+        // restored role is applied the way a tap applies it.
+        const btnId = { primary: 'handyRolePrimaryBtn', secondary: 'handyRoleSecondaryBtn', off: 'handyRoleOffBtn' }[result.handy.role];
+        document.getElementById(btnId)?.click();
+    }
+    if (result.handy.maxCap !== null) {
+        state.handyMaxCap = result.handy.maxCap;
+        safeSet('handy_max_cap', String(result.handy.maxCap));
+        const slider = document.getElementById('handyCapSlider');
+        const capVal = document.getElementById('handyCapVal');
+        if (slider) slider.value = String(result.handy.maxCap);
+        if (capVal) capVal.textContent = `${result.handy.maxCap}%`;
+    }
+    if (Object.keys(result.devices.intiface).length) {
+        safeSet(INTIFACE_STORAGE_KEY, mergeDeviceMaps(safeParse(INTIFACE_STORAGE_KEY, {}), result.devices.intiface));
+    }
+    if (Object.keys(result.devices.tcode).length) {
+        safeSet(TCODE_STORAGE_KEY, mergeDeviceMaps(safeParse(TCODE_STORAGE_KEY, {}), result.devices.tcode));
+    }
+    // Only ever set: a file that never passed the age gate must not put the
+    // overlay back in front of someone who did.
+    if (result.flags.ageVerified) safeSet('edgeloop_age_verified', 'true');
+    if (result.flags.wizardSeen) safeSet('edgeloop_wizard_seen', 'true');
+}
 
 document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (evt) => {
+        let parsed;
         try {
-            const parsed = JSON.parse(evt.target.result);
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a settings object');
-            Object.assign(advancedSettings, parsed);
+            parsed = JSON.parse(evt.target.result);
+        } catch {
+            // Picking the wrong file is the common mistake, so name that
+            // case instead of reporting it as a bad backup.
+            alert('That file is not JSON, so it is not an EdgeLoop backup. Pick the .json the Backup tab writes with Export.');
+            return;
+        }
+        try {
+            const result = readBackup(parsed);
+            // describeBackupImport says which way the file is wrong.
+            if (!result.ok) { alert(describeBackupImport(result)); return; }
+            const hadExistingKey = Boolean(safeGet('handy_connection_key', '') || '');
+            // An older build merged every unknown top-level field into the
+            // settings store, so a connection key could be sitting in there
+            // and ride along in every future export. Clear those names out
+            // before merging, and never let the file add one back.
+            pruneReservedKeys(advancedSettings);
+            Object.assign(advancedSettings, result.settings);
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
             syncGuardSettings();
             persistSettings();
             syncParamsUI();
-            updateEngine();
-            alert("Settings successfully imported!");
+            // Before the engine tick, so a restored Handy speed cap reaches
+            // the device on the same pass as the settings it came with.
+            applyImportedBackup(result);
+            // Repaints the learning line and ticks the engine, so the panel
+            // agrees with the offset the engine has just been handed.
+            renderLearningStatus();
+            alert(describeBackupImport(result, { hadExistingKey }));
         } catch (err) {
-            alert("Invalid configuration file.");
+            alert(`This backup could not be applied: ${err && err.message ? err.message : 'unknown error'}.`);
         }
     };
     reader.readAsText(file);

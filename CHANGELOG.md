@@ -260,6 +260,81 @@ credited by username.
   DTR print a boot banner first), a swallowed D0 is asked once more, and a
   boot banner is never taken for the device name or version.
 
+### Backup & Restore
+- The backup is a backup again. **Export (.json)** wrote the Session Setup
+  blob and nothing else, so a restore came back without your **Handy
+  connection key** - X333 reported that one, and the release post had
+  already promised the file covered it - and without four more things
+  nobody had counted: the Handy channel role, the Handy speed cap, and the
+  saved Intiface and T-Code device maps (per-axis role, cap and invert),
+  plus the age gate and wizard flags. The file carries all of it now and
+  Import puts each piece back in its own store. The speed cap was the
+  sharpest of them: someone who had capped the device at 65% because more
+  than that hurts restored a "backup" and got a device that would run to
+  100%, with nothing said about it. The role was worse than lost - boot
+  wrote `primary` back before you touched anything, so a channel you never
+  chose looked deliberate. Rebuilding a six-axis OSR2 map by hand is the
+  most tedious thing on that list and the one a new device actually needs.
+- **Your connection key is in the file only when you ask for it.** A tick
+  box under Export, off by default, labelled with what it means rather than
+  what it does: anyone who has that file can then drive your Handy from
+  anywhere, with no password and no way to revoke it from here. The threat
+  is not a burglar, it is a backup being mailed to your own inbox, dropped
+  in cloud storage or pasted into a thread when somebody asks what your
+  settings are. So the file you get without thinking about it is safe to
+  send, and the one with the key in it is a file you chose: it downloads as
+  `edgeloop_settings_with_key.json` rather than `edgeloop_settings.json`,
+  the panel says which you just wrote, and the file's own second line is
+  the warning. A file **without** the key says so too, in as many words, so
+  an export can never again be silently incomplete - which was the other
+  half of what X333 ran into.
+- Import tells you what it did instead of "Settings successfully imported!".
+  It names what came back (how many Session Setup values, the Handy role and
+  cap, how many device maps), and it always answers the key question: the
+  key was restored, or the file had none and the one saved here was kept, or
+  the file had none and there is none here, so enter yours in the Handy
+  panel. That last sentence is the one that would have saved a wasted
+  restore. A restored key is painted into the Handy panel but **nothing is
+  connected**: starting a motor stays behind your own click.
+- A backup that carries no key never clears the key you have. Restoring
+  settings on a machine that is already paired must not break the pairing.
+- A field the app does not recognise can no longer become a setting. Import
+  was a bare `Object.assign`, so every unknown top-level field in a file was
+  merged into the settings store and written back - a connection key that
+  got in that way would have ridden along in every future export, surviving
+  you deleting it from the Handy panel. Unknown fields are dropped now, the
+  file's own field names are pruned from the settings store on the way in
+  (cleaning up after any file that already did this), and everything the
+  file does carry is type-checked and clamped exactly as a typed value is:
+  a key must be a printable string within a length bound or it is refused
+  rather than handed to the device API, a speed or axis cap is clamped to
+  0-100, a role must be one of the three the drivers know, a learned
+  biometric offset is clamped to 0-30 BPM (a hand-edited negative one would
+  have RAISED the working ceiling above the Climax HR you typed), and a
+  device map cannot push either store past its own limit. Restoring device maps merges
+  rather than replaces, so toys the file never knew about stay mapped. The
+  filter runs on the way out as well, so a store an older build already
+  polluted cannot carry the junk - or a stray copy of the key - into the
+  next file, and the number of restored values the import reports is the
+  number it actually stored.
+- A restored learning profile now repaints the panel that describes it.
+  The engine was handed the imported offset immediately, while Session Setup
+  went on saying "Zero breakthrough events recorded. Typed Climax HR is used
+  as-is." over a ceiling that was already several BPM lower.
+- A file that is not a backup says which way it is not one - not JSON at
+  all, a JSON list, empty, or carrying nothing this version recognises -
+  instead of the same "Invalid configuration file." for every case. Picking
+  the wrong file is the common mistake, and that sentence never said so.
+- The file has a format version now, so a later change can migrate it, and
+  a backup written before this one - a bare settings blob with no marker -
+  still imports and is described as what it is.
+- **Session history stays out of the backup, on purpose**, and the panel
+  says so. It is a health and sexual-activity record (peak heart rate,
+  outcome, timestamps and a 4 Hz trace of the whole session), it is the
+  bulkiest thing in storage, and a backup that quietly mails that to your
+  own inbox is a worse surprise than the bug being fixed. The per-session
+  `.funscript` download already exists for getting a session out of the app.
+
 ### Session engine and lifecycle
 - The **typed session limits survive a reload**. Resting HR, Climax HR, the
   Target Mode with its Fixed length and Mystery window, and the Endgame

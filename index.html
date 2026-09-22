@@ -981,7 +981,12 @@
         <div id="paramsBackupSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <span class="text-xs font-bold text-slate-200 block">Backup & Restore</span>
-            <p class="text-[9px] text-slate-400 leading-snug">Exports every Session Setup value, including your voice-phrase lists. Import restores them. Phrase files can also be exported on their own from the Audio &amp; Mic tab.</p>
+            <p class="text-[9px] text-slate-400 leading-snug">Exports every Session Setup value (voice-phrase lists included), your Handy channel role and speed cap, your saved Intiface and T-Code device maps, and the age / wizard flags. Import restores them and tells you what it put back. Session history is never included. Phrase files can also be exported on their own from the Audio &amp; Mic tab.</p>
+            <label class="flex items-start gap-1.5 pt-0.5 cursor-pointer">
+              <input id="exportIncludeKey" type="checkbox" class="mt-0.5 accent-rose-600 cursor-pointer">
+              <span class="text-[9px] text-slate-400 leading-snug">Include my Handy connection key <span class="text-rose-400">- anyone who has the file can then control my Handy</span>. Off by default; the file itself says which kind it is, and the download is named differently when the key is in it.</span>
+            </label>
+            <p id="exportKeyNotice" class="text-[9px] leading-snug text-slate-400"></p>
             <div class="flex gap-2 pt-1">
               <button id="exportSettingsBtn" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer">
                 Export (.json)

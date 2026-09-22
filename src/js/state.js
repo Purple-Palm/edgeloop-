@@ -182,10 +182,19 @@ export const advancedSettings = {
     micEnabled: false,
     micSensitivityThreshold: 40,
     micBoostMaxBpm: 8,
-    customProfiles: {},
     learningProfile: {
         breakthroughEvents: 0,
         suggestedMaxHrOffset: 0,
         lastBreakthroughHr: null
     }
 };
+
+// The field names a factory-fresh install has, captured here - before boot
+// loads the stored blob, before an import merges a file - so the list is the
+// pristine one. backup.js filters both the export and the import against it.
+// It has to be taken at module load: a build older than that filter merged
+// every unknown top-level field of an imported file straight into the
+// settings store, so the live object can carry names this version never
+// wrote, and a list read off it later would bless exactly the junk the
+// filter exists to keep out.
+export const SETTING_KEYS = Object.freeze(Object.keys(advancedSettings));

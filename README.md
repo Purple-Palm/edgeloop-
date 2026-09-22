@@ -126,6 +126,16 @@ Typing into one of those fields updates the running session on the keystroke; th
 
 Stored limits are validated on the way out of storage exactly as typed ones are on the way in: a corrupt or hand-edited store cannot restore a Climax HR outside 30-250 BPM, or one at or below your Resting HR. A pair that fails that check falls back to the factory 70 / 140. A pair that passes comes back exactly as you typed it, a narrow Resting/Climax band included - the pullback mark simply sits at the ceiling there, as it always has - so a reload can never hand you limits you did not choose, and never a working ceiling above the Climax HR you typed. All of it rides in the **Backup** export and comes back on import.
 
+### Backup & Restore
+
+**Export (.json)** on the Backup tab writes one file with everything this browser remembers: every Session Setup value and voice-phrase list, the learned biometric offset, the Handy channel role and speed cap, your saved Intiface and T-Code device maps (per-axis role, cap and invert) and the age / wizard flags. Import puts all of it back and then tells you in words what it restored.
+
+Your **Handy connection key is left out unless you tick the box** beside the button. That key is a bearer credential: whoever holds the string can drive your Handy from anywhere, with no password, and the app cannot revoke it. A backup file, meanwhile, is exactly the sort of thing people mail to themselves, drop in cloud storage or paste into a thread when somebody asks what their settings are. So the file you get without thinking about it is safe to send, and the file with the key in it is one you chose: it downloads as `edgeloop_settings_with_key.json` instead of `edgeloop_settings.json`, the panel tells you which you just wrote, and the file's own second line is the warning. A file without the key says so too, so an export is never silently incomplete.
+
+Import never breaks a pairing you already have: a file with no key leaves the key saved in this browser exactly where it was, and nothing an import restores connects a toy - press Connect yourself when you want it. A toy that is connected while you import keeps the axis map it is running; reconnect it to pick up the restored one. Everything in the file is type-checked and clamped on the way in the same way a typed value is, so a hand-edited or hostile file cannot restore an out-of-range ceiling, an inverted envelope or a 400% axis cap, and a key that is not a plain printable string within a sane length is refused rather than handed to The Handy's API. Older backups (a bare settings blob, written before the file had a version marker) still import. A field this version does not have is skipped rather than stored, in both directions - the import says how many it skipped, and the count of restored values it reports is the count it actually stored - and a file that turns out not to be a backup at all says which way it is wrong (not JSON, a JSON list, empty, or nothing in it this version knows) instead of one flat "invalid file".
+
+**Session history is never in a backup**, deliberately, and the panel says so. It is a health and sexual-activity record - peak heart rate, outcome, timestamps and a 4 Hz trace of the whole session - it is the bulkiest thing in storage, and a backup that quietly mails that to your own inbox is a worse surprise than the gap it would close. The per-session `.funscript` download already exists for getting a session out of the app.
+
 ## Session guards
 
 The **Guards** tab of Session Setup holds every safety rule. They are independent of the selected mode.
@@ -207,6 +217,8 @@ edgeloop/
         ├── storage.test.js
         ├── write-coalescer.js  # Pure write batcher: one settings write per window instead of one per keystroke, flushed on demand
         ├── write-coalescer.test.js
+        ├── backup.js           # Pure backup file: what an export carries (settings, Handy role/cap, device maps, opt-in connection key), and every clamp an import puts a file through
+        ├── backup.test.js
         ├── docs.test.js        # Documentation guard: README and CHANGELOG may not quote a test count that goes stale
         ├── hr-watchdog.js      # Pure heart-rate signal watchdog: ok / holding / stale verdicts, no-contact flag, one-shot trip and recovery
         ├── hr-watchdog.test.js
@@ -255,7 +267,7 @@ There is no build step and no dependency to install. Clone the repository, serve
 npm test
 ```
 
-runs every `*.test.js` under `src/js/` with Node's built-in test runner, which prints the exact count on its last lines (`# tests` / `# pass`). No number is quoted here: the suite grows most weeks, and a number in a document nobody re-counts is simply wrong after the next change - `docs.test.js` fails if one creeps back in. The convention: anything with logic worth testing lives in a **pure module** with no DOM, timers or sockets (`engine.js`, `session-rules.js`, `hr-watchdog.js`, `funscript.js`, `storage.js`, `write-coalescer.js`, `chart.js`, `peer-messages.js`, `voice-queue.js`, the `*-protocol.js` helpers and `stroke-planner.js`), with a `*.test.js` file next to it. The drivers (`handy.js`, `intiface.js`, `tcode.js`, `ble.js`) keep their browser API calls inside functions so they can be imported under Node and tested with fakes. If you add a feature, put its rules in a pure module and test them there; `app.js` should only wire the DOM to those modules.
+runs every `*.test.js` under `src/js/` with Node's built-in test runner, which prints the exact count on its last lines (`# tests` / `# pass`). No number is quoted here: the suite grows most weeks, and a number in a document nobody re-counts is simply wrong after the next change - `docs.test.js` fails if one creeps back in. The convention: anything with logic worth testing lives in a **pure module** with no DOM, timers or sockets (`engine.js`, `session-rules.js`, `hr-watchdog.js`, `funscript.js`, `storage.js`, `write-coalescer.js`, `backup.js`, `chart.js`, `peer-messages.js`, `voice-queue.js`, the `*-protocol.js` helpers and `stroke-planner.js`), with a `*.test.js` file next to it. The drivers (`handy.js`, `intiface.js`, `tcode.js`, `ble.js`) keep their browser API calls inside functions so they can be imported under Node and tested with fakes. If you add a feature, put its rules in a pure module and test them there; `app.js` should only wire the DOM to those modules.
 
 **Browser smoke test** (needs Chromium through Playwright, which is deliberately not a project dependency):
 
