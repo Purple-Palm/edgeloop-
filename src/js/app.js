@@ -188,7 +188,15 @@ function syncGuardSettings() {
     // other "a typed value is clamped, so a stored one is too" rule lives.
     advancedSettings.ceilingBehaviour = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
     for (const name of BOOLEAN_SETTINGS) {
-        advancedSettings[name] = advancedSettings[name] === true || advancedSettings[name] === 'true';
+        const value = advancedSettings[name];
+        // Falling back to `false` would be falling back to the OPPOSITE of
+        // the factory value for every setting that ships on - the stall
+        // guard among them, which is the watchdog that halts the primary
+        // after too long at the edge. A value nobody can type is a value
+        // with no information in it, so the factory one is what replaces it.
+        advancedSettings[name] = value === true || value === 'true' ? true
+            : value === false || value === 'false' ? false
+            : SETTING_DEFAULTS[name];
     }
     if (typeof advancedSettings.voiceURI !== 'string') advancedSettings.voiceURI = SETTING_DEFAULTS.voiceURI;
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
@@ -2771,8 +2779,16 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
     // is on screen (and announced, the notice is a live region) by the time
     // the save dialog asks where to put it - not after it is already on disk.
     paintExportNotice(describeBackupExport(file, { requestedKey: includeKey, hasSavedKey: savedKey.trim().length > 0 }));
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+        a.click();
+    } catch (err) {
+        // The notice is painted first so the key warning is announced
+        // before the file exists; if the download never starts, the claim
+        // that it did must not be left on screen.
+        paintExportNotice({ tone: 'warn', message: 'The download did not start, so nothing was written. Your browser may be blocking downloads from this page.' });
+    } finally {
+        URL.revokeObjectURL(url);
+    }
 });
 
 // Everything an import restores that does not live in advancedSettings. A
@@ -2786,19 +2802,24 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
 function applyImportedBackup(result) {
     const unsaved = [];
     if (result.keyPresent) {
-        if (!safeSet('handy_connection_key', result.handyConnectionKey)) unsaved.push('your Handy connection key');
+        if (!safeSet('handy_connection_key', result.handyConnectionKey)) unsaved.push('key');
         const input = document.getElementById('modalHandyInput');
         if (input) input.value = result.handyConnectionKey;
     }
     if (result.handy.role) {
         // The role buttons own the badge and the button painting, so the
-        // restored role is applied the way a tap applies it.
+        // restored role is applied the way a tap applies it. The write
+        // itself happens inside that handler, so it is verified by reading
+        // it back: the role is the setting whose loss is worst of all,
+        // because boot writes `primary` over a missing one and hands back a
+        // live channel the user did not choose.
         const btnId = { primary: 'handyRolePrimaryBtn', secondary: 'handyRoleSecondaryBtn', off: 'handyRoleOffBtn' }[result.handy.role];
         document.getElementById(btnId)?.click();
+        if (safeGet('handy_role', '') !== result.handy.role) unsaved.push('role');
     }
     if (result.handy.maxCap !== null) {
         state.handyMaxCap = result.handy.maxCap;
-        if (!safeSet('handy_max_cap', String(result.handy.maxCap))) unsaved.push('the Handy speed cap');
+        if (!safeSet('handy_max_cap', String(result.handy.maxCap))) unsaved.push('cap');
         const slider = document.getElementById('handyCapSlider');
         const capVal = document.getElementById('handyCapVal');
         if (slider) slider.value = String(result.handy.maxCap);
@@ -2808,19 +2829,19 @@ function applyImportedBackup(result) {
     if (Object.keys(result.devices.intiface).length) {
         const existing = safeParse(INTIFACE_STORAGE_KEY, {});
         droppedDeviceMaps += countDroppedOnMerge(existing, result.devices.intiface);
-        if (!safeSet(INTIFACE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.intiface))) unsaved.push('your Intiface device maps');
+        if (!safeSet(INTIFACE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.intiface))) unsaved.push('intiface');
     }
     if (Object.keys(result.devices.tcode).length) {
         const existing = safeParse(TCODE_STORAGE_KEY, {});
         droppedDeviceMaps += countDroppedOnMerge(existing, result.devices.tcode);
-        if (!safeSet(TCODE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.tcode))) unsaved.push('your T-Code device maps');
+        if (!safeSet(TCODE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.tcode))) unsaved.push('tcode');
     }
     // Only ever set: a file that never passed the age gate must not put the
     // overlay back in front of someone who did.
     let flagsRefused = false;
     if (result.flags.ageVerified && !safeSet('edgeloop_age_verified', 'true')) flagsRefused = true;
     if (result.flags.wizardSeen && !safeSet('edgeloop_wizard_seen', 'true')) flagsRefused = true;
-    if (flagsRefused) unsaved.push('the age / wizard flags');
+    if (flagsRefused) unsaved.push('flags');
     return { unsaved, droppedDeviceMaps };
 }
 
@@ -2833,10 +2854,13 @@ function countStoredSettings(fileSettings) {
     for (const [name, value] of Object.entries(fileSettings)) {
         if (name === 'voiceCues') {
             // mergeVoiceCues fills in every bank the file did not mention,
-            // so only the banks the file DID carry can be compared.
-            const banks = value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [];
+            // so only the banks the file DID carry can be compared. A
+            // voiceCues that is not an object at all carries no bank and
+            // restored nothing; `[].every()` is true, so it has to be
+            // rejected before the comparison, not by it.
+            if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
             const live = advancedSettings.voiceCues || {};
-            if (banks.every((bank) => JSON.stringify(live[bank]) === JSON.stringify(value[bank]))) kept += 1;
+            if (Object.keys(value).every((bank) => JSON.stringify(live[bank]) === JSON.stringify(value[bank]))) kept += 1;
             continue;
         }
         if (JSON.stringify(advancedSettings[name]) === JSON.stringify(value)) kept += 1;
@@ -2880,8 +2904,12 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             syncGuardSettings();
             // Counted after the clamps, before the write, so the number the
             // user reads is the number that is actually in the store.
-            const settingsStored = countStoredSettings(result.settings);
-            const unsaved = persistSettings() ? [] : ['your Session Setup values'];
+            // result.settings is what readBackup already clamped, so a
+            // field it corrected would compare equal and read as untouched.
+            const settingsStored = countStoredSettings(result.settings) - result.clampedSettingKeys.length;
+            // Refusals are reported by part name (see RESTORE_PARTS), so the
+            // message cannot name a part as lost and as restored at once.
+            const unsaved = persistSettings() ? [] : ['settings'];
             syncParamsUI();
             // Before the engine tick, so a restored Handy speed cap reaches
             // the device on the same pass as the settings it came with.

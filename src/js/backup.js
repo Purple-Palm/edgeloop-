@@ -416,8 +416,18 @@ export function readBackup(parsed, options = {}) {
     // drop its role, caps, device maps and flags without a word - while
     // telling the user it "has no version marker", which it plainly has.
     const versionNumber = Number(parsed.version);
-    const enveloped = parsed.format === BACKUP_FORMAT
-        || (Number.isFinite(versionNumber) && isPlainObject(parsed.settings));
+    // Two things have to be true. The file has to SAY it is a backup, and
+    // it has to have the shape of one. Either test alone gets a real file
+    // wrong: on the declaration alone, a legacy blob that picked up a
+    // stray `format` field from the old Object.assign import (exactly the
+    // pollution this change exists to stop) is read as an envelope and its
+    // settings vanish; on the settings block alone, a declared backup whose
+    // settings block is damaged is demoted to legacy and silently loses its
+    // role, caps, device maps and flags.
+    const declaresItself = parsed.format === BACKUP_FORMAT || Number.isFinite(versionNumber);
+    const hasEnvelopeBody = ['settings', 'handy', 'devices', 'flags'].some((name) => parsed[name] !== undefined)
+        || parsed.handyConnectionKeyIncluded !== undefined;
+    const enveloped = declaresItself && hasEnvelopeBody;
     const version = enveloped && Number.isFinite(versionNumber) ? Math.round(versionNumber) : (enveloped ? BACKUP_VERSION : LEGACY_VERSION);
     // Declared as a backup, but the settings block is not readable.
     const settingsUnreadable = enveloped && parsed.settings !== undefined && !isPlainObject(parsed.settings);
@@ -431,10 +441,19 @@ export function readBackup(parsed, options = {}) {
     // numeric sanitizers the rest of the settings pass through on the way in.
     // An unreadable one is dropped, which leaves this browser's own profile
     // in place - the same rule the connection key follows.
+    // Fields this module corrected itself. The caller counts what survived
+    // by comparing the store against `settings`, and a field corrected here
+    // would compare equal and read as a clean restore.
+    const clampedSettingKeys = [];
     if (Object.prototype.hasOwnProperty.call(settings, 'learningProfile')) {
+        const before = JSON.stringify(settings.learningProfile);
         const profile = sanitizeLearningProfile(settings.learningProfile);
-        if (profile) settings.learningProfile = profile;
-        else delete settings.learningProfile;
+        if (profile) {
+            settings.learningProfile = profile;
+            if (JSON.stringify(profile) !== before) clampedSettingKeys.push('learningProfile');
+        } else {
+            delete settings.learningProfile;
+        }
     }
 
     // The key is read from the top level in BOTH shapes. In a legacy file it
@@ -492,6 +511,7 @@ export function readBackup(parsed, options = {}) {
         legacy: !enveloped,
         futureVersion: version > BACKUP_VERSION,
         settings,
+        clampedSettingKeys,
         unknownSettingKeys,
         retiredSettingKeys,
         settingsUnreadable,
@@ -507,6 +527,20 @@ export function readBackup(parsed, options = {}) {
     };
 }
 
+// The parts an import restores, each with the words the message uses for
+// it. The caller reports a refused write by NAME from this list rather
+// than by prose, so the two lists can never disagree: a part whose write
+// the browser refused is named as lost and is not also named as restored.
+export const RESTORE_PARTS = {
+    settings: 'your Session Setup values',
+    key: 'your Handy connection key',
+    role: 'the Handy channel role',
+    cap: 'the Handy speed cap',
+    intiface: 'your Intiface device maps',
+    tcode: 'your T-Code device maps',
+    flags: 'the age / wizard flags'
+};
+
 // What the import tells the user it did. It names every part it restored and
 // always answers the key question, because "did my key come back?" was the
 // question the silent export left the reporter to answer by hand.
@@ -520,6 +554,9 @@ export function describeBackupImport(result, context = {}) {
             ? `This is not an EdgeLoop backup: ${reason}. Pick the .json the Backup tab writes with Export.`
             : 'This is not an EdgeLoop backup. Pick the .json the Backup tab writes with Export.';
     }
+    // Parts the browser refused to save. They are named as lost, once,
+    // and never also named as restored.
+    const refused = new Set((Array.isArray(context.unsaved) ? context.unsaved : []).filter((id) => RESTORE_PARTS[id]));
     const restored = [];
     // What the file offered, and what was still there after the app's own
     // clamps had their say. `stored` is supplied by the caller, which is the
@@ -529,17 +566,19 @@ export function describeBackupImport(result, context = {}) {
     // quiet the silent export was.
     const offered = Object.keys(result.settings).length;
     const settingsCount = Number.isFinite(context.settingsStored) ? Math.min(context.settingsStored, offered) : offered;
-    if (settingsCount) restored.push(`${settingsCount} Session Setup value${settingsCount === 1 ? '' : 's'}`);
-    if (result.handy.role && result.handy.maxCap !== null) restored.push('the Handy channel role and speed cap');
-    else if (result.handy.role) restored.push('the Handy channel role');
-    else if (result.handy.maxCap !== null) restored.push('the Handy speed cap');
-    const intiface = Object.keys(result.devices.intiface).length;
+    if (settingsCount && !refused.has('settings')) restored.push(`${settingsCount} Session Setup value${settingsCount === 1 ? '' : 's'}`);
+    const roleIn = Boolean(result.handy.role) && !refused.has('role');
+    const capIn = result.handy.maxCap !== null && !refused.has('cap');
+    if (roleIn && capIn) restored.push('the Handy channel role and speed cap');
+    else if (roleIn) restored.push('the Handy channel role');
+    else if (capIn) restored.push('the Handy speed cap');
+    const intiface = refused.has('intiface') ? 0 : Object.keys(result.devices.intiface).length;
     if (intiface) restored.push(`${intiface} Intiface device map${intiface === 1 ? '' : 's'}`);
-    const tcode = Object.keys(result.devices.tcode).length;
+    const tcode = refused.has('tcode') ? 0 : Object.keys(result.devices.tcode).length;
     if (tcode) restored.push(`${tcode} T-Code device map${tcode === 1 ? '' : 's'}`);
     // The flags are restored too, so they are named too. "Settings imported"
     // over a file that only carried a flag was a sentence about nothing.
-    if (result.flags.ageVerified || result.flags.wizardSeen) restored.push('the age / wizard flags');
+    if ((result.flags.ageVerified || result.flags.wizardSeen) && !refused.has('flags')) restored.push('the age / wizard flags');
 
     const lines = [];
     // A refused write comes first: it changes what every line below means.
@@ -547,7 +586,7 @@ export function describeBackupImport(result, context = {}) {
     // write, and a full or blocked store is a live condition in this app -
     // session history is what fills it. Saying "restored" over a store that
     // refused the write would promise a restore that a reload undoes.
-    const unsaved = Array.isArray(context.unsaved) ? context.unsaved.filter(Boolean) : [];
+    const unsaved = [...refused].map((id) => RESTORE_PARTS[id]);
     if (unsaved.length) {
         lines.push(`THIS BROWSER REFUSED TO SAVE ${joinList(unsaved)}. It is in use right now, but a reload will lose it - the store is full or unavailable (private mode, or blocked site data). Free some space, or delete old sessions from History, and import again.`);
     }
@@ -557,16 +596,25 @@ export function describeBackupImport(result, context = {}) {
     // Said whenever Session Setup is untouched, even if something else came
     // back: "Settings imported: the age / wizard flags" is true but leaves
     // the obvious question - what happened to my settings? - unanswered.
-    if (!settingsCount && !offered && restored.length) {
+    if (!settingsCount && !offered && restored.length && !refused.has('settings')) {
         lines.push('This file carried no Session Setup values, so nothing in Session Setup changed.');
     }
 
-    const adjusted = offered - settingsCount;
+    const adjusted = refused.has('settings') ? 0 : offered - settingsCount;
     if (adjusted > 0) {
-        lines.push(`${adjusted} more value${adjusted === 1 ? ' was' : 's were'} outside what this app accepts and came back at ${adjusted === 1 ? 'its' : 'their'} safe default instead - the same check a value typed into the panel gets.`);
+        // Not "came back at their safe default": what the app does with a
+        // value it will not take depends on the value. 9999 seconds of
+        // stall guard comes back at the 120-second maximum, not at the
+        // 20-second factory setting, and telling someone it reverted to the
+        // default would send them looking for a number that is not there.
+        lines.push(`${adjusted} value${adjusted === 1 ? '' : 's'} in the file ${adjusted === 1 ? 'was' : 'were'} outside what this app accepts, so ${adjusted === 1 ? 'it' : 'they'} came back at the nearest value it does - a limit, or the factory setting. It is the same check a value typed into the panel gets; open Session Setup to see where ${adjusted === 1 ? 'it' : 'they'} landed.`);
     }
 
-    if (result.keyPresent && context.keyReplaced === true) {
+    if (result.keyPresent && refused.has('key')) {
+        // The refusal line above already named it; do not also say it was
+        // restored, and say what it means for the pairing.
+        lines.push('The Handy connection key in this file is in use right now but was not saved, so this browser goes back to the key it had (or to none) when you reload.');
+    } else if (result.keyPresent && context.keyReplaced === true) {
         // Restoring an older or a borrowed backup re-pairs this browser with
         // a different Handy. That is what the file asked for, but it is not
         // something to discover later by wondering why Connect fails.

@@ -324,13 +324,20 @@ credited by username.
   data made every write fail silently while the alert announced a full
   restore: the settings, the speed cap and the key were live until the
   next reload and then gone. The sibling phrase importer already reported
-  this; the backup importer now checks all seven of its writes.
+  this; the backup importer now checks all eight of its writes - the Handy
+  channel role included, which is written inside the role button's own
+  handler and so is verified by reading it back. That one matters most:
+  boot writes `primary` over a missing role, so a refused write does not
+  leave the role unset, it hands back a live channel nobody chose.
 - The count the import reports is what the store kept, not what the file
   offered. A file carrying `minHr 5 / maxHr 9999` is refused by the same
   check a typed pair gets and comes back at the factory numbers, and
   "2 Session Setup values imported" over two defaults was a count of
-  nothing; those values are now named as having come back at their safe
-  default. A setting a control can only write one way - the two-option
+  nothing; those values are now named as having come back at the nearest
+  value the app does accept - a limit, or the factory setting, since 9999
+  seconds of stall guard comes back at the 120-second maximum and not at
+  the 20-second default, and sending someone to look for a number that is
+  not there is its own small lie. A setting a control can only write one way - the two-option
   "At the ceiling" select, every toggle - is coerced on the way in too, so
   a hand-edited `ceilingBehaviour: "melt"` can no longer sit in the store
   disagreeing with the panel and ride out in the next export.
@@ -355,6 +362,24 @@ credited by username.
   declares itself a backup but whose settings block is damaged keeps its
   role, caps, device maps and flags instead of being demoted to "no
   version marker" and losing them unmentioned.
+- A setting whose value nobody can type comes back at the FACTORY value,
+  not at `false`. Coercing the toggles to a boolean is right; coercing an
+  unrecognised value to `false` turned off every toggle that ships on -
+  the stall guard among them, the watchdog that halts the primary after
+  too long at the edge - and reported it as a safe default. It also
+  cleared the one-shot envelope-migration flag, which re-armed the
+  15/85 -> 0/100 migration and wiped a just-restored travel envelope on
+  the next reload.
+- A file is read as a versioned backup when it both says so and has the
+  shape of one. Either test alone gets a real file wrong: on the
+  declaration alone, a legacy blob that picked up a stray `format` field
+  from the old merging import - exactly the pollution this change exists
+  to stop - was read as an envelope and its settings vanished; on the
+  settings block alone, a backup whose settings block is damaged was
+  demoted to "no version marker" and lost its role, caps, device maps and
+  flags without a word.
+- An export whose download never starts says so instead of leaving
+  "Exported ..." on screen, and releases the object URL either way.
 - A restored learning profile now repaints the panel that describes it.
   The engine was handed the imported offset immediately, while Session Setup
   went on saying "Zero breakthrough events recorded. Typed Climax HR is used

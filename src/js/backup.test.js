@@ -27,13 +27,14 @@ import {
     sanitizeLearningProfile,
     MAX_LEARNED_OFFSET_BPM,
     MIN_CAP_PERCENT,
+    RESTORE_PARTS,
     CAP_STEP_PERCENT,
     countDroppedOnMerge,
     backupNote,
     NOTE_KEY_NONE_SAVED,
     NOTE_KEY_UNUSABLE
 } from './backup.js';
-import { advancedSettings, SETTING_KEYS } from './state.js';
+import { advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
 
 const KEY = 'AUDITKEY-9f3c21';
 
@@ -594,10 +595,10 @@ describe('the documented backup is the backup that is written', () => {
                 () => backupFilename(file) === FILENAME_WITH_KEY && backupFilename(buildBackup(STORES, { now: NOW })) === FILENAME_PLAIN],
             ['a file carrying a **different** key does re-pair this browser, which the import says out loud',
                 () => /REPLACED/.test(describeBackupImport(readBackup({ minHr: 70, handyConnectionKey: 'X' }), { hadExistingKey: true, keyReplaced: true }))],
-            ['A value the app itself would refuse comes back at its safe default and is counted as such',
-                () => /came back at their safe default/.test(describeBackupImport(readBackup({ minHr: 5, maxHr: 9999 }), { settingsStored: 0 }))],
+            ['comes back at the nearest value it accepts - a limit, or the factory setting - and is counted as refused',
+                () => /came back at the nearest value it does/.test(describeBackupImport(readBackup({ minHr: 5, maxHr: 9999 }), { settingsStored: 0 }))],
             ['the import says so first and in those words',
-                () => describeBackupImport(readBackup({ minHr: 70 }), { unsaved: ['x'] }).startsWith('THIS BROWSER REFUSED TO SAVE')]
+                () => describeBackupImport(readBackup({ minHr: 70 }), { unsaved: ['settings'] }).startsWith('THIS BROWSER REFUSED TO SAVE')]
         ];
         for (const [claim, holds] of claims) {
             assert.ok(section.includes(claim), `README no longer makes the claim "${claim}" - update this guard with it`);
@@ -719,10 +720,11 @@ describe('the second round of findings', () => {
         // What the caller found in the store afterwards: neither survived.
         const text = describeBackupImport(read, { settingsStored: 0 });
         assert.ok(!/Settings imported: 2 Session Setup values/.test(text));
-        assert.match(text, /2 more values were outside what this app accepts and came back at their safe default/);
+        assert.match(text, /2 values in the file were outside what this app accepts/);
+        assert.match(text, /came back at the nearest value it does - a limit, or the factory setting/);
         // one of two
         assert.match(describeBackupImport(read, { settingsStored: 1 }), /Settings imported: 1 Session Setup value\./);
-        assert.match(describeBackupImport(read, { settingsStored: 1 }), /1 more value was outside/);
+        assert.match(describeBackupImport(read, { settingsStored: 1 }), /1 value in the file was outside/);
         // the honest all-good case says nothing extra
         assert.ok(!/outside what this app accepts/.test(describeBackupImport(read, { settingsStored: 2 })));
     });
@@ -738,11 +740,19 @@ describe('the second round of findings', () => {
 
     it('leads with the refused write, because it changes what every other line means', () => {
         const read = readBackup({ minHr: 70, handyConnectionKey: 'KEY-1' });
-        const text = describeBackupImport(read, { unsaved: ['your Session Setup values', 'your Handy connection key'] });
+        const text = describeBackupImport(read, { unsaved: ['settings', 'key'] });
         assert.match(text.split('\n')[0], /THIS BROWSER REFUSED TO SAVE/);
         assert.match(text, /your Session Setup values and your Handy connection key/);
         assert.match(text, /a reload will lose it/);
         assert.ok(!/REFUSED/.test(describeBackupImport(read, { unsaved: [] })));
+        // and a part named as lost is never also named as restored
+        assert.ok(!/connection key was restored/.test(text), 'the key cannot be both refused and restored');
+        const roleRefused = describeBackupImport(readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, handy: { role: 'off', maxCap: 40 } }), { unsaved: ['role'] });
+        assert.match(roleRefused, /REFUSED TO SAVE the Handy channel role/);
+        assert.match(roleRefused, /Settings imported: the Handy speed cap\./, 'the cap did save, so the cap alone is what was restored');
+        assert.ok(!/channel role and speed cap/.test(roleRefused));
+        // an id this version does not know is ignored rather than printed raw
+        assert.ok(!/REFUSED/.test(describeBackupImport(read, { unsaved: ['nonsense'] })));
     });
 
     it('says when the device-map limit displaced maps that were already here', () => {
@@ -780,7 +790,7 @@ describe('app.js keeps its side of the second round', () => {
     });
 
     it('counts what the store kept, not what the file offered', () => {
-        assert.match(src, /const settingsStored = countStoredSettings\(result\.settings\);/);
+        assert.match(src, /const settingsStored = countStoredSettings\(result\.settings\) - result\.clampedSettingKeys\.length;/);
         const order = src.indexOf('syncGuardSettings();', src.indexOf('readBackup(parsed)'));
         assert.ok(order >= 0 && order < src.indexOf('countStoredSettings(result.settings)'), 'count after the clamps, not before');
     });
@@ -808,6 +818,94 @@ describe('app.js keeps its side of the second round', () => {
         const notice = html.slice(html.indexOf('id="exportKeyNotice"') - 10, html.indexOf('id="exportKeyNotice"') + 120);
         assert.match(notice, /aria-live="polite"/);
         assert.match(notice, /role="status"/);
+    });
+});
+
+describe('the third round: what the fixes themselves broke', () => {
+    it('an unrecognised boolean falls back to the factory value, not to false', () => {
+        // The fix that coerced booleans coerced them to `false`, which is
+        // the OPPOSITE of the factory value for every setting that ships
+        // on - the stall guard among them, the watchdog that halts the
+        // primary after too long at the edge. It was switched off by a
+        // hand-edited file and reported as "the safe default".
+        const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const block = APP.slice(APP.indexOf('for (const name of BOOLEAN_SETTINGS)'), APP.indexOf('advancedSettings.voiceCues = mergeVoiceCues'));
+        assert.match(block, /SETTING_DEFAULTS\[name\]/, 'the fallback has to be the factory value');
+        assert.match(block, /value === false \|\| value === 'false' \? false/, 'a real false must still be false');
+        // the settings that ship ON are the ones the old fallback inverted
+        const onByDefault = SETTING_KEYS.filter((name) => SETTING_DEFAULTS[name] === true);
+        assert.ok(onByDefault.includes('stallGuard'), 'the stall guard ships on');
+        assert.ok(onByDefault.length >= 5, `expected several on-by-default toggles, found ${onByDefault.length}`);
+    });
+
+    it('the role write is verified, so it is the eighth checked write and not the one hole', () => {
+        const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const fn = APP.slice(APP.indexOf('function applyImportedBackup'), APP.indexOf('function countStoredSettings'));
+        // The role is written inside the button handler, so it is verified
+        // by reading it back rather than by a return value.
+        assert.match(fn, /safeGet\('handy_role', ''\) !== result\.handy\.role/);
+        assert.match(fn, /unsaved\.push\('role'\)/);
+        // every part the import writes reports by the same names
+        const ids = [...fn.matchAll(/unsaved\.push\('([a-z]+)'\)/g)].map((m) => m[1]);
+        assert.deepEqual(ids.sort(), ['cap', 'flags', 'intiface', 'key', 'role', 'tcode']);
+        for (const id of ids) assert.ok(RESTORE_PARTS[id], `${id} must be a known restore part`);
+    });
+
+    it('a file that only declares itself is not an envelope, and a damaged one still is', () => {
+        // Either half of the test alone gets a real file wrong.
+        const pollutedLegacy = readBackup({ minHr: 62, maxHr: 158, format: BACKUP_FORMAT });
+        assert.equal(pollutedLegacy.ok, true, 'a legacy blob that picked up a stray format field still imports');
+        assert.equal(pollutedLegacy.legacy, true);
+        assert.equal(pollutedLegacy.settings.minHr, 62);
+
+        const declaredByVersion = readBackup({ version: 2, settings: 'oops', handy: { role: 'off', maxCap: 20 }, flags: { ageVerified: true, wizardSeen: false } });
+        assert.equal(declaredByVersion.ok, true, 'a declared backup with a damaged settings block keeps the rest');
+        assert.equal(declaredByVersion.legacy, false);
+        assert.equal(declaredByVersion.settingsUnreadable, true);
+        assert.equal(declaredByVersion.handy.role, 'off');
+        assert.equal(declaredByVersion.handy.maxCap, 20);
+        assert.equal(declaredByVersion.flags.ageVerified, true);
+
+        // and the ordinary shapes are unchanged
+        assert.equal(readBackup(buildBackup(STORES, { now: NOW })).legacy, false);
+        assert.equal(readBackup({ minHr: 70 }).legacy, true);
+        assert.equal(readBackup({ minHr: 61, version: 2 }).legacy, true, 'a stray version field alone is not an envelope either');
+        assert.equal(readBackup({ format: BACKUP_FORMAT, version: '2', settings: { minHr: 61 } }).version, 2, 'a version written as a string still reads as 2');
+    });
+
+    it('what readBackup clamped itself is not reported as a clean restore', () => {
+        const read = readBackup({ minHr: 70, learningProfile: { breakthroughEvents: 99999, suggestedMaxHrOffset: 500, lastBreakthroughHr: 9 } });
+        assert.deepEqual(read.clampedSettingKeys, ['learningProfile']);
+        assert.deepEqual(read.settings.learningProfile, { breakthroughEvents: 9999, suggestedMaxHrOffset: MAX_LEARNED_OFFSET_BPM, lastBreakthroughHr: null });
+        // a profile that needed no correction is not flagged
+        assert.deepEqual(readBackup({ minHr: 70, learningProfile: { breakthroughEvents: 3, suggestedMaxHrOffset: 9, lastBreakthroughHr: 141 } }).clampedSettingKeys, []);
+        assert.deepEqual(readBackup({ minHr: 70 }).clampedSettingKeys, []);
+    });
+
+    it('says a refused value came back at the nearest the app takes, not at the default', () => {
+        // stallGuardSeconds 9999 comes back at the 120-second maximum, not
+        // at the 20-second factory setting: "reverted to the default" would
+        // send the reader looking for a number that is not there.
+        const read = readBackup({ stallGuardSeconds: 9999 });
+        const text = describeBackupImport(read, { settingsStored: 0 });
+        assert.match(text, /came back at the nearest value it does - a limit, or the factory setting/);
+        assert.ok(!/safe default/.test(text));
+        assert.match(text, /open Session Setup to see where it landed/);
+    });
+
+    it('a garbage phrase list restored nothing and is not counted as a value', () => {
+        const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const fn = APP.slice(APP.indexOf('function countStoredSettings'), APP.indexOf('function countStoredSettings') + 1200);
+        // [].every() is true, so a non-object voiceCues counted as restored.
+        assert.match(fn, /if \(!value \|\| typeof value !== 'object' \|\| Array\.isArray\(value\)\) continue;/);
+    });
+
+    it('a download that never starts leaves no claim and no leaked object URL', () => {
+        const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const handler = APP.slice(APP.indexOf("getElementById('exportSettingsBtn')"), APP.indexOf("getElementById('exportSettingsBtn')") + 2500);
+        assert.match(handler, /try \{\s*a\.click\(\);/);
+        assert.match(handler, /The download did not start, so nothing was written/);
+        assert.match(handler, /\} finally \{\s*URL\.revokeObjectURL\(url\);/);
     });
 });
 
