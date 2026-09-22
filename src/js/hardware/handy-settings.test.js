@@ -38,7 +38,7 @@ describe('the end-stop margin is settled like every other setting', () => {
         assert.match(body, /handyEndMarginInput/,
             'syncHwEnvelopeInputs must repaint the margin input, not only the envelope');
         assert.match(body, /clampEndMargin\(/, 'and clamp what it paints');
-        assert.match(APP, /syncHwEnvelopeInputs\(\);[\s\S]{0,400}syncGuardSettings\(\);[\s\S]{0,200}persistSettings\(\)/,
+        assert.match(APP, /syncHwEnvelopeInputs\(\);[\s\S]{0,400}syncGuardSettings\(\);[\s\S]{0,800}persistSettings\(\)/,
             'the import path must still run the envelope sync');
     });
 

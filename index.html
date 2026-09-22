@@ -930,7 +930,7 @@
             <div id="voiceCuesList" class="space-y-1.5 max-h-96 overflow-y-auto pr-0.5"></div>
             <div class="flex flex-wrap gap-2 pt-1">
               <button id="voiceCuesExportBtn" type="button" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer">Export phrases</button>
-              <label class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer text-center">
+              <label for="voiceCuesImportFile" role="button" tabindex="0" data-file-label="voiceCuesImportFile" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-2 rounded-lg text-[10px] cursor-pointer text-center">
                 Import phrases
                 <input id="voiceCuesImportFile" type="file" accept=".json,.txt,text/plain,application/json" class="hidden">
               </label>
@@ -986,12 +986,15 @@
               <input id="exportIncludeKey" type="checkbox" class="mt-0.5 accent-rose-600 cursor-pointer">
               <span class="text-[9px] text-slate-400 leading-snug">Include my Handy connection key <span class="text-rose-400">- anyone who has the file can then control my Handy</span>. Off by default; the file itself says which kind it is, and the download is named differently when the key is in it.</span>
             </label>
-            <p id="exportKeyNotice" class="text-[9px] leading-snug text-slate-400"></p>
+            <p id="exportKeyNotice" role="status" aria-live="polite" class="text-[9px] leading-snug text-slate-400"></p>
             <div class="flex gap-2 pt-1">
               <button id="exportSettingsBtn" class="flex-1 bg-purple-600 hover:bg-purple-500 text-white font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer">
                 Export (.json)
               </button>
-              <label class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer text-center border border-slate-700">
+              <!-- The file input itself is display:none, so the label carries
+                   the keyboard affordance: without these it sits outside the
+                   tab order and Import cannot be reached without a mouse. -->
+              <label for="importConfigFile" role="button" tabindex="0" data-file-label="importConfigFile" class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-1.5 px-3 rounded-lg text-xs transition cursor-pointer text-center border border-slate-700">
                 Import (.json)
                 <input id="importConfigFile" type="file" accept=".json" class="hidden">
               </label>

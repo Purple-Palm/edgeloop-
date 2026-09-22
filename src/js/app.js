@@ -1,4 +1,4 @@
-import { state, advancedSettings } from './state.js';
+import { state, advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
 import {
     calculateEngineOutputs,
     resolveEngineMode,
@@ -30,7 +30,7 @@ import {
     sanitizeSessionLimits
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
-import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, pruneReservedKeys } from './backup.js';
+import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
 import { createWriteCoalescer } from './write-coalescer.js';
 import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
@@ -167,6 +167,10 @@ function syncWatchdogSettings() {
 }
 // Stall hold (3-120 s), stall pause (2-60 s), edge hold percent (90-100)
 // and the mic gate are clamped wherever they enter: load, Apply and import.
+// The settings whose factory value is a boolean; a toggle can write nothing
+// else. Taken from the frozen defaults so adding a toggle needs no list.
+const BOOLEAN_SETTINGS = SETTING_KEYS.filter((name) => typeof SETTING_DEFAULTS[name] === 'boolean');
+
 function syncGuardSettings() {
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
     advancedSettings.stallPauseSeconds = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
@@ -176,6 +180,17 @@ function syncGuardSettings() {
     advancedSettings.handyEndMargin = clampEndMargin(advancedSettings.handyEndMargin);
     advancedSettings.micSensitivityThreshold = clampMicGate(advancedSettings.micSensitivityThreshold);
     advancedSettings.micBoostMaxBpm = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
+    // A select can only hold one of its options and a toggle can only hold
+    // true or false, so a stored or imported `ceilingBehaviour: 'melt'` or
+    // `stallGuard: 'no'` is a value no control could have produced: the
+    // panel would show one thing, the store another, and the next export
+    // would carry the impossible one forward. Coerced here, where every
+    // other "a typed value is clamped, so a stored one is too" rule lives.
+    advancedSettings.ceilingBehaviour = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
+    for (const name of BOOLEAN_SETTINGS) {
+        advancedSettings[name] = advancedSettings[name] === true || advancedSettings[name] === 'true';
+    }
+    if (typeof advancedSettings.voiceURI !== 'string') advancedSettings.voiceURI = SETTING_DEFAULTS.voiceURI;
     advancedSettings.voiceCues = mergeVoiceCues(advancedSettings.voiceCues);
     advancedSettings.voiceEncourageSeconds = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
     // The typed HR limits, the duration window and the Endgame Trigger are
@@ -2709,6 +2724,18 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     syncTelemetry();
 });
 
+// A <label> wrapping a display:none file input is not in the tab order and
+// answers no key, so Import could only be reached with a mouse. The labels
+// carry role="button" and tabindex="0" in the markup; this opens the picker
+// on Enter and Space, which is what a button does.
+document.querySelectorAll('[data-file-label]').forEach((label) => {
+    label.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+        e.preventDefault();
+        document.getElementById(label.dataset.fileLabel)?.click();
+    });
+});
+
 // Export & Import Settings. The file shape, every clamp on the way in and
 // every sentence the user reads live in backup.js; this side only reads the
 // stores, offers the file and routes each restored piece home.
@@ -2740,18 +2767,26 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
     const a = document.createElement('a');
     a.href = url;
     a.download = backupFilename(file);
+    // Painted before the download starts, so "this file CONTAINS your key"
+    // is on screen (and announced, the notice is a live region) by the time
+    // the save dialog asks where to put it - not after it is already on disk.
+    paintExportNotice(describeBackupExport(file, { requestedKey: includeKey, hasSavedKey: savedKey.trim().length > 0 }));
     a.click();
     URL.revokeObjectURL(url);
-    paintExportNotice(describeBackupExport(file, { requestedKey: includeKey, hasSavedKey: savedKey.trim().length > 0 }));
 });
 
 // Everything an import restores that does not live in advancedSettings. A
 // file that carries no key never clears the one saved here: restoring
 // settings on a paired machine must not break that pairing. Nothing here
 // connects anything - that stays behind the user's own click.
+// Returns what the browser refused to save and what the merge had to drop,
+// so the import can say so instead of announcing a restore that a reload
+// undoes. safeSet reports whether the write landed; a full or blocked store
+// is a live condition here, since session history is what fills it.
 function applyImportedBackup(result) {
+    const unsaved = [];
     if (result.keyPresent) {
-        safeSet('handy_connection_key', result.handyConnectionKey);
+        if (!safeSet('handy_connection_key', result.handyConnectionKey)) unsaved.push('your Handy connection key');
         const input = document.getElementById('modalHandyInput');
         if (input) input.value = result.handyConnectionKey;
     }
@@ -2763,28 +2798,60 @@ function applyImportedBackup(result) {
     }
     if (result.handy.maxCap !== null) {
         state.handyMaxCap = result.handy.maxCap;
-        safeSet('handy_max_cap', String(result.handy.maxCap));
+        if (!safeSet('handy_max_cap', String(result.handy.maxCap))) unsaved.push('the Handy speed cap');
         const slider = document.getElementById('handyCapSlider');
         const capVal = document.getElementById('handyCapVal');
         if (slider) slider.value = String(result.handy.maxCap);
         if (capVal) capVal.textContent = `${result.handy.maxCap}%`;
     }
+    let droppedDeviceMaps = 0;
     if (Object.keys(result.devices.intiface).length) {
-        safeSet(INTIFACE_STORAGE_KEY, mergeDeviceMaps(safeParse(INTIFACE_STORAGE_KEY, {}), result.devices.intiface));
+        const existing = safeParse(INTIFACE_STORAGE_KEY, {});
+        droppedDeviceMaps += countDroppedOnMerge(existing, result.devices.intiface);
+        if (!safeSet(INTIFACE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.intiface))) unsaved.push('your Intiface device maps');
     }
     if (Object.keys(result.devices.tcode).length) {
-        safeSet(TCODE_STORAGE_KEY, mergeDeviceMaps(safeParse(TCODE_STORAGE_KEY, {}), result.devices.tcode));
+        const existing = safeParse(TCODE_STORAGE_KEY, {});
+        droppedDeviceMaps += countDroppedOnMerge(existing, result.devices.tcode);
+        if (!safeSet(TCODE_STORAGE_KEY, mergeDeviceMaps(existing, result.devices.tcode))) unsaved.push('your T-Code device maps');
     }
     // Only ever set: a file that never passed the age gate must not put the
     // overlay back in front of someone who did.
-    if (result.flags.ageVerified) safeSet('edgeloop_age_verified', 'true');
-    if (result.flags.wizardSeen) safeSet('edgeloop_wizard_seen', 'true');
+    let flagsRefused = false;
+    if (result.flags.ageVerified && !safeSet('edgeloop_age_verified', 'true')) flagsRefused = true;
+    if (result.flags.wizardSeen && !safeSet('edgeloop_wizard_seen', 'true')) flagsRefused = true;
+    if (flagsRefused) unsaved.push('the age / wizard flags');
+    return { unsaved, droppedDeviceMaps };
+}
+
+// How many of the file's Session Setup values are still what the file said
+// once the app's own clamps have run. A pair like minHr 5 / maxHr 9999 is
+// refused by sanitizeSessionLimits and comes back at the factory numbers,
+// and "2 values imported" over two defaults is a count of nothing.
+function countStoredSettings(fileSettings) {
+    let kept = 0;
+    for (const [name, value] of Object.entries(fileSettings)) {
+        if (name === 'voiceCues') {
+            // mergeVoiceCues fills in every bank the file did not mention,
+            // so only the banks the file DID carry can be compared.
+            const banks = value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [];
+            const live = advancedSettings.voiceCues || {};
+            if (banks.every((bank) => JSON.stringify(live[bank]) === JSON.stringify(value[bank]))) kept += 1;
+            continue;
+        }
+        if (JSON.stringify(advancedSettings[name]) === JSON.stringify(value)) kept += 1;
+    }
+    return kept;
 }
 
 document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
+    // A file that vanishes or loses its permission between the pick and the
+    // read fires `error`, not `load`. Without this the button does nothing
+    // at all, which reads as "the app ignored me".
+    reader.onerror = () => alert('That file could not be read. Nothing was changed.');
     reader.onload = (evt) => {
         let parsed;
         try {
@@ -2799,7 +2866,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             const result = readBackup(parsed);
             // describeBackupImport says which way the file is wrong.
             if (!result.ok) { alert(describeBackupImport(result)); return; }
-            const hadExistingKey = Boolean(safeGet('handy_connection_key', '') || '');
+            const existingKey = safeGet('handy_connection_key', '') || '';
+            const hadExistingKey = Boolean(existingKey);
+            const keyReplaced = result.keyPresent && hadExistingKey && existingKey !== result.handyConnectionKey;
             // An older build merged every unknown top-level field into the
             // settings store, so a connection key could be sitting in there
             // and ride along in every future export. Clear those names out
@@ -2809,15 +2878,24 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
             syncGuardSettings();
-            persistSettings();
+            // Counted after the clamps, before the write, so the number the
+            // user reads is the number that is actually in the store.
+            const settingsStored = countStoredSettings(result.settings);
+            const unsaved = persistSettings() ? [] : ['your Session Setup values'];
             syncParamsUI();
             // Before the engine tick, so a restored Handy speed cap reaches
             // the device on the same pass as the settings it came with.
-            applyImportedBackup(result);
+            const applied = applyImportedBackup(result);
             // Repaints the learning line and ticks the engine, so the panel
             // agrees with the offset the engine has just been handed.
             renderLearningStatus();
-            alert(describeBackupImport(result, { hadExistingKey }));
+            alert(describeBackupImport(result, {
+                hadExistingKey,
+                keyReplaced,
+                settingsStored,
+                droppedDeviceMaps: applied.droppedDeviceMaps,
+                unsaved: [...unsaved, ...applied.unsaved]
+            }));
         } catch (err) {
             alert(`This backup could not be applied: ${err && err.message ? err.message : 'unknown error'}.`);
         }

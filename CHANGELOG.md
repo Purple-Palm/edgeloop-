@@ -284,8 +284,10 @@ credited by username.
   settings are. So the file you get without thinking about it is safe to
   send, and the one with the key in it is a file you chose: it downloads as
   `edgeloop_settings_with_key.json` rather than `edgeloop_settings.json`,
-  the panel says which you just wrote, and the file's own second line is
-  the warning. A file **without** the key says so too, in as many words, so
+  the panel says which you just wrote - before the download starts, not
+  after it is already on disk - and the file's own second line is the
+  warning. Tick the box with no usable key saved here and both the panel
+  and the file say that, instead of telling you to tick the box. A file **without** the key says so too, in as many words, so
   an export can never again be silently incomplete - which was the other
   half of what X333 ran into.
 - Import tells you what it did instead of "Settings successfully imported!".
@@ -317,6 +319,42 @@ credited by username.
   polluted cannot carry the junk - or a stray copy of the key - into the
   next file, and the number of restored values the import reports is the
   number it actually stored.
+- An import that the browser refuses to save says so, first and in those
+  words. A full store (session history is what fills it) or blocked site
+  data made every write fail silently while the alert announced a full
+  restore: the settings, the speed cap and the key were live until the
+  next reload and then gone. The sibling phrase importer already reported
+  this; the backup importer now checks all seven of its writes.
+- The count the import reports is what the store kept, not what the file
+  offered. A file carrying `minHr 5 / maxHr 9999` is refused by the same
+  check a typed pair gets and comes back at the factory numbers, and
+  "2 Session Setup values imported" over two defaults was a count of
+  nothing; those values are now named as having come back at their safe
+  default. A setting a control can only write one way - the two-option
+  "At the ceiling" select, every toggle - is coerced on the way in too, so
+  a hand-edited `ceilingBehaviour: "melt"` can no longer sit in the store
+  disagreeing with the panel and ride out in the next export.
+- A file carrying a DIFFERENT connection key re-pairs this browser, and
+  the import now says so. The opposite case was already careful ("the one
+  saved in this browser was kept"); restoring an older or a borrowed
+  backup silently replaced the key instead.
+- The phrase importer accepts a full settings backup. Its own refusal
+  message offers "a settings backup" by name, and the new file nests the
+  phrase lists one level down, so the shape the Backup tab writes was the
+  one shape it turned away.
+- Both Import buttons are reachable from the keyboard. A `<label>` around
+  a `display:none` file input is not in the tab order and answers no key,
+  so Import could only ever be clicked with a mouse. The export notice is
+  a live region, so the line that says the file contains your key is
+  announced rather than silently swapped in.
+- A file that could not be read at all (picked, then moved or locked)
+  produced complete silence on the settings import; it says so now, the
+  way the phrase import already did.
+- A device-map merge can no longer trim out the maps it just announced,
+  and says how many of the ones already here had to make room. A file that
+  declares itself a backup but whose settings block is damaged keeps its
+  role, caps, device maps and flags instead of being demoted to "no
+  version marker" and losing them unmentioned.
 - A restored learning profile now repaints the panel that describes it.
   The engine was handed the imported offset immediately, while Session Setup
   went on saying "Zero breakthrough events recorded. Typed Climax HR is used

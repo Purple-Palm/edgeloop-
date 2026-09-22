@@ -25,7 +25,13 @@ import {
     describeBackupImport,
     filterSettings,
     sanitizeLearningProfile,
-    MAX_LEARNED_OFFSET_BPM
+    MAX_LEARNED_OFFSET_BPM,
+    MIN_CAP_PERCENT,
+    CAP_STEP_PERCENT,
+    countDroppedOnMerge,
+    backupNote,
+    NOTE_KEY_NONE_SAVED,
+    NOTE_KEY_UNUSABLE
 } from './backup.js';
 import { advancedSettings, SETTING_KEYS } from './state.js';
 
@@ -98,12 +104,21 @@ describe('the Handy role and speed cap are clamped, never invented', () => {
         for (const junk of ['PRIMARY', 'boss', '', null, 3, {}]) assert.equal(sanitizeHandyRole(junk), null);
     });
 
-    it('clamps a cap into 0-100 whole percent', () => {
+    it('snaps a cap onto the grid the cap slider can actually show', () => {
+        // min=10 max=100 step=5 is every cap control in the app, so those
+        // are the only values it can write. A restored cap off that grid
+        // left the slider showing 35 while the store and the driver used 37,
+        // and the next nudge of the slider committed the 35.
         assert.equal(sanitizeMaxCap(65), 65);
         assert.equal(sanitizeMaxCap('65'), 65);
-        assert.equal(sanitizeMaxCap(64.6), 65);
+        assert.equal(sanitizeMaxCap(37), 35, 'rounds DOWN: of two neighbours, the slower one');
+        assert.equal(sanitizeMaxCap(64.6), 60);
         assert.equal(sanitizeMaxCap(1e9), 100);
-        assert.equal(sanitizeMaxCap(-40), 0);
+        assert.equal(sanitizeMaxCap(-40), MIN_CAP_PERCENT);
+        assert.equal(sanitizeMaxCap(3), MIN_CAP_PERCENT, 'below the grid there is nothing to round down to');
+        for (let cap = MIN_CAP_PERCENT; cap <= 100; cap += CAP_STEP_PERCENT) {
+            assert.equal(sanitizeMaxCap(cap), cap, `${cap} is on the grid and must survive untouched`);
+        }
     });
 
     it('reports a missing cap as null so nothing restores a 100% cap by accident', () => {
@@ -408,7 +423,11 @@ describe('the import says what it did', () => {
 
     it('says a key-less file kept the key already saved here', () => {
         const read = readBackup(buildBackup(STORES, { now: NOW }));
-        assert.match(describeBackupImport(read, { hadExistingKey: true }), /no Handy connection key, so the one saved in this browser was kept/);
+        // Our own export declares the absence, so the sentence says the file
+        // was exported without one rather than that it merely lacks one.
+        assert.match(describeBackupImport(read, { hadExistingKey: true }), /exported without a Handy connection key, so the one saved in this browser was kept/);
+        // A legacy blob has no opinion, and gets the older wording.
+        assert.match(describeBackupImport(readBackup({ minHr: 70 }), { hadExistingKey: true }), /contained no Handy connection key, so the one saved in this browser was kept/);
     });
 
     it('tells a user with no key at all where to get one - the wasted-restore sentence', () => {
@@ -565,6 +584,27 @@ describe('the documented backup is the backup that is written', () => {
         }
     });
 
+    it('every claim in it that this module decides is true of this module', () => {
+        const file = buildBackup(STORES, { includeKey: true, now: NOW });
+        const claims = [
+            // claim in the docs -> what has to be true of the code
+            ["the file's own second line is the warning",
+                () => /"note":/.test(JSON.stringify(file, null, 2).split('\n')[1])],
+            ['downloads as `edgeloop_settings_with_key.json` instead of `edgeloop_settings.json`',
+                () => backupFilename(file) === FILENAME_WITH_KEY && backupFilename(buildBackup(STORES, { now: NOW })) === FILENAME_PLAIN],
+            ['a file carrying a **different** key does re-pair this browser, which the import says out loud',
+                () => /REPLACED/.test(describeBackupImport(readBackup({ minHr: 70, handyConnectionKey: 'X' }), { hadExistingKey: true, keyReplaced: true }))],
+            ['A value the app itself would refuse comes back at its safe default and is counted as such',
+                () => /came back at their safe default/.test(describeBackupImport(readBackup({ minHr: 5, maxHr: 9999 }), { settingsStored: 0 }))],
+            ['the import says so first and in those words',
+                () => describeBackupImport(readBackup({ minHr: 70 }), { unsaved: ['x'] }).startsWith('THIS BROWSER REFUSED TO SAVE')]
+        ];
+        for (const [claim, holds] of claims) {
+            assert.ok(section.includes(claim), `README no longer makes the claim "${claim}" - update this guard with it`);
+            assert.ok(holds(), `README claims "${claim}" and the code does not do it`);
+        }
+    });
+
     it('promises nothing the settings object does not have', () => {
         // README.md used to say a backup carried "your custom profiles".
         // advancedSettings had a customProfiles field that no screen, no
@@ -574,6 +614,200 @@ describe('the documented backup is the backup that is written', () => {
         // checkable is not trusted about anything else.
         assert.ok(!/custom profile/i.test(section), 'the Backup section names a feature this build does not have');
         assert.ok(!SETTING_KEYS.includes('customProfiles'), 'customProfiles is dead state; do not bring it back without a screen that uses it');
+    });
+});
+
+describe('the second round of findings', () => {
+    it('the note is the first line of the file, and answers the box that was ticked', () => {
+        const withKey = buildBackup(STORES, { includeKey: true, now: NOW });
+        const lines = JSON.stringify(withKey, null, 2).split('\n');
+        // README and CHANGELOG both say "the file's own second line is the
+        // warning". It was line 5, behind format/version/exportedAt.
+        assert.match(lines[1], /"note":/);
+        assert.match(lines[1], /WARNING: this file contains your Handy connection key/);
+        // Telling someone to tick a box they ticked is worse than silence.
+        assert.equal(backupNote(false, true, ''), NOTE_KEY_NONE_SAVED);
+        assert.equal(backupNote(false, true, 'BAD KEY'), NOTE_KEY_UNUSABLE);
+        assert.equal(buildBackup({ ...STORES, handyConnectionKey: '' }, { includeKey: true, now: NOW }).note, NOTE_KEY_NONE_SAVED);
+        assert.equal(buildBackup({ ...STORES, handyConnectionKey: 'BAD KEY' }, { includeKey: true, now: NOW }).note, NOTE_KEY_UNUSABLE);
+        // and the note in the file agrees with what the panel just said
+        const unusable = buildBackup({ ...STORES, handyConnectionKey: 'BAD KEY' }, { includeKey: true, now: NOW });
+        const panel = describeBackupExport(unusable, { requestedKey: true, hasSavedKey: true });
+        assert.equal(/Tick "Include my Handy connection key"/.test(unusable.note), false);
+        assert.match(panel.message, /not a usable key/);
+        assert.match(unusable.note, /not a usable key/);
+    });
+
+    it('a merge never trims out the maps it just restored', () => {
+        const existing = {};
+        for (let i = 0; i < MAX_SAVED_DEVICES; i += 1) existing[`mine${i}`] = { axes: {}, savedAt: 2_000_000_000_000 + i };
+        const incoming = { fromFile: { axes: {}, savedAt: 1 } };
+        const merged = mergeDeviceMaps(existing, incoming);
+        assert.equal(Object.keys(merged).length, MAX_SAVED_DEVICES);
+        assert.ok(merged.fromFile, 'the restored map is the one the import announced');
+        assert.equal(merged.mine0, undefined, 'the oldest of my own went instead');
+        assert.equal(countDroppedOnMerge(existing, incoming), 1);
+        assert.equal(countDroppedOnMerge(existing, {}), 0);
+    });
+
+    it('a merge survives a store that holds junk', () => {
+        // The existing store comes straight out of localStorage; a throw
+        // here would surface as "this backup could not be applied" AFTER
+        // the settings were already in.
+        const existing = { good: { axes: {}, savedAt: 5 } };
+        for (let i = 0; i < MAX_SAVED_DEVICES; i += 1) existing[`n${i}`] = null;
+        assert.doesNotThrow(() => mergeDeviceMaps(existing, { fromFile: { axes: {}, savedAt: 9 } }));
+        assert.ok(mergeDeviceMaps(existing, { fromFile: { axes: {}, savedAt: 9 } }).fromFile);
+    });
+
+    it('a retired field is dropped in silence, not reported as a skip', () => {
+        // Every backup written by the build before this one carries
+        // customProfiles, and it never meant anything.
+        const read = readBackup({ minHr: 70, maxHr: 140, customProfiles: { mine: {} } });
+        assert.deepEqual(read.retiredSettingKeys, ['customProfiles']);
+        assert.deepEqual(read.unknownSettingKeys, []);
+        assert.equal('customProfiles' in read.settings, false);
+        assert.ok(!/not a setting this version has/.test(describeBackupImport(read, {})));
+    });
+
+    it('a file that says it is a backup is read as one even with a broken settings block', () => {
+        const read = readBackup({
+            format: BACKUP_FORMAT,
+            version: BACKUP_VERSION,
+            settings: 'oops',
+            handy: { role: 'off', maxCap: 20 },
+            devices: { intiface: { X: { axes: {}, savedAt: 1 } } },
+            flags: { ageVerified: true }
+        });
+        assert.equal(read.ok, true);
+        assert.equal(read.legacy, false, 'it plainly carries a version marker');
+        assert.equal(read.settingsUnreadable, true);
+        assert.equal(read.handy.role, 'off');
+        assert.equal(read.handy.maxCap, 20);
+        assert.equal(Object.keys(read.devices.intiface).length, 1);
+        assert.equal(read.flags.ageVerified, true);
+        const text = describeBackupImport(read, {});
+        assert.match(text, /Session Setup block in this file is damaged/);
+        assert.ok(!/no version marker/.test(text));
+    });
+
+    it('an empty key field is an absent key, not junk in place of one', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: { minHr: 70 }, handyConnectionKeyIncluded: false, handyConnectionKey: '' });
+        assert.equal(read.keyRejected, false);
+        assert.equal(read.keyDeclaredAbsent, true);
+        const text = describeBackupImport(read, { hadExistingKey: true });
+        assert.match(text, /exported without a Handy connection key/);
+        assert.ok(!/not a usable key/.test(text));
+        // something that IS there and unusable is still called out
+        const junk = readBackup({ minHr: 70, handyConnectionKey: 'has a space' });
+        assert.equal(junk.keyRejected, true);
+    });
+
+    it('names the flags, and does not say "settings imported" over no settings', () => {
+        const flagsOnly = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, flags: { ageVerified: true, wizardSeen: true } });
+        const text = describeBackupImport(flagsOnly, {});
+        assert.match(text, /age \/ wizard flags/);
+        assert.ok(!/Settings imported: 0/.test(text));
+        const keyOnly = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, handyConnectionKey: 'KEY-1' });
+        assert.match(describeBackupImport(keyOnly, {}), /Nothing in this file changed a setting here/);
+        // and with something else restored, the question is still answered
+        assert.match(describeBackupImport(flagsOnly, {}), /carried no Session Setup values, so nothing in Session Setup changed/);
+    });
+
+    it('reports the values that survived the clamps, not the values offered', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: { minHr: 5, maxHr: 9999 } });
+        // What the caller found in the store afterwards: neither survived.
+        const text = describeBackupImport(read, { settingsStored: 0 });
+        assert.ok(!/Settings imported: 2 Session Setup values/.test(text));
+        assert.match(text, /2 more values were outside what this app accepts and came back at their safe default/);
+        // one of two
+        assert.match(describeBackupImport(read, { settingsStored: 1 }), /Settings imported: 1 Session Setup value\./);
+        assert.match(describeBackupImport(read, { settingsStored: 1 }), /1 more value was outside/);
+        // the honest all-good case says nothing extra
+        assert.ok(!/outside what this app accepts/.test(describeBackupImport(read, { settingsStored: 2 })));
+    });
+
+    it('says when a file re-paired this browser with a different Handy', () => {
+        const read = readBackup({ minHr: 70, handyConnectionKey: 'FROM-FILE-2' });
+        const text = describeBackupImport(read, { hadExistingKey: true, keyReplaced: true });
+        assert.match(text, /was REPLACED by the one in this file/);
+        assert.match(text, /Nothing is connected either way/);
+        // the same key twice is not a re-pairing
+        assert.ok(!/REPLACED/.test(describeBackupImport(read, { hadExistingKey: true, keyReplaced: false })));
+    });
+
+    it('leads with the refused write, because it changes what every other line means', () => {
+        const read = readBackup({ minHr: 70, handyConnectionKey: 'KEY-1' });
+        const text = describeBackupImport(read, { unsaved: ['your Session Setup values', 'your Handy connection key'] });
+        assert.match(text.split('\n')[0], /THIS BROWSER REFUSED TO SAVE/);
+        assert.match(text, /your Session Setup values and your Handy connection key/);
+        assert.match(text, /a reload will lose it/);
+        assert.ok(!/REFUSED/.test(describeBackupImport(read, { unsaved: [] })));
+    });
+
+    it('says when the device-map limit displaced maps that were already here', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: { minHr: 70 }, devices: { intiface: { A: { axes: {}, savedAt: 1 } } } });
+        assert.match(describeBackupImport(read, { droppedDeviceMaps: 3 }), /3 of the device maps already saved here had to be dropped/);
+        assert.ok(!/had to be dropped/.test(describeBackupImport(read, { droppedDeviceMaps: 0 })));
+    });
+});
+
+describe('app.js keeps its side of the second round', () => {
+    const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+    const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+
+    it('checks every storage write the import makes', () => {
+        // safeSet returns whether the write landed; announcing a restore a
+        // reload will undo is the failure this whole change is about.
+        const fn = src.slice(src.indexOf('function applyImportedBackup'), src.indexOf('function countStoredSettings'));
+        const writes = fn.match(/safeSet\(/g) || [];
+        const checked = fn.match(/!safeSet\(/g) || [];
+        assert.equal(writes.length, checked.length, 'every safeSet in the import path must be checked');
+        assert.ok(writes.length >= 6, `expected the six restore writes, found ${writes.length}`);
+        assert.match(src, /const unsaved = persistSettings\(\) \? \[\] : \[/, 'the settings write is checked too');
+        assert.match(src, /unsaved: \[\.\.\.unsaved, \.\.\.applied\.unsaved\]/);
+    });
+
+    it('reads an unreadable file out loud instead of doing nothing', () => {
+        assert.match(src, /reader\.onerror = \(\) => alert\('That file could not be read/);
+    });
+
+    it('paints the export notice before the download starts', () => {
+        const handler = src.slice(src.indexOf("getElementById('exportSettingsBtn')"));
+        const paint = handler.indexOf('paintExportNotice(');
+        const click = handler.indexOf('a.click()');
+        assert.ok(paint >= 0 && click >= 0 && paint < click, 'the warning must be on screen before the file is written');
+    });
+
+    it('counts what the store kept, not what the file offered', () => {
+        assert.match(src, /const settingsStored = countStoredSettings\(result\.settings\);/);
+        const order = src.indexOf('syncGuardSettings();', src.indexOf('readBackup(parsed)'));
+        assert.ok(order >= 0 && order < src.indexOf('countStoredSettings(result.settings)'), 'count after the clamps, not before');
+    });
+
+    it('coerces the settings a control can only write one way', () => {
+        assert.match(src, /advancedSettings\.ceilingBehaviour = advancedSettings\.ceilingBehaviour === 'stop' \? 'stop' : 'crawl';/);
+        assert.match(src, /for \(const name of BOOLEAN_SETTINGS\)/);
+        assert.ok(/BOOLEAN_SETTINGS = SETTING_KEYS\.filter/.test(src));
+    });
+
+    it('leaves both file imports reachable from the keyboard', () => {
+        // A <label> around a display:none input is not in the tab order.
+        const labels = html.match(/data-file-label="[^"]+"/g) || [];
+        assert.equal(labels.length, 2, 'the settings import and the phrase import');
+        for (const id of ['importConfigFile', 'voiceCuesImportFile']) {
+            const label = html.slice(html.indexOf(`data-file-label="${id}"`) - 200, html.indexOf(`data-file-label="${id}"`) + 40);
+            assert.match(label, /tabindex="0"/);
+            assert.match(label, /role="button"/);
+        }
+        assert.match(src, /label\.dataset\.fileLabel/);
+        assert.match(src, /e\.key !== 'Enter' && e\.key !== ' '/);
+    });
+
+    it('announces the export notice to a screen reader', () => {
+        const notice = html.slice(html.indexOf('id="exportKeyNotice"') - 10, html.indexOf('id="exportKeyNotice"') + 120);
+        assert.match(notice, /aria-live="polite"/);
+        assert.match(notice, /role="status"/);
     });
 });
 
@@ -597,7 +831,7 @@ describe('app.js routes the backup through this module', () => {
     it('repaints the learning line after an import applies a restored profile', () => {
         const apply = src.indexOf('applyImportedBackup(result);');
         const paint = src.indexOf('renderLearningStatus();', apply);
-        const alerted = src.indexOf('alert(describeBackupImport(result, { hadExistingKey }))');
+        const alerted = src.indexOf('alert(describeBackupImport(result, {', apply);
         assert.ok(apply >= 0 && paint > apply && paint < alerted,
             'the panel has to be repainted before the import reports what it did');
     });

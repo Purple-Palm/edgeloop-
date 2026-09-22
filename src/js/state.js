@@ -197,4 +197,9 @@ export const advancedSettings = {
 // settings store, so the live object can carry names this version never
 // wrote, and a list read off it later would bless exactly the junk the
 // filter exists to keep out.
-export const SETTING_KEYS = Object.freeze(Object.keys(advancedSettings));
+const deepFreeze = (value) => {
+    if (value && typeof value === 'object') Object.values(value).forEach(deepFreeze);
+    return Object.freeze(value);
+};
+export const SETTING_DEFAULTS = deepFreeze(JSON.parse(JSON.stringify(advancedSettings)));
+export const SETTING_KEYS = Object.freeze(Object.keys(SETTING_DEFAULTS));

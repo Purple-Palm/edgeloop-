@@ -301,6 +301,14 @@ function extractCueMap(parsed) {
     if (parsed.voiceCues && typeof parsed.voiceCues === 'object' && !Array.isArray(parsed.voiceCues)) {
         return parsed.voiceCues;
     }
+    // A full settings backup keeps the phrase lists one level down, under
+    // `settings`. The refusal below offers "a settings backup" by name, so
+    // the shape the Backup tab actually writes has to be one of the three.
+    const nested = parsed.settings;
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)
+        && nested.voiceCues && typeof nested.voiceCues === 'object' && !Array.isArray(nested.voiceCues)) {
+        return nested.voiceCues;
+    }
     const keys = Object.keys(parsed);
     if (keys.some((key) => KNOWN_IDS.has(key))) return parsed;
     return null;

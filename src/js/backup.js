@@ -18,12 +18,21 @@
 //    and the download is named differently when the key is in it. A file with
 //    no key still says so, so an export can never again be SILENTLY
 //    incomplete - that was the other half of the report.
-// 2. Nothing in a file is trusted. Every value is type-checked and clamped on
-//    the way in, and anything this version does not recognise is dropped
-//    rather than merged. The old import was a bare Object.assign, so an
-//    unknown top-level field landed inside the settings store and rode along
-//    in every later export; a credential that got in that way would outlive
-//    the user deleting it from the Handy panel.
+// 2. Nothing in a file is trusted. A name this version does not have is
+//    dropped rather than merged, in both directions: the old import was a
+//    bare Object.assign, so an unknown top-level field landed inside the
+//    settings store and rode along in every later export, and a credential
+//    that got in that way would outlive the user deleting it from the Handy
+//    panel. Every value this module itself restores - the key, the roles,
+//    the caps, the device maps, the learning profile - is type-checked and
+//    clamped here. The VALUES of the allow-listed Session Setup fields are
+//    not clamped here: they go through exactly the sanitizers a typed value
+//    goes through (session-rules.sanitizeSessionLimits and the clamps in
+//    syncGuardSettings / syncWatchdogSettings, applied by app.js on the same
+//    pass), which is the only place those bounds are defined. So an
+//    allow-listed name still carries the user's own value into the store and
+//    out again - that is what a settings backup is - but it can be neither a
+//    name this build never wrote nor a value the app itself would refuse.
 
 // The factory field list, captured at module load in state.js. It is the
 // allow-list for both directions: this version writes the names it knows and
@@ -71,11 +80,23 @@ export const FILENAME_WITH_KEY = 'edgeloop_settings_with_key.json';
 // The first thing a human sees on opening the file.
 export const NOTE_WITH_KEY = 'WARNING: this file contains your Handy connection key. Anyone who has this file can control your Handy from anywhere, without any password. Do not mail it, upload it or post it.';
 export const NOTE_WITHOUT_KEY = 'This file does NOT contain your Handy connection key. Tick "Include my Handy connection key" in the Backup tab before exporting if you want it carried over.';
+// Telling someone to tick a box they did tick is worse than saying nothing.
+// These two are for the export that was asked to carry the key and could
+// not, and they match what the panel says at the same instant.
+export const NOTE_KEY_NONE_SAVED = 'This file does NOT contain your Handy connection key: you asked for it, but no key is saved in this browser. Enter it in the Handy panel and export again.';
+export const NOTE_KEY_UNUSABLE = 'This file does NOT contain your Handy connection key: you asked for it, but what is saved in this browser is not a usable key. Re-enter it in the Handy panel and export again.';
 
 // Top-level field names the file itself uses. They are never settings, so
 // they are stripped from the settings object both on the way out and on the
 // way in - and from the live settings store too, to clean up after the build
 // whose Object.assign merged them in.
+// Field names this build has retired. They are dropped in silence rather
+// than counted as unrecognised: `customProfiles` was declared in the
+// defaults and read by nothing at all, so every backup written before it
+// was removed carries it, and telling those users a field "was skipped"
+// would be a warning about nothing on the commonest upgrade path there is.
+export const RETIRED_SETTING_KEYS = ['customProfiles'];
+
 export const RESERVED_SETTING_KEYS = [
     'format',
     'version',
@@ -114,13 +135,26 @@ export function sanitizeHandyRole(value) {
     return HANDY_ROLES.includes(value) ? value : null;
 }
 
-// 0-100 whole percent, or null when the file does not carry a usable number.
+// Every cap in this app - the Handy speed cap and each per-axis cap - is a
+// slider of `min=10 max=100 step=5`, so those are the only values the app
+// itself can write. A restored cap is snapped onto that grid, DOWNWARDS, so
+// the slider, the label, the store and the driver all show the same number
+// and a later nudge of the slider cannot silently commit a different one.
+// Rounding down means a hand-edited 37 restores as 35 rather than 40: of the
+// two representable neighbours, the slower one is the one to pick. Below the
+// grid there is nothing to round down to, so 3 becomes the app's own floor
+// of 10; a cap that low cannot be typed here in the first place, and "off"
+// is a channel role, not a cap.
 // Null is never turned into 100: inventing a cap would be inventing the
 // permissive one, and a missing cap must leave the saved cap untouched.
+export const MIN_CAP_PERCENT = 10;
+export const CAP_STEP_PERCENT = 5;
+
 export function sanitizeMaxCap(value) {
     const n = typeof value === 'number' ? value : parseInt(String(value ?? ''), 10);
     if (!Number.isFinite(n)) return null;
-    return Math.max(0, Math.min(100, Math.round(n)));
+    const bounded = Math.max(MIN_CAP_PERCENT, Math.min(100, n));
+    return Math.floor(bounded / CAP_STEP_PERCENT) * CAP_STEP_PERCENT;
 }
 
 // An axis entry keeps only what the drivers read back. An unreadable role or
@@ -163,10 +197,22 @@ function sanitizeDevice(raw, { extras }) {
 
 // Keep the newest MAX_SAVED_DEVICES entries, exactly as the drivers do when
 // their own store grows, so an import can never push a store past the cap.
-function trimToNewest(map, limit = MAX_SAVED_DEVICES) {
+// `protect` are the keys the file just restored: they go last in the queue
+// to be dropped, because an import that announces "1 device map restored"
+// and then trims that very map back out is a lie in two directions at once.
+// savedAt is read defensively - the existing store comes straight out of
+// localStorage and can hold anything, and a throw here would surface as
+// "this backup could not be applied" after the settings were already in.
+function trimToNewest(map, limit = MAX_SAVED_DEVICES, protect = new Set()) {
     const keys = Object.keys(map);
     if (keys.length <= limit) return map;
-    keys.sort((a, b) => (Number(map[a].savedAt) || 0) - (Number(map[b].savedAt) || 0));
+    const age = (key) => Number(map[key] && map[key].savedAt) || 0;
+    keys.sort((a, b) => {
+        const pa = protect.has(a) ? 1 : 0;
+        const pb = protect.has(b) ? 1 : 0;
+        if (pa !== pb) return pa - pb;
+        return age(a) - age(b);
+    });
     const trimmed = { ...map };
     keys.slice(0, keys.length - limit).forEach((key) => { delete trimmed[key]; });
     return trimmed;
@@ -191,7 +237,16 @@ export function mergeDeviceMaps(existing, incoming) {
     const base = isPlainObject(existing) ? { ...existing } : {};
     const add = isPlainObject(incoming) ? incoming : {};
     for (const key of Object.keys(add)) base[key] = add[key];
-    return trimToNewest(base);
+    return trimToNewest(base, MAX_SAVED_DEVICES, new Set(Object.keys(add)));
+}
+
+// How many maps a merge had to drop to stay under the cap. The import says
+// so out loud rather than letting a toy quietly lose its axis map.
+export function countDroppedOnMerge(existing, incoming) {
+    const base = isPlainObject(existing) ? Object.keys(existing) : [];
+    const add = isPlainObject(incoming) ? Object.keys(incoming) : [];
+    const union = new Set([...base, ...add]).size;
+    return Math.max(0, union - Object.keys(mergeDeviceMaps(existing, incoming)).length);
 }
 
 // Delete the file's own field names from a live settings object. Returns the
@@ -216,13 +271,15 @@ export function filterSettings(raw, allowed = SETTING_KEYS) {
     const keep = allowed instanceof Set ? allowed : new Set(allowed || []);
     const settings = {};
     const unknown = [];
-    if (!isPlainObject(raw)) return { settings, unknown };
+    const retired = [];
+    if (!isPlainObject(raw)) return { settings, unknown, retired };
     for (const [name, value] of Object.entries(raw)) {
         if (RESERVED_SETTING_KEYS.includes(name)) continue;
+        if (RETIRED_SETTING_KEYS.includes(name)) { retired.push(name); continue; }
         if (!keep.has(name)) { unknown.push(name); continue; }
         settings[name] = value;
     }
-    return { settings, unknown };
+    return { settings, unknown, retired };
 }
 
 // The learning profile is the one setting the engine reads as a structure
@@ -263,11 +320,14 @@ export function buildBackup(stores = {}, options = {}) {
     if (maxCap !== null) handy.maxCap = maxCap;
 
     const now = Number.isFinite(options.now) ? options.now : Date.now();
+    // The note is the first thing in the file, so opening it in any editor
+    // answers "is my key in this?" on line 2 without scrolling or knowing
+    // the format. The reader does not care about key order.
     return {
+        note: backupNote(carriesKey, includeKey, stores.handyConnectionKey),
         format: BACKUP_FORMAT,
         version: BACKUP_VERSION,
         exportedAt: new Date(now).toISOString(),
-        note: carriesKey ? NOTE_WITH_KEY : NOTE_WITHOUT_KEY,
         handyConnectionKeyIncluded: carriesKey,
         handyConnectionKey: carriesKey ? key : null,
         settings,
@@ -281,6 +341,17 @@ export function buildBackup(stores = {}, options = {}) {
             wizardSeen: stores.wizardSeen === true
         }
     };
+}
+
+// Which of the four notes belongs in the file. It answers the same question
+// the panel answers, from the same three facts, so the two can never
+// disagree - they did: a file exported WITH the box ticked but no usable key
+// still told the user to tick the box.
+export function backupNote(carriesKey, requestedKey, savedKey) {
+    if (carriesKey) return NOTE_WITH_KEY;
+    if (requestedKey !== true) return NOTE_WITHOUT_KEY;
+    const raw = typeof savedKey === 'string' ? savedKey.trim() : '';
+    return raw ? NOTE_KEY_UNUSABLE : NOTE_KEY_NONE_SAVED;
 }
 
 // The filename carries the warning into the mail client.
@@ -338,15 +409,21 @@ export function readBackup(parsed, options = {}) {
         };
     }
 
-    // A versioned file is one that says so. Everything else is read as the
+    // A versioned file is one that SAYS so. Everything else is read as the
     // bare advancedSettings blob older builds wrote, which stays importable.
+    // The marker alone decides: a file whose settings block is missing or
+    // corrupt is still that file, and demoting it to the legacy path would
+    // drop its role, caps, device maps and flags without a word - while
+    // telling the user it "has no version marker", which it plainly has.
     const versionNumber = Number(parsed.version);
-    const enveloped = isPlainObject(parsed.settings)
-        && (parsed.format === BACKUP_FORMAT || Number.isFinite(versionNumber));
+    const enveloped = parsed.format === BACKUP_FORMAT
+        || (Number.isFinite(versionNumber) && isPlainObject(parsed.settings));
     const version = enveloped && Number.isFinite(versionNumber) ? Math.round(versionNumber) : (enveloped ? BACKUP_VERSION : LEGACY_VERSION);
+    // Declared as a backup, but the settings block is not readable.
+    const settingsUnreadable = enveloped && parsed.settings !== undefined && !isPlainObject(parsed.settings);
 
-    const rawSettings = enveloped ? parsed.settings : parsed;
-    const { settings, unknown: unknownSettingKeys } = filterSettings(
+    const rawSettings = enveloped ? (isPlainObject(parsed.settings) ? parsed.settings : {}) : parsed;
+    const { settings, unknown: unknownSettingKeys, retired: retiredSettingKeys } = filterSettings(
         rawSettings,
         options.allowedSettingKeys || SETTING_KEYS
     );
@@ -366,7 +443,12 @@ export function readBackup(parsed, options = {}) {
     // user's own key, and the import says out loud that it found one.
     const rawKey = parsed.handyConnectionKey;
     const handyConnectionKey = sanitizeConnectionKey(rawKey);
-    const keyRejected = rawKey !== undefined && rawKey !== null && handyConnectionKey === null;
+    // An empty or blank string is how a file says "no key", the same as a
+    // null or a missing field; only something that is there and unusable
+    // counts as rejected.
+    const keyBlank = rawKey === undefined || rawKey === null
+        || (typeof rawKey === 'string' && rawKey.trim() === '');
+    const keyRejected = !keyBlank && handyConnectionKey === null;
 
     const handySource = enveloped && isPlainObject(parsed.handy) ? parsed.handy : {};
     const handy = {
@@ -387,6 +469,7 @@ export function readBackup(parsed, options = {}) {
     };
 
     const carriesSomething = Object.keys(settings).length > 0
+        || settingsUnreadable
         || handy.role !== null
         || handy.maxCap !== null
         || Object.keys(devices.intiface).length > 0
@@ -410,6 +493,8 @@ export function readBackup(parsed, options = {}) {
         futureVersion: version > BACKUP_VERSION,
         settings,
         unknownSettingKeys,
+        retiredSettingKeys,
+        settingsUnreadable,
         handy,
         devices,
         flags,
@@ -436,7 +521,14 @@ export function describeBackupImport(result, context = {}) {
             : 'This is not an EdgeLoop backup. Pick the .json the Backup tab writes with Export.';
     }
     const restored = [];
-    const settingsCount = Object.keys(result.settings).length;
+    // What the file offered, and what was still there after the app's own
+    // clamps had their say. `stored` is supplied by the caller, which is the
+    // only place that can know: a pair like minHr 5 / maxHr 9999 is refused
+    // by sanitizeSessionLimits and comes back at the factory numbers, and
+    // announcing "2 values imported" over two defaults is the same kind of
+    // quiet the silent export was.
+    const offered = Object.keys(result.settings).length;
+    const settingsCount = Number.isFinite(context.settingsStored) ? Math.min(context.settingsStored, offered) : offered;
     if (settingsCount) restored.push(`${settingsCount} Session Setup value${settingsCount === 1 ? '' : 's'}`);
     if (result.handy.role && result.handy.maxCap !== null) restored.push('the Handy channel role and speed cap');
     else if (result.handy.role) restored.push('the Handy channel role');
@@ -445,20 +537,59 @@ export function describeBackupImport(result, context = {}) {
     if (intiface) restored.push(`${intiface} Intiface device map${intiface === 1 ? '' : 's'}`);
     const tcode = Object.keys(result.devices.tcode).length;
     if (tcode) restored.push(`${tcode} T-Code device map${tcode === 1 ? '' : 's'}`);
+    // The flags are restored too, so they are named too. "Settings imported"
+    // over a file that only carried a flag was a sentence about nothing.
+    if (result.flags.ageVerified || result.flags.wizardSeen) restored.push('the age / wizard flags');
 
     const lines = [];
-    lines.push(restored.length ? `Settings imported: ${joinList(restored)}.` : 'Settings imported.');
+    // A refused write comes first: it changes what every line below means.
+    // safeSet and persistSettings both report whether the browser took the
+    // write, and a full or blocked store is a live condition in this app -
+    // session history is what fills it. Saying "restored" over a store that
+    // refused the write would promise a restore that a reload undoes.
+    const unsaved = Array.isArray(context.unsaved) ? context.unsaved.filter(Boolean) : [];
+    if (unsaved.length) {
+        lines.push(`THIS BROWSER REFUSED TO SAVE ${joinList(unsaved)}. It is in use right now, but a reload will lose it - the store is full or unavailable (private mode, or blocked site data). Free some space, or delete old sessions from History, and import again.`);
+    }
 
-    if (result.keyPresent) {
+    if (restored.length) lines.push(`Settings imported: ${joinList(restored)}.`);
+    else lines.push('Nothing in this file changed a setting here.');
+    // Said whenever Session Setup is untouched, even if something else came
+    // back: "Settings imported: the age / wizard flags" is true but leaves
+    // the obvious question - what happened to my settings? - unanswered.
+    if (!settingsCount && !offered && restored.length) {
+        lines.push('This file carried no Session Setup values, so nothing in Session Setup changed.');
+    }
+
+    const adjusted = offered - settingsCount;
+    if (adjusted > 0) {
+        lines.push(`${adjusted} more value${adjusted === 1 ? ' was' : 's were'} outside what this app accepts and came back at ${adjusted === 1 ? 'its' : 'their'} safe default instead - the same check a value typed into the panel gets.`);
+    }
+
+    if (result.keyPresent && context.keyReplaced === true) {
+        // Restoring an older or a borrowed backup re-pairs this browser with
+        // a different Handy. That is what the file asked for, but it is not
+        // something to discover later by wondering why Connect fails.
+        lines.push('The Handy connection key saved in this browser was REPLACED by the one in this file - they are different keys. If you did not mean to re-pair this browser, enter your own key again in the Handy panel. Nothing is connected either way.');
+    } else if (result.keyPresent) {
         lines.push('Your Handy connection key was restored. Open the Handy panel and press Connect when you want to use it - an import never connects a toy by itself.');
     } else if (result.keyRejected) {
         lines.push(context.hadExistingKey
             ? 'What this file carried in place of a Handy connection key is not a usable key, so it was ignored and the one saved here was kept.'
             : 'What this file carried in place of a Handy connection key is not a usable key, so it was ignored. Enter yours in the Handy panel.');
+    } else if (result.keyDeclaredAbsent) {
+        // The file says in its own words that it was exported without one.
+        lines.push(context.hadExistingKey
+            ? 'This file was exported without a Handy connection key, so the one saved in this browser was kept.'
+            : 'This file was exported without a Handy connection key. Enter yours in the Handy panel, or export again with the box ticked on the machine that has it.');
     } else if (context.hadExistingKey) {
         lines.push('This file contained no Handy connection key, so the one saved in this browser was kept.');
     } else {
         lines.push('This file contained no Handy connection key. Enter yours in the Handy panel.');
+    }
+
+    if (result.settingsUnreadable) {
+        lines.push('The Session Setup block in this file is damaged and could not be read; everything else in it was restored.');
     }
 
     const skipped = Array.isArray(result.unknownSettingKeys) ? result.unknownSettingKeys.length : 0;
@@ -468,6 +599,10 @@ export function describeBackupImport(result, context = {}) {
 
     if (intiface || tcode) {
         lines.push('A toy that is connected right now keeps the axis map it is already running; reconnect it to pick up the restored one.');
+    }
+    const dropped = Number(context.droppedDeviceMaps) || 0;
+    if (dropped > 0) {
+        lines.push(`${dropped} of the device maps already saved here had to be dropped to stay within the ${MAX_SAVED_DEVICES}-device limit; the oldest went first, and the ones from this file were kept.`);
     }
     if (result.legacy) {
         lines.push('This file has no version marker, so it was read as an older, settings-only backup.');

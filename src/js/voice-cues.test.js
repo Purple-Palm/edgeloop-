@@ -394,3 +394,37 @@ describe('voice cue templates', () => {
         assert.equal(clampEncourageSeconds('nope'), DEFAULT_ENCOURAGE_SECONDS);
     });
 });
+
+describe('the phrase importer accepts the file the Backup tab writes', () => {
+    it('finds the phrase lists inside a full settings backup', () => {
+        // The refusal message offers "a settings backup" by name. The new
+        // backup nests everything under `settings`, so the importer that
+        // suggests it has to be able to read it.
+        const backup = {
+            note: 'This file does NOT contain your Handy connection key.',
+            format: 'edgeloop-backup',
+            version: 2,
+            settings: { minHr: 62, voiceCues: { edge: ['Hold it.'] }, voiceEncourageSeconds: 50 },
+            handy: {},
+            devices: { intiface: {}, tcode: {} },
+            flags: { ageVerified: false, wizardSeen: false }
+        };
+        const parsed = parseVoiceCuesText(JSON.stringify(backup));
+        assert.equal(parsed.error, null);
+        assert.deepEqual(parsed.cues.edge, ['Hold it.']);
+    });
+
+    it('still reads the phrase-only export and the legacy settings blob', () => {
+        const own = parseVoiceCuesText(JSON.stringify({ voiceCues: { edge: ['A.'] }, voiceEncourageSeconds: 40 }));
+        assert.equal(own.error, null);
+        assert.deepEqual(own.cues.edge, ['A.']);
+        const legacy = parseVoiceCuesText(JSON.stringify({ minHr: 62, voiceCues: { edge: ['B.'] } }));
+        assert.equal(legacy.error, null);
+        assert.deepEqual(legacy.cues.edge, ['B.']);
+    });
+
+    it('does not mistake a settings block with no phrases for a phrase file', () => {
+        const none = parseVoiceCuesText(JSON.stringify({ format: 'edgeloop-backup', version: 2, settings: { minHr: 62 } }));
+        assert.equal(none.error, 'json');
+    });
+});
