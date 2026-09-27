@@ -9,6 +9,7 @@ import {
     MIN_LEG_MS,
     REST_MOVE_MS
 } from './stroke-planner.js';
+import { calculateEngineOutputs, TEASE_MODES } from '../engine.js';
 
 describe('legDurationMs', () => {
     it('maps 100 % to the fast leg and 0 % to the slow leg over full travel', () => {
@@ -183,5 +184,72 @@ describe('stroke planner', () => {
         assert.equal(a, legDurationMs(10, 1));
         assert.equal(b, legDurationMs(50, 1));
         assert.ok(a > b, 'the period falls as the speed rises');
+    });
+});
+
+describe('what a running session hands the planner', () => {
+    // The T-Code stroke axis and every Intiface linear axis run on this
+    // planner, and a speed of 0 parks the sleeve at the bottom of the zone.
+    // Release 1.1.0's near-stop rounded to 0 in the upper band and all
+    // through the warm-up, so those axes dropped to the bottom and started
+    // over several times a minute. Since 1.1.1 the dip waits for the last
+    // stretch before the mark, and 1.1.2 rounded it to 0 there: at 139 BPM
+    // on this 70-140 band, in the band and in a warm-up held there. The
+    // engine now hands them a crawl, which is the planner's slowest leg.
+    function drive(planner, segment) {
+        const kinds = [];
+        let timerAt = null;
+        // One pump, the way the drivers pump: a leg when none is in flight,
+        // and a timer at its end that asks again.
+        const pump = (at) => {
+            const leg = planner.next(at);
+            if (!leg) return;
+            kinds.push(leg.kind);
+            timerAt = at + leg.durationMs;
+        };
+        for (let i = 0; i < segment.ticks; i++) {
+            const tickAt = segment.startMs + i * 1000;
+            while (timerAt !== null && timerAt <= tickAt) {
+                const at = timerAt;
+                timerAt = null;
+                pump(Math.max(at, planner.legEndsAt()));
+            }
+            const out = calculateEngineOutputs({
+                hr: segment.hr,
+                edgeHr: segment.hr,
+                minHr: 70,
+                maxHr: 140,
+                activeMode: segment.mode,
+                sessionStatus: 'RUNNING',
+                isEdged: false,
+                orgasmMode: false,
+                warmupMinutes: segment.warmupMinutes,
+                ceilingBehaviour: 'crawl',
+                sessionSeconds: segment.fromSecond + i
+            });
+            planner.setInput({
+                speed: out.primaryPercent,
+                cap: 100,
+                zoneMin: out.strokeMinPercent / 100,
+                zoneMax: out.strokeMaxPercent / 100,
+                enabled: true
+            });
+            pump(tickAt);
+        }
+        return kinds;
+    }
+
+    it('keeps a linear axis stroking through every pattern near-stop instead of parking it', () => {
+        for (const mode of TEASE_MODES) {
+            const planner = createStrokePlanner();
+            const kinds = [
+                // The default warm-up, held at the last BPM before the mark.
+                ...drive(planner, { mode, hr: 139, warmupMinutes: 5, fromSecond: 0, ticks: 300, startMs: 0 }),
+                // The same pulse once the warm-up is over.
+                ...drive(planner, { mode, hr: 139, warmupMinutes: 0, fromSecond: 600, ticks: 600, startMs: 300000 })
+            ];
+            assert.equal(kinds.filter((k) => k === 'rest').length, 0, `${mode} parked the sleeve mid-session`);
+            assert.ok(kinds.length > 300, `${mode} barely stroked: ${kinds.length} legs`);
+        }
     });
 });

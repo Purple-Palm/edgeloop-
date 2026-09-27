@@ -7,7 +7,7 @@
  * and an edge is only released once the pulse has clearly come back down.
  */
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
-import { teaseFrame, warmupShape, placeStroke, orgasmFrame } from './patterns.js';
+import { teaseFrame, warmupShape, placeStroke, orgasmFrame, roundSpeed } from './patterns.js';
 
 export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
 export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
@@ -375,14 +375,19 @@ export function calculateEngineOutputs({
     // Over the warm-up the wearer set, speed and stroke length ease in from
     // a short slow stroke. The stroke still starts at the bottom of whatever
     // window the mode asked for, which is already inside the travel envelope.
+    // The ease slows a speed down and never stops it: at the first minutes'
+    // factor (0.16) a speed of 3% or less rounded to 0, and a default
+    // warm-up held at 139 BPM on a 70/140 band sent The Handy 17-19 stop /
+    // start pairs. A stop decided above (the stall guard, Full Stop) is 0
+    // and stays 0.
     if (!orgasmMode && sessionStatus === 'RUNNING') {
         const wake = warmupShape(seconds, warmupMinutes);
         if (wake.depth < 1 || wake.speed < 1) {
             const woken = placeStroke(strokeMinPercent, strokeMaxPercent, wake.depth, 'low');
             strokeMinPercent = woken.min;
             strokeMaxPercent = woken.max;
-            primaryPercent = Math.round(primaryPercent * wake.speed);
-            secondaryPercent = Math.round(secondaryPercent * wake.speed);
+            primaryPercent = roundSpeed(primaryPercent * wake.speed);
+            secondaryPercent = roundSpeed(secondaryPercent * wake.speed);
         }
     }
 
@@ -394,13 +399,11 @@ export function calculateEngineOutputs({
         strokeMaxPercent = Math.max(strokeMinPercent, Math.round(strokeMaxPercent - cut));
     }
 
+    // Global Intensity scales both channels by 0.5-1.5x. Like the warm-up it
+    // may slow a motion down but never round it into a stop.
     const intensityScale = 0.5 + (intensitySafe / 100);
-    if (primaryPercent > 0) {
-        primaryPercent = Math.min(100, Math.round(primaryPercent * intensityScale));
-    }
-    if (secondaryPercent > 0) {
-        secondaryPercent = Math.min(100, Math.round(secondaryPercent * intensityScale));
-    }
+    primaryPercent = roundSpeed(primaryPercent * intensityScale);
+    secondaryPercent = roundSpeed(secondaryPercent * intensityScale);
 
     // Zone sanity: whatever the mode and warm-up cap did, the zone must stay
     // ordered and at least MIN_ZONE_WIDTH wide. The cap (upper bound) wins,

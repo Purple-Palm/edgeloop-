@@ -39,7 +39,7 @@ import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting }
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
-import { normalizeEnvelope, applyEndMargin, clampEndMargin } from './hardware/handy-protocol.js';
+import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed } from './hardware/handy-protocol.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
@@ -968,15 +968,10 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
 function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false) {
     if (isRemotePage) return;
 
-    let targetHandySpeed = 0;
-    const handyCap = (state.handyMaxCap ?? 100) / 100;
-    if (state.handyRole === 'primary') {
-        targetHandySpeed = Math.round(primarySpeed * handyCap);
-    } else if (state.handyRole === 'secondary') {
-        targetHandySpeed = Math.round(secondarySpeed * handyCap);
-    } else {
-        targetHandySpeed = 0;
-    }
+    // The role picks the channel and the speed cap scales it. A low cap
+    // slows a crawl down to the slowest velocity the Handy has; it never
+    // rounds one into PUT /hamp/stop (handy-protocol.js says why).
+    const targetHandySpeed = handyTargetSpeed(state.handyRole, primarySpeed, secondarySpeed, state.handyMaxCap);
 
     const range = effectiveStrokeRange(strokeMin, strokeMax);
 

@@ -17,7 +17,8 @@ import {
     isHandyOfflineStopPending,
     handyConnected
 } from './handy.js';
-import { HANDY_API_BASE } from './handy-protocol.js';
+import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed } from './handy-protocol.js';
+import { calculateEngineOutputs } from '../engine.js';
 
 const KEY = 'test-key-123';
 
@@ -682,5 +683,98 @@ describe('handy driver', () => {
         // Explaining a refusal is all it does: the existing offline counter
         // is still the only thing that decides when to give up on the link.
         assert.equal(offline.length, 0);
+    });
+
+    // ---- what a running session sends ------------------------------------------------
+
+    // Drive the driver with the real engine, one master-clock second per
+    // tick, the way app.js does: the Handy's channel and speed cap through
+    // handyTargetSpeed, the engine's zone as the stroke, and no force. Date.now
+    // is stepped a second per tick so the 400 ms throttle sees the 1 s clock.
+    async function runSession(segments) {
+        const realNow = Date.now;
+        let clock = realNow.call(Date);
+        Date.now = () => clock;
+        const log = [];
+        try {
+            for (const segment of segments) {
+                const { ticks, role = 'primary', cap = 100, ...engine } = segment;
+                for (let i = 0; i < ticks; i++) {
+                    const out = calculateEngineOutputs({
+                        minHr: 70,
+                        maxHr: 140,
+                        sessionStatus: 'RUNNING',
+                        isEdged: false,
+                        orgasmMode: false,
+                        warmupMinutes: 0,
+                        ceilingBehaviour: 'crawl',
+                        ...engine,
+                        edgeHr: engine.hr,
+                        sessionSeconds: (engine.sessionSeconds || 0) + i
+                    });
+                    const velocity = handyTargetSpeed(role, out.primaryPercent, out.secondaryPercent, cap);
+                    const before = calls.length;
+                    dispatchHandy(velocity, out.strokeMinPercent, out.strokeMaxPercent, false, 0, 100);
+                    clock += 1000;
+                    await tick(0);
+                    log.push({ velocity, sent: calls.slice(before).map((c) => c.path) });
+                }
+            }
+        } finally {
+            Date.now = realNow;
+        }
+        return log;
+    }
+
+    it('a pattern near-stop reaches the device as the slowest velocity, never as a stop / start pair', async () => {
+        await connectOk();
+        // In release 1.1.2 each of these sent PUT /hamp/stop and PUT
+        // /hamp/start over and over at 139 BPM, the last BPM before the mark
+        // on this 70-140 band: the default warm-up (17 pairs), Classic and
+        // Ultimate (about 4 and 2 a minute), Milker under a 40% speed cap
+        // (about 5 a minute), and the Handy on Head Play's secondary channel
+        // (about 4 a minute). 1.1.0 did the same from 130 BPM up, in a
+        // warm-up from a resting pulse, and at 100 BPM under the cap.
+        await runSession([
+            { ticks: 300, activeMode: 'classic', hr: 139, warmupMinutes: 5, sessionSeconds: 0 },
+            { ticks: 240, activeMode: 'classic', hr: 139, sessionSeconds: 600 },
+            { ticks: 240, activeMode: 'ultimate', hr: 139, sessionSeconds: 900 },
+            { ticks: 240, activeMode: 'milker', hr: 139, cap: 40, sessionSeconds: 1200 },
+            { ticks: 240, activeMode: 'headplay', hr: 139, role: 'secondary', sessionSeconds: 1500 }
+        ]);
+        assert.equal(sent('/hamp/stop').length, 0, 'no stop the engine did not decide on');
+        assert.equal(sent('/hamp/start').length, 1, 'one start for the whole session');
+        const velocities = sent('/hamp/velocity').map((c) => c.body.velocity);
+        assert.ok(velocities.includes(HANDY_MIN_VELOCITY), 'the near-stops went out as the crawl');
+        assert.ok(velocities.every((v) => v >= HANDY_MIN_VELOCITY), `a velocity under the crawl was sent: ${Math.min(...velocities)}`);
+        assert.equal(isHandyMoving(), true);
+        assert.equal(notices.length, 0);
+    });
+
+    it('a stop the engine decides on still reaches the device as PUT /hamp/stop', async () => {
+        await connectOk();
+        const moving = { ticks: 5, activeMode: 'classic', hr: 118, ceilingBehaviour: 'stop' };
+        const log = await runSession([
+            { ...moving, sessionSeconds: 400 },
+            { ...moving, ticks: 8, stallGuardEngaged: true, sessionSeconds: 405 },
+            { ...moving, sessionSeconds: 413 },
+            // Full Stop, parked at the pullback mark.
+            { ...moving, hr: 140, isEdged: true, sessionSeconds: 418 },
+            { ...moving, sessionSeconds: 423 },
+            { ...moving, activeMode: 'ruin', hr: 140, isEdged: true, ruinHoldSeconds: 5, sessionSeconds: 428 },
+            { ...moving, sessionSeconds: 433 },
+            // The speed cap at 0 and the role Off are the wearer's own stops.
+            { ...moving, cap: 0, sessionSeconds: 438 },
+            { ...moving, sessionSeconds: 443 },
+            { ...moving, role: 'off', sessionSeconds: 448 }
+        ]);
+        assert.equal(sent('/hamp/stop').length, 5, 'stall guard, Full Stop, Ruin lock, cap 0 and Off each stop once');
+        assert.equal(sent('/hamp/start').length, 5, 'and the session starts again after each');
+        // Each halt is a stop on the tick it begins, and nothing moves until it ends.
+        for (const first of [5, 18, 28, 38, 48]) {
+            assert.equal(log[first].velocity, 0);
+            assert.deepEqual(log[first].sent, ['/hamp/stop'], `tick ${first}: ${JSON.stringify(log[first].sent)}`);
+        }
+        assert.equal(isHandyMoving(), false);
     });
 });

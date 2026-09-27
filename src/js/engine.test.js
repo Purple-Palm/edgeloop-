@@ -18,8 +18,10 @@ import {
     MIN_EDGE_HOLD_PERCENT,
     MAX_EDGE_HOLD_PERCENT,
     gameEdgeReleased,
-    micBoostReachesMotors
+    micBoostReachesMotors,
+    TEASE_MODES
 } from './engine.js';
+import { MIN_MOVING_PERCENT } from './patterns.js';
 
 const running = {
     hr: 95,
@@ -1557,5 +1559,95 @@ describe('the MIC badge only promises a push that reaches a motor', () => {
             /micReaches/.test(badge[0]),
             `the badge must report nothing in a blind mode: ${badge[0]}`
         );
+    });
+});
+
+describe('0% reaches the motors only as a stop the engine decided on', () => {
+    // The Handy's driver answers 0% with PUT /hamp/stop and the next moving
+    // tick with PUT /hamp/start, and the T-Code and Intiface planners park the
+    // sleeve at the bottom of the zone. So a running session may hand on 0%
+    // only where the engine means a stop. Releases up to 1.1.2 also produced
+    // it by rounding. In 1.1.2 that is the two-wave dip, which opens above
+    // about 97% of the band, and the warm-up's 0.16 factor on the few percent
+    // left there: at 139 BPM on 70-140, about 246 stop / start pairs an hour
+    // in Classic, 168 in Ultimate, and 17 in a default warm-up held there.
+    // 1.1.0 did it from 130 BPM up, and in a warm-up from a resting pulse.
+    const sweep = (visit) => {
+        for (const mode of TEASE_MODES) {
+            for (const warmupMinutes of [0, 5]) {
+                for (const intensityValue of [0, 50, 100]) {
+                    for (let hr = 70; hr < 140; hr += 3) visit({ mode, warmupMinutes, intensityValue, hr });
+                }
+            }
+        }
+    };
+
+    it('a tease mode running below the pullback mark never hands on 0%', () => {
+        let ticks = 0;
+        sweep(({ mode, warmupMinutes, intensityValue, hr }) => {
+            for (let sessionSeconds = 0; sessionSeconds < 900; sessionSeconds += 1) {
+                const out = calculateEngineOutputs({
+                    ...running, activeMode: mode, hr, edgeHr: hr, warmupMinutes, intensityValue, sessionSeconds
+                });
+                if (!(out.primaryPercent >= MIN_MOVING_PERCENT) || !(out.secondaryPercent >= MIN_MOVING_PERCENT)) {
+                    assert.fail(`${mode} hr=${hr} warm-up ${warmupMinutes} min intensity ${intensityValue} t=${sessionSeconds}:`
+                        + ` primary ${out.primaryPercent}%, secondary ${out.secondaryPercent}%`);
+                }
+                ticks += 1;
+            }
+        });
+        assert.ok(ticks > 500000, `expected a real sweep, ran ${ticks} ticks`);
+    });
+
+    it('the warm-up slows a near-stop down to the crawl instead of stopping it', () => {
+        // The measured case: Classic at 139 BPM, the last BPM before the mark
+        // on 70-140, through the default warm-up. The pattern runs at 1-3%
+        // there and the wake-up factor starts at 0.16, so 1.1.2 rounded most
+        // of the first minutes to 0: 17 stop / start pairs. Since 1.1.1 the
+        // pattern no longer dips at a resting pulse, so a warm-up from 80 BPM
+        // never gets that low.
+        const speeds = [];
+        for (let sessionSeconds = 0; sessionSeconds < 300; sessionSeconds += 1) {
+            speeds.push(calculateEngineOutputs({
+                ...running, activeMode: 'classic', hr: 139, edgeHr: 139, warmupMinutes: 5, sessionSeconds
+            }).primaryPercent);
+        }
+        assert.equal(Math.min(...speeds), MIN_MOVING_PERCENT);
+        assert.ok(speeds.filter((speed) => speed === MIN_MOVING_PERCENT).length >= 8, 'the near-stops of a warm-up are crawls');
+    });
+
+    it('every stop the engine decides on is still exactly 0%, warm-up and intensity notwithstanding', () => {
+        const atMark = { ...running, hr: 140, edgeHr: 140, isEdged: true };
+        for (const shared of [
+            { warmupMinutes: 0, sessionSeconds: 400 },
+            { warmupMinutes: 5, sessionSeconds: 30 }
+        ]) {
+            for (const intensityValue of [0, 50, 100]) {
+                const at = { ...shared, intensityValue };
+                // Full Stop at the ceiling, in every tease mode that obeys it.
+                for (const mode of TEASE_MODES.filter((m) => m !== 'ruin')) {
+                    const out = calculateEngineOutputs({ ...atMark, ...at, activeMode: mode, ceilingBehaviour: 'stop' });
+                    assert.equal(out.primaryPercent, 0, `${mode} Full Stop, intensity ${intensityValue}`);
+                }
+                // The stall guard, in the middle of the band.
+                for (const mode of TEASE_MODES) {
+                    const out = calculateEngineOutputs({ ...running, ...at, activeMode: mode, hr: 118, edgeHr: 118, stallGuardEngaged: true });
+                    assert.equal(out.primaryPercent, 0, `${mode} stall guard, intensity ${intensityValue}`);
+                }
+                // The Ruin lock.
+                const lock = calculateEngineOutputs({ ...atMark, ...at, activeMode: 'ruin', ruinHoldSeconds: 5 });
+                assert.equal(lock.primaryPercent, 0, `Ruin lock, intensity ${intensityValue}`);
+                // The Oracle's denial stops both channels.
+                const denial = calculateEngineOutputs({ ...atMark, ...at, activeMode: 'oracle', oracleState: 'DENIAL' });
+                assert.equal(denial.primaryPercent, 0);
+                assert.equal(denial.secondaryPercent, 0);
+                // Pause (STOP, the HR watchdog) and every other state that is not running.
+                for (const sessionStatus of ['IDLE', 'PAUSED']) {
+                    const idle = calculateEngineOutputs({ ...running, ...at, activeMode: 'classic', sessionStatus });
+                    assert.equal(idle.primaryPercent, 0);
+                    assert.equal(idle.secondaryPercent, 0);
+                }
+            }
+        }
     });
 });

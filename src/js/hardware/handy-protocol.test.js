@@ -16,7 +16,9 @@ import {
     isHampModeError,
     describeDeviceStop,
     parseBatteryLevel,
-    describeHandyInfo
+    describeHandyInfo,
+    HANDY_MIN_VELOCITY,
+    handyTargetSpeed
 } from './handy-protocol.js';
 
 describe('handy mode constants', () => {
@@ -287,5 +289,62 @@ describe('isHampModeError / describeDeviceStop', () => {
         // It never claims a fault code the v2 API cannot give us.
         assert.ok(!/slider_blocked/.test(msg));
         assert.match(describeDeviceStop(), /^The Handy's firmware/);
+    });
+});
+
+describe('handyTargetSpeed', () => {
+    // The driver answers 0 with PUT /hamp/stop and the next moving tick with
+    // PUT /hamp/start, so this is where a speed the engine wants moving must
+    // not be rounded into a stop by the wearer's speed cap.
+    it('follows the role and scales by the cap exactly as before', () => {
+        assert.equal(handyTargetSpeed('primary', 50, 20, 100), 50);
+        assert.equal(handyTargetSpeed('secondary', 50, 20, 100), 20);
+        assert.equal(handyTargetSpeed('primary', 50, 20, 40), 20);
+        assert.equal(handyTargetSpeed('secondary', 50, 20, 55), 11);
+        // Wherever the old arithmetic already gave a moving speed, the
+        // answer is unchanged, float rounding included (90% at a 35% cap is
+        // 31.499999999999996, which has always gone out as 31).
+        for (let cap = 0; cap <= 100; cap += 1) {
+            for (let speed = 0; speed <= 100; speed += 1) {
+                const before = Math.round(speed * (cap / 100));
+                if (before >= 1) assert.equal(handyTargetSpeed('primary', speed, 0, cap), before, `${speed}% at cap ${cap}%`);
+            }
+        }
+        assert.equal(handyTargetSpeed('primary', 90, 0, 35), 31);
+    });
+
+    it('sends a slow speed under a low cap as the slowest crawl, never as a stop', () => {
+        assert.equal(HANDY_MIN_VELOCITY, 1);
+        // The cases that used to go out as PUT /hamp/stop.
+        assert.equal(handyTargetSpeed('primary', 1, 0, 40), HANDY_MIN_VELOCITY);
+        assert.equal(handyTargetSpeed('primary', 4, 0, 10), HANDY_MIN_VELOCITY);
+        assert.equal(handyTargetSpeed('secondary', 0, 2, 20), HANDY_MIN_VELOCITY);
+        for (let cap = 1; cap <= 100; cap += 1) {
+            for (let speed = 1; speed <= 100; speed += 1) {
+                const primary = handyTargetSpeed('primary', speed, 0, cap);
+                const secondary = handyTargetSpeed('secondary', 0, speed, cap);
+                assert.ok(primary >= HANDY_MIN_VELOCITY && secondary >= HANDY_MIN_VELOCITY, `${speed}% at cap ${cap}% stopped the Handy`);
+                // The floor never lifts the Handy past the cap the wearer set.
+                assert.ok(primary <= cap && secondary <= cap, `${speed}% at cap ${cap}% went past the cap`);
+            }
+        }
+    });
+
+    it('is 0 only for a stop, a cap of 0, the role Off, or a value that is not a number', () => {
+        assert.equal(handyTargetSpeed('primary', 0, 50, 100), 0);
+        assert.equal(handyTargetSpeed('secondary', 50, 0, 100), 0);
+        assert.equal(handyTargetSpeed('primary', 50, 50, 0), 0);
+        assert.equal(handyTargetSpeed('off', 50, 50, 100), 0);
+        assert.equal(handyTargetSpeed(undefined, 50, 50, 100), 0);
+        assert.equal(handyTargetSpeed('primary', -5, 50, 100), 0);
+        // Doubt ends in a stop.
+        assert.equal(handyTargetSpeed('primary', NaN, 50, 100), 0);
+        assert.equal(handyTargetSpeed('primary', 50, 50, NaN), 0);
+        assert.equal(handyTargetSpeed('primary', 50, 50, 'lots'), 0);
+        assert.equal(handyTargetSpeed('primary', Infinity, 50, 100), 0);
+        // No stored cap at all is the factory 100%, as it always was.
+        assert.equal(handyTargetSpeed('primary', 37, 0, undefined), 37);
+        assert.equal(handyTargetSpeed('primary', 37, 0, null), 37);
+        assert.equal(handyTargetSpeed('primary', 250, 0, 100), 100);
     });
 });

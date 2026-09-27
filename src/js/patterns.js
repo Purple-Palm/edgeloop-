@@ -12,6 +12,14 @@ export const RUIN_LOCK_SECONDS = 18;
 export const RUIN_LOCK_SECONDARY = 18;
 const MIN_WIDTH = 10;
 
+// The slowest speed a pattern hands on. 0% is not a slow speed, it is a
+// stop, and every motor downstream treats it as one: The Handy's driver
+// answers it with PUT /hamp/stop and the next moving tick with PUT
+// /hamp/start, and the T-Code and Intiface stroke planners park the sleeve
+// at the bottom of the zone. 1% is the slowest step all of them still move
+// at, so a motion the pattern wants goes out as that crawl instead.
+export const MIN_MOVING_PERCENT = 1;
+
 // Overlapping waves whose lengths do not divide into each other. A session
 // never settles on one tempo you can count. `salt` gives each mode its own
 // phase so two modes at the same second do not move together.
@@ -45,6 +53,7 @@ export function motion(seconds, salt = 0, nearness = 0) {
     const weave = 0.5 * a + 0.3 * b + 0.2 * c;
     // High floor through the band. A real dip, including two waves lining up
     // into a brief stop, opens only in the last stretch before the mark.
+    // roundSpeed() turns that dip into the 1% crawl, never a real stop.
     const speedFloor = 0.8 - 0.52 * close;
     let speed = speedFloor + (1 - speedFloor) * weave;
     if (close > 0.55 && a < 0.16 && b < 0.22) speed *= 0.28;
@@ -115,8 +124,21 @@ export function warmupShape(seconds, warmupMinutes) {
     return { speed: 0.16 + 0.84 * ease, depth: 0.28 + 0.72 * ease };
 }
 
-function roundPct(value) {
-    return clamp(Math.round(value), 0, 100);
+// A speed in whole percent that cannot round away to a stop. Above about
+// 97% of the band two waves lining up take the speed to 0.28 of itself
+// (Ultimate's own near-stop, from 94% of the band, to 0.45), and there that
+// is a fraction of a speed already down to a few percent: plain rounding
+// made it 0, and on the 1 s clock that was a PUT /hamp/stop and a PUT
+// /hamp/start about four times a minute in Classic, Milker and Head Play,
+// and about three in Ultimate, at 139 BPM on a 70/140 band. The pattern
+// means "almost stops", so it crawls. The engine's warm-up and intensity
+// scale a speed through this too. Only a speed that really is 0 stays 0:
+// the Ruin lock, Full Stop at the ceiling and the other stops are decided
+// as 0, not rounded down to it.
+export function roundSpeed(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return clamp(Math.max(MIN_MOVING_PERCENT, Math.round(n)), 0, 100);
 }
 
 function atCeiling(crawlPercent) {
@@ -149,13 +171,13 @@ export function teaseFrame({
         // shorter stroke does not arrive as a stall in the middle of the band.
         const shared = (1 - shaped) * 100;
         const quicker = (1 - raw * 0.5) * 100;
-        const primary = atPeak ? atCeiling(crawlPercent) : roundPct(Math.max(shared, quicker) * beat.speed);
+        const primary = atPeak ? atCeiling(crawlPercent) : roundSpeed(Math.max(shared, quicker) * beat.speed);
         // The window stays the full range until the pulse is close, then
         // closes on the base. At the mark it is the bottom 35%.
         const bite = atPeak ? 1 : bandCharacter(sensor);
         const top = Math.max(35, Math.round(100 - bite * 65));
         const stroke = placeStroke(0, top, atPeak ? 1 : beat.depth, 'low');
-        const secondary = roundPct(6 + beat.secondary * 16);
+        const secondary = roundSpeed(6 + beat.secondary * 16);
         return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
     }
 
@@ -165,14 +187,14 @@ export function teaseFrame({
         // one at a crawl around 120 BPM, while the stroke had already climbed
         // off the shaft.
         const falling = (1 - shaped) * 100;
-        const primary = atPeak ? atCeiling(crawlPercent) : roundPct(falling * beat.speed);
+        const primary = atPeak ? atCeiling(crawlPercent) : roundSpeed(falling * beat.speed);
         const bite = atPeak ? 1 : bandCharacter(sensor);
         // Until the climb starts, a short weave would pin the stroke at the
         // head (high align keeps the top). Hold the length open so it still
         // covers the shaft.
         const depth = bite > 0 ? beat.depth : Math.max(beat.depth, 0.85);
         const stroke = placeStroke(Math.round(bite * 75), 100, atPeak ? 1 : depth, 'high');
-        const secondary = atPeak ? primary : roundPct(primary * (0.45 + 0.55 * beat.secondary));
+        const secondary = atPeak ? primary : roundSpeed(primary * (0.45 + 0.55 * beat.secondary));
         return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
     }
 
@@ -185,9 +207,9 @@ export function teaseFrame({
         const baseSecondary = 20 + climb * 80;
         const primary = atPeak
             ? atCeiling(crawlPercent)
-            : roundPct(basePrimary * beat.speed);
+            : roundSpeed(basePrimary * beat.speed);
         const secondaryGain = milking ? beat.secondary : (0.35 + 0.65 * beat.secondary);
-        const secondary = roundPct((atPeak ? 100 : baseSecondary) * secondaryGain);
+        const secondary = roundSpeed((atPeak ? 100 : baseSecondary) * secondaryGain);
         const stroke = placeStroke(0, 100, beat.depth, 'low');
         return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
     }
@@ -203,8 +225,8 @@ export function teaseFrame({
         const baseSecondary = 20 + climb * 70;
         const primary = atPeak
             ? atCeiling(crawlPercent)
-            : roundPct(basePrimary * (nearStop ? 0.45 : beat.speed));
-        const secondary = roundPct((atPeak ? 100 : baseSecondary) * (nearStop ? Math.max(0.4, beat.secondary * 0.7) : beat.secondary));
+            : roundSpeed(basePrimary * (nearStop ? 0.45 : beat.speed));
+        const secondary = roundSpeed((atPeak ? 100 : baseSecondary) * (nearStop ? Math.max(0.4, beat.secondary * 0.7) : beat.secondary));
         let depth = beat.depth;
         if (chapter === 0) depth = Math.max(depth, 0.82);
         else if (nearStop) depth = Math.min(depth, 0.5);
@@ -223,8 +245,8 @@ export function teaseFrame({
         const secondaryBase = 28 + climb * 42;
         const stroke = placeStroke(0, 100, beat.depth, 'low');
         return {
-            primary: roundPct(base * beat.speed),
-            secondary: roundPct(secondaryBase * beat.secondary),
+            primary: roundSpeed(base * beat.speed),
+            secondary: roundSpeed(secondaryBase * beat.secondary),
             strokeMin: stroke.min,
             strokeMax: stroke.max
         };
@@ -232,8 +254,8 @@ export function teaseFrame({
 
     const beat = motion(seconds, 0.6, sensor);
     const falling = (1 - shaped) * 100;
-    const primary = atPeak ? atCeiling(crawlPercent) : roundPct(falling * beat.speed);
-    const secondary = atPeak ? primary : roundPct(primary * (0.5 + 0.5 * beat.secondary));
+    const primary = atPeak ? atCeiling(crawlPercent) : roundSpeed(falling * beat.speed);
+    const secondary = atPeak ? primary : roundSpeed(primary * (0.5 + 0.5 * beat.secondary));
     const stroke = placeStroke(0, 100, atPeak ? 1 : beat.depth, 'low');
     return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
 }

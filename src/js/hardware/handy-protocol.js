@@ -98,6 +98,46 @@ export function clampVelocity(velocity) {
     return clampPercent(velocity, 0);
 }
 
+// The slowest HAMP velocity EdgeLoop sends, and the one a pattern's
+// near-stop goes out as. What the API says about the range, and what is
+// known about the bottom of it:
+//   - PUT /hamp/velocity takes a PercentValue, any number from 0 to 100 (the
+//     v2 OpenAPI spec), and is refused unless HAMP is running (state MOVING).
+//   - 0 is accepted and is not a stop: HAMP stays running and the slider
+//     stands still (the v3 guide starts every /hamp/start "with an initial
+//     velocity of 0"). EdgeLoop never sends it. A stop is always PUT
+//     /hamp/stop, the one command the driver can verify.
+//   - Anything above 0 moves, and no slower than the firmware's minimum
+//     speed. The vendor gives a Handy 1 a range of 32-400 mm/s and says a
+//     slower request is run at 32 (said of script playback; the v3 slider
+//     settings name the same floor x_min_speed, "the minimum speed the
+//     device will use"). 1% of the top is 4 mm/s, already under it.
+//   - The vendor's own HAMP control steps in whole percent.
+// So 1 is the smallest velocity that still moves, and it moves at the
+// slowest speed the slider has: the crawl the pattern means by "almost
+// stops".
+export const HANDY_MIN_VELOCITY = 1;
+
+// The Handy's velocity for one engine tick: the channel its role follows,
+// scaled by the wearer's speed cap. The driver answers 0 with PUT /hamp/stop
+// and the next moving tick with PUT /hamp/start, so 0 has to be a decision
+// and never a rounding result: under any cap below 50% a 1% speed rounded
+// to 0 (0.4 at a 40% cap), and the engine's crawl went out as a stop /
+// start pair. A speed the engine wants moving leaves here at
+// HANDY_MIN_VELOCITY or more; only a speed of 0, a cap of 0 or the role Off
+// give 0. A cap that is not a number is doubt, and doubt ends in a stop, as
+// it did before this lived in its own function.
+export function handyTargetSpeed(role, primarySpeed, secondarySpeed, capPercent = 100) {
+    const speed = role === 'primary' ? Number(primarySpeed)
+        : role === 'secondary' ? Number(secondarySpeed)
+        : 0;
+    const cap = Number(capPercent ?? 100);
+    if (!(speed > 0) || !(cap > 0)) return 0;
+    const scaled = speed * (cap / 100);
+    if (!Number.isFinite(scaled)) return 0;
+    return Math.min(100, Math.max(HANDY_MIN_VELOCITY, Math.round(scaled)));
+}
+
 export function clampEndMargin(value, fallback = HANDY_DEFAULT_END_MARGIN) {
     const n = toInt(value, fallback);
     return Math.max(0, Math.min(HANDY_MAX_END_MARGIN, n));
