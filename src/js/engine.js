@@ -7,6 +7,16 @@
  * and an edge is only released once the pulse has clearly come back down.
  */
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
+import { teaseFrame, warmupShape, placeStroke } from './patterns.js';
+
+export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
+export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
+
+export function resolveTeaseMode(strokeMode, activeMode) {
+    if (TEASE_MODES.includes(strokeMode)) return strokeMode;
+    if (TEASE_MODES.includes(activeMode)) return activeMode;
+    return 'classic';
+}
 
 export const ENGINE_MODES = [
     'classic',
@@ -198,11 +208,13 @@ export function calculateEngineOutputs({
     ceilingBehaviour = 'crawl',
     edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,
     ruinHoldSeconds = 0,
+    strokeMode,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30,
     trainingState = 'climb'
 }) {
     const mode = resolveEngineMode(activeMode);
+    const teaseMode = resolveTeaseMode(strokeMode, mode);
     // The hardware envelope is normalised here so an inverted, narrow or
     // garbage envelope (hand-edited settings) can never invert the zone.
     const env = safeEnvelope(handyHwMin, handyHwMax);
@@ -289,94 +301,50 @@ export function calculateEngineOutputs({
     const crawl = resolveCeilingBehaviour(ceilingBehaviour) === 'crawl';
     const crawlPercent = crawl ? CRAWL_PERCENT : 0;
 
-    // Stall guard only ever cuts the PRIMARY stroker: the secondary (milker)
+    // Stall guard only ever cuts the PRIMARY stroker: the secondary
     // channel keeps whatever the mode gives it at the ceiling.
-    const applyClassicTease = () => {
-        const atPeak = nextIsEdged && !orgasmMode;
-        if (atPeak && crawl) {
-            primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
-            secondaryPercent = crawlPercent;
-        } else if (atPeak) {
-            primaryPercent = 0;
-            secondaryPercent = 0;
-        } else {
-            const val = Math.round((1.0 - progress) * 100);
-            primaryPercent = val;
-            secondaryPercent = val;
-        }
-        strokeMaxPercent = Math.round(100 - (progress * depthContractAmount));
+    const teaseArgs = {
+        mode: teaseMode,
+        rawProgress: clamp((hr - minHr) / span, 0, 1),
+        shapedProgress: progress,
+        sensorRaw: sensorRawProgress,
+        climbProgress,
+        atPeak: nextIsEdged && !orgasmMode,
+        crawlPercent,
+        stallGuardEngaged,
+        seconds,
+        ruinHoldSeconds
     };
+    const stroke = teaseFrame(teaseArgs);
+    const isGame = mode === 'oracle' || mode === 'survival' || mode === 'edgetrain';
 
     if (sessionStatus === 'RAMPDOWN') {
         const rampFactor = Math.max(0, rampLeft / 45);
         primaryPercent = Math.round(50 * rampFactor);
         secondaryPercent = Math.round(50 * rampFactor);
-        strokeMaxPercent = Math.max(25, Math.round(100 - (1.0 - rampFactor) * depthContractAmount));
     } else if (mode === 'oracle') {
         const oracle = applyOracle(oracleState, climbProgress, nextIsEdged, orgasmMode, seconds, crawlPercent);
         primaryPercent = oracle.primary;
         secondaryPercent = oracle.secondary;
-        strokeMinPercent = oracle.strokeMin;
-        strokeMaxPercent = oracle.strokeMax;
     } else if (mode === 'survival') {
         const floor = clamp(finiteOr(survivalSpeedFloor, 30), 5, 100);
         primaryPercent = orgasmMode ? 100 : floor;
         secondaryPercent = orgasmMode ? 100 : Math.round(floor * 0.7);
-        strokeMaxPercent = Math.round(100 - (progress * depthContractAmount * 0.4));
     } else if (mode === 'edgetrain') {
         const train = applyEdgeTrain(trainingState, climbProgress, nextIsEdged, orgasmMode, crawlPercent);
         primaryPercent = train.primary;
         secondaryPercent = train.secondary;
-        strokeMinPercent = train.strokeMin;
-        strokeMaxPercent = train.strokeMax;
-    } else if (mode === 'classic') {
-        applyClassicTease();
-    } else if (mode === 'milker') {
-        if (nextIsEdged && !orgasmMode) {
-            primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
-            secondaryPercent = 100;
-        } else {
-            primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (climbProgress * 80));
-        }
-        strokeMaxPercent = Math.round(100 - (progress * depthContractAmount));
-    } else if (mode === 'shortener') {
-        // Full length at rest, base micro-strokes (0-35%) at the ceiling.
-        applyClassicTease();
-        strokeMinPercent = 0;
-        const shortenerSpan = 100 - SHORTENER_TOP_PERCENT;
-        strokeMaxPercent = Math.max(SHORTENER_TOP_PERCENT, Math.round(100 - (progress * shortenerSpan)));
-    } else if (mode === 'headplay') {
-        applyClassicTease();
-        strokeMinPercent = Math.min(75, Math.round(progress * 75));
-        strokeMaxPercent = 100;
-    } else if (mode === 'ultimate') {
-        if (nextIsEdged && !orgasmMode) {
-            primaryPercent = stallGuardEngaged ? 0 : crawlPercent;
-            secondaryPercent = 100;
-            strokeMaxPercent = Math.max(25, depthSafe);
-        } else {
-            primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (climbProgress * 80));
-            strokeMaxPercent = Math.max(25, Math.round(100 - (progress * depthContractAmount)));
-        }
-    } else if (mode === 'ruin') {
-        // Ruin & Leak cuts penile input COLD for its 18 s lockout while the
-        // secondary surges: that dead halt IS the mode, so it is a full stop
-        // whichever "At the ceiling" rule the wearer picked. Survival Mode is
-        // the other mode the setting does not govern. The Guards tab, both
-        // mode cards and the README name both exceptions.
-        if ((nextIsEdged || ruinHoldSeconds > 0) && !orgasmMode) {
-            primaryPercent = 0;
-            secondaryPercent = 100;
-            strokeMaxPercent = 25;
-        } else {
-            primaryPercent = Math.round((1.0 - progress) * 100);
-            secondaryPercent = Math.round(20 + (climbProgress * 60));
-        }
     } else {
-        applyClassicTease();
+        const tease = isGame ? stroke : teaseFrame({ ...teaseArgs, mode });
+        primaryPercent = tease.primary;
+        secondaryPercent = tease.secondary;
     }
+
+    // Games keep their own speeds. The stroke always comes from the tease
+    // mode the wearer selected, then the warm-up and the envelope below
+    // can only shrink it further. A game used to substitute its own zone.
+    strokeMinPercent = stroke.strokeMin;
+    strokeMaxPercent = stroke.strokeMax;
 
     if (orgasmMode) {
         primaryPercent = Math.max(primaryPercent, 85);
@@ -389,29 +357,27 @@ export function calculateEngineOutputs({
         primaryPercent = 0;
     }
 
-    const warmupSeconds = Math.max(0, finiteOr(warmupMinutes, 0)) * 60;
-    if (warmupSeconds > 0 && seconds < warmupSeconds && !orgasmMode && sessionStatus === 'RUNNING') {
-        const warmT = seconds / warmupSeconds;
-        const warmCap = 55 + (45 * warmT);
-        strokeMaxPercent = Math.min(strokeMaxPercent, Math.round(warmCap));
-        const speedScale = 0.45 + (0.55 * warmT);
-        primaryPercent = Math.round(primaryPercent * speedScale);
-        secondaryPercent = Math.round(secondaryPercent * speedScale);
+    // Wake-up: a resting pulse used to mean full speed on the first tick.
+    // Over the warm-up the wearer set, speed and stroke length ease in from
+    // a short slow stroke. The stroke still starts at the bottom of whatever
+    // window the mode asked for, which is already inside the travel envelope.
+    if (!orgasmMode && sessionStatus === 'RUNNING') {
+        const wake = warmupShape(seconds, warmupMinutes);
+        if (wake.depth < 1 || wake.speed < 1) {
+            const woken = placeStroke(strokeMinPercent, strokeMaxPercent, wake.depth, 'low');
+            strokeMinPercent = woken.min;
+            strokeMaxPercent = woken.max;
+            primaryPercent = Math.round(primaryPercent * wake.speed);
+            secondaryPercent = Math.round(secondaryPercent * wake.speed);
+        }
     }
 
-    if (sessionStatus === 'RUNNING' && !orgasmMode && !stallGuardEngaged) {
-        if (cadenceBreathing && (mode === 'ultimate' || mode === 'classic')) {
-            const wave = 0.5 + 0.5 * Math.sin((seconds * Math.PI) / 4);
-            if (primaryPercent > 0) {
-                primaryPercent = Math.round(primaryPercent * (0.82 + 0.18 * wave));
-            }
-        }
-        if (milkingWave && (mode === 'ultimate' || mode === 'milker' || mode === 'ruin')) {
-            const wave = 0.5 + 0.5 * Math.sin((seconds * Math.PI) / 3);
-            if (secondaryPercent > 0) {
-                secondaryPercent = Math.round(secondaryPercent * (0.72 + 0.28 * wave));
-            }
-        }
+    // Optional stored stroke-depth contraction. Default depth is the full
+    // window, so this is a no-op until a backup carries a smaller value.
+    // It reads the boosted curve, so a louder room can only shorten travel.
+    if (depthContractAmount > 0) {
+        const cut = progress * depthContractAmount;
+        strokeMaxPercent = Math.max(strokeMinPercent, Math.round(strokeMaxPercent - cut));
     }
 
     const intensityScale = 0.5 + (intensitySafe / 100);
@@ -436,8 +402,12 @@ export function calculateEngineOutputs({
     }
 
     const envSpan = env.max - env.min;
-    const physicalMin = Math.round(env.min + (strokeMinPercent / 100) * envSpan);
-    const physicalMax = Math.round(env.min + (strokeMaxPercent / 100) * envSpan);
+    // The wearer's travel limits are the last word. A mode, a pattern, a
+    // game, warm-up, or Force Orgasm can use less of that range. None of
+    // them can stroke past it.
+    let physicalMin = clamp(Math.round(env.min + (strokeMinPercent / 100) * envSpan), env.min, env.max);
+    let physicalMax = clamp(Math.round(env.min + (strokeMaxPercent / 100) * envSpan), env.min, env.max);
+    if (physicalMax < physicalMin) [physicalMin, physicalMax] = [physicalMax, physicalMin];
 
     return {
         primaryPercent: clamp(finiteOr(primaryPercent, 0), 0, 100),

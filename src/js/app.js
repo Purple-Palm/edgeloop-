@@ -41,6 +41,8 @@ import { describeBluetoothSupport, describeBleError } from './hardware/ble-proto
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin } from './hardware/handy-protocol.js';
+import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
+import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
     disconnectIntiface,
@@ -556,23 +558,6 @@ intensitySlider?.addEventListener('input', (e) => {
     syncTelemetry();
 });
 
-// Full Stroke Slide Toggle
-const fullStrokeToggleBtn = document.getElementById('fullStrokeToggleBtn');
-const fullStrokeToggleKnob = document.getElementById('fullStrokeToggleKnob');
-fullStrokeToggleBtn?.addEventListener('click', () => {
-    state.alwaysFullStroke = !state.alwaysFullStroke;
-    if (fullStrokeToggleBtn && fullStrokeToggleKnob) {
-        if (state.alwaysFullStroke) {
-            fullStrokeToggleBtn.className = "w-11 h-6 bg-purple-600 rounded-full p-0.5 transition cursor-pointer relative";
-            fullStrokeToggleKnob.className = "w-5 h-5 bg-white rounded-full transition transform translate-x-5 shadow";
-        } else {
-            fullStrokeToggleBtn.className = "w-11 h-6 bg-slate-800 rounded-full p-0.5 transition cursor-pointer relative";
-            fullStrokeToggleKnob.className = "w-5 h-5 bg-slate-400 rounded-full transition transform translate-x-0";
-        }
-    }
-    updateEngine();
-});
-
 // The hardware travel envelope is ONE persisted setting (advancedSettings
 // handyHwMin / handyHwMax) that bounds The Handy and every TCode linear axis,
 // so it is edited from both the Handy and the TCode modal. Every input and
@@ -882,6 +867,7 @@ function updateEngine() {
         gamma: advancedSettings.gammaCurve,
         intensityValue: state.intensityValue,
         edgeStrokeDepth: advancedSettings.edgeStrokeDepth,
+        strokeMode: state.teaseMode,
         handyHwMin: advancedSettings.handyHwMin,
         handyHwMax: advancedSettings.handyHwMax,
         sessionSeconds: state.sessionSeconds,
@@ -901,7 +887,6 @@ function updateEngine() {
         state.edges += 1;
         const edgeEl = document.getElementById('edgeCount');
         if (edgeEl) edgeEl.textContent = state.edges;
-        if (state.activeMode === 'ruin') state.ruinHoldSeconds = 18;
         reverseIntifaceRotation('edge');
         cueVoice('edge');
     }
@@ -965,12 +950,9 @@ function updateEngine() {
 }
 
 // Physical stroke bounds to send to the toys. engine.js has ALREADY mapped
-// strokeMin/strokeMax into the hardware envelope, so they are passed through;
-// "Full Length Strokes Only" swaps in the full envelope instead of raw 0-100
-// so the user's typed guards are never exceeded.
+// strokeMin/strokeMax into the hardware envelope, so they are passed through.
 function effectiveStrokeRange(strokeMin, strokeMax) {
     const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
-    if (state.alwaysFullStroke) return { min: env.min, max: env.max, env };
     return { min: strokeMin, max: strokeMax, env };
 }
 
@@ -1192,6 +1174,7 @@ function resetGameState() {
     state.stallPauseElapsed = 0;
     state.stallGuardEngaged = false;
     state.ruinHoldSeconds = 0;
+    state.ruinRideSeconds = 0;
     state.lastSpokenPrompt = '';
     document.getElementById('stallGuardNotice')?.classList.add('hidden');
     document.getElementById('gameNotice')?.classList.add('hidden');
@@ -1200,7 +1183,25 @@ function resetGameState() {
 function tickSessionGuardsAndGames() {
     if (state.sessionStatus !== 'RUNNING') return;
 
-    if (state.ruinHoldSeconds > 0) state.ruinHoldSeconds -= 1;
+    // Ruin keeps stroking through the edge. The dead stop starts only after
+    // the pulse has stayed on the mark long enough to be past a casual touch,
+    // then holds for RUIN_LOCK_SECONDS. A game does not use this ending; it
+    // only borrows Ruin's stroke when that is the selected mode.
+    if (state.activeMode === 'ruin') {
+        if (state.ruinHoldSeconds > 0) state.ruinHoldSeconds -= 1;
+        else if (state.isEdged) {
+            state.ruinRideSeconds += 1;
+            if (state.ruinRideSeconds >= RUIN_RIDE_SECONDS) {
+                state.ruinHoldSeconds = RUIN_LOCK_SECONDS;
+                state.ruinRideSeconds = 0;
+            }
+        } else {
+            state.ruinRideSeconds = 0;
+        }
+    } else if (state.ruinHoldSeconds > 0 || state.ruinRideSeconds > 0) {
+        state.ruinHoldSeconds = 0;
+        state.ruinRideSeconds = 0;
+    }
 
     // Guards and games judge against the SAME ceiling the engine used on its
     // last tick (after dual-stim / decay / learned offsets), never the raw
@@ -1377,8 +1378,8 @@ function tickSessionGuardsAndGames() {
 }
 
 // 250ms Live Funscript Sampling Loop (4Hz). Records what was really sent to
-// the toys (speed plus the physical stroke zone, honouring "Full Length
-// Strokes Only"); the buffer is capped at four hours, oldest dropped first.
+// the toys (speed plus the physical stroke zone); the buffer is capped at
+// four hours, oldest dropped first.
 setInterval(() => {
     if (isRemotePage) return;
     const active = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
@@ -1961,6 +1962,7 @@ expTabBioBtn?.addEventListener('click', () => {
     if (expTabGameBtn) expTabGameBtn.className = "px-2.5 py-0.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer";
     bioProfilesGrid?.classList.remove('hidden');
     gameModesGrid?.classList.add('hidden');
+    renderModeDetail();
 });
 
 expTabGameBtn?.addEventListener('click', () => {
@@ -1968,15 +1970,44 @@ expTabGameBtn?.addEventListener('click', () => {
     if (expTabBioBtn) expTabBioBtn.className = "px-2.5 py-0.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer";
     gameModesGrid?.classList.remove('hidden');
     bioProfilesGrid?.classList.add('hidden');
+    renderModeDetail();
 });
 
-// Experience Mode Selection
+// Experience Mode Selection. A tease mode owns the stroke. A game, while
+// selected, owns the speeds and uses that stroke. Clicking the selected
+// game again turns the game off and leaves the tease mode running.
+const GAME_CARD_MODES = ['oracle', 'survival', 'edgetrain'];
 const modeCards = document.querySelectorAll('.mode-card');
-function highlightModeCard(mode) {
+
+const MODE_DETAILS = {
+    classic: 'Full strokes inside the travel range you set. Tempo and depth drift so the same pulse does not feel identical, then Crawl or Full Stop at the ceiling.',
+    milker: 'The stroker eases off as you climb. In the top third of the band it switches to short bursts while the internal toy pulses on and off, instead of sitting at full power.',
+    shortener: 'The stroke shortens to the base as you get close, and stays quicker than Classic so it still feels like stroking. The secondary channel stays low.',
+    headplay: 'The stroke starts narrowing around the middle of the band and climbs toward the head. Speed comes down with the length, and it opens back up when your pulse drops.',
+    ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast, then stops and short bursts. The internal toy follows the same chapters.',
+    ruin: 'The stroker keeps moving through the edge. After about 12 seconds on the mark it stops dead for 18 seconds and the other toy drops low, so it can leak without a full orgasm. "At the ceiling" does not govern the ride or that stop.',
+    oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
+    survival: 'Speed climbs on its own clock until the run ends. "At the ceiling" does not govern this game. The stroke range is the tease mode you selected.',
+    edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
+};
+
+// The paragraph above the cards follows the card you are looking at.
+// On Modes it is the tease mode. On Games it is the game, when one is on.
+function renderModeDetail() {
+    const el = document.getElementById('modeDetail');
+    if (!el) return;
+    const gamesVisible = gameModesGrid && !gameModesGrid.classList.contains('hidden');
+    const mode = (gamesVisible && state.gameMode) ? state.gameMode : state.teaseMode;
+    el.textContent = MODE_DETAILS[mode] || '';
+}
+
+function highlightModeCard() {
     modeCards.forEach(c => {
+        const mode = c.getAttribute('data-mode');
+        const on = mode === state.teaseMode || mode === state.gameMode;
         const check = c.querySelector('.mode-check');
         const title = c.querySelector('.font-bold');
-        if (c.getAttribute('data-mode') === mode) {
+        if (on) {
             c.className = "mode-card text-left p-2 rounded-xl bg-purple-950/20 border border-purple-800 hover:border-purple-600 transition cursor-pointer flex flex-col justify-between";
             if (title) title.className = "font-bold text-[11px] text-purple-300 flex justify-between items-center";
             check?.classList.remove('hidden');
@@ -1987,18 +2018,40 @@ function highlightModeCard(mode) {
         }
     });
 }
+
+function applyModeSelection(mode, enabled) {
+    if (GAME_CARD_MODES.includes(mode)) {
+        const turnOn = enabled !== undefined ? enabled : state.gameMode !== mode;
+        if (!turnOn) {
+            state.gameMode = null;
+            resetGameState();
+        } else {
+            if (state.gameMode !== mode) resetGameState();
+            state.gameMode = mode;
+        }
+    } else {
+        state.teaseMode = mode;
+        state.ruinHoldSeconds = 0;
+        state.ruinRideSeconds = 0;
+    }
+    state.activeMode = state.gameMode || state.teaseMode;
+    highlightModeCard();
+    renderModeDetail();
+    updateEngine();
+}
+
 modeCards.forEach(card => {
     card.addEventListener('click', () => {
         if (isRemoteViewer) return;
-        state.activeMode = card.getAttribute('data-mode');
-        resetGameState();
-        highlightModeCard(state.activeMode);
-        // A controller asks the host; the host tells every remote via telemetry.
-        if (isRemoteController) sendPeerCommand({ type: 'MODE_CHANGE', mode: state.activeMode });
+        const mode = card.getAttribute('data-mode');
+        const enabled = GAME_CARD_MODES.includes(mode) ? state.gameMode !== mode : true;
+        applyModeSelection(mode, enabled);
+        if (isRemoteController) sendPeerCommand({ type: 'MODE_CHANGE', mode, enabled });
         else syncTelemetry();
-        updateEngine();
     });
 });
+
+renderModeDetail();
 
 function persistTrainSettings() {
     advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(document.getElementById('trainHoldSecondsInput')?.value);
@@ -2035,6 +2088,7 @@ const modals = {
     Params: document.getElementById('modalBodyParams'),
     Partner: document.getElementById('modalBodyPartner'),
     Legal: document.getElementById('modalBodyLegal'),
+    Changelog: document.getElementById('modalBodyChangelog'),
     HrGuide: document.getElementById('modalBodyHrGuide')
 };
 
@@ -2062,6 +2116,11 @@ function openModal(type) {
     else if (type === 'Params' && modalTitle) { modalTitle.textContent = "Session Setup"; modals.Params?.classList.remove('hidden'); renderLearningStatus(); syncParamsUI(); }
     else if (type === 'Partner' && modalTitle) { modalTitle.textContent = "Share Control Hub"; modals.Partner?.classList.remove('hidden'); setupPartnerHost(); }
     else if (type === 'Legal' && modalTitle) { modalTitle.textContent = "Legal & Medical Disclaimer"; modals.Legal?.classList.remove('hidden'); }
+    else if (type === 'Changelog' && modalTitle) {
+        modalTitle.textContent = `Changelog · v${APP_VERSION}`;
+        modals.Changelog?.classList.remove('hidden');
+        loadChangelog();
+    }
     else if (type === 'HrGuide' && modalTitle) { modalTitle.textContent = "Smartwatch Pairing Guide"; modals.HrGuide?.classList.remove('hidden'); }
     overlay?.classList.remove('hidden');
 }
@@ -2085,6 +2144,78 @@ document.getElementById('openParamsBtn')?.addEventListener('click', () => openMo
 document.getElementById('partnerShareBtn')?.addEventListener('click', () => { if (!isRemotePage) openModal('Partner'); });
 document.getElementById('bleQuickHelpBtn')?.addEventListener('click', () => openModal('HrGuide'));
 document.getElementById('footerLegalBtn')?.addEventListener('click', () => openModal('Legal'));
+document.getElementById('footerChangelogBtn')?.addEventListener('click', () => openModal('Changelog'));
+
+const versionEl = document.getElementById('appVersion');
+if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
+
+function appendChangelogText(parent, text) {
+    const parts = String(text).split('**');
+    parts.forEach((part, index) => {
+        if (!part) return;
+        if (index % 2 === 1) {
+            const strong = document.createElement('strong');
+            strong.className = 'text-slate-200';
+            strong.textContent = part;
+            parent.appendChild(strong);
+        } else {
+            parent.appendChild(document.createTextNode(part));
+        }
+    });
+}
+
+function paintChangelog(markdown) {
+    const body = document.getElementById('changelogBody');
+    if (!body) return;
+    body.replaceChildren();
+    for (const section of parseChangelog(markdown)) {
+        const heading = document.createElement('h4');
+        heading.className = 'text-xs font-bold text-slate-200 uppercase tracking-wider pt-1';
+        heading.textContent = section.title;
+        body.appendChild(heading);
+        let list = null;
+        for (const block of section.blocks) {
+            if (block.type !== 'item') list = null;
+            if (block.type === 'area') {
+                const area = document.createElement('div');
+                area.className = 'font-semibold text-slate-300 pt-1';
+                area.textContent = block.text;
+                body.appendChild(area);
+            } else if (block.type === 'text') {
+                const paragraph = document.createElement('p');
+                appendChangelogText(paragraph, block.text);
+                body.appendChild(paragraph);
+            } else if (block.type === 'item') {
+                if (!list) {
+                    list = document.createElement('ul');
+                    list.className = 'list-disc list-inside space-y-1';
+                    body.appendChild(list);
+                }
+                const item = document.createElement('li');
+                appendChangelogText(item, block.text);
+                list.appendChild(item);
+            }
+        }
+    }
+}
+
+let changelogLoaded = false;
+async function loadChangelog() {
+    const body = document.getElementById('changelogBody');
+    const github = document.getElementById('changelogGithubLink');
+    const releases = document.getElementById('changelogReleasesLink');
+    if (github) github.href = GITHUB_CHANGELOG_URL;
+    if (releases) releases.href = GITHUB_RELEASES_URL;
+    if (!body || changelogLoaded) return;
+    try {
+        const response = await fetch('./CHANGELOG.md', { cache: 'no-cache' });
+        if (!response.ok) throw new Error(String(response.status));
+        paintChangelog(await response.text());
+        changelogLoaded = true;
+    } catch {
+        body.textContent = 'This copy could not load its changelog. It is on GitHub at the link below.';
+    }
+}
 document.getElementById('modalCloseBtn')?.addEventListener('click', closeModal);
 overlay?.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
 
@@ -3827,8 +3958,8 @@ function setupPartnerHost() {
             } else if (cmd.type === 'SESSION_RESET') resetBtn?.click();
             else if (cmd.type === 'ORGASM_TOGGLE') orgasmBtn?.click();
             else if (cmd.type === 'MODE_CHANGE') {
-                const target = document.querySelector(`.mode-card[data-mode="${cmd.mode}"]`);
-                if (target) target.click();
+                applyModeSelection(cmd.mode, cmd.enabled);
+                syncTelemetry();
             }
         }
     });
@@ -3840,7 +3971,7 @@ function setupPartnerHost() {
 // every telemetry frame because some renderers reset element classes.
 const VIEWER_LOCKED_IDS = [
     'sessionPlayPauseBtn', 'sessionStopBtn', 'sessionResetBtn', 'cameEarlyBtn', 'orgasmBtn',
-    'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
+    'intensitySlider', 'openParamsBtn', 'sessionParamsHeaderBtn',
     'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
     // Nested in the Edge Training card: a disabled ancestor does not stop a
     // browser from focusing and editing them, so they are disabled themselves.
@@ -3862,7 +3993,7 @@ function lockViewerControls() {
 // Everything else is host-only (its handlers return or its state never
 // leaves the page), so it is locked rather than left looking clickable.
 const CONTROLLER_LOCKED_IDS = [
-    'cameEarlyBtn', 'intensitySlider', 'fullStrokeToggleBtn', 'openParamsBtn', 'sessionParamsHeaderBtn',
+    'cameEarlyBtn', 'intensitySlider', 'openParamsBtn', 'sessionParamsHeaderBtn',
     'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
     // The mode cards stay live (MODE_CHANGE is a legal command), but the two
     // Edge Training numbers inside one of them are host-only settings.
@@ -3951,9 +4082,13 @@ function applyRemoteTelemetry(data) {
     const showHoldBadge = shouldDrawPullbackLine(state.edgeTriggerHr, state.effectiveMaxHr);
     if (remoteHoldText && showHoldBadge) remoteHoldText.textContent = `${state.edgeTriggerHr}`;
     remoteHoldBadge?.classList.toggle('hidden', !showHoldBadge);
-    if (data.activeMode !== undefined && data.activeMode !== state.activeMode) {
-        state.activeMode = data.activeMode;
-        highlightModeCard(state.activeMode);
+    if (data.teaseMode !== undefined) state.teaseMode = data.teaseMode;
+    if (data.gameMode === 'off') state.gameMode = null;
+    else if (data.gameMode !== undefined) state.gameMode = data.gameMode;
+    if (data.activeMode !== undefined) state.activeMode = data.activeMode;
+    if (data.teaseMode !== undefined || data.gameMode !== undefined || data.activeMode !== undefined) {
+        highlightModeCard();
+        renderModeDetail();
     }
     if (data.orgasmMode !== undefined && data.orgasmMode !== state.orgasmMode) setOrgasmMode(data.orgasmMode);
     if (data.ready !== undefined) state.remoteHostReady = data.ready;
@@ -4022,6 +4157,8 @@ function syncTelemetry() {
         maxHr: state.effectiveMaxHr,
         edgeTriggerHr: state.edgeTriggerHr,
         activeMode: state.activeMode,
+        teaseMode: state.teaseMode,
+        gameMode: state.gameMode || 'off',
         // The host's game settings. A remote page holds its own persisted
         // copies of these; without them on the wire the Edge Training card a
         // partner is reading quotes THEIR numbers for the wearer's session.

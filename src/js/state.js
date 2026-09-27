@@ -49,7 +49,10 @@ export const state = {
     // that orgasm must not make the endgame re-arm it a second later.
     endgameHeldByOrgasm: false,
     activeMode: 'classic',
-    alwaysFullStroke: false,
+    // The tease mode owns the stroke. A game, when set, owns the speeds
+    // and borrows this stroke. Neither is restored on reload on purpose.
+    teaseMode: 'classic',
+    gameMode: null,
     lastHrTimestamp: Date.now(),
     // Heart-rate watchdog (hr-watchdog.js): last verdict, whether packets
     // arrive without a usable pulse, how long since the last valid reading,
@@ -68,6 +71,7 @@ export const state = {
     strokeMin: 0,
     strokeMax: 100,
     ruinHoldSeconds: 0,
+    ruinRideSeconds: 0,
     edgeStallSeconds: 0,
     stallPauseElapsed: 0,
     stallGuardEngaged: false,

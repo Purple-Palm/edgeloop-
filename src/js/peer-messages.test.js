@@ -11,6 +11,10 @@ describe('sanitizeCommand', () => {
         assert.deepEqual(sanitizeCommand({ type: 'SESSION_RESET' }), { type: 'SESSION_RESET' });
         assert.deepEqual(sanitizeCommand({ type: 'ORGASM_TOGGLE' }), { type: 'ORGASM_TOGGLE' });
         assert.deepEqual(sanitizeCommand({ type: 'MODE_CHANGE', mode: 'milker' }), { type: 'MODE_CHANGE', mode: 'milker' });
+        assert.deepEqual(
+            sanitizeCommand({ type: 'MODE_CHANGE', mode: 'oracle', enabled: false }),
+            { type: 'MODE_CHANGE', mode: 'oracle', enabled: false }
+        );
     });
 
     it('strips every extra field so raw limits or speeds never reach the host', () => {
@@ -90,9 +94,19 @@ describe('sanitizeTelemetry', () => {
     });
 
     it('accepts known statuses, modes and booleans', () => {
-        const t = sanitizeTelemetry({ type: 'TELEMETRY', sessionStatus: 'RAMPDOWN', activeMode: 'oracle', orgasmMode: true, ready: false });
+        const t = sanitizeTelemetry({
+            type: 'TELEMETRY',
+            sessionStatus: 'RAMPDOWN',
+            activeMode: 'oracle',
+            teaseMode: 'shortener',
+            gameMode: 'off',
+            orgasmMode: true,
+            ready: false
+        });
         assert.equal(t.sessionStatus, 'RAMPDOWN');
         assert.equal(t.activeMode, 'oracle');
+        assert.equal(t.teaseMode, 'shortener');
+        assert.equal(t.gameMode, 'off');
         assert.equal(t.orgasmMode, true);
         assert.equal(t.ready, false);
     });
