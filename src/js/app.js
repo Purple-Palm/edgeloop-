@@ -42,6 +42,7 @@ import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin } from './hardware/handy-protocol.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
+import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
     disconnectIntiface,
@@ -2087,6 +2088,7 @@ const modals = {
     Params: document.getElementById('modalBodyParams'),
     Partner: document.getElementById('modalBodyPartner'),
     Legal: document.getElementById('modalBodyLegal'),
+    Changelog: document.getElementById('modalBodyChangelog'),
     HrGuide: document.getElementById('modalBodyHrGuide')
 };
 
@@ -2114,6 +2116,11 @@ function openModal(type) {
     else if (type === 'Params' && modalTitle) { modalTitle.textContent = "Session Setup"; modals.Params?.classList.remove('hidden'); renderLearningStatus(); syncParamsUI(); }
     else if (type === 'Partner' && modalTitle) { modalTitle.textContent = "Share Control Hub"; modals.Partner?.classList.remove('hidden'); setupPartnerHost(); }
     else if (type === 'Legal' && modalTitle) { modalTitle.textContent = "Legal & Medical Disclaimer"; modals.Legal?.classList.remove('hidden'); }
+    else if (type === 'Changelog' && modalTitle) {
+        modalTitle.textContent = `Changelog · v${APP_VERSION}`;
+        modals.Changelog?.classList.remove('hidden');
+        loadChangelog();
+    }
     else if (type === 'HrGuide' && modalTitle) { modalTitle.textContent = "Smartwatch Pairing Guide"; modals.HrGuide?.classList.remove('hidden'); }
     overlay?.classList.remove('hidden');
 }
@@ -2137,6 +2144,78 @@ document.getElementById('openParamsBtn')?.addEventListener('click', () => openMo
 document.getElementById('partnerShareBtn')?.addEventListener('click', () => { if (!isRemotePage) openModal('Partner'); });
 document.getElementById('bleQuickHelpBtn')?.addEventListener('click', () => openModal('HrGuide'));
 document.getElementById('footerLegalBtn')?.addEventListener('click', () => openModal('Legal'));
+document.getElementById('footerChangelogBtn')?.addEventListener('click', () => openModal('Changelog'));
+
+const versionEl = document.getElementById('appVersion');
+if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
+
+function appendChangelogText(parent, text) {
+    const parts = String(text).split('**');
+    parts.forEach((part, index) => {
+        if (!part) return;
+        if (index % 2 === 1) {
+            const strong = document.createElement('strong');
+            strong.className = 'text-slate-200';
+            strong.textContent = part;
+            parent.appendChild(strong);
+        } else {
+            parent.appendChild(document.createTextNode(part));
+        }
+    });
+}
+
+function paintChangelog(markdown) {
+    const body = document.getElementById('changelogBody');
+    if (!body) return;
+    body.replaceChildren();
+    for (const section of parseChangelog(markdown)) {
+        const heading = document.createElement('h4');
+        heading.className = 'text-xs font-bold text-slate-200 uppercase tracking-wider pt-1';
+        heading.textContent = section.title;
+        body.appendChild(heading);
+        let list = null;
+        for (const block of section.blocks) {
+            if (block.type !== 'item') list = null;
+            if (block.type === 'area') {
+                const area = document.createElement('div');
+                area.className = 'font-semibold text-slate-300 pt-1';
+                area.textContent = block.text;
+                body.appendChild(area);
+            } else if (block.type === 'text') {
+                const paragraph = document.createElement('p');
+                appendChangelogText(paragraph, block.text);
+                body.appendChild(paragraph);
+            } else if (block.type === 'item') {
+                if (!list) {
+                    list = document.createElement('ul');
+                    list.className = 'list-disc list-inside space-y-1';
+                    body.appendChild(list);
+                }
+                const item = document.createElement('li');
+                appendChangelogText(item, block.text);
+                list.appendChild(item);
+            }
+        }
+    }
+}
+
+let changelogLoaded = false;
+async function loadChangelog() {
+    const body = document.getElementById('changelogBody');
+    const github = document.getElementById('changelogGithubLink');
+    const releases = document.getElementById('changelogReleasesLink');
+    if (github) github.href = GITHUB_CHANGELOG_URL;
+    if (releases) releases.href = GITHUB_RELEASES_URL;
+    if (!body || changelogLoaded) return;
+    try {
+        const response = await fetch('./CHANGELOG.md', { cache: 'no-cache' });
+        if (!response.ok) throw new Error(String(response.status));
+        paintChangelog(await response.text());
+        changelogLoaded = true;
+    } catch {
+        body.textContent = 'This copy could not load its changelog. It is on GitHub at the link below.';
+    }
+}
 document.getElementById('modalCloseBtn')?.addEventListener('click', closeModal);
 overlay?.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
 

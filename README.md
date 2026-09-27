@@ -33,9 +33,9 @@ EdgeLoop runs 100% locally in your web browser with zero accounts, zero subscrip
 * **Remote Partner Control & Viewers:** Peer-to-peer WebRTC room links let one partner anywhere in the world manage the session remotely (transport, Force Orgasm, mode), while any number of read-only viewers watch the live heart-rate telemetry. Every inbound message is validated; a dropped link is shown as disconnected, never as connected. Host-only settings — the Edge Training hold length and edge count, and the pullback percent — are read from the host's telemetry, never from the remote device's own saved settings, so a partner never paces the session by numbers out of their own browser. The same goes for everything a remote page shows about the session itself: the Resting / Climax pair, the Target Mode and the Endgame Trigger are the wearer's, so a partner page never fills them in from its own storage.
 * **Broad Protocol Support:** Direct connection to BLE heart rate monitors (standard 0x180D GATT service), The Handy (Wi-Fi HAMP API), T-Code strokers (OSR2, SR6, OSSM) straight over their USB serial port via Web Serial, and Buttplug.io / Intiface Central for vibrators, reciprocating sex machines, and rotational devices.
 
-### What changed since v1.0
+### Versions
 
-Everything that landed after the v1.0 write-up, from the Handy protocol fix to the direct T-Code driver, the smooth Intiface strokes and the heart-rate watchdog, is listed in [CHANGELOG.md](CHANGELOG.md), grouped by area and credited to the forum reports that prompted each change.
+EdgeLoop uses semantic versions. **1.0.0** is the app as it stood when the footer started showing a number, which is the build that had been called 1.0. **1.1.0** is PATTERNS. The footer shows the number and a **Changelog** button that opens [CHANGELOG.md](CHANGELOG.md) in the app. That file is the same list on GitHub. Publishing a [GitHub Release](https://github.com/marshallmims/edgeloop/releases) for a version is what posts it to the Discord changelog channel.
 
 ---
 
@@ -192,7 +192,7 @@ edgeloop/
 ├── .github/
 │   └── workflows/
 │       └── test.yml            # GitHub Actions: node --check every module, then npm test on every push to main and every PR
-├── CHANGELOG.md                # What changed since v1.0, by area, with forum credits
+├── CHANGELOG.md                # Version history, by area, with forum credits. The footer opens this file.
 ├── LICENSE                     # AGPL-3.0
 ├── README.md
 ├── icon.svg                    # App icon (manifest, PWA install)

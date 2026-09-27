@@ -6,6 +6,8 @@ credited by username.
 
 ## Unreleased
 
+## 1.1.0
+
 ### Patterns
 - **PATTERNS!** Speed and stroke length wander on overlapping cycles, so the same heart rate does not settle into a beat you can count. Prostate Milker pulses harder in the top third of the band. Ultimate Milker changes chapter as you climb, and near the edge it drops into stops and short bursts. Ruin & Leak keeps stroking through the edge, then after about 12 seconds on the mark stops the stroker dead for 18 seconds and drops the other toy low.
 - The travel range you set is the limit for every mode, pattern, game, warm-up and Force Orgasm. A pattern can only use less of that range.
@@ -13,6 +15,13 @@ credited by username.
 - **Full Length Strokes Only** is gone.
 - A game uses the stroke of whichever tease mode is selected, and clicking that game again turns it off.
 - Mode cards are one short line. The paragraph above them follows the mode or game you select.
+
+### Site
+- The footer shows the version and opens this changelog. It is the same file on GitHub. Publishing a GitHub Release for a version is what posts it to Discord.
+
+## 1.0.0
+
+The app as it stood when the footer started showing a version: the build that had been called 1.0. Entries below were written as they landed after the original v1.0 write-up.
 
 ### Site
 - The footer links to the Discord server and the GitHub repository. Every footer link uses the same color. The support address is no longer in the footer; it remains the private contact for reports that should not be posted in public.
