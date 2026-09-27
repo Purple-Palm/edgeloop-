@@ -7,7 +7,7 @@
  * and an edge is only released once the pulse has clearly come back down.
  */
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
-import { teaseFrame, warmupShape, placeStroke } from './patterns.js';
+import { teaseFrame, warmupShape, placeStroke, orgasmFrame } from './patterns.js';
 
 export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
 export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
@@ -195,6 +195,9 @@ export function calculateEngineOutputs({
     rampdownSecondsLeft,
     isEdged,
     orgasmMode,
+    // Seconds since Force Orgasm was armed. The ceiling already climbs 1 BPM
+    // per second from this; the motors ramp on the same clock.
+    orgasmBoost = 0,
     gamma = 2.0,
     intensityValue = 50,
     edgeStrokeDepth = 100,
@@ -328,8 +331,9 @@ export function calculateEngineOutputs({
         secondaryPercent = oracle.secondary;
     } else if (mode === 'survival') {
         const floor = clamp(finiteOr(survivalSpeedFloor, 30), 5, 100);
-        primaryPercent = orgasmMode ? 100 : floor;
-        secondaryPercent = orgasmMode ? 100 : Math.round(floor * 0.7);
+        // Force Orgasm ramps from this floor; it does not replace it with a flat 100.
+        primaryPercent = floor;
+        secondaryPercent = Math.round(floor * 0.7);
     } else if (mode === 'edgetrain') {
         const train = applyEdgeTrain(trainingState, climbProgress, nextIsEdged, orgasmMode, crawlPercent);
         primaryPercent = train.primary;
@@ -346,11 +350,21 @@ export function calculateEngineOutputs({
     strokeMinPercent = stroke.strokeMin;
     strokeMaxPercent = stroke.strokeMax;
 
-    if (orgasmMode) {
-        primaryPercent = Math.max(primaryPercent, 85);
-        secondaryPercent = 100;
-        strokeMinPercent = 0;
-        strokeMaxPercent = 100;
+    // Force Orgasm eases both channels up from whatever the mode was doing
+    // and keeps a wave at the top. It never drops a toy that was already
+    // hotter, and the stroke opens toward the full travel window. The
+    // working ceiling climbs on the same clock (app.js), so the pulse is
+    // allowed past the typed max until the wearer finishes.
+    if (orgasmMode && sessionStatus === 'RUNNING') {
+        const frame = orgasmFrame(seconds, orgasmBoost);
+        const ease = frame.ease;
+        primaryPercent = Math.round(primaryPercent * (1 - ease) + frame.primary * ease);
+        secondaryPercent = Math.round(secondaryPercent * (1 - ease) + frame.secondary * ease);
+        const openMin = strokeMinPercent * (1 - ease);
+        const openMax = strokeMaxPercent + (100 - strokeMaxPercent) * ease;
+        const opened = placeStroke(openMin, openMax, frame.depth, 'low');
+        strokeMinPercent = opened.min;
+        strokeMaxPercent = opened.max;
     }
 
     if (stallGuardEngaged && !orgasmMode && sessionStatus === 'RUNNING') {
@@ -422,18 +436,18 @@ export function calculateEngineOutputs({
 
 function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeconds, crawlPercent = CRAWL_PERCENT) {
     const out = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
-    if (orgasmMode) {
-        out.primary = 100;
-        out.secondary = 100;
-        return out;
-    }
+    // Force Orgasm is applied once, after this, so a climax ramps instead of
+    // replacing the game with a flat 100. `orgasmMode` stays on the signature
+    // so a caller cannot forget the flag exists; the ramp reads it.
+    void orgasmMode;
     // Every Oracle state below HOLD is reached with the wearer parked at the
     // pullback mark (app.js only enters HOLD from `state.isEdged`, and the
     // flag is not cleared until the pulse drops out of the release band), so
     // the wearer's "At the ceiling" rule decides the primary there exactly as
     // it does in Edge Training and every tease mode: Full Stop parks it at
-    // 0%, Crawl keeps the micro-motion. Only Force Orgasm (above) overrides
-    // it. The stall guard is disarmed for this mode, so nothing else would.
+    // 0%, Crawl keeps the micro-motion. Force Orgasm ramps over that after
+    // this function returns. The stall guard is disarmed for this mode, so
+    // nothing else would.
     // The secondary channel keeps the game's own level.
     switch (oracleState) {
         case 'HOLD':
@@ -454,12 +468,10 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
             break;
         }
         // CLIMAX is reached with Force Orgasm ON (app.js arms it with the
-        // roll), and that is handled above, so the only way into this branch
-        // is the wearer cancelling. The climax is withdrawn and app.js hands
-        // the game back to APPROACH on the very next tick; running 100/100
-        // until it did surged both channels to full speed for a second or
-        // two on someone who had just said no. A withdrawn climax IS the
-        // approach, so it settles there immediately.
+        // roll). The ramp above lifts that. Reaching CLIMAX with it OFF
+        // means the wearer cancelled: app.js hands the game back to APPROACH
+        // on the very next tick. A withdrawn climax IS the approach, so it
+        // settles there immediately instead of surging.
         case 'CLIMAX':
         case 'APPROACH':
         default: {
@@ -474,22 +486,18 @@ function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeco
 
 function applyEdgeTrain(trainingState, progress, nextIsEdged, orgasmMode, crawlPercent = CRAWL_PERCENT) {
     const out = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
-    if (orgasmMode) {
-        out.primary = 100;
-        out.secondary = 100;
-        return out;
-    }
-    // 'finish' is the completed set, and app.js arms Force Orgasm with it
-    // (handled above), so reaching it here means the wearer cancelled.
-    // tickEdgeTraining hands the game back to the climb on the next tick;
-    // running 100/100 until it did surged both channels to full speed for a
-    // second or two on someone who had just said no. The switch below sends
-    // 'finish' down the climb branch, so the cancel settles immediately.
+    // Same as Oracle: Force Orgasm ramps after the game picks a speed.
+    void orgasmMode;
+    // 'finish' is the completed set, and app.js arms Force Orgasm with it.
+    // The ramp lifts that. Reaching 'finish' with Force Orgasm OFF means the
+    // wearer cancelled. tickEdgeTraining hands the game back to the climb on
+    // the next tick; the switch below sends 'finish' down the climb branch,
+    // so the cancel settles immediately instead of surging.
     //
     // A training hold is a hold AT the pullback mark, so the wearer's
     // ceiling rule decides the primary there exactly as it does in every
     // other mode: Full Stop parks it at 0%, Crawl keeps the micro-motion.
-    // Only Force Orgasm (above) overrides it. The secondary channel is not
+    // Force Orgasm ramps over that after this function returns. The secondary channel is not
     // governed by that rule and keeps the game's own level.
     switch (trainingState) {
         case 'hold':

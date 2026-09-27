@@ -6,6 +6,14 @@ credited by username.
 
 ## Unreleased
 
+## 1.1.1
+
+A fix for 1.1.0. Sessions were easing off and stopping well before the heart rate you set. Bug fixes bump the last number. 1.1.0 stays PATTERNS. The next feature release still bumps the middle number.
+
+### Patterns
+- **The toys stay up until you are actually close.** Speed, stroke length, and the stops were backing off from around 120 BPM on a 140 max, so a session that used to hold at 135–140 sat under 125 and the stroker was not enough to keep an erection. The heart-rate curve is the backoff again, in every tease mode. The pattern still changes the tempo and the length the whole way up, and a fast stretch can still be a shorter stroke, but a real dip or a stop waits until your pulse is in the last stretch before the pullback mark. Ultimate Milker's stop-and-burst chapter and Prostate Milker's short bursts open there. Glans Protector keeps a full stroke until then, then shortens to the base, and it stays quicker than Classic on the way. Head Play keeps a full stroke until then too, then climbs toward the head; it no longer drops to a slow short stroke around the middle of the band. Ruin & Leak keeps stroking through the edge instead of taking that dip. Crawl and Full Stop are still the pullback mark, not a pattern pause in the middle of the band. Games keep their own speeds and use whichever tease stroke you picked, so they follow the same stroke timing. Intensity still scales whatever the pattern is doing; it no longer has to fight a near-stop that arrived early.
+- **Force Orgasm ramps.** The button used to pin the stroker at at least 85% and the other toy at 100%, full travel, immediately. It now eases up over about half a minute from whatever the toys were doing, and keeps changing speed and stroke length at the top instead of sitting on one flat maximum. The ceiling still climbs one beat per second while it is on (up to 60), so your pulse can run past the max you typed until you finish. The first second does not jump. Cancelling still settles immediately, and it still does not count a new edge on the way up or on the way out.
+
 ## 1.1.0
 
 ### Patterns

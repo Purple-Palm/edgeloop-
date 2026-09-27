@@ -864,6 +864,7 @@ function updateEngine() {
         rampdownSecondsLeft: state.rampdownSecondsLeft,
         isEdged: state.isEdged,
         orgasmMode: state.orgasmMode,
+        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0,
         gamma: advancedSettings.gammaCurve,
         intensityValue: state.intensityValue,
         edgeStrokeDepth: advancedSettings.edgeStrokeDepth,
@@ -1638,11 +1639,11 @@ setInterval(() => {
 
 function handleTargetTimeReached() {
     // A latched Force Orgasm does not survive an ending that is not an
-    // orgasm. The engine floors the primary at 85% and pins the secondary at
-    // 100% while it is on, so a Soft Landing reached with the latch still
+    // orgasm. While it is on, the motors ramp toward a high varied output
+    // and the ceiling climbs, so a Soft Landing reached with the latch still
     // set - the wearer tapped it during an Oracle hold, and the roll or the
-    // timer then chose the tease-down - ran the gentlest ending in the app
-    // at full speed for all 45 s. Denied stops the session, which clears it
+    // timer then chose the tease-down - would keep driving the toys instead
+    // of the gentle ending. Denied stops the session, which clears it
     // anyway; the Orgasm endgame IS the latch and keeps it.
     if (!endgameKeepsOrgasmLatch(state.endgameType)) setOrgasmMode(false);
     if (state.endgameType === 'orgasm') {
@@ -1981,10 +1982,10 @@ const modeCards = document.querySelectorAll('.mode-card');
 
 const MODE_DETAILS = {
     classic: 'Full strokes inside the travel range you set. Tempo and depth drift so the same pulse does not feel identical, then Crawl or Full Stop at the ceiling.',
-    milker: 'The stroker eases off as you climb. In the top third of the band it switches to short bursts while the internal toy pulses on and off, instead of sitting at full power.',
-    shortener: 'The stroke shortens to the base as you get close, and stays quicker than Classic so it still feels like stroking. The secondary channel stays low.',
-    headplay: 'The stroke starts narrowing around the middle of the band and climbs toward the head. Speed comes down with the length, and it opens back up when your pulse drops.',
-    ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast, then stops and short bursts. The internal toy follows the same chapters.',
+    milker: 'The stroker eases off as you climb and the internal toy takes over. Short bursts and the on-off pulse wait until your pulse is close to the heart rate you set.',
+    shortener: 'Full strokes until your pulse is close to the heart rate you set, then the stroke shortens to the base. It stays quicker than Classic. The secondary channel stays low.',
+    headplay: 'Full strokes until your pulse is close to the heart rate you set, then the stroke climbs toward the head. Speed eases off with your pulse, and the stroke opens back up when your pulse drops.',
+    ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast. Stops and short bursts wait until your pulse is close to the heart rate you set. The internal toy follows the same chapters.',
     ruin: 'The stroker keeps moving through the edge. After about 12 seconds on the mark it stops dead for 18 seconds and the other toy drops low, so it can leak without a full orgasm. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
     survival: 'Speed climbs on its own clock until the run ends. "At the ceiling" does not govern this game. The stroke range is the tease mode you selected.',
