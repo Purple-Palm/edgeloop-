@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
-import { sanitizeSessionLimits } from './session-rules.js';
+import { sanitizeSessionLimits, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import {
     SETTING_SANITIZERS,
@@ -213,5 +213,45 @@ describe('applySettingSchema', () => {
     it('survives a non-object', () => {
         assert.deepEqual(applySettingSchema(null), []);
         assert.deepEqual(applySettingSchema('x'), []);
+    });
+});
+
+describe('the enum settings are the owner\'s own lists', () => {
+    // A hand-copied endgame list here read ['orgasm', 'denial', 'ruin'] while
+    // the endgames are ['orgasm', 'rampdown', 'denial']. Soft Landing
+    // ('rampdown') was therefore "unknown" and fell back to the factory
+    // 'orgasm' on every boot, Apply and import: a wearer who asked to be
+    // landed softly was armed for a forced orgasm at the target time.
+    it('every endgame survives the schema and the cross-field pass', () => {
+        for (const v of ENDGAME_TYPES) {
+            assert.equal(sanitizeSetting('endgameType', v), v);
+            const s = { endgameType: v };
+            applySettingSchema(s);
+            assert.equal(sanitizeSessionLimits(s).endgameType, v, `${v} must survive`);
+        }
+        assert.ok(ENDGAME_TYPES.includes('rampdown'), 'Soft Landing is an endgame');
+    });
+
+    it('every duration mode survives the schema and the cross-field pass', () => {
+        for (const v of DURATION_MODES) {
+            assert.equal(sanitizeSetting('durationMode', v), v);
+            const s = { durationMode: v, durationMinMinutes: 25, durationMaxMinutes: 45, durationFixedMinutes: 30 };
+            applySettingSchema(s);
+            assert.equal(sanitizeSessionLimits(s).durationMode, v, `${v} must survive`);
+        }
+    });
+
+    it('junk and retired values fall back to the factory value', () => {
+        for (const junk of ['ruin', 'melt', '', null, 7, ['orgasm']]) {
+            assert.equal(sanitizeSetting('endgameType', junk), SETTING_DEFAULTS.endgameType, JSON.stringify(junk));
+            assert.equal(sanitizeSetting('durationMode', junk), SETTING_DEFAULTS.durationMode, JSON.stringify(junk));
+        }
+    });
+
+    it('the schema lists are the owner\'s exports, not copies', () => {
+        const src = readFileSync(new URL('./settings-schema.js', import.meta.url), 'utf8');
+        assert.match(src, /durationMode: oneOf\('durationMode', DURATION_MODES\)/);
+        assert.match(src, /endgameType: oneOf\('endgameType', ENDGAME_TYPES\)/);
+        assert.ok(!/\['orgasm', 'denial'/.test(src), 'no hand-copied endgame list may remain');
     });
 });

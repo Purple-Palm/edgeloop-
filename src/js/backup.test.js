@@ -1051,6 +1051,19 @@ describe('the fourth round: an import is not something to do mid-session', () =>
     });
 });
 
+describe('a Soft Landing survives a backup round trip', () => {
+    // The schema once mapped 'rampdown' to the factory 'orgasm', so a
+    // restored backup silently changed the endgame from a soft landing to a
+    // forced orgasm at the target time.
+    it('restores rampdown as rampdown', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: { endgameType: 'rampdown' } });
+        assert.equal(read.settings.endgameType, 'rampdown');
+        assert.equal(read.requested.endgameType, 'rampdown');
+        const file = buildBackup({ settings: { endgameType: 'rampdown' } }, { now: NOW });
+        assert.equal(file.settings.endgameType, 'rampdown');
+    });
+});
+
 describe('app.js routes the backup through this module', () => {
     const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 

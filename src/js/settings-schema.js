@@ -20,7 +20,7 @@
 // after this pass; this file is per-field only.
 
 import { SETTING_DEFAULTS } from './state.js';
-import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, MAX_SESSION_MINUTES } from './session-rules.js';
+import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, MAX_SESSION_MINUTES, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
 import { clampEdgeHoldPercent } from './engine.js';
 import { clampStaleSeconds } from './hr-watchdog.js';
 import { clampEndMargin } from './hardware/handy-protocol.js';
@@ -127,7 +127,13 @@ export const SETTING_SANITIZERS = {
     // documentation promises. The owner sees both ends and decides.
     minHr: passToOwner,
     maxHr: passToOwner,
-    durationMode: oneOf('durationMode', ['fixed', 'range', 'endless']),
+    // The two enums are the owner's own lists, imported rather than copied.
+    // A copy of the endgame list here was wrong ('ruin' instead of
+    // 'rampdown'), so a wearer who chose Soft Landing had it silently turned
+    // into the Orgasm endgame on every boot, Apply and import - and at the
+    // target time that arms Force Orgasm instead of landing softly. A list
+    // that lives in one place cannot drift from the buttons that write it.
+    durationMode: oneOf('durationMode', DURATION_MODES),
     // The lengths go to their owner as written, for the same reason the HR
     // pair does: the owner REFUSES a length outside the window and falls
     // back to the factory one, and clamping -3 to 1 here would hand it a
@@ -136,7 +142,7 @@ export const SETTING_SANITIZERS = {
     durationFixedMinutes: passToOwner,
     durationMinMinutes: passToOwner,
     durationMaxMinutes: passToOwner,
-    endgameType: oneOf('endgameType', ['orgasm', 'denial', 'ruin']),
+    endgameType: oneOf('endgameType', ENDGAME_TYPES),
 
     // No control in the app; see fixedAtFactory.
     gammaCurve: fixedAtFactory('gammaCurve'),
