@@ -565,6 +565,7 @@ export function describeGameNotice({
     trainEdgesGoal,
     survivalSpeedFloor = 0,
     survivalOverdrive = 0,
+    survivalCalibrating = false,
     sessionSeconds = 0,
     minSeconds = 0,
     maxSeconds = 0,
@@ -599,7 +600,8 @@ export function describeGameNotice({
     if (activeMode === 'survival') {
         const floor = Math.round(Number.isFinite(survivalSpeedFloor) ? survivalSpeedFloor : 0);
         const over = Math.max(0, Math.round(Number.isFinite(survivalOverdrive) ? survivalOverdrive : 0));
-        return `SURVIVAL: FLOOR ${floor}% — +${over} BPM`;
+        const mark = survivalCalibrating ? 'CALIBRATING — ' : '';
+        return `SURVIVAL: ${mark}FLOOR ${floor}% — +${over} BPM`;
     }
 
     const need = clampTrainEdges(trainEdgesGoal);

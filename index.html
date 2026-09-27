@@ -418,6 +418,10 @@
               <p class="text-[9px] text-slate-300 mt-0.5 leading-snug">
                 Slow climb. Each edge pushes your max higher.
               </p>
+              <label class="flex items-center gap-1.5 mt-1.5 pt-1.5 border-t border-slate-800 text-[9px] text-slate-300" data-survival-calibrate>
+                <input id="survivalCalibrateToggle" type="checkbox" class="accent-rose-500">
+                Calibration — this run sets my max
+              </label>
             </button>
 
             <div class="sm:col-span-2">
@@ -1155,8 +1159,9 @@
       <div id="wizardStep2" class="wizard-pane space-y-2 text-center hidden">
         <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 3 of 3</p>
         <h3 class="text-base font-bold text-white">Set your ceiling and start</h3>
-        <p class="text-xs text-slate-400 leading-relaxed">Enter Resting HR and Climax HR, then open <strong class="text-slate-200">Session Setup</strong> for duration, warm-up, and guards. Pick a mode (or a game) and press Start when both HR and a toy are ready.</p>
-        <p class="text-[10px] text-slate-500 leading-relaxed">The engine throttles automatically. If you go over, tap <strong>Came Early</strong> so local bio-learning lowers the working ceiling next time. Two guards watch the sensor: the <strong>signal-loss timeout</strong> (3-20 s) pauses the motors when readings stop, and <strong>auto-resume</strong> picks the session back up when they return.</p>
+        <p class="text-xs text-slate-400 leading-relaxed">Enter Resting HR and Climax HR, then open <strong class="text-slate-200">Session Setup</strong> for duration, warm-up, and guards. If you do not know your top heart rate yet, start with <strong class="text-slate-200">Survival</strong>. It climbs past the number you typed until you come.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">Leave <strong>Calibration</strong> checked, then tap <strong>Finished me</strong> and that heart rate becomes your Climax HR. After you know the number, Came Early still lowers the ceiling for an accidental release. The signal-loss timeout pauses the motors when readings stop, and auto-resume picks the session back up.</p>
+        <button type="button" id="wizardCalibrateBtn" class="w-full bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 font-bold py-2.5 rounded-xl text-xs cursor-pointer">Start with Survival</button>
       </div>
 
       <div class="flex gap-2 pt-1">

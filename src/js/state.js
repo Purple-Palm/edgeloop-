@@ -172,6 +172,9 @@ export const advancedSettings = {
     edgeHoldPercent: 100,
     trainHoldSeconds: 15,
     trainEdges: 5,
+    // Survival can be marked as the run that finds your top heart rate.
+    // Off by default; the first-run wizard offers to turn it on.
+    survivalCalibrating: false,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,

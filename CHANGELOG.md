@@ -8,7 +8,8 @@ credited by username.
 
 ### Games
 - **Survival climbs past your max, slowly.** It no longer ends the session when your pulse crosses the max. The speed starts low and takes about half an hour to get hard on its own. Each edge while Survival is on raises the mark by 1 BPM and adds a little speed, up to 40 BPM past the working ceiling. Edges from before you switched it on do not count. Adaptive ceiling decay does not fight that climb. Crawl and Full Stop still do not park the toy.
-- **Finished me, during Survival.** Came Early changes to Finished me while Survival is selected. That tap saves the top heart rate of the run as your Climax HR, after you confirm it, and the toys stop. It does not lower the ceiling. In every other mode, Came Early still logs an accidental release.
+- **Finished me, during Survival.** Came Early changes to Finished me while Survival is selected. With Calibration checked, that tap saves the top heart rate of the run as your Climax HR, after you confirm it, and the toys stop. It does not lower the ceiling. Without Calibration it ends the run and leaves the typed max alone. In every other mode, Came Early still logs an accidental release.
+- **New users can start with Survival.** The first-run wizard offers Start with Survival, which selects the game and marks the run as a calibration. The check stays on the Survival card after that.
 
 ## 1.1.1
 

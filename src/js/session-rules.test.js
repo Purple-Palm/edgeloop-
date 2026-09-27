@@ -419,7 +419,10 @@ describe('survival climb', () => {
         const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
         assert.equal(html.includes('survivalCameBtn'), false);
         assert.match(html, /id="cameEarlyLabel"[^>]*>Came Early</);
+        assert.match(html, /id="survivalCalibrateToggle"/);
+        assert.match(html, /id="wizardCalibrateBtn"/);
         assert.match(src, /Finished me/);
+        assert.match(src, /survivalCalibrating/);
         const handler = src.match(/cameEarlyBtn\?\.addEventListener\([\s\S]*?stopSession\('Survival calibration'/);
         assert.ok(handler, 'Finished me has no handler on the Came Early button');
         assert.match(handler[0], /activeMode === 'survival'/);
@@ -706,6 +709,14 @@ describe('the cockpit game banner', () => {
         assert.match(
             describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4 }),
             /SURVIVAL: FLOOR 42%/
+        );
+        assert.equal(
+            describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4 }).includes('CALIBRATING'),
+            false
+        );
+        assert.match(
+            describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4, survivalCalibrating: true }),
+            /SURVIVAL: CALIBRATING — FLOOR 42%/
         );
     });
 
