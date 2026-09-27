@@ -309,14 +309,16 @@ describe('engine modes', () => {
     it('oracle hold/denial/climax/purgatory are distinct', () => {
         const hold = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'HOLD', isEdged: true, hr: 140 });
         const denial = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'DENIAL', hr: 140 });
-        const climax = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'CLIMAX', orgasmMode: true, hr: 140 });
+        const climax = calculateEngineOutputs({
+            ...running, activeMode: 'oracle', oracleState: 'CLIMAX', orgasmMode: true, orgasmBoost: 28, hr: 140
+        });
         const purgatory = calculateEngineOutputs({ ...running, activeMode: 'oracle', oracleState: 'PURGATORY', sessionSeconds: 4 });
         // HOLD is a hold AT the pullback mark, so it obeys the wearer's
         // ceiling rule; `running` selects Full Stop.
         assert.equal(hold.primaryPercent, 0);
         assert.ok(hold.secondaryPercent > 0, 'the secondary channel keeps running');
         assert.equal(denial.primaryPercent, 0);
-        assert.ok(climax.primaryPercent >= 85);
+        assert.ok(climax.primaryPercent >= 70, 'a climax that has ramped is driving, not crawling');
         assert.ok(purgatory.primaryPercent > 0);
         assert.ok(purgatory.primaryPercent < 100);
     });
@@ -350,9 +352,10 @@ describe('engine modes', () => {
         }
         // Force Orgasm is still the one thing that overrides it.
         const forced = calculateEngineOutputs({
-            ...atMark, activeMode: 'oracle', oracleState: 'HOLD', ceilingBehaviour: 'stop', orgasmMode: true
+            ...atMark, activeMode: 'oracle', oracleState: 'HOLD', ceilingBehaviour: 'stop',
+            orgasmMode: true, orgasmBoost: 28
         });
-        assert.ok(forced.primaryPercent >= 85);
+        assert.ok(forced.primaryPercent >= 70, 'Force Orgasm overrides Full Stop once it has ramped');
         // Global Intensity cannot smuggle motion past Full Stop either.
         const loud = calculateEngineOutputs({
             ...atMark, activeMode: 'oracle', oracleState: 'PURGATORY', ceilingBehaviour: 'stop', intensityValue: 100
@@ -394,15 +397,100 @@ describe('engine modes', () => {
             assert.equal(crawl.primaryPercent, CRAWL_PERCENT, `${where} must crawl with Crawl`);
         }
 
-        // Force Orgasm itself is untouched: while it is ON both run flat out.
+        // The first second stays with the game. A ramped Force Orgasm is high
+        // and not a flat 100 on both channels.
+        const settled = {
+            oracle: approach,
+            edgetrain: climb
+        };
         for (const probe of [
             { activeMode: 'oracle', oracleState: 'CLIMAX' },
             { activeMode: 'edgetrain', trainingState: 'finish' }
         ]) {
-            const forcing = calculateEngineOutputs({ ...below, ...probe, orgasmMode: true });
-            assert.ok(forcing.primaryPercent >= 85);
-            assert.equal(forcing.secondaryPercent, 100);
+            const armed = calculateEngineOutputs({ ...below, ...probe, orgasmMode: true, orgasmBoost: 0 });
+            const quiet = settled[probe.activeMode];
+            assert.equal(armed.primaryPercent, quiet.primaryPercent);
+            assert.equal(armed.secondaryPercent, quiet.secondaryPercent);
+            const forcing = calculateEngineOutputs({ ...below, ...probe, orgasmMode: true, orgasmBoost: 28, sessionSeconds: 3 });
+            assert.ok(forcing.primaryPercent >= 70);
+            assert.ok(forcing.secondaryPercent >= 60);
         }
+    });
+
+    it('Force Orgasm ramps with variance and can run past the typed max', () => {
+        const parked = {
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            edgeHr: 140,
+            isEdged: true,
+            ceilingBehaviour: 'stop',
+            sessionSeconds: 4
+        };
+        const armed = calculateEngineOutputs({ ...parked, orgasmMode: true, orgasmBoost: 0 });
+        assert.ok(armed.primaryPercent < 40, 'the first second does not slam the toys');
+        const mid = calculateEngineOutputs({ ...parked, orgasmMode: true, orgasmBoost: 14 });
+        const full = [];
+        for (let sessionSeconds = 0; sessionSeconds < 36; sessionSeconds += 1) {
+            full.push(calculateEngineOutputs({
+                ...parked, orgasmMode: true, orgasmBoost: 28, sessionSeconds, maxHr: 155
+            }));
+        }
+        assert.ok(mid.primaryPercent > armed.primaryPercent, 'halfway up the ramp is hotter than the start');
+        assert.ok(Math.min(...full.map((sample) => sample.primaryPercent)) >= 70);
+        assert.ok(new Set(full.map((sample) => sample.primaryPercent)).size >= 4, 'the top of the ramp is not one flat speed');
+        assert.ok(full.some((sample) => sample.secondaryPercent < 100));
+        assert.ok(full.every((sample) => sample.isEdged === true), 'overdrive does not release the edge');
+        assert.ok(full.every((sample) => sample.newEdgeTriggered === false));
+        // Stroke still lives inside the travel window the wearer set.
+        const boxed = calculateEngineOutputs({
+            ...parked, orgasmMode: true, orgasmBoost: 28, handyHwMin: 15, handyHwMax: 80, sessionSeconds: 6
+        });
+        assert.ok(boxed.strokeMinPercent >= 15);
+        assert.ok(boxed.strokeMaxPercent <= 80);
+    });
+
+    it('ultimate keeps stroking until the pulse is close to the mark', () => {
+        const sweep = (hr) => {
+            const samples = [];
+            for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+                samples.push(calculateEngineOutputs({
+                    ...running,
+                    activeMode: 'ultimate',
+                    hr,
+                    edgeHr: hr,
+                    isEdged: false,
+                    ceilingBehaviour: 'crawl',
+                    sessionSeconds
+                }));
+            }
+            const primary = samples.map((sample) => sample.primaryPercent);
+            const reach = samples.map((sample) => sample.strokeMaxPercent - sample.strokeMinPercent);
+            return {
+                low: Math.min(...primary),
+                mean: primary.reduce((sum, value) => sum + value, 0) / primary.length,
+                reach: Math.min(...reach)
+            };
+        };
+        // 120 BPM is nowhere near a 140 max (resting 70). The old pattern
+        // was already in its stop chapter here and would park the toy.
+        const at120 = sweep(120);
+        assert.ok(at120.low > 20, `lowest primary at 120 was ${at120.low}`);
+        assert.ok(at120.mean > 35, `mean primary at 120 was ${at120.mean}`);
+        assert.ok(at120.reach >= 55, `shortest stroke at 120 was ${at120.reach}`);
+        const at125 = sweep(125);
+        assert.ok(at125.low > 15, `lowest primary at 125 was ${at125.low}`);
+        assert.ok(at125.mean > 28, `mean primary at 125 was ${at125.mean}`);
+        // Crawl is still the pullback mark, not a pattern stop in the middle.
+        const early = calculateEngineOutputs({
+            ...running, activeMode: 'ultimate', hr: 125, edgeHr: 125, isEdged: false, ceilingBehaviour: 'crawl'
+        });
+        assert.ok(early.primaryPercent > CRAWL_PERCENT);
+        assert.equal(early.isEdged, false);
+        const atMark = calculateEngineOutputs({
+            ...running, activeMode: 'ultimate', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl'
+        });
+        assert.equal(atMark.primaryPercent, CRAWL_PERCENT);
     });
 
     it('Force Orgasm freezes the edge flag instead of releasing it', () => {

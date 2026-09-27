@@ -602,9 +602,9 @@ describe('the endgame and a latched Force Orgasm', () => {
 
     it('app.js clears the latch before it runs a Soft Landing', () => {
         // The helper is worthless unless the cockpit asks it on the way in:
-        // Force Orgasm floors the primary at 85% and pins the secondary at
-        // 100% for as long as it is latched, so a Soft Landing reached with
-        // it still on ran the gentlest ending in the app flat out for 45 s.
+        // Force Orgasm keeps driving the toys and raising the ceiling for as
+        // long as it is latched, so a Soft Landing reached with it still on
+        // would not be the gentle ending.
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
         const fn = src.match(/function handleTargetTimeReached\(\)[\s\S]*?\n}/);
         assert.ok(fn, 'handleTargetTimeReached anchor moved');

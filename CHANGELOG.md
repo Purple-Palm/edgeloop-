@@ -6,6 +6,10 @@ credited by username.
 
 ## Unreleased
 
+### Patterns
+- **The toys stay up until you are actually close.** Speed, stroke length, and the stops were backing off from around 120 BPM on a 140 max, so a session that used to hold at 135–140 sat under 125 and the stroker was not enough to keep an erection. The heart-rate curve is the backoff again. The pattern still changes the tempo and the length the whole way up, and a fast stretch can still be a shorter stroke, but a real dip or a stop waits until your pulse is in the last stretch before the pullback mark. Ultimate Milker's stop-and-burst chapter, and Prostate Milker's short bursts, open there too. Crawl and Full Stop are still that mark, not a pattern pause in the middle of the band. Intensity still scales whatever the pattern is doing; it no longer has to fight a near-stop that arrived early.
+- **Force Orgasm ramps.** The button used to pin the stroker at at least 85% and the other toy at 100%, full travel, immediately. It now eases up over about half a minute from whatever the toys were doing, and keeps changing speed and stroke length at the top instead of sitting on one flat maximum. The ceiling still climbs one beat per second while it is on (up to 60), so your pulse can run past the max you typed until you finish. The first second does not jump. Cancelling still settles immediately, and it still does not count a new edge on the way up or on the way out.
+
 ## 1.1.0
 
 ### Patterns

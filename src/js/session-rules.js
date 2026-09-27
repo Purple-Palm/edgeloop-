@@ -464,11 +464,10 @@ export function tickEdgeTraining(
 
 // What arriving at the endgame does to a latched Force Orgasm. The latch is
 // armed earlier in the session, by the wearer or by an Oracle climax roll,
-// and the engine's orgasm override floors the primary at 85% and pins the
-// secondary at 100% for as long as it is on. Only the Orgasm endgame keeps
-// it, because that ending IS the latch: a Soft Landing is a 45 s tease-down
-// and would otherwise run at full speed from its first second to its last,
-// and Denied stops the session (which clears the latch anyway).
+// and while it is on the motors ramp up and the ceiling climbs. Only the
+// Orgasm endgame keeps it, because that ending IS the latch: a Soft Landing
+// is a 45 s tease-down and would otherwise keep driving the toys, and Denied
+// stops the session (which clears the latch anyway).
 export function endgameKeepsOrgasmLatch(endgameType) {
     return endgameType === 'orgasm';
 }

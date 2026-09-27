@@ -37,8 +37,13 @@ describe('parseChangelog', () => {
     it('reads the real changelog as 1.1.0 over 1.0.0', () => {
         const text = readFileSync(new URL('../../CHANGELOG.md', import.meta.url), 'utf8');
         const sections = parseChangelog(text);
-        assert.equal(sections[0].title, '1.1.0');
-        assert.equal(sections[1].title, '1.0.0');
-        assert.ok(sections[0].blocks.some((block) => /PATTERNS/.test(block.text)));
+        const titles = sections.map((section) => section.title);
+        const patterns = titles.indexOf('1.1.0');
+        const previous = titles.indexOf('1.0.0');
+        assert.ok(patterns >= 0 && previous > patterns, titles.join(', '));
+        assert.ok(sections[patterns].blocks.some((block) => /PATTERNS/.test(block.text)));
+        if (titles[0] === 'Unreleased') {
+            assert.ok(sections[0].blocks.some((block) => /Force Orgasm/.test(block.text)));
+        }
     });
 });
