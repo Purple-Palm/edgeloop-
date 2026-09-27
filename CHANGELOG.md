@@ -6,6 +6,10 @@ credited by username.
 
 ## Unreleased
 
+### Games
+- **Survival climbs past your max, slowly.** It no longer ends the session when your pulse crosses the max. The speed starts low and takes about half an hour to get hard on its own. Each edge while Survival is on raises the mark by 1 BPM and adds a little speed, up to 40 BPM past the working ceiling. Edges from before you switched it on do not count. Adaptive ceiling decay does not fight that climb. Crawl and Full Stop still do not park the toy.
+- **I came, during Survival.** While Survival is running, that button saves the top heart rate of the run as your Climax HR, after you confirm it. The toys stop. Came Early is unchanged: that one still lowers the ceiling for an accidental release.
+
 ## 1.1.1
 
 A fix for 1.1.0. Sessions were easing off and stopping well before the heart rate you set. Bug fixes bump the last number. 1.1.0 stays PATTERNS. The next feature release still bumps the middle number.

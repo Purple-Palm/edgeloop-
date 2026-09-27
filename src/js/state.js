@@ -88,8 +88,11 @@ export const state = {
     })(),
     oracleState: 'IDLE',
     oracleTimer: 0,
-    survivalSpeedFloor: 30,
+    survivalSpeedFloor: 18,
     survivalTimer: 0,
+    survivalEdges: 0,
+    survivalOverdrive: 0,
+    survivalEdgesSeen: 0,
     survivalBreachTicks: 0,
     // Timestamp of the reading the last Survival tick judged, so a value held
     // across ticks by a slow source counts as one breach reading.

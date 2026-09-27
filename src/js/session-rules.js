@@ -18,8 +18,21 @@ export const MIN_CEILING_GAP = 15;
 export const ORGASM_BOOST_CAP = 60;
 
 // Survival Mode only ends after this many consecutive READINGS at or above
-// the ceiling, so a single HR-sensor spike cannot end the game.
+// the ceiling, so a single HR-sensor spike cannot end the game. The game
+// itself no longer ends on this streak. The counter stays so a held reading
+// is still one reading.
 export const SURVIVAL_BREACH_TICKS = 3;
+
+// Survival climbs for a long session. The time term takes 30 minutes to add
+// SURVIVAL_TIME_SPEED, and each counted edge adds a little speed plus one
+// BPM of ceiling. Neither one is allowed to finish the run in the first
+// few minutes.
+export const SURVIVAL_START_FLOOR = 18;
+export const SURVIVAL_SLOW_SPAN_SECONDS = 30 * 60;
+export const SURVIVAL_TIME_SPEED = 42;
+export const SURVIVAL_EDGE_SPEED = 1.25;
+export const SURVIVAL_EDGE_BPM = 1;
+export const SURVIVAL_OVERDRIVE_CAP = 40;
 
 // How long pulse may sit at the pullback trigger before the primary is cut.
 export const MIN_STALL_GUARD_SECONDS = 3;
@@ -73,7 +86,8 @@ export function sanitizeHrLimits(rawMin, rawMax, lastGood = {}) {
 
 // Compute the ceiling the engine actually uses. Every offset only ever LOWERS
 // the typed ceiling (never below min + MIN_CEILING_GAP, and never above the
-// typed value); only the explicit Force Orgasm boost may raise it.
+// typed value). Two explicit raises sit on top: Force Orgasm, and Survival's
+// per-edge overdrive while that game is on.
 export function computeEffectiveCeiling({
     minHr,
     maxHr,
@@ -86,7 +100,8 @@ export function computeEffectiveCeiling({
     decayEdgeCount = 2,
     decayBpm = 2,
     decayFloor = 105,
-    orgasmBoost = 0
+    orgasmBoost = 0,
+    survivalOverdrive = 0
 }) {
     const min = Number.isFinite(minHr) ? minHr : DEFAULT_MIN_HR;
     const typedMax = Number.isFinite(maxHr) ? maxHr : DEFAULT_MAX_HR;
@@ -126,7 +141,11 @@ export function computeEffectiveCeiling({
     max = Math.min(max, typedMax);
 
     const boost = clamp(Number.isFinite(orgasmBoost) ? orgasmBoost : 0, 0, ORGASM_BOOST_CAP);
-    max += boost;
+    // Survival is the other explicit raise. It is session-only, one BPM per
+    // edge counted while that game is on, and it drops the moment the game
+    // is off. Offsets above still lower the base it climbs from.
+    const overdrive = clamp(Number.isFinite(survivalOverdrive) ? survivalOverdrive : 0, 0, SURVIVAL_OVERDRIVE_CAP);
+    max += boost + overdrive;
 
     return {
         minHr: min,
@@ -378,6 +397,20 @@ export function isSurvivalDefeated(breachTicks) {
     return (breachTicks || 0) >= SURVIVAL_BREACH_TICKS;
 }
 
+// Speed floor and how far the working ceiling sits above the typed max.
+// `seconds` is time spent IN Survival, not the whole session. `edges` is
+// edges counted since Survival was switched on.
+export function survivalDrive({ seconds = 0, edges = 0 } = {}) {
+    const t = Math.max(0, Number(seconds) || 0);
+    const n = Math.max(0, Math.floor(Number(edges) || 0));
+    const timeMix = t / SURVIVAL_SLOW_SPAN_SECONDS;
+    const floor = clamp(Math.round(
+        SURVIVAL_START_FLOOR + timeMix * SURVIVAL_TIME_SPEED + n * SURVIVAL_EDGE_SPEED
+    ), 5, 100);
+    const overdriveBpm = clamp(n * SURVIVAL_EDGE_BPM, 0, SURVIVAL_OVERDRIVE_CAP);
+    return { floor, overdriveBpm };
+}
+
 // Edge Training: climb to the pullback mark, hold there for holdGoal
 // seconds, repeat until edgesGoal successful holds, then finish.
 export const MIN_TRAIN_HOLD_SECONDS = 5;
@@ -531,6 +564,7 @@ export function describeGameNotice({
     trainHoldGoal,
     trainEdgesGoal,
     survivalSpeedFloor = 0,
+    survivalOverdrive = 0,
     sessionSeconds = 0,
     minSeconds = 0,
     maxSeconds = 0,
@@ -564,7 +598,8 @@ export function describeGameNotice({
 
     if (activeMode === 'survival') {
         const floor = Math.round(Number.isFinite(survivalSpeedFloor) ? survivalSpeedFloor : 0);
-        return `SURVIVAL: FLOOR ${floor}% — STAY UNDER YOUR LIMIT`;
+        const over = Math.max(0, Math.round(Number.isFinite(survivalOverdrive) ? survivalOverdrive : 0));
+        return `SURVIVAL: FLOOR ${floor}% — +${over} BPM`;
     }
 
     const need = clampTrainEdges(trainEdgesGoal);

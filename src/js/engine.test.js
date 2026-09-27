@@ -1414,9 +1414,10 @@ describe('the Guards pullback preview', () => {
 
 describe('Survival Mode and Ruin & Leak are the documented exceptions to the ceiling rule', () => {
     it('keeps climbing whatever the At-the-ceiling setting says', () => {
-        // Deliberate and self-terminating: the run ends on a breach, which is
-        // why the Guards text, the mode card and the README name Survival as
-        // one of the two modes Full Stop / Crawl does not govern.
+        // Deliberate: the toys keep the speed floor on the mark, which is
+        // why the Guards text and the README name Survival as one of the
+        // two modes Full Stop / Crawl does not govern. The run does not end
+        // there. Each edge raises the mark instead.
         for (const ceilingBehaviour of ['stop', 'crawl']) {
             const onTheMark = calculateEngineOutputs({
                 ...running,

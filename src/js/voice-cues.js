@@ -172,7 +172,7 @@ export const VOICE_CUE_CATALOG = [
     { id: 'sessionStart', group: 'Session', label: 'Session start', lines: ['Session started. Breathe.'] },
     { id: 'paused', group: 'Session', label: 'Paused', lines: ['Paused.'] },
     { id: 'sessionStop', group: 'Session', label: 'Session stop', lines: ['Session stopped.'] },
-    { id: 'survivalBreach', group: 'Guards', label: 'Survival over the limit', lines: ['Over the limit. Drop it.'] },
+    { id: 'survivalBreach', group: 'Guards', label: 'Survival mark moved', lines: ['The mark moved up.'] },
     { id: 'signalLost', group: 'Guards', label: 'Heart-rate signal lost', lines: ['Heart rate signal lost. Motors stopped.'] },
     { id: 'signalRestored', group: 'Guards', label: 'Heart-rate restored', lines: ['Signal restored. Resuming.'] }
 ];
