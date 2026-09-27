@@ -1991,8 +1991,25 @@ const MODE_DETAILS = {
 function showModeDetail(mode) {
     const el = document.getElementById('modeDetail');
     if (!el) return;
-    el.textContent = MODE_DETAILS[mode] || '';
-    el.classList.toggle('hidden', !el.textContent);
+    const text = MODE_DETAILS[mode] || '';
+    const alreadyOpen = el.dataset.mode === mode && !el.classList.contains('hidden');
+    if (!text || alreadyOpen) {
+        el.textContent = '';
+        el.dataset.mode = '';
+        el.classList.add('hidden');
+        return;
+    }
+    el.dataset.mode = mode;
+    el.textContent = text;
+    el.classList.remove('hidden');
+}
+
+function hideModeDetail() {
+    const el = document.getElementById('modeDetail');
+    if (!el) return;
+    el.textContent = '';
+    el.dataset.mode = '';
+    el.classList.add('hidden');
 }
 
 function highlightModeCard() {
@@ -2029,6 +2046,7 @@ function applyModeSelection(mode, enabled) {
         state.ruinRideSeconds = 0;
     }
     state.activeMode = state.gameMode || state.teaseMode;
+    if (document.getElementById('modeDetail')?.dataset.mode !== mode) hideModeDetail();
     highlightModeCard();
     updateEngine();
 }
