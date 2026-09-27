@@ -9,15 +9,22 @@ credited by username.
 ## 1.1.0
 
 ### Patterns
-- **PATTERNS!** Speed and stroke length wander on overlapping cycles, so the same heart rate does not settle into a beat you can count. Prostate Milker pulses harder in the top third of the band. Ultimate Milker changes chapter as you climb, and near the edge it drops into stops and short bursts. Ruin & Leak keeps stroking through the edge, then after about 12 seconds on the mark stops the stroker dead for 18 seconds and drops the other toy low.
-- The travel range you set is the limit for every mode, pattern, game, warm-up and Force Orgasm. A pattern can only use less of that range.
-- Session warm-up eases in from a short, slow stroke over the warm-up minutes you already set, instead of jumping to full speed at a low heart rate. Zero minutes is still instant.
-- **Full Length Strokes Only** is gone.
-- A game uses the stroke of whichever tease mode is selected, and clicking that game again turns it off.
-- Mode cards are one short line. The paragraph above them follows the mode or game you select.
+- **PATTERNS. The stroke keeps changing.** Speed, stroke length, and the secondary toy move on several overlapping cycles, so a steady heart rate does not settle into one beat you can count. A fast stretch tends to be a short stroke, a slow stretch a long one, and every so often the stroker nearly stops.
+- **Your travel range is the limit.** The min and max you set on the toy bound every mode, every pattern, every game, warm-up, and Force Orgasm. A pattern can only use less of that range. It cannot bottom the sleeve out past your minimum, and it cannot climb past your maximum. The Handy's end-stop margin still pulls the carriage a little further off the mechanical ends, inside that range.
+- **Warm-up starts gentle.** A low heart rate at the start of a session used to jump the toy toward full speed. Over the warm-up minutes you already set, it now begins with a short, slow stroke and eases up to the full pattern. Set warm-up to 0 minutes and it is still instant.
+- **Full Length Strokes Only is gone.** There is no switch that locks every stroke to the full travel range. Modes and patterns choose a shorter stroke inside the range you set.
+- **Classic Tease.** Full strokes inside your range. Speed eases off as your pulse climbs, and the length and tempo drift so the same pulse does not feel identical. At the ceiling, Crawl or Full Stop still decides the stroker.
+- **Prostate Milker.** The stroker backs off as you climb and the internal toy takes over. In the top third of the band the stroker switches to short bursts, and the internal toy pulses on and off instead of sitting at full power.
+- **Glans Protector.** The stroke shortens toward the base as you get close, and it stays quicker than Classic so those shorter strokes still feel like stroking. The secondary channel stays low. At the ceiling the stroke is held to the base of your range, about the bottom 35% of it.
+- **Head Play.** The stroke starts narrowing around the middle of the band and climbs toward the head. Speed comes down as the stroke gets shorter, and the stroke opens back up when your pulse drops.
+- **Ultimate Milker.** The pattern changes chapter as you get closer: long and steady, then long-slow strokes against short-fast ones, then stops and short bursts near the edge. The internal toy follows the same chapters.
+- **Ruin & Leak.** The stroker keeps moving through the edge. After about 12 seconds continuously on the pullback mark it stops dead for 18 seconds and the other toy drops low, so ejaculation can happen without a full orgasm. Crawl and Full Stop do not govern that ride or that stop. It no longer cuts the moment you touch the mark, and the other toy is no longer pinned at full power during the stop.
+- **Games use the mode's stroke.** The Oracle, Survival, and Edge Training keep their own speeds. The stroke range is whichever tease mode you have selected. Clicking the selected game again turns the game off and leaves that mode running. You can have one mode and one game selected at the same time.
+- **Mode cards are one line.** Each card is a short description. The paragraph above the cards follows the mode you are looking at, or the game while one is selected on the Games tab.
 
 ### Site
-- The footer shows the version and opens this changelog. It is the same file on GitHub. Publishing a GitHub Release for a version is what posts it to Discord.
+- **Version in the footer.** The footer shows the version next to the copyright. 1.0.0 is the app as it stood when numbers started appearing, which is the build that had been called 1.0. This release is 1.1.0. The next feature release bumps the middle number.
+- **Changelog.** The Changelog link in the footer opens this list in the app, in the same color as the other footer links. It is the same file on GitHub. Publishing a GitHub Release for a version is what posts that version to Discord.
 
 ## 1.0.0
 
