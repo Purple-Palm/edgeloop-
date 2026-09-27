@@ -5,7 +5,7 @@
 // speeds), a viewer may only ping, and the host's telemetry is coerced and
 // clamped before it touches the remote page's state. Anything else is
 // dropped, never partially applied.
-import { ENGINE_MODES, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT } from './engine.js';
+import { ENGINE_MODES, TEASE_MODES, GAME_MODES, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT } from './engine.js';
 import {
     MIN_TRAIN_HOLD_SECONDS,
     MAX_TRAIN_HOLD_SECONDS,
@@ -62,7 +62,12 @@ export function sanitizeCommand(raw, role = 'controller') {
             return { type: 'ORGASM_TOGGLE' };
         case 'MODE_CHANGE': {
             const mode = oneOf(raw.mode, ENGINE_MODES);
-            return mode ? { type: 'MODE_CHANGE', mode } : null;
+            if (!mode) return null;
+            const command = { type: 'MODE_CHANGE', mode };
+            // Present only when the sender said so. A game click carries
+            // whether that game should be on, so the host does not toggle twice.
+            if (typeof raw.enabled === 'boolean') command.enabled = raw.enabled;
+            return command;
         }
         default:
             return null;
@@ -90,6 +95,8 @@ export function sanitizeTelemetry(raw) {
     // instead of one of its own.
     out.edgeTriggerHr = clampNumber(raw.edgeTriggerHr, 30, HR_MAX_BPM, true);
     out.activeMode = oneOf(raw.activeMode, ENGINE_MODES);
+    out.teaseMode = oneOf(raw.teaseMode, TEASE_MODES);
+    out.gameMode = raw.gameMode === 'off' ? 'off' : oneOf(raw.gameMode, GAME_MODES);
     // The host's own game settings. A remote page has its own persisted
     // copies of these, and showing those would quote the PARTNER's numbers
     // back at them while they pace the wearer's session by them.

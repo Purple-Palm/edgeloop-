@@ -205,16 +205,45 @@ describe('engine modes', () => {
         assert.ok(high.primaryPercent < low.primaryPercent);
     });
 
-    it('ruin holds secondary while primary is cut', () => {
-        const result = calculateEngineOutputs({
+    it('ruin rides the edge, then cuts the primary and drops the secondary', () => {
+        const ride = calculateEngineOutputs({
+            ...running,
+            activeMode: 'ruin',
+            hr: 140,
+            isEdged: true,
+            ruinHoldSeconds: 0,
+            sessionSeconds: 0
+        });
+        assert.ok(ride.primaryPercent > 0, 'the ride keeps stroking through the edge');
+        const lock = calculateEngineOutputs({
             ...running,
             activeMode: 'ruin',
             hr: 140,
             isEdged: true,
             ruinHoldSeconds: 10
         });
-        assert.equal(result.primaryPercent, 0);
-        assert.equal(result.secondaryPercent, 100);
+        assert.equal(lock.primaryPercent, 0);
+        assert.equal(lock.secondaryPercent, 18);
+    });
+
+    it('milker near the ceiling pulses the secondary instead of pinning it', () => {
+        const samples = [0, 3, 6, 9].map((sessionSeconds) => calculateEngineOutputs({
+            ...running,
+            activeMode: 'milker',
+            hr: 140,
+            isEdged: true,
+            sessionSeconds
+        }));
+        assert.ok(samples.some((sample) => sample.secondaryPercent < 50));
+        assert.ok(samples.some((sample) => sample.secondaryPercent > 80));
+    });
+
+    it('head play starts narrowing around the middle of the band', () => {
+        const mid = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 105, sessionSeconds: 0 });
+        // Halfway up the band is linear, not the squared curve, so the stroke
+        // has already climbed well off the base.
+        assert.ok(mid.strokeMinPercent >= 30, `strokeMin ${mid.strokeMinPercent}`);
+        assert.equal(mid.strokeMaxPercent, 100);
     });
 
     it('oracle approach pulls instead of teasing down', () => {
@@ -428,22 +457,47 @@ describe('engine modes', () => {
         assert.ok(recoverCrawl.secondaryPercent > 0, 'the secondary channel keeps running');
     });
 
-    it('warmup caps travel at session start', () => {
-        const result = calculateEngineOutputs({
+    it('warmup starts slow and short, then opens to the full pattern', () => {
+        const cold = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             warmupMinutes: 5,
             sessionSeconds: 0,
             hr: 80
         });
-        assert.equal(result.strokeMaxPercent, 55);
+        const open = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            warmupMinutes: 0,
+            sessionSeconds: 0,
+            hr: 80
+        });
+        assert.ok(cold.primaryPercent < open.primaryPercent * 0.4, `cold ${cold.primaryPercent} open ${open.primaryPercent}`);
+        assert.ok(cold.strokeMaxPercent < open.strokeMaxPercent);
+        assert.ok(cold.strokeMaxPercent > cold.strokeMinPercent);
+        const done = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            warmupMinutes: 5,
+            sessionSeconds: 300,
+            hr: 80
+        });
+        const sameBeat = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            warmupMinutes: 0,
+            sessionSeconds: 300,
+            hr: 80
+        });
+        assert.equal(done.primaryPercent, sameBeat.primaryPercent);
+        assert.equal(done.strokeMaxPercent, sameBeat.strokeMaxPercent);
     });
 });
 
 describe('engine safety guards', () => {
-    it('head play during warm-up never collapses or inverts the zone', () => {
-        // Progress near the top pushes strokeMin to 75 while warm-up caps
-        // strokeMax at 55: the old code returned a zero-width zone.
+    it('head play during warm-up stays inside the head window', () => {
+        // Warm-up used to cap strokeMax at 55 while head play had already
+        // lifted strokeMin to 75, which collapsed the zone.
         const result = calculateEngineOutputs({
             ...running,
             activeMode: 'headplay',
@@ -451,8 +505,67 @@ describe('engine safety guards', () => {
             warmupMinutes: 5,
             sessionSeconds: 0
         });
+        const open = calculateEngineOutputs({
+            ...running,
+            activeMode: 'headplay',
+            hr: 135,
+            warmupMinutes: 0,
+            sessionSeconds: 0
+        });
         assert.ok(result.strokeMaxPercent - result.strokeMinPercent >= MIN_ZONE_WIDTH);
-        assert.ok(result.strokeMaxPercent <= 55);
+        assert.ok(result.strokeMinPercent >= open.strokeMinPercent);
+        assert.ok(result.strokeMaxPercent <= open.strokeMaxPercent);
+        assert.ok(result.primaryPercent < open.primaryPercent);
+    });
+
+    it('no mode, pattern, game, warm-up or orgasm leaves the travel envelope', () => {
+        const games = ['oracle', 'survival', 'edgetrain'];
+        for (const mode of ENGINE_MODES) {
+            for (const sessionSeconds of [0, 3, 7, 12, 20, 40]) {
+                for (const hr of [70, 105, 140]) {
+                    for (const orgasmMode of [false, true]) {
+                        const result = calculateEngineOutputs({
+                            ...running,
+                            activeMode: mode,
+                            strokeMode: games.includes(mode) ? 'headplay' : undefined,
+                            handyHwMin: 15,
+                            handyHwMax: 80,
+                            hr,
+                            edgeHr: hr,
+                            sessionSeconds,
+                            isEdged: hr >= 140,
+                            orgasmMode,
+                            warmupMinutes: sessionSeconds === 0 ? 5 : 0,
+                            ruinHoldSeconds: sessionSeconds % 2 ? 8 : 0,
+                            oracleState: 'HOLD',
+                            trainingState: 'hold'
+                        });
+                        assert.ok(
+                            result.strokeMinPercent >= 15
+                                && result.strokeMaxPercent <= 80
+                                && result.strokeMaxPercent > result.strokeMinPercent,
+                            `${mode} t=${sessionSeconds} hr=${hr} orgasm=${orgasmMode} zone ${result.strokeMinPercent}-${result.strokeMaxPercent}`
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    it('a game borrows the selected tease stroke instead of its own zone', () => {
+        const held = calculateEngineOutputs({
+            ...running,
+            activeMode: 'oracle',
+            strokeMode: 'shortener',
+            oracleState: 'HOLD',
+            hr: 140,
+            isEdged: true,
+            handyHwMin: 15,
+            handyHwMax: 80
+        });
+        assert.equal(held.primaryPercent, 0);
+        assert.equal(held.strokeMinPercent, 15);
+        assert.equal(held.strokeMaxPercent, 15 + Math.round(0.35 * 65));
     });
 
     it('an inverted or narrow hardware envelope still yields an ordered zone', () => {
@@ -544,7 +657,8 @@ describe('engine safety guards', () => {
             hr: 134,
             isEdged: true,
             ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 115
+            edgeHoldPercent: 115,
+            sessionSeconds: 0
         });
         assert.equal(released.isEdged, false);
         assert.ok(released.primaryPercent > CRAWL_PERCENT);
@@ -1128,24 +1242,21 @@ describe('Survival Mode and Ruin & Leak are the documented exceptions to the cei
         }
     });
 
-    it('Ruin & Leak halts the primary dead whatever the setting says', () => {
-        // Ruin's premise is cutting penile input cold while the secondary
-        // surges, so its 18 s lockout is a full stop on Crawl too. That is
-        // the second exception, and the wording that called Survival the ONLY
-        // one was ours - it has to name both or the code has to change.
+    it('Ruin & Leak rides through the edge, then the lockout is a dead stop', () => {
+        // The ride ignores Crawl and Full Stop. The lockout is a dead stop
+        // on the primary either way, with the secondary dropped low.
         for (const ceilingBehaviour of ['stop', 'crawl']) {
-            const onTheMark = calculateEngineOutputs({
-                ...running, activeMode: 'ruin', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour
+            const ride = calculateEngineOutputs({
+                ...running, activeMode: 'ruin', hr: 140, edgeHr: 140, isEdged: true,
+                ruinHoldSeconds: 0, sessionSeconds: 0, ceilingBehaviour
             });
-            assert.equal(onTheMark.primaryPercent, 0, `ruin ignores ${ceilingBehaviour} on the mark by design`);
-            assert.ok(onTheMark.secondaryPercent > 0, 'the secondary surges while the primary is dead');
-            // And for the whole lockout, with the pulse long back down.
+            assert.ok(ride.primaryPercent > 0, `ruin keeps stroking on ${ceilingBehaviour}`);
             const lockout = calculateEngineOutputs({
                 ...running, activeMode: 'ruin', hr: 100, edgeHr: 100, isEdged: false,
                 ruinHoldSeconds: 12, ceilingBehaviour
             });
             assert.equal(lockout.primaryPercent, 0, `ruin's lockout ignores ${ceilingBehaviour} by design`);
-            assert.ok(lockout.secondaryPercent > 0);
+            assert.equal(lockout.secondaryPercent, 18);
         }
     });
 
@@ -1172,17 +1283,18 @@ describe('Survival Mode and Ruin & Leak are the documented exceptions to the cei
                 `${where} still calls one mode THE exception: ${match[0]}`
             );
         }
-        const survivalCard = guards.match(/Speed steadily accelerates[^<]*/);
-        assert.ok(survivalCard, 'Survival mode card anchor missing');
+        const app = read('src/js/app.js');
+        const survivalDetail = app.match(/survival: '([^']*)'/);
+        const ruinDetail = app.match(/ruin: '([^']*)'/);
+        assert.ok(survivalDetail, 'Survival detail anchor missing');
+        assert.ok(ruinDetail, 'Ruin & Leak detail anchor missing');
         assert.ok(
-            /At the ceiling/.test(survivalCard[0]),
-            `the Survival card must say the rule does not govern it: ${survivalCard[0]}`
+            /At the ceiling/.test(survivalDetail[1]),
+            `the Survival detail must say the rule does not govern it: ${survivalDetail[1]}`
         );
-        const ruinCard = guards.match(/Immediate 0% halt[^<]*/);
-        assert.ok(ruinCard, 'Ruin & Leak mode card anchor missing');
         assert.ok(
-            /At the ceiling/.test(ruinCard[0]),
-            `the Ruin & Leak card must say the rule does not govern it either: ${ruinCard[0]}`
+            /At the ceiling/.test(ruinDetail[1]),
+            `the Ruin & Leak detail must say the rule does not govern it either: ${ruinDetail[1]}`
         );
     });
 });
