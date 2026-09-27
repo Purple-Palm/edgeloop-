@@ -161,6 +161,7 @@ export const SETTING_SANITIZERS = {
     edgeHoldPercent: (value) => clampEdgeHoldPercent(value),
     trainHoldSeconds: (value) => clampTrainHoldSeconds(value),
     trainEdges: (value) => clampTrainEdges(value),
+    survivalCalibrating: boolean('survivalCalibrating'),
 
     hrStaleSeconds: (value) => clampStaleSeconds(value),
     hrAutoResume: boolean('hrAutoResume'),

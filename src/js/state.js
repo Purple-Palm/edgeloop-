@@ -88,8 +88,11 @@ export const state = {
     })(),
     oracleState: 'IDLE',
     oracleTimer: 0,
-    survivalSpeedFloor: 30,
+    survivalSpeedFloor: 18,
     survivalTimer: 0,
+    survivalEdges: 0,
+    survivalOverdrive: 0,
+    survivalEdgesSeen: 0,
     survivalBreachTicks: 0,
     // Timestamp of the reading the last Survival tick judged, so a value held
     // across ticks by a slow source counts as one breach reading.
@@ -169,6 +172,9 @@ export const advancedSettings = {
     edgeHoldPercent: 100,
     trainHoldSeconds: 15,
     trainEdges: 5,
+    // Survival can be marked as the run that finds your top heart rate.
+    // Off by default; the first-run wizard offers to turn it on.
+    survivalCalibrating: false,
     // Heart-rate signal-loss timeout (seconds, 3-20) and whether a session
     // the watchdog paused resumes by itself once readings return.
     hrStaleSeconds: 8,

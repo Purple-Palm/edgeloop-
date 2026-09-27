@@ -18,8 +18,7 @@ import {
     tickEdgeTraining,
     clampTrainHoldSeconds,
     clampTrainEdges,
-    countSurvivalBreach,
-    isSurvivalDefeated,
+    survivalDrive,
     clampStallGuardSeconds,
     clampStallPauseSeconds,
     tickStallGuard,
@@ -725,9 +724,11 @@ function initHandyRoleUI() {
 }
 
 // The working ceiling: typed Climax HR minus learned / dual-stim / decay
-// offsets (never raised by any of them), plus the explicit Force Orgasm
-// boost. One place only, so the engine, the cockpit badges and the Session
-// Setup preview can never quote different BPM at the wearer.
+// offsets (never raised by any of them), plus two explicit raises: Force
+// Orgasm, and Survival's per-edge overdrive. Decay is off while Survival is
+// on so it cannot fight that climb. One place only, so the engine, the
+// cockpit badges and the Session Setup preview can never quote different
+// BPM at the wearer.
 function workingCeiling(minHr, typedMaxHr) {
     // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
     // (secondary) are both live. The Handy counts for whichever role it holds;
@@ -743,12 +744,15 @@ function workingCeiling(minHr, typedMaxHr) {
         dualStimActive: hasPrimary && hasSecondary,
         dualDampening: Boolean(advancedSettings.dualDampening),
         dualDampeningBpm: advancedSettings.dualDampeningBpm,
-        adaptiveDecay: Boolean(advancedSettings.adaptiveDecay),
+        // Decay lowers the ceiling as edges pile up. Survival is climbing
+        // past the typed max, so that drop does not run during the game.
+        adaptiveDecay: state.activeMode === 'survival' ? false : Boolean(advancedSettings.adaptiveDecay),
         edges: state.edges,
         decayEdgeCount: advancedSettings.decayEdgeCount,
         decayBpm: advancedSettings.decayBpm,
         decayFloor: advancedSettings.decayFloor,
-        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0
+        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0,
+        survivalOverdrive: state.activeMode === 'survival' ? state.survivalOverdrive : 0
     });
 }
 
@@ -842,7 +846,11 @@ function updateEngine() {
     const ceilingBadge = document.getElementById('effectiveCeilingBadge');
     const ceilingLabel = document.getElementById('effectiveCeilingLabel');
     const ceilingText = document.getElementById('effectiveCeilingText');
-    if (ceilingLabel) ceilingLabel.textContent = (state.orgasmMode && ceiling.orgasmBoost > 0) ? 'OVERDRIVE CEILING' : 'CEILING';
+    if (ceilingLabel) {
+        const raised = (state.orgasmMode && ceiling.orgasmBoost > 0)
+            || (state.activeMode === 'survival' && (state.survivalOverdrive || 0) > 0);
+        ceilingLabel.textContent = raised ? 'OVERDRIVE CEILING' : 'CEILING';
+    }
     if (ceilingText) ceilingText.textContent = max;
     ceilingBadge?.classList.toggle('hidden', max === typedMax);
 
@@ -1079,6 +1087,8 @@ function updateGameNotice() {
         trainHoldGoal: advancedSettings.trainHoldSeconds,
         trainEdgesGoal: advancedSettings.trainEdges,
         survivalSpeedFloor: state.survivalSpeedFloor,
+        survivalOverdrive: state.survivalOverdrive,
+        survivalCalibrating: Boolean(advancedSettings.survivalCalibrating),
         sessionSeconds: state.sessionSeconds,
         minSeconds: state.durationMinSeconds,
         maxSeconds: state.durationMaxSeconds,
@@ -1087,6 +1097,35 @@ function updateGameNotice() {
     });
     notice.textContent = text || 'GAME MODE ACTIVE';
     notice.classList.toggle('hidden', !text);
+    renderCameEarlyButton();
+}
+
+// Came Early is an accidental release in every other mode. Survival is the
+// climb that is supposed to finish you, so that same button changes its
+// words while the game is selected and, during the run, saves the heart rate.
+function renderCameEarlyButton() {
+    const kicker = document.getElementById('cameEarlyKicker');
+    const label = document.getElementById('cameEarlyLabel');
+    if (!cameEarlyBtn || !kicker || !label) return;
+    const survival = !isRemotePage && state.activeMode === 'survival';
+    const calibrating = survival && Boolean(advancedSettings.survivalCalibrating);
+    kicker.textContent = survival ? 'The app' : 'Accidental';
+    label.textContent = survival ? 'Finished me' : 'Came Early';
+    cameEarlyBtn.title = calibrating
+        ? 'This calibration run sets your Climax HR to the heart rate Survival pushed you to.'
+        : survival
+            ? 'Survival finished you. Check Calibration on the card if this heart rate should become your max.'
+            : 'Log accidental release so local learning engine tightens limits next time.';
+    kicker.classList.toggle('text-rose-300', survival);
+    kicker.classList.toggle('text-amber-400', !survival);
+    cameEarlyBtn.classList.toggle('bg-rose-950/60', survival);
+    cameEarlyBtn.classList.toggle('hover:bg-rose-900', survival);
+    cameEarlyBtn.classList.toggle('border-rose-800', survival);
+    cameEarlyBtn.classList.toggle('text-rose-300', survival);
+    cameEarlyBtn.classList.toggle('bg-amber-950/60', !survival);
+    cameEarlyBtn.classList.toggle('hover:bg-amber-900', !survival);
+    cameEarlyBtn.classList.toggle('border-amber-800', !survival);
+    cameEarlyBtn.classList.toggle('text-amber-300', !survival);
 }
 
 // Validate the Session Setup duration fields and flag any bad one in red.
@@ -1164,8 +1203,12 @@ function resetSessionCounters() {
 function resetGameState() {
     state.oracleState = 'IDLE';
     state.oracleTimer = 0;
-    state.survivalSpeedFloor = 30;
+    state.survivalSpeedFloor = 18;
     state.survivalTimer = 0;
+    state.survivalEdges = 0;
+    state.survivalOverdrive = 0;
+    // Edges already counted before Survival was switched on do not step it.
+    state.survivalEdgesSeen = state.edges || 0;
     state.survivalBreachTicks = 0;
     state.survivalLastReadingAt = null;
     state.trainState = 'climb';
@@ -1338,22 +1381,17 @@ function tickSessionGuardsAndGames() {
             }
         }
     } else if (state.activeMode === 'survival') {
+        // Edges counted before this game was switched on are ignored. Each
+        // new one raises the mark 1 BPM and the speed a step. The clock is
+        // slow on purpose: half an hour of it is still a build, not a finish.
+        const seen = state.survivalEdgesSeen || 0;
+        const gained = Math.max(0, (state.edges || 0) - seen);
+        state.survivalEdges = (state.survivalEdges || 0) + gained;
+        state.survivalEdgesSeen = state.edges || 0;
         state.survivalTimer += 1;
-        state.survivalSpeedFloor = Math.min(100, 28 + state.survivalTimer * 0.45);
-        // One spike is not a defeat: the ceiling must be breached on
-        // SURVIVAL_BREACH_TICKS consecutive READINGS before the game ends. A
-        // watch or relay app that updates every 2-5 s holds one value across
-        // several ticks; only a tick that saw a new reading advances the
-        // streak (the simulator's slider counts on every tick).
-        const readingAt = state.simEngaged ? Date.now() : hrWatchdog.lastValidAt;
-        const newReading = readingAt !== state.survivalLastReadingAt;
-        state.survivalLastReadingAt = readingAt;
-        state.survivalBreachTicks = state.orgasmMode ? 0 : countSurvivalBreach(state.survivalBreachTicks, hr, ceiling, newReading);
-        if (isSurvivalDefeated(state.survivalBreachTicks)) {
-            stopSession('Survival Defeat', 'Survival failed. Limit breached.');
-            return;
-        }
-        if (state.survivalBreachTicks > 0) cueVoice('survivalBreach');
+        const drive = survivalDrive({ seconds: state.survivalTimer, edges: state.survivalEdges });
+        state.survivalSpeedFloor = drive.floor;
+        state.survivalOverdrive = drive.overdriveBpm;
     } else if (state.activeMode === 'edgetrain') {
         const next = tickEdgeTraining(
             { state: state.trainState, holdSeconds: state.trainHoldSeconds, edgesDone: state.trainEdgesDone },
@@ -1869,8 +1907,36 @@ function renderLearningStatus() {
 }
 
 cameEarlyBtn?.addEventListener('click', () => {
-    // The learning profile belongs to the host; a remote page never logs one.
-    if (isRemotePage) return;
+    // The learning profile and the typed max belong to the host.
+    if (isRemotePage || isRemoteViewer) return;
+    if (state.activeMode === 'survival') {
+        if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'PAUSED') {
+            confirm(advancedSettings.survivalCalibrating
+                ? 'Start Survival first. Once it is running, Finished me saves the heart rate the climb pushed you to.'
+                : 'Start Survival first. Check Calibration on the card if Finished me should save your heart rate.');
+            return;
+        }
+        const typed = readHrLimits().maxHr;
+        if (!advancedSettings.survivalCalibrating) {
+            if (confirm(`End the run? Your Climax HR stays ${typed}. Check Calibration on the Survival card first if you want this heart rate saved.`)) {
+                stopSession('Survival');
+            }
+            return;
+        }
+        const now = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
+        const peak = Number.isFinite(state.peakHr) ? state.peakHr : now;
+        const hr = Math.round(Math.max(Number(now) || 0, Number(peak) || 0));
+        if (!Number.isFinite(hr) || hr < 40 || hr > 220) return;
+        const ok = confirm(`Set Climax HR to ${hr}? Survival pushed you there. Your typed max is ${typed}. The toys stop, and the next session uses ${hr}.`);
+        if (!ok) return;
+        const input = document.getElementById('maxHr');
+        if (input) {
+            input.value = String(hr);
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        stopSession('Survival calibration', 'Saved. That heart rate is your max.');
+        return;
+    }
     if (confirm("Log an accidental release? EdgeLoop will lower your working climax ceiling on this and future sessions.")) {
         if (!advancedSettings.learningProfile) {
             advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
@@ -1988,7 +2054,7 @@ const MODE_DETAILS = {
     ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast. Stops and short bursts wait until your pulse is close to the heart rate you set. The internal toy follows the same chapters.',
     ruin: 'The stroker keeps moving through the edge. After about 12 seconds on the mark it stops dead for 18 seconds and the other toy drops low, so it can leak without a full orgasm. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
-    survival: 'Speed climbs on its own clock until the run ends. "At the ceiling" does not govern this game. The stroke range is the tease mode you selected.',
+    survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. Check Calibration when this run should set your Climax HR, then tap Finished me when you come. The stroke range is the tease mode you selected.',
     edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
 };
 
@@ -2041,6 +2107,17 @@ function applyModeSelection(mode, enabled) {
     updateEngine();
 }
 
+document.getElementById('wizardCalibrateBtn')?.addEventListener('click', () => {
+    if (isRemotePage || isRemoteViewer) return;
+    advancedSettings.survivalCalibrating = true;
+    const box = document.getElementById('survivalCalibrateToggle');
+    if (box) box.checked = true;
+    persistSettings();
+    document.getElementById('expTabGameBtn')?.click();
+    applyModeSelection('survival', true);
+    closeWizard();
+});
+
 modeCards.forEach(card => {
     card.addEventListener('click', () => {
         if (isRemoteViewer) return;
@@ -2074,6 +2151,14 @@ if (!isRemotePage) {
         const el = document.getElementById(id);
         el?.addEventListener('click', (e) => e.stopPropagation());
         el?.addEventListener('change', persistTrainSettings);
+    });
+    const calibrate = document.getElementById('survivalCalibrateToggle');
+    document.querySelector('[data-survival-calibrate]')?.addEventListener('click', (e) => e.stopPropagation());
+    calibrate?.addEventListener('change', () => {
+        advancedSettings.survivalCalibrating = Boolean(calibrate.checked);
+        persistSettings();
+        if (calibrate.checked && state.gameMode !== 'survival') applyModeSelection('survival', true);
+        else updateGameNotice();
     });
 }
 
@@ -2374,6 +2459,8 @@ function syncParamsUI() {
     // as wrong. They stay blank until telemetry carries the host's numbers.
     if (trainHold) trainHold.value = isRemotePage ? '' : clampTrainHoldSeconds(advancedSettings.trainHoldSeconds);
     if (trainEdges) trainEdges.value = isRemotePage ? '' : clampTrainEdges(advancedSettings.trainEdges);
+    const calibrate = document.getElementById('survivalCalibrateToggle');
+    if (calibrate) calibrate.checked = !isRemotePage && Boolean(advancedSettings.survivalCalibrating);
     if (isRemotePage) {
         if (trainHold) trainHold.placeholder = '--';
         if (trainEdges) trainEdges.placeholder = '--';
@@ -3976,7 +4063,7 @@ const VIEWER_LOCKED_IDS = [
     'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
     // Nested in the Edge Training card: a disabled ancestor does not stop a
     // browser from focusing and editing them, so they are disabled themselves.
-    'trainHoldSecondsInput', 'trainEdgesInput'
+    'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle'
 ];
 function lockElement(el) {
     if (!el) return;
@@ -3998,7 +4085,7 @@ const CONTROLLER_LOCKED_IDS = [
     'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
     // The mode cards stay live (MODE_CHANGE is a legal command), but the two
     // Edge Training numbers inside one of them are host-only settings.
-    'trainHoldSecondsInput', 'trainEdgesInput'
+    'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle'
 ];
 function lockControllerControls() {
     CONTROLLER_LOCKED_IDS.forEach((id) => lockElement(document.getElementById(id)));

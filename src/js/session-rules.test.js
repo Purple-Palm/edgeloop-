@@ -21,6 +21,10 @@ import {
     MAX_TRAIN_EDGES,
     countSurvivalBreach,
     isSurvivalDefeated,
+    survivalDrive,
+    SURVIVAL_START_FLOOR,
+    SURVIVAL_OVERDRIVE_CAP,
+    SURVIVAL_EDGE_BPM,
     endgameKeepsOrgasmLatch,
     describeGameNotice,
     describeCutoffNotice,
@@ -151,6 +155,13 @@ describe('computeEffectiveCeiling', () => {
         assert.equal(computeEffectiveCeiling({ ...base, orgasmBoost: 12 }).maxHr, 152);
         assert.equal(computeEffectiveCeiling({ ...base, orgasmBoost: 500 }).maxHr, 140 + ORGASM_BOOST_CAP);
         assert.equal(computeEffectiveCeiling({ ...base, orgasmBoost: -3 }).maxHr, 140);
+    });
+
+    it('adds Survival overdrive on top of the typed max and caps it', () => {
+        assert.equal(computeEffectiveCeiling({ ...base, survivalOverdrive: 8 }).maxHr, 148);
+        assert.equal(computeEffectiveCeiling({ ...base, survivalOverdrive: 500 }).maxHr, 140 + SURVIVAL_OVERDRIVE_CAP);
+        assert.equal(computeEffectiveCeiling({ ...base, survivalOverdrive: -4 }).maxHr, 140);
+        assert.equal(computeEffectiveCeiling({ ...base, orgasmBoost: 5, survivalOverdrive: 3 }).maxHr, 148);
     });
 });
 
@@ -377,6 +388,48 @@ describe('oracle timing and fate', () => {
         }
         // An unknown endgame still resolves to an ending, never to nothing.
         assert.ok(['CLIMAX', 'DENIAL'].includes(rollOracleFate(due, { random: () => 0.2, endgameType: 'mystery-meat' })));
+    });
+});
+
+describe('survival climb', () => {
+    it('stays gentle for a long while and steps up on each edge', () => {
+        const start = survivalDrive({ seconds: 0, edges: 0 });
+        assert.equal(start.floor, SURVIVAL_START_FLOOR);
+        assert.equal(start.overdriveBpm, 0);
+        const fiveMin = survivalDrive({ seconds: 5 * 60, edges: 0 });
+        assert.ok(fiveMin.floor < 40, `five minutes was already ${fiveMin.floor}%`);
+        const halfHour = survivalDrive({ seconds: 30 * 60, edges: 0 });
+        assert.ok(halfHour.floor > 50 && halfHour.floor < 80, `thirty minutes was ${halfHour.floor}%`);
+        const edged = survivalDrive({ seconds: 30 * 60, edges: 12 });
+        assert.equal(edged.overdriveBpm, 12 * SURVIVAL_EDGE_BPM);
+        assert.ok(edged.floor > halfHour.floor);
+        const capped = survivalDrive({ seconds: 90 * 60, edges: 80 });
+        assert.equal(capped.floor, 100);
+        assert.equal(capped.overdriveBpm, SURVIVAL_OVERDRIVE_CAP);
+    });
+
+    it('does not end the session when the pulse crosses the max', () => {
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        assert.equal(src.includes('Survival Defeat'), false);
+        assert.equal(src.includes('isSurvivalDefeated'), false);
+    });
+
+    it('saves the run peak from the Came Early button only after the wearer confirms', () => {
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+        assert.equal(html.includes('survivalCameBtn'), false);
+        assert.match(html, /id="cameEarlyLabel"[^>]*>Came Early</);
+        assert.match(html, /id="survivalCalibrateToggle"/);
+        assert.match(html, /id="wizardCalibrateBtn"/);
+        assert.match(src, /Finished me/);
+        assert.match(src, /survivalCalibrating/);
+        const handler = src.match(/cameEarlyBtn\?\.addEventListener\([\s\S]*?stopSession\('Survival calibration'/);
+        assert.ok(handler, 'Finished me has no handler on the Came Early button');
+        assert.match(handler[0], /activeMode === 'survival'/);
+        assert.match(handler[0], /confirm\(/);
+        assert.equal(handler[0].includes('suggestedMaxHrOffset'), false);
+        assert.match(handler[0], /isRemotePage/);
+        assert.match(src, /suggestedMaxHrOffset/);
     });
 });
 
@@ -656,6 +709,14 @@ describe('the cockpit game banner', () => {
         assert.match(
             describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4 }),
             /SURVIVAL: FLOOR 42%/
+        );
+        assert.equal(
+            describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4 }).includes('CALIBRATING'),
+            false
+        );
+        assert.match(
+            describeGameNotice({ activeMode: 'survival', sessionStatus: 'RUNNING', survivalSpeedFloor: 42.4, survivalCalibrating: true }),
+            /SURVIVAL: CALIBRATING — FLOOR 42%/
         );
     });
 
