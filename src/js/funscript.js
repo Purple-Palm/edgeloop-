@@ -2,11 +2,13 @@
 // (speed %, secondary %, stroke zone) and this module turns that timeline
 // into real stroke actions for a player: a ping-pong between strokeMin and
 // strokeMax whose half-stroke period is derived from the speed with the SAME
-// mapping the Intiface linear driver uses (see strokeDurationMs in
-// hardware/intiface.js: 100% speed ~ 180 ms per half-stroke, 0% ~ 2200 ms,
-// scaled by the travel fraction). Zero speed holds position.
+// mapping the linear drivers use (see legDurationMs in
+// hardware/stroke-planner.js, which times every Intiface and T-Code stroke:
+// 100% speed ~ 180 ms per half-stroke, 0% ~ 2200 ms, scaled by the travel
+// fraction, never below MIN_LEG_MS). Zero speed holds position.
 //
 // No DOM, no storage: everything here runs under node:test.
+import { MIN_LEG_MS } from './hardware/stroke-planner.js';
 
 export const FUNSCRIPT_SAMPLE_INTERVAL_MS = 250;
 // Four hours of 4 Hz samples; older samples are dropped first.
@@ -27,12 +29,18 @@ function clampPercent(value, fallback = 0) {
 }
 
 // Milliseconds for one half-stroke (one direction) at `speedPercent` over
-// `travelFraction` (0-1) of full travel. Mirrors the Intiface linear driver.
+// `travelFraction` (0-1) of full travel. Mirrors the linear drivers' stroke
+// planner, floor included. The planner never sends a leg shorter than
+// MIN_LEG_MS, so a narrow zone at speed is stroked no faster than that; with
+// a floor of its own at 1 ms, the file recorded a 10-point zone at full
+// speed as 18 ms legs - more than six times faster than the toy was ever
+// driven, and a player sends whatever the file says to the device that
+// replays it.
 export function halfStrokeMs(speedPercent, travelFraction) {
     const speed = clampPercent(speedPercent, 0);
     const span = Math.max(MIN_TRAVEL_FRACTION, Number.isFinite(travelFraction) ? travelFraction : 1);
     const duration = HALF_STROKE_MIN_MS + ((100 - speed) / 100) * (HALF_STROKE_MAX_MS - HALF_STROKE_MIN_MS);
-    return Math.max(1, Math.round(duration * span));
+    return Math.max(MIN_LEG_MS, Math.round(duration * span));
 }
 
 // Coerce one raw sample into { at, speed, secondary, strokeMin, strokeMax }

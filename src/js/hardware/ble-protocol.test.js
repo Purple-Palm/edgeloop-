@@ -5,7 +5,8 @@ import {
     reconnectDelayMs,
     parseHeartRateMeasurement,
     describeBluetoothSupport,
-    describeBleError
+    describeBleError,
+    CHOOSER_EMPTY_HELP
 } from './ble-protocol.js';
 
 function view(bytes) {
@@ -104,9 +105,74 @@ describe('describeBleError', () => {
         const other = describeBleError({ name: 'NetworkError', message: 'GATT Server is disconnected.' });
         assert.equal(other.kind, 'network');
         assert.match(other.message, /GATT Server is disconnected/);
+        assert.equal(other.help, undefined);
         const plain = describeBleError(new Error('boom'));
         assert.equal(plain.kind, 'error');
         assert.equal(plain.message, 'boom');
         assert.equal(describeBleError(null).message, 'Bluetooth pairing failed.');
     });
+
+    // Chrome rejects with this one message whether the list was empty or the
+    // wearer closed it, and also when the chooser only said that Bluetooth
+    // is off or not allowed. Other browsers (Bluefy) word it their own way.
+    for (const message of ['User cancelled the requestDevice() chooser.', 'The user cancelled the request.', '']) {
+        it(`says why a monitor can be missing from the chooser (${message || 'no message'})`, () => {
+            const described = describeBleError({ name: 'NotFoundError', message });
+            assert.equal(described.kind, 'cancelled');
+            assert.equal(described.message, 'No sensor selected.');
+            assert.equal(described.help, CHOOSER_EMPTY_HELP);
+            const text = [described.help.title, ...described.help.items].join('\n');
+            assert.match(text, /not in the list/);
+            // Held by the system or another app: the cause a HeartCast user
+            // hit, and the one the chooser gives no hint of.
+            assert.match(text, /already connected/);
+            assert.match(text, /one app at a time/);
+            assert.match(text, /Disconnect or forget it in the Bluetooth settings/);
+            assert.match(text, /close the app using it/);
+            // A phone standing in for the monitor.
+            assert.match(text, /HeartCast/);
+            assert.match(text, /broadcasting and open on screen/);
+            assert.match(text, /background/);
+            // A chooser that only said Bluetooth is off.
+            assert.match(text, /Bluetooth is off/);
+            // A strap that is not awake yet.
+            assert.match(text, /worn/);
+        });
+    }
+
+    it('keeps the help as plain lines the modal can list', () => {
+        assert.ok(Object.isFrozen(CHOOSER_EMPTY_HELP) && Object.isFrozen(CHOOSER_EMPTY_HELP.items));
+        assert.equal(typeof CHOOSER_EMPTY_HELP.title, 'string');
+        assert.ok(CHOOSER_EMPTY_HELP.items.length >= 4);
+        for (const line of CHOOSER_EMPTY_HELP.items) {
+            assert.equal(typeof line, 'string');
+            assert.ok(line.length > 20 && !line.includes('<'), line);
+        }
+    });
+
+    // Chrome's own words for the NotFoundErrors that are not a closed
+    // chooser (blink bluetooth_error.cc and the GATT lookups). None of them
+    // may send the wearer looking through a list they never saw.
+    const causes = [
+        ['Bluetooth adapter not available.', 'no-adapter', /no Bluetooth adapter/],
+        ['Bluetooth Low Energy not available.', 'no-adapter', /Bluetooth Low Energy/],
+        ['Web Bluetooth is not supported on this platform. For a list of supported platforms see: https://goo.gl/J6ASzs', 'no-adapter', /Chrome or Edge/],
+        ['User denied the browser permission to scan for Bluetooth devices.', 'blocked', /permission to scan/],
+        ['User or their enterprise policy has disabled Web Bluetooth.', 'blocked', /blocked for websites/],
+        ['Web Bluetooth API globally disabled.', 'blocked', /blocked for websites/],
+        ["User selected a device that doesn't exist anymore.", 'network', /disappeared/],
+        ['Does not exist.', 'network', /disappeared/],
+        ['No Services matching UUID 0000180d-0000-1000-8000-00805f9b34fb found in Device.', 'unsupported', /does not expose the Heart Rate service \(No Services matching UUID 0000180d-0000-1000-8000-00805f9b34fb found in Device\)\.$/],
+        ['No Characteristics matching UUID 00002a37-0000-1000-8000-00805f9b34fb found in Service with UUID 0000180d-0000-1000-8000-00805f9b34fb.', 'unsupported', /does not expose the Heart Rate service/],
+        ['No Services found in device.', 'unsupported', /does not expose the Heart Rate service/]
+    ];
+    for (const [message, kind, says] of causes) {
+        it(`names the real cause of "${message.slice(0, 48)}"`, () => {
+            const described = describeBleError({ name: 'NotFoundError', message });
+            assert.equal(described.kind, kind);
+            assert.match(described.message, says);
+            assert.equal(described.help, undefined, 'no chooser list to explain');
+            assert.doesNotMatch(described.message, /No sensor selected|not in the list/);
+        });
+    }
 });

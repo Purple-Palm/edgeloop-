@@ -14,6 +14,7 @@ import {
     toFunscript,
     buildFunscripts
 } from './funscript.js';
+import { MIN_LEG_MS, legDurationMs } from './hardware/stroke-planner.js';
 
 function timeline(seconds, fields) {
     const out = [];
@@ -44,9 +45,26 @@ describe('halfStrokeMs', () => {
         assert.equal(halfStrokeMs(50, 1), Math.round(HALF_STROKE_MIN_MS + 0.5 * (HALF_STROKE_MAX_MS - HALF_STROKE_MIN_MS)));
     });
 
-    it('scales by travel with a floor on tiny zones', () => {
-        assert.equal(halfStrokeMs(100, 0.5), Math.round(HALF_STROKE_MIN_MS * 0.5));
-        assert.equal(halfStrokeMs(100, 0), Math.round(HALF_STROKE_MIN_MS * MIN_TRAVEL_FRACTION));
+    it('scales by travel, and a tiny zone stops at the stroke planner floor', () => {
+        assert.equal(halfStrokeMs(0, 0.5), Math.round(HALF_STROKE_MAX_MS * 0.5));
+        assert.equal(halfStrokeMs(50, 0.5), Math.round(halfStrokeMs(50, 1) * 0.5));
+        // 180 ms over half the travel would be 90 ms, and over the minimum
+        // travel fraction 14 ms. The planner sends neither, so neither may
+        // the file.
+        assert.ok(Math.round(HALF_STROKE_MIN_MS * MIN_TRAVEL_FRACTION) < MIN_LEG_MS);
+        assert.equal(halfStrokeMs(100, 0.5), MIN_LEG_MS);
+        assert.equal(halfStrokeMs(100, 0), MIN_LEG_MS);
+    });
+
+    it('times every leg exactly as the stroke planner does', () => {
+        // The file is the record of a session, so a leg in it may be no
+        // faster and no slower than the one the Intiface and T-Code drivers
+        // sent for the same speed over the same zone width.
+        for (let speed = 0; speed <= 100; speed++) {
+            for (let width = 0; width <= 100; width++) {
+                assert.equal(halfStrokeMs(speed, width / 100), legDurationMs(speed, width / 100), `speed ${speed}%, zone ${width} points wide`);
+            }
+        }
     });
 
     it('tolerates garbage', () => {
@@ -109,6 +127,18 @@ describe('buildStrokeActions', () => {
         const full = buildStrokeActions(timeline(10, { speed: 60, strokeMin: 0, strokeMax: 100 }));
         const narrow = buildStrokeActions(timeline(10, { speed: 60, strokeMin: 40, strokeMax: 60 }));
         assert.ok(narrow.length > full.length);
+    });
+
+    it('never strokes a narrow zone faster than the toy was driven', () => {
+        // Full speed over the narrowest zone the engine emits (10 points).
+        const actions = buildStrokeActions(timeline(5, { speed: 100, strokeMin: 45, strokeMax: 55 }));
+        assertMonotonic(actions);
+        const legs = [];
+        for (let i = 1; i < actions.length; i++) {
+            if (actions[i].pos !== actions[i - 1].pos) legs.push(actions[i].at - actions[i - 1].at);
+        }
+        assert.ok(legs.length > 30, `only ${legs.length} legs in 5 s`);
+        assert.deepEqual([...new Set(legs)], [MIN_LEG_MS]);
     });
 
     it('holds position at zero speed', () => {

@@ -3203,8 +3203,11 @@ partnerTabGroupBtn?.addEventListener('click', () => {
     partner1on1Section?.classList.add('hidden');
 });
 
-// BLE modal "Status:" line. tone: 'idle' | 'busy' | 'ok' | 'error'
-function setBleStatus(text, tone = 'idle') {
+// BLE modal "Status:" line. tone: 'idle' | 'busy' | 'ok' | 'error'. `help`
+// ({ title, items }, from describeBleError) is listed under the line; every
+// other status clears it, so the reasons a chooser came back empty never
+// linger beside "Scanning" or "Connected".
+function setBleStatus(text, tone = 'idle', help = null) {
     const el = document.getElementById('modalBleMsg');
     if (!el) return;
     el.textContent = `Status: ${text}`;
@@ -3213,6 +3216,17 @@ function setBleStatus(text, tone = 'idle') {
         : tone === 'busy' ? 'text-amber-300'
         : 'text-slate-500';
     el.className = `text-xs leading-snug ${toneClass}`;
+    const items = help && Array.isArray(help.items) ? help.items : [];
+    const box = document.getElementById('modalBleHelp');
+    const title = document.getElementById('modalBleHelpTitle');
+    const list = document.getElementById('modalBleHelpList');
+    if (title) title.textContent = items.length > 0 ? String(help.title || '') : '';
+    list?.replaceChildren(...items.map((line) => {
+        const item = document.createElement('li');
+        item.textContent = line;
+        return item;
+    }));
+    box?.classList.toggle('hidden', items.length === 0);
 }
 
 function bleBatteryLabel() {
@@ -3308,7 +3322,7 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
         syncTelemetry();
     } catch (e) {
         const described = describeBleError(e);
-        setBleStatus(described.message, described.kind === 'cancelled' ? 'idle' : 'error');
+        setBleStatus(described.message, described.kind === 'cancelled' ? 'idle' : 'error', described.help);
         if (isBleConnected()) {
             // The chooser was closed before anything changed: the previous
             // sensor is still linked and keeps its badge.

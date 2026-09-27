@@ -6,7 +6,18 @@
 // offline once it has been visited. Bump CACHE_VERSION when the precache list
 // changes; old caches are removed on activate.
 
-const CACHE_VERSION = 'edgeloop-v4';
+const CACHE_VERSION = 'edgeloop-v5';
+
+// Every module the page imports, directly or through another module, belongs
+// here. One import that fails fails the whole module graph, so a module
+// missing from this list is not a missing feature offline, it is a page that
+// never starts: 1.1.0 left five of them out, and the first offline open after
+// that update showed the page with not one of its modules running. The fetch
+// handler's own copies cannot cover for a gap. A first visit loads every
+// module before this worker exists, and activating an update deletes the
+// previous cache together with every copy the fetch handler had put in it.
+// src/js/precache.test.js walks the import graph from index.html and fails
+// when a module is missing here.
 const PRECACHE = [
     './',
     './index.html',
@@ -19,12 +30,17 @@ const PRECACHE = [
     './src/js/engine.js',
     './src/js/patterns.js',
     './src/js/session-rules.js',
+    './src/js/settings-schema.js',
     './src/js/hr-watchdog.js',
     './src/js/funscript.js',
     './src/js/storage.js',
+    './src/js/write-coalescer.js',
+    './src/js/backup.js',
+    './src/js/alert-banner.js',
     './src/js/chart.js',
     './src/js/voice.js',
     './src/js/voice-queue.js',
+    './src/js/voice-cues.js',
     './src/js/webrtc.js',
     './src/js/peer-messages.js',
     './src/js/hardware/ble.js',
@@ -38,11 +54,28 @@ const PRECACHE = [
     './src/js/hardware/tcode-protocol.js'
 ];
 
+// The two scripts index.html loads from a CDN, precached for the same two
+// reasons: a first visit fetches them before this worker exists, and the
+// copies the fetch handler keeps later go with the cache an update deletes.
+// Without Tailwind, every panel the page keeps out of sight with its `hidden`
+// class - the modals and the setup wizard among them - is on screen at once.
+// They are fetched the way the page's own <script> tags fetch them, without
+// CORS, because the Tailwind CDN sends no CORS header; the opaque reply that
+// gives is one cache.add refuses, so it is put in by hand.
+const PRECACHE_CDN = [
+    'https://cdn.tailwindcss.com',
+    'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'
+];
+
 self.addEventListener('install', (event) => {
     event.waitUntil(
         caches.open(CACHE_VERSION)
             // addAll rejects on the first failure; cache what we can instead.
-            .then((cache) => Promise.allSettled(PRECACHE.map((url) => cache.add(url))))
+            .then((cache) => Promise.allSettled([
+                ...PRECACHE.map((url) => cache.add(url)),
+                ...PRECACHE_CDN.map((url) => fetch(new Request(url, { mode: 'no-cors' }))
+                    .then((response) => cache.put(url, response)))
+            ]))
             .then(() => self.skipWaiting())
     );
 });

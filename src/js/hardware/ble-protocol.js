@@ -78,12 +78,80 @@ export function describeBluetoothSupport(userAgent = '') {
     return `${message}.`;
 }
 
+// Shown under the status line after the chooser closed with nothing picked.
+// Chrome's chooser lists a monitor that advertises the Heart Rate service
+// while it scans, and one the browser's own Bluetooth adapter already reports
+// as connected. It does not ask the system for devices that other apps hold
+// (see the TODO on PopulateConnectedDevices in content/browser/bluetooth/
+// bluetooth_device_chooser_controller.cc), and a monitor that is connected
+// somewhere usually stops advertising. Bluetooth switched off, or kept from
+// the browser by the system, opens the same chooser with a note instead of a
+// list, and closing it rejects exactly like a cancel. A user whose HeartCast
+// broadcast was already connected elsewhere got "No sensor selected" and no
+// way to know why.
+export const CHOOSER_EMPTY_HELP = Object.freeze({
+    title: 'Monitor not in the list? The usual reasons:',
+    items: Object.freeze([
+        'It is already connected to something else. A monitor usually serves one app at a time and stops advertising while it is connected, so the chooser cannot list it. Disconnect or forget it in the Bluetooth settings of the computer or phone holding it, or close the app using it, then scan again.',
+        'A phone app standing in for the monitor, such as HeartCast or Echo, has to be broadcasting and open on screen while you pair: on iOS a broadcasting app that goes to the background stops advertising in a way the browser can find.',
+        'Bluetooth is off, or the browser has no permission to use it. The chooser then says what is missing and links to the setting; fix it there, then scan again.',
+        'The monitor is not broadcasting yet: a chest strap wakes when it is worn with damp electrodes, and a watch needs its heart-rate broadcast switched on.'
+    ])
+});
+
+// NotFoundError is not only a closed chooser. Chrome words each of its other
+// causes itself (third_party/blink/renderer/modules/bluetooth/
+// bluetooth_error.cc), in English whatever the browser's language, and for
+// these no chooser was shown, or the monitor was picked and then lost.
+// Telling someone to look for their monitor in a list they never saw sends
+// them after the wrong fault.
+const NOT_FOUND_CAUSES = [
+    {
+        match: /adapter not available/i,
+        kind: 'no-adapter',
+        message: 'The browser found no Bluetooth adapter. Check that this computer or phone has Bluetooth and that it is switched on, then try again.'
+    },
+    {
+        match: /low energy not available/i,
+        kind: 'no-adapter',
+        message: 'This Bluetooth adapter cannot do Bluetooth Low Energy, which heart-rate monitors use.'
+    },
+    {
+        match: /not supported on this platform/i,
+        kind: 'no-adapter',
+        message: 'This browser cannot pair Bluetooth devices here. Use Chrome or Edge on a computer or an Android phone (Bluefy on iOS).'
+    },
+    {
+        match: /permission to scan/i,
+        kind: 'blocked',
+        message: 'The browser was refused permission to scan for Bluetooth devices. Allow it in the system settings for the browser app (Nearby devices, or Location on older Android), then try again.'
+    },
+    {
+        match: /disabled Web Bluetooth|Web Bluetooth API globally disabled/i,
+        kind: 'blocked',
+        message: 'Bluetooth devices are blocked for websites in this browser, by its site settings or by an administrator. Allow them, then try again.'
+    },
+    {
+        match: /doesn't exist anymore|^Does not exist/i,
+        kind: 'network',
+        message: 'The monitor you picked disappeared before the browser could connect. Keep it close and awake, then scan again.'
+    }
+];
+
 // Map a requestDevice / connect failure to a short, honest status line.
+// `help` ({ title, items }) comes only with a closed chooser.
 export function describeBleError(error) {
     const name = error && error.name ? String(error.name) : '';
     const message = error && error.message ? String(error.message) : '';
     if (name === 'NotFoundError') {
-        return { kind: 'cancelled', message: 'No sensor selected. Pick your monitor in the browser chooser; it must be powered on and advertising the Heart Rate service.' };
+        // The monitor was picked and connected, and has no heart-rate
+        // service to subscribe to: the same answer as NotSupportedError.
+        if (/^No (Services|Characteristics|Descriptors)\b/i.test(message)) {
+            return { kind: 'unsupported', message: `The selected device does not expose the Heart Rate service (${message.replace(/\.$/, '')}).` };
+        }
+        const cause = NOT_FOUND_CAUSES.find((c) => c.match.test(message));
+        if (cause) return { kind: cause.kind, message: cause.message };
+        return { kind: 'cancelled', message: 'No sensor selected.', help: CHOOSER_EMPTY_HELP };
     }
     if (name === 'SecurityError') {
         return { kind: 'security', message: 'Web Bluetooth is blocked here: the page must be served over https:// (or localhost) and Bluetooth must be allowed for this site.' };
