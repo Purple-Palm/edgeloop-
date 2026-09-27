@@ -179,17 +179,33 @@ describe('engine modes', () => {
 
     it('shortener runs full length at rest and lands on base micro-strokes 0-35% at the ceiling', () => {
         assert.equal(SHORTENER_TOP_PERCENT, 35);
-        const rest = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 70 });
-        assert.equal(rest.strokeMinPercent, 0);
-        assert.equal(rest.strokeMaxPercent, 100);
+        const rest = [];
+        for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+            const sample = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 70, sessionSeconds });
+            assert.equal(sample.strokeMinPercent, 0);
+            assert.ok(sample.strokeMaxPercent <= 100);
+            rest.push(sample.strokeMaxPercent);
+        }
+        // The allowed window at rest is the full range. The pattern uses
+        // less of it some seconds and almost all of it on others.
+        assert.ok(Math.max(...rest) >= 90, `rest tops ${Math.max(...rest)}`);
+        assert.ok(Math.min(...rest) <= 70, `rest tops ${Math.min(...rest)}`);
         const mid = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 125 });
-        assert.ok(mid.strokeMaxPercent < 100 && mid.strokeMaxPercent > SHORTENER_TOP_PERCENT);
-        const ceiling = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 140, isEdged: true, ceilingBehaviour: 'crawl' });
-        assert.equal(ceiling.strokeMinPercent, 0);
-        assert.equal(ceiling.strokeMaxPercent, SHORTENER_TOP_PERCENT);
-        // Never narrower than promised, even past the ceiling.
-        const over = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 170, isEdged: true, ceilingBehaviour: 'crawl' });
-        assert.equal(over.strokeMaxPercent, SHORTENER_TOP_PERCENT);
+        assert.ok(mid.strokeMaxPercent < 100);
+        assert.equal(mid.strokeMinPercent, 0);
+        for (const sessionSeconds of [0, 7, 20, 33]) {
+            const ceiling = calculateEngineOutputs({
+                ...running, activeMode: 'shortener', hr: 140, isEdged: true,
+                ceilingBehaviour: 'crawl', sessionSeconds
+            });
+            assert.equal(ceiling.strokeMinPercent, 0);
+            assert.equal(ceiling.strokeMaxPercent, SHORTENER_TOP_PERCENT);
+            const over = calculateEngineOutputs({
+                ...running, activeMode: 'shortener', hr: 170, isEdged: true,
+                ceilingBehaviour: 'crawl', sessionSeconds
+            });
+            assert.equal(over.strokeMaxPercent, SHORTENER_TOP_PERCENT);
+        }
     });
 
     it('headplay contracts the envelope toward the glans', () => {
@@ -199,10 +215,21 @@ describe('engine modes', () => {
     });
 
     it('milker cross-fades secondary up as HR rises', () => {
-        const low = calculateEngineOutputs({ ...running, activeMode: 'milker', hr: 75 });
-        const high = calculateEngineOutputs({ ...running, activeMode: 'milker', hr: 125 });
-        assert.ok(high.secondaryPercent > low.secondaryPercent);
-        assert.ok(high.primaryPercent < low.primaryPercent);
+        const mean = (hr) => {
+            let secondary = 0;
+            let primary = 0;
+            const n = 60;
+            for (let sessionSeconds = 0; sessionSeconds < n; sessionSeconds += 1) {
+                const sample = calculateEngineOutputs({ ...running, activeMode: 'milker', hr, sessionSeconds });
+                secondary += sample.secondaryPercent;
+                primary += sample.primaryPercent;
+            }
+            return { secondary: secondary / n, primary: primary / n };
+        };
+        const low = mean(75);
+        const high = mean(125);
+        assert.ok(high.secondary > low.secondary, `high ${high.secondary} low ${low.secondary}`);
+        assert.ok(high.primary < low.primary, `high ${high.primary} low ${low.primary}`);
     });
 
     it('ruin rides the edge, then cuts the primary and drops the secondary', () => {
@@ -227,15 +254,37 @@ describe('engine modes', () => {
     });
 
     it('milker near the ceiling pulses the secondary instead of pinning it', () => {
-        const samples = [0, 3, 6, 9].map((sessionSeconds) => calculateEngineOutputs({
-            ...running,
-            activeMode: 'milker',
-            hr: 140,
-            isEdged: true,
-            sessionSeconds
-        }));
-        assert.ok(samples.some((sample) => sample.secondaryPercent < 50));
-        assert.ok(samples.some((sample) => sample.secondaryPercent > 80));
+        const samples = [];
+        for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+            samples.push(calculateEngineOutputs({
+                ...running,
+                activeMode: 'milker',
+                hr: 140,
+                isEdged: true,
+                sessionSeconds
+            }));
+        }
+        assert.ok(samples.some((sample) => sample.secondaryPercent < 40));
+        assert.ok(samples.some((sample) => sample.secondaryPercent > 70));
+    });
+
+    it('the same heart rate does not repeat on an 8 second beat', () => {
+        const at = (sessionSeconds) => calculateEngineOutputs({
+            ...running, activeMode: 'classic', hr: 100, sessionSeconds
+        });
+        const speeds = [];
+        const depths = [];
+        for (let sessionSeconds = 0; sessionSeconds < 48; sessionSeconds += 1) {
+            const sample = at(sessionSeconds);
+            speeds.push(sample.primaryPercent);
+            depths.push(sample.strokeMaxPercent);
+        }
+        const uniqueSpeeds = new Set(speeds);
+        const uniqueDepths = new Set(depths);
+        assert.ok(uniqueSpeeds.size >= 8, `only ${uniqueSpeeds.size} speeds`);
+        assert.ok(uniqueDepths.size >= 4, `only ${uniqueDepths.size} stroke lengths`);
+        const sameBeat = speeds.filter((speed, index) => index >= 8 && speed === speeds[index - 8]);
+        assert.ok(sameBeat.length < 20, 'an 8 second loop would match almost every sample');
     });
 
     it('head play starts narrowing around the middle of the band', () => {

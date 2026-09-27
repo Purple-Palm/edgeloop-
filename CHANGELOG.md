@@ -7,12 +7,12 @@ credited by username.
 ## Unreleased
 
 ### Patterns
-- **PATTERNS!** Each tease mode varies speed and stroke length over time, so the same heart rate does not feel like one endless wave. Classic, Glans Protector and Head Play stay single-purpose with a light tempo change. Prostate Milker pulses in the top third of the band. Ultimate Milker changes chapter as you climb: long and steady, then long-slow against short-fast, then stops and short bursts. Ruin & Leak keeps stroking through the edge, then after about 12 seconds on the mark stops the stroker dead for 18 seconds and drops the other toy low.
+- **PATTERNS!** Speed and stroke length wander on overlapping cycles, so the same heart rate does not settle into a beat you can count. Prostate Milker pulses harder in the top third of the band. Ultimate Milker changes chapter as you climb, and near the edge it drops into stops and short bursts. Ruin & Leak keeps stroking through the edge, then after about 12 seconds on the mark stops the stroker dead for 18 seconds and drops the other toy low.
 - The travel range you set is the limit for every mode, pattern, game, warm-up and Force Orgasm. A pattern can only use less of that range.
 - Session warm-up eases in from a short, slow stroke over the warm-up minutes you already set, instead of jumping to full speed at a low heart rate. Zero minutes is still instant.
 - **Full Length Strokes Only** is gone.
 - A game uses the stroke of whichever tease mode is selected, and clicking that game again turns it off.
-- Mode cards are one short line. The **i** on a card opens a longer description.
+- Mode cards are one short line. The paragraph above them follows the mode or game you select.
 
 ### Site
 - The footer links to the Discord server and the GitHub repository. Every footer link uses the same color. The support address is no longer in the footer; it remains the private contact for reports that should not be posted in public.

@@ -1961,6 +1961,7 @@ expTabBioBtn?.addEventListener('click', () => {
     if (expTabGameBtn) expTabGameBtn.className = "px-2.5 py-0.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer";
     bioProfilesGrid?.classList.remove('hidden');
     gameModesGrid?.classList.add('hidden');
+    renderModeDetail();
 });
 
 expTabGameBtn?.addEventListener('click', () => {
@@ -1968,6 +1969,7 @@ expTabGameBtn?.addEventListener('click', () => {
     if (expTabBioBtn) expTabBioBtn.className = "px-2.5 py-0.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer";
     gameModesGrid?.classList.remove('hidden');
     bioProfilesGrid?.classList.add('hidden');
+    renderModeDetail();
 });
 
 // Experience Mode Selection. A tease mode owns the stroke. A game, while
@@ -1988,28 +1990,14 @@ const MODE_DETAILS = {
     edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
 };
 
-function showModeDetail(mode) {
+// The paragraph above the cards follows the card you are looking at.
+// On Modes it is the tease mode. On Games it is the game, when one is on.
+function renderModeDetail() {
     const el = document.getElementById('modeDetail');
     if (!el) return;
-    const text = MODE_DETAILS[mode] || '';
-    const alreadyOpen = el.dataset.mode === mode && !el.classList.contains('hidden');
-    if (!text || alreadyOpen) {
-        el.textContent = '';
-        el.dataset.mode = '';
-        el.classList.add('hidden');
-        return;
-    }
-    el.dataset.mode = mode;
-    el.textContent = text;
-    el.classList.remove('hidden');
-}
-
-function hideModeDetail() {
-    const el = document.getElementById('modeDetail');
-    if (!el) return;
-    el.textContent = '';
-    el.dataset.mode = '';
-    el.classList.add('hidden');
+    const gamesVisible = gameModesGrid && !gameModesGrid.classList.contains('hidden');
+    const mode = (gamesVisible && state.gameMode) ? state.gameMode : state.teaseMode;
+    el.textContent = MODE_DETAILS[mode] || '';
 }
 
 function highlightModeCard() {
@@ -2046,8 +2034,8 @@ function applyModeSelection(mode, enabled) {
         state.ruinRideSeconds = 0;
     }
     state.activeMode = state.gameMode || state.teaseMode;
-    if (document.getElementById('modeDetail')?.dataset.mode !== mode) hideModeDetail();
     highlightModeCard();
+    renderModeDetail();
     updateEngine();
 }
 
@@ -2062,17 +2050,7 @@ modeCards.forEach(card => {
     });
 });
 
-document.querySelectorAll('.mode-info').forEach((info) => {
-    const open = (event) => {
-        event.stopPropagation();
-        event.preventDefault();
-        showModeDetail(info.getAttribute('data-info'));
-    };
-    info.addEventListener('click', open);
-    info.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') open(event);
-    });
-});
+renderModeDetail();
 
 function persistTrainSettings() {
     advancedSettings.trainHoldSeconds = clampTrainHoldSeconds(document.getElementById('trainHoldSecondsInput')?.value);
@@ -4031,6 +4009,7 @@ function applyRemoteTelemetry(data) {
     if (data.activeMode !== undefined) state.activeMode = data.activeMode;
     if (data.teaseMode !== undefined || data.gameMode !== undefined || data.activeMode !== undefined) {
         highlightModeCard();
+        renderModeDetail();
     }
     if (data.orgasmMode !== undefined && data.orgasmMode !== state.orgasmMode) setOrgasmMode(data.orgasmMode);
     if (data.ready !== undefined) state.remoteHostReady = data.ready;
