@@ -414,15 +414,19 @@ describe('survival climb', () => {
         assert.equal(src.includes('isSurvivalDefeated'), false);
     });
 
-    it('saves the run peak as the typed max only after the wearer confirms', () => {
+    it('saves the run peak from the Came Early button only after the wearer confirms', () => {
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
         const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
-        assert.match(html, /id="survivalCameBtn"/);
-        const handler = src.match(/getElementById\('survivalCameBtn'\)\?\.addEventListener\([\s\S]*?stopSession\('Survival calibration'/);
-        assert.ok(handler, 'the I came button has no handler');
+        assert.equal(html.includes('survivalCameBtn'), false);
+        assert.match(html, /id="cameEarlyLabel"[^>]*>Came Early</);
+        assert.match(src, /Finished me/);
+        const handler = src.match(/cameEarlyBtn\?\.addEventListener\([\s\S]*?stopSession\('Survival calibration'/);
+        assert.ok(handler, 'Finished me has no handler on the Came Early button');
+        assert.match(handler[0], /activeMode === 'survival'/);
         assert.match(handler[0], /confirm\(/);
         assert.equal(handler[0].includes('suggestedMaxHrOffset'), false);
         assert.match(handler[0], /isRemotePage/);
+        assert.match(src, /suggestedMaxHrOffset/);
     });
 });
 

@@ -1096,9 +1096,32 @@ function updateGameNotice() {
     });
     notice.textContent = text || 'GAME MODE ACTIVE';
     notice.classList.toggle('hidden', !text);
-    const came = document.getElementById('survivalCameBtn');
-    const showCame = !isRemotePage && state.activeMode === 'survival' && state.sessionStatus === 'RUNNING';
-    came?.classList.toggle('hidden', !showCame);
+    renderCameEarlyButton();
+}
+
+// Came Early is an accidental release in every other mode. Survival is the
+// climb that is supposed to finish you, so that same button changes its
+// words while the game is selected and, during the run, saves the heart rate.
+function renderCameEarlyButton() {
+    const kicker = document.getElementById('cameEarlyKicker');
+    const label = document.getElementById('cameEarlyLabel');
+    if (!cameEarlyBtn || !kicker || !label) return;
+    const survival = !isRemotePage && state.activeMode === 'survival';
+    kicker.textContent = survival ? 'The app' : 'Accidental';
+    label.textContent = survival ? 'Finished me' : 'Came Early';
+    cameEarlyBtn.title = survival
+        ? 'Survival pushed you over. Save this heart rate as your Climax HR.'
+        : 'Log accidental release so local learning engine tightens limits next time.';
+    kicker.classList.toggle('text-rose-300', survival);
+    kicker.classList.toggle('text-amber-400', !survival);
+    cameEarlyBtn.classList.toggle('bg-rose-950/60', survival);
+    cameEarlyBtn.classList.toggle('hover:bg-rose-900', survival);
+    cameEarlyBtn.classList.toggle('border-rose-800', survival);
+    cameEarlyBtn.classList.toggle('text-rose-300', survival);
+    cameEarlyBtn.classList.toggle('bg-amber-950/60', !survival);
+    cameEarlyBtn.classList.toggle('hover:bg-amber-900', !survival);
+    cameEarlyBtn.classList.toggle('border-amber-800', !survival);
+    cameEarlyBtn.classList.toggle('text-amber-300', !survival);
 }
 
 // Validate the Session Setup duration fields and flag any bad one in red.
@@ -1879,27 +1902,29 @@ function renderLearningStatus() {
     updateEngine();
 }
 
-document.getElementById('survivalCameBtn')?.addEventListener('click', () => {
-    if (isRemotePage || isRemoteViewer) return;
-    if (state.activeMode !== 'survival' || state.sessionStatus !== 'RUNNING') return;
-    const now = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
-    const peak = Number.isFinite(state.peakHr) ? state.peakHr : now;
-    const hr = Math.round(Math.max(Number(now) || 0, Number(peak) || 0));
-    if (!Number.isFinite(hr) || hr < 40 || hr > 220) return;
-    const typed = readHrLimits().maxHr;
-    const ok = confirm(`Set Climax HR to ${hr}? That is the top of this Survival run. Your typed max is ${typed}. The toys stop, and the next session uses ${hr}.`);
-    if (!ok) return;
-    const input = document.getElementById('maxHr');
-    if (input) {
-        input.value = String(hr);
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-    stopSession('Survival calibration', 'Saved. That heart rate is your max.');
-});
-
 cameEarlyBtn?.addEventListener('click', () => {
-    // The learning profile belongs to the host; a remote page never logs one.
-    if (isRemotePage) return;
+    // The learning profile and the typed max belong to the host.
+    if (isRemotePage || isRemoteViewer) return;
+    if (state.activeMode === 'survival') {
+        if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'PAUSED') {
+            confirm('Start Survival first. Once it is running, Finished me saves the heart rate the climb pushed you to.');
+            return;
+        }
+        const now = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
+        const peak = Number.isFinite(state.peakHr) ? state.peakHr : now;
+        const hr = Math.round(Math.max(Number(now) || 0, Number(peak) || 0));
+        if (!Number.isFinite(hr) || hr < 40 || hr > 220) return;
+        const typed = readHrLimits().maxHr;
+        const ok = confirm(`Set Climax HR to ${hr}? Survival pushed you there. Your typed max is ${typed}. The toys stop, and the next session uses ${hr}.`);
+        if (!ok) return;
+        const input = document.getElementById('maxHr');
+        if (input) {
+            input.value = String(hr);
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        stopSession('Survival calibration', 'Saved. That heart rate is your max.');
+        return;
+    }
     if (confirm("Log an accidental release? EdgeLoop will lower your working climax ceiling on this and future sessions.")) {
         if (!advancedSettings.learningProfile) {
             advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
@@ -2017,7 +2042,7 @@ const MODE_DETAILS = {
     ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast. Stops and short bursts wait until your pulse is close to the heart rate you set. The internal toy follows the same chapters.',
     ruin: 'The stroker keeps moving through the edge. After about 12 seconds on the mark it stops dead for 18 seconds and the other toy drops low, so it can leak without a full orgasm. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
-    survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. When you come, tap I came and that heart rate can become your Climax HR. The stroke range is the tease mode you selected.',
+    survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. When you come, tap Finished me and that heart rate can become your Climax HR. The stroke range is the tease mode you selected.',
     edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
 };
 
