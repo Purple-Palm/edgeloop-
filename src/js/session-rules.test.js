@@ -37,6 +37,13 @@ import {
     clampStallGuardSeconds,
     clampStallPauseSeconds,
     tickStallGuard,
+    stallPauseSecondsLeft,
+    stallGuardArmed,
+    stallGuardCues,
+    tickRuin,
+    startRuinEdge,
+    ruinRideSecondsLeft,
+    tickRuinAndStallGuard,
     describeStallPauseNotice,
     sanitizeStoredHrLimits,
     sanitizeStoredDuration,
@@ -50,6 +57,8 @@ import {
     DEFAULT_RANGE_MAX_MINUTES,
     DEFAULT_ENDGAME_TYPE
 } from './session-rules.js';
+import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM } from './engine.js';
+import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS, RUIN_LOCK_SECONDARY } from './patterns.js';
 
 describe('sanitizeHrLimits', () => {
     it('parses typed strings', () => {
@@ -910,6 +919,574 @@ describe('describeStallPauseNotice', () => {
         const call = src.slice(at, at + 220);
         assert.ok(/mode: state\.activeMode/.test(call), 'the banner must be told the active mode');
         assert.ok(/ceilingBehaviour: advancedSettings\.ceilingBehaviour/.test(call), 'the banner must be told the ceiling rule');
+    });
+});
+
+// ---- Ruin & Leak: one ride per edge ----------------------------------------
+
+// A session driven the way app.js drives it, one second at a time. The pulse
+// readings that arrived since the last tick come first (recordHrReading runs
+// the engine on each), then the 1 s master tick: the engine, then the Ruin
+// clock and the stall guard in the one step app.js calls, then the engine
+// again - whose output is what the toys hold until the next tick. A new edge
+// re-arms the ride on whichever engine call counts it, as updateEngine does.
+// Force Orgasm's clock runs the way app.js keeps it: back to 0 on every
+// toggle, +1 after the guards on every second it is on (capped at
+// ORGASM_BOOST_CAP), and the working ceiling raised by it, so the ramp moves
+// exactly as it does in the page.
+// Each row is one second: what the toys were sent, and the state behind it.
+function driveSession({
+    seconds,
+    pulse,
+    mode = () => 'ruin',
+    ceilingBehaviour = 'crawl',
+    stallGuard = true,
+    holdTimeoutSeconds = DEFAULT_STALL_GUARD_SECONDS,
+    pauseTimeoutSeconds = DEFAULT_STALL_PAUSE_SECONDS,
+    orgasm = () => false,
+    intensityValue = 50
+}) {
+    let isEdged = false;
+    let edges = 0;
+    let ruin = { rideSeconds: 0, lockSeconds: 0, spent: false };
+    let guard = { holdSeconds: 0, pauseSeconds: 0, engaged: false };
+    let orgasmOn = false;
+    let orgasmBoost = 0;
+    const rows = [];
+    const engine = (t, hr, activeMode, orgasmMode) => {
+        const boost = orgasmMode ? orgasmBoost : 0;
+        const out = calculateEngineOutputs({
+            hr,
+            edgeHr: hr,
+            minHr: 70,
+            maxHr: 140 + boost,
+            activeMode,
+            // A game borrows the selected tease mode's stroke: Ruin's, here.
+            strokeMode: TEASE_MODES.includes(activeMode) ? activeMode : 'ruin',
+            sessionStatus: 'RUNNING',
+            isEdged,
+            orgasmMode,
+            orgasmBoost: boost,
+            sessionSeconds: t,
+            warmupMinutes: 0,
+            intensityValue,
+            ceilingBehaviour,
+            stallGuardEngaged: guard.engaged,
+            ruinHoldSeconds: ruin.lockSeconds,
+            ruinSpent: ruin.spent
+        });
+        isEdged = out.isEdged;
+        if (out.newEdgeTriggered) {
+            edges += 1;
+            ruin = startRuinEdge(ruin);
+        }
+        return out;
+    };
+    for (let t = 1; t <= seconds; t += 1) {
+        const activeMode = mode(t);
+        const orgasmMode = orgasm(t);
+        if (orgasmMode !== orgasmOn) {
+            orgasmOn = orgasmMode;
+            orgasmBoost = 0;
+        }
+        const readings = [].concat(pulse(t));
+        for (const bpm of readings) engine(t, bpm, activeMode, orgasmMode);
+        const hr = readings[readings.length - 1];
+        engine(t, hr, activeMode, orgasmMode);
+        const step = tickRuinAndStallGuard({ ruin, guard }, {
+            activeMode, isEdged, orgasmMode, stallGuard, ceilingBehaviour, holdTimeoutSeconds, pauseTimeoutSeconds
+        });
+        ruin = step.ruin;
+        guard = { holdSeconds: step.guard.holdSeconds, pauseSeconds: step.guard.pauseSeconds, engaged: step.guard.engaged };
+        if (orgasmMode) orgasmBoost = Math.min(ORGASM_BOOST_CAP, orgasmBoost + 1);
+        const out = engine(t, hr, activeMode, orgasmMode);
+        const rideLeft = ruinRideSecondsLeft(ruin, { active: activeMode === 'ruin', isEdged });
+        rows.push({
+            t,
+            hr,
+            activeMode,
+            isEdged,
+            edges,
+            primary: out.primaryPercent,
+            secondary: out.secondaryPercent,
+            ruin: { ...ruin },
+            engaged: guard.engaged,
+            cues: step.cues,
+            rideLeft,
+            banner: guard.engaged
+                ? describeStallPauseNotice({
+                    mode: activeMode,
+                    ceilingBehaviour,
+                    rideSecondsLeft: rideLeft,
+                    pauseSecondsLeft: stallPauseSecondsLeft(guard, { pauseTimeoutSeconds })
+                })
+                : ''
+        });
+    }
+    return rows;
+}
+
+const at = (rows, t) => rows.find((r) => r.t === t);
+// The seconds a lockout started: the first row holding a full lockout.
+const lockStarts = (rows) => rows
+    .filter((r, i) => r.ruin.lockSeconds === RUIN_LOCK_SECONDS && (i === 0 || rows[i - 1].ruin.lockSeconds !== RUIN_LOCK_SECONDS))
+    .map((r) => r.t);
+const RIDE_TEXT = 'STALL PAUSE: PRIMARY HALTED — RUIN RIDE RESUMES AFTER THE PAUSE';
+const LOCKOUT_TEXT = 'STALL PAUSE: PRIMARY HALTED — RUIN LOCKOUT HOLDS IT AT 0%';
+
+describe('Ruin & Leak rides each edge once', () => {
+    it('rides the edge, stops dead, and holds the primary at 0% for as long as the pulse stays on the mark', () => {
+        // The reported defect: 1.1.0 started the ride again the moment the
+        // 18 s lockout ran out, so a pulse parked on the mark got 12 s at up
+        // to 74% out of every 30, without end. Five minutes on the mark, on
+        // both ceiling rules, with and without the stall guard.
+        for (const ceilingBehaviour of ['crawl', 'stop']) {
+            for (const stallGuard of [true, false]) {
+                const rows = driveSession({ seconds: 300, pulse: (t) => (t < 5 ? 90 : 145), ceilingBehaviour, stallGuard });
+                const label = `${ceilingBehaviour}, stall guard ${stallGuard ? 'on' : 'off'}`;
+                const onset = rows.find((r) => r.isEdged).t;
+                const [lockAt, ...more] = lockStarts(rows);
+                assert.equal(more.length, 0, `${label}: the lockout must start once, not every 30 s`);
+                // The designed timings: twelve seconds on the mark (the onset
+                // second counts), then eighteen seconds of lockout.
+                assert.equal(lockAt - onset + 1, RUIN_RIDE_SECONDS, `${label}: the ride lasts ${RUIN_RIDE_SECONDS} s`);
+                for (let t = onset; t < lockAt; t += 1) {
+                    assert.ok(at(rows, t).primary > 0, `${label}: the ride keeps stroking at t=${t}`);
+                }
+                for (let i = 0; i < RUIN_LOCK_SECONDS; i += 1) {
+                    assert.equal(at(rows, lockAt + i).ruin.lockSeconds, RUIN_LOCK_SECONDS - i, `${label}: lockout clock`);
+                }
+                for (const row of rows.filter((r) => r.t >= lockAt)) {
+                    assert.equal(row.primary, 0, `${label}: the primary moved again at t=${row.t} with the pulse still on the mark`);
+                    assert.equal(row.secondary, RUIN_LOCK_SECONDARY, `${label}: the secondary stays at the lockout level at t=${row.t}`);
+                    assert.ok(row.isEdged, 'the pulse never left the mark');
+                }
+                assert.equal(at(rows, 300).ruin.spent, true);
+                assert.equal(at(rows, 300).edges, 1, 'one edge, so one ride');
+            }
+        }
+    });
+
+    it('only a real release of the edge earns the next ride', () => {
+        // The release point is the one the engine already uses: more than
+        // EDGE_RELEASE_BPM below the mark. A dip that stops on it is not a
+        // release and must not hand out a second ride; a dip below it is, and
+        // the next crossing of the mark rides again - once.
+        const onTheBand = 140 - EDGE_RELEASE_BPM;
+        const pulse = (t) => {
+            if (t < 5) return 90;
+            if (t >= 60 && t < 70) return onTheBand;
+            if (t >= 120 && t < 125) return onTheBand - 1;
+            return 145;
+        };
+        const rows = driveSession({ seconds: 200, pulse });
+        const [first, second, ...rest] = lockStarts(rows);
+        assert.equal(rest.length, 0);
+        for (const row of rows.filter((r) => r.t >= first && r.t < 120)) {
+            assert.ok(row.isEdged, `a pulse sitting on the release point is still edged (t=${row.t})`);
+            assert.equal(row.primary, 0, `no second ride without a release (t=${row.t})`);
+        }
+        const released = rows.filter((r) => r.t >= 120 && r.t < 125);
+        assert.ok(released.every((r) => !r.isEdged), 'the dip below the release point released the edge');
+        assert.ok(released.some((r) => r.primary > 0), 'off the edge, Ruin teases again');
+        assert.equal(at(rows, 125).edges, 2, 'the next crossing is a new edge');
+        const ride = rows.filter((r) => r.t >= 125 && r.t < second);
+        assert.ok(ride.length > 0 && ride.length <= RUIN_RIDE_SECONDS);
+        assert.ok(ride.every((r) => r.primary > 0), 'the new edge gets its ride');
+        assert.ok(rows.filter((r) => r.t >= second).every((r) => r.primary === 0), 'and then the stop holds again');
+    });
+
+    it('a release during the lockout re-arms the next ride but never shortens the lockout', () => {
+        const base = (t) => (t < 5 ? 90 : 145);
+        const [lockAt] = lockStarts(driveSession({ seconds: 40, pulse: base }));
+        // (a) The pulse drops out of the band a few seconds into the lockout
+        // and stays out: the dead stop still runs its full 18 s.
+        const dropped = driveSession({ seconds: 80, pulse: (t) => (t >= lockAt + 4 ? 120 : base(t)) });
+        for (let t = lockAt; t < lockAt + RUIN_LOCK_SECONDS; t += 1) {
+            assert.equal(at(dropped, t).primary, 0, `the lockout was cut short at t=${t}`);
+        }
+        assert.ok(!at(dropped, lockAt + RUIN_LOCK_SECONDS).isEdged);
+        assert.ok(at(dropped, lockAt + RUIN_LOCK_SECONDS).primary > 0, 'off the edge after the lockout, Ruin teases again');
+        // (b) It drops out and climbs back while the lockout is still running:
+        // that is a new edge, and it rides - but only once the lockout is over.
+        const back = driveSession({
+            seconds: 120,
+            pulse: (t) => (t >= lockAt + 4 && t < lockAt + 7 ? 120 : base(t))
+        });
+        assert.equal(at(back, lockAt + 7).edges, 2, 'the climb back is a new edge');
+        for (let t = lockAt; t < lockAt + RUIN_LOCK_SECONDS; t += 1) {
+            assert.equal(at(back, t).primary, 0, `the new edge rode inside the lockout at t=${t}`);
+        }
+        const [, secondLock, ...rest] = lockStarts(back);
+        assert.equal(rest.length, 0);
+        const ride = back.filter((r) => r.t >= lockAt + RUIN_LOCK_SECONDS && r.t < secondLock);
+        assert.ok(ride.length > 0 && ride.length <= RUIN_RIDE_SECONDS, `second ride of ${ride.length} s`);
+        assert.ok(ride.every((r) => r.primary > 0));
+        assert.ok(back.filter((r) => r.t >= secondLock).every((r) => r.primary === 0));
+    });
+
+    it('a pulse that releases and crosses back between two ticks still earns its ride; one that does not release does not', () => {
+        // The tick only reads the edge flag once a second. The engine counts
+        // the edge on the reading itself, and that is what re-arms the ride.
+        const run = (dip) => driveSession({
+            seconds: 90,
+            pulse: (t) => {
+                if (t < 5) return 90;
+                if (t === 60) return [dip, 145];
+                return 145;
+            }
+        });
+        const released = run(140 - EDGE_RELEASE_BPM - 1);
+        assert.equal(at(released, 60).edges, 2);
+        assert.ok(at(released, 60).primary > 0, 'the new edge rides');
+        assert.equal(lockStarts(released).length, 2);
+        const held = run(140 - EDGE_RELEASE_BPM);
+        assert.equal(at(held, 60).edges, 1);
+        assert.ok(held.filter((r) => r.t >= 60).every((r) => r.primary === 0), 'no release, no ride');
+    });
+
+    it('switching modes, re-selecting Ruin or running a game does not hand out a second ride', () => {
+        // The clock is session state. 1.1.0 zeroed it on every mode card and
+        // game toggle, so one tap during the lockout started a fresh ride.
+        const pulse = (t) => (t < 5 ? 90 : 145);
+        const [lockAt] = lockStarts(driveSession({ seconds: 40, pulse }));
+        const plans = {
+            'Classic and back during the lockout': (t) => (t >= lockAt + 3 && t < lockAt + 6 ? 'classic' : 'ruin'),
+            'Classic and back after the lockout': (t) => (t >= lockAt + 25 && t < lockAt + 40 ? 'classic' : 'ruin'),
+            'a game on and off during the lockout': (t) => (t >= lockAt + 3 && t < lockAt + 9 ? 'oracle' : 'ruin'),
+            'every game in turn': (t) => (t >= lockAt + 2 && t < lockAt + 60 ? GAME_MODES[Math.floor(t / 7) % GAME_MODES.length] : 'ruin')
+        };
+        for (const [label, mode] of Object.entries(plans)) {
+            for (const ceilingBehaviour of ['crawl', 'stop']) {
+                const rows = driveSession({ seconds: 150, pulse, mode, ceilingBehaviour });
+                const again = rows.filter((r) => r.t >= lockAt && r.activeMode === 'ruin' && r.primary > 0);
+                assert.deepEqual(again.map((r) => r.t), [], `${label} (${ceilingBehaviour}): Ruin rode again`);
+                assert.equal(lockStarts(rows).length, 1, `${label} (${ceilingBehaviour})`);
+            }
+        }
+        // Leaving in the middle of the ride keeps what is left of it, no more.
+        const split = driveSession({
+            seconds: 120,
+            pulse,
+            mode: (t) => (t >= 9 && t < 40 ? 'classic' : 'ruin')
+        });
+        const ruinRide = split.filter((r) => r.activeMode === 'ruin' && r.isEdged && r.primary > 0);
+        assert.ok(ruinRide.length <= RUIN_RIDE_SECONDS, `one ride in total across the switch, got ${ruinRide.length} s`);
+        assert.ok(ruinRide.some((r) => r.t >= 40), 'the rest of the ride is still there on the way back');
+        const [splitLock, ...splitRest] = lockStarts(split);
+        assert.equal(splitRest.length, 0);
+        assert.ok(split.filter((r) => r.t >= splitLock).every((r) => r.primary === 0));
+    });
+
+    it('Force Orgasm overrides the stop, and cancelling it on the mark goes back to 0%', () => {
+        const rows = driveSession({
+            seconds: 90,
+            pulse: (t) => (t < 5 ? 90 : 145),
+            orgasm: (t) => t >= 50 && t < 60
+        });
+        // Since 1.1.1 Force Orgasm ramps over 28 s from what the toy was
+        // doing. Over this spent edge that is the dead stop, so it climbs
+        // from there - it does not jump to a fresh ride on its first second.
+        const forced = rows.filter((r) => r.t >= 50 && r.t < 60).map((r) => r.primary);
+        assert.ok(forced[0] > 0 && forced[0] <= 5, `the ramp must start at the stop: ${forced.join(',')}`);
+        assert.ok(forced.every((p, i) => i === 0 || p >= forced[i - 1] - 3), `the ramp must climb: ${forced.join(',')}`);
+        assert.ok(forced[forced.length - 1] >= 25, `ten seconds in the ramp is well on its way: ${forced.join(',')}`);
+        assert.ok(rows.filter((r) => r.t >= 60).every((r) => r.primary === 0), 'no ride after a cancelled Force Orgasm on the same edge');
+    });
+
+    it('holds on a pulse that wanders, whatever the settings (a seeded sweep)', () => {
+        // The rules, checked second by second on random sessions: within one
+        // stretch on the mark the primary never moves again after a lockout
+        // has started (unless the engine counted a new edge inside it); a
+        // lockout is never shorter than 18 s; the stall banner is right about
+        // what the end of each pause brings; and no cue says something that
+        // is not happening.
+        let seed = 20260927;
+        const random = () => {
+            seed = (seed * 1103515245 + 12345) % 2147483648;
+            return seed / 2147483648;
+        };
+        const pick = (list) => list[Math.floor(random() * list.length)];
+        let checkedPauses = 0;
+        let checkedLocks = 0;
+        for (let run = 0; run < 250; run += 1) {
+            const segments = [];
+            let t = 1;
+            while (t <= 240) {
+                const length = 1 + Math.floor(random() * 25);
+                segments.push({ from: t, to: t + length, bpm: pick([100, 128, 134, 135, 138, 140, 142, 150]) });
+                t += length;
+            }
+            const settings = {
+                ceilingBehaviour: pick(['crawl', 'stop']),
+                stallGuard: random() < 0.8,
+                holdTimeoutSeconds: 3 + Math.floor(random() * 22),
+                pauseTimeoutSeconds: 2 + Math.floor(random() * 12),
+                intensityValue: pick([0, 50, 100])
+            };
+            const rows = driveSession({
+                seconds: 240,
+                pulse: (s) => segments.find((g) => s >= g.from && s < g.to).bpm,
+                ...settings
+            });
+            const label = `run ${run} ${JSON.stringify(settings)}`;
+            let lockedThisStretch = false;
+            rows.forEach((row, i) => {
+                const prev = rows[i - 1];
+                if (!row.isEdged) lockedThisStretch = false;
+                // A new edge inside a lockout rides once the lockout is over:
+                // that is its first ride, not a second one.
+                if (prev && row.edges > prev.edges) lockedThisStretch = false;
+                const lockStarted = row.ruin.lockSeconds === RUIN_LOCK_SECONDS && (!prev || prev.ruin.lockSeconds !== RUIN_LOCK_SECONDS);
+                if (lockStarted) {
+                    checkedLocks += 1;
+                    lockedThisStretch = true;
+                    for (let k = 0; k < RUIN_LOCK_SECONDS && rows[i + k]; k += 1) {
+                        assert.equal(rows[i + k].primary, 0, `${label}: lockout broken at t=${rows[i + k].t}`);
+                    }
+                }
+                if (lockedThisStretch && row.isEdged && row.primary > 0) {
+                    assert.fail(`${label}: a second ride on one edge at t=${row.t}`);
+                }
+                for (const cue of row.cues) {
+                    assert.notEqual(cue, 'stallResume', `${label}: promised a crawl in Ruin at t=${row.t}`);
+                    if (cue === 'stallRecover') assert.ok(!row.isEdged, `${label}: "recovered" on the mark at t=${row.t}`);
+                }
+                if (row.engaged && (!prev || !prev.engaged)) {
+                    const claim = row.banner;
+                    let j = i;
+                    while (rows[j] && rows[j].engaged) {
+                        assert.equal(rows[j].banner, claim, `${label}: the banner changed its mind at t=${rows[j].t}`);
+                        j += 1;
+                    }
+                    const after = rows[j];
+                    // Only a pause that ran its course is a promise to check:
+                    // leaving the edge releases the guard early, and ends the ride.
+                    if (after && after.isEdged && rows[j - 1].isEdged && after.edges === row.edges) {
+                        checkedPauses += 1;
+                        if (claim === RIDE_TEXT) {
+                            assert.ok(after.rideLeft > 0 && after.primary > 0, `${label}: promised the ride back at t=${after.t}`);
+                        } else {
+                            assert.equal(claim, LOCKOUT_TEXT, label);
+                            assert.equal(after.primary, 0, `${label}: promised the lockout, the ride came back at t=${after.t}`);
+                        }
+                    }
+                }
+            });
+        }
+        assert.ok(checkedLocks > 100, `the sweep must reach the lockout, reached it ${checkedLocks} times`);
+        assert.ok(checkedPauses > 50, `the sweep must check real pauses, checked ${checkedPauses}`);
+    });
+});
+
+describe('the stall guard during a Ruin ride', () => {
+    it('is armed during the ride whichever ceiling rule is set, and cuts it at once', () => {
+        // With Full Stop the guard used to be disarmed on the premise that
+        // the primary is parked at 0% on the mark - which a Ruin ride is not.
+        for (const ceilingBehaviour of ['crawl', 'stop']) {
+            const rows = driveSession({
+                seconds: 60,
+                pulse: (t) => (t < 5 ? 90 : 145),
+                ceilingBehaviour,
+                holdTimeoutSeconds: 5,
+                pauseTimeoutSeconds: 8
+            });
+            const halt = rows.find((r) => r.cues.includes('stallHalt'));
+            assert.ok(halt, `${ceilingBehaviour}: the guard never engaged during the ride`);
+            assert.ok(halt.rideLeft > 0, 'it engaged during the ride');
+            assert.equal(halt.primary, 0, 'and cut the primary on the same second');
+            // Five seconds into a twelve second ride, an eight second pause
+            // outlasts it: the ride is over, and the banner says so for the
+            // whole pause, which runs its course across the end of the ride.
+            const paused = rows.filter((r) => r.engaged);
+            assert.equal(paused.length, 8, 'the pause runs its full length');
+            assert.ok(paused.every((r) => r.banner === LOCKOUT_TEXT));
+            assert.ok(rows.filter((r) => r.t >= halt.t).every((r) => r.primary === 0));
+            assert.ok(!rows.some((r) => r.cues.includes('stallResume')), 'no crawl is promised');
+        }
+    });
+
+    it('leaving a paused ride for a Full Stop mode says nothing about recovering', () => {
+        // Full Stop disarms the guard in Classic, which releases the pause
+        // with the pulse still on the mark. "Recovered. Resume." there would
+        // send someone who is still on the edge back up.
+        const rows = driveSession({
+            seconds: 40,
+            pulse: (t) => (t < 5 ? 90 : 145),
+            mode: (t) => (t < 9 ? 'ruin' : 'classic'),
+            ceilingBehaviour: 'stop',
+            holdTimeoutSeconds: 3,
+            pauseTimeoutSeconds: 8
+        });
+        const halt = rows.find((r) => r.cues.includes('stallHalt'));
+        assert.ok(halt && halt.t < 9, 'the guard engaged during the ride');
+        const left = at(rows, 9);
+        assert.equal(left.engaged, false, 'Full Stop released the pause');
+        assert.ok(left.isEdged);
+        assert.deepEqual(left.cues, [], 'and said nothing untrue about it');
+        assert.equal(left.primary, 0, 'Full Stop holds the primary at 0%');
+    });
+
+    it('lets a ride with time left come back after a short pause, and says so', () => {
+        for (const ceilingBehaviour of ['crawl', 'stop']) {
+            const rows = driveSession({
+                seconds: 60,
+                pulse: (t) => (t < 5 ? 90 : 145),
+                ceilingBehaviour,
+                holdTimeoutSeconds: 3,
+                pauseTimeoutSeconds: 2
+            });
+            const halt = rows.find((r) => r.cues.includes('stallHalt'));
+            assert.equal(halt.banner, RIDE_TEXT, ceilingBehaviour);
+            const resumed = rows.find((r) => r.t > halt.t && !r.engaged);
+            assert.ok(resumed.primary > 0, 'the ride came back');
+            const [lockAt] = lockStarts(rows);
+            assert.ok(rows.filter((r) => r.t >= lockAt).every((r) => r.primary === 0 && !r.engaged));
+            // The guard carved pauses out of the ride; it never made it longer.
+            const onset = rows.find((r) => r.isEdged).t;
+            assert.equal(lockAt - onset + 1, RUIN_RIDE_SECONDS);
+        }
+    });
+
+    it('stands down in the lockout and the stop after it, where the primary is at 0% already', () => {
+        // 1.1.0 kept it armed there with Crawl: it paused a primary that was
+        // not moving, said the lockout held it, and spoke "Crawl again" when
+        // the pause ended. The allow window that would run out on the very
+        // second the ride does is the edge case: the ride ends first, so there
+        // is nothing left to halt.
+        for (const holdTimeoutSeconds of [RUIN_RIDE_SECONDS, RUIN_RIDE_SECONDS + 1, 20, 60]) {
+            for (const ceilingBehaviour of ['crawl', 'stop']) {
+                const rows = driveSession({ seconds: 200, pulse: (t) => (t < 5 ? 90 : 145), ceilingBehaviour, holdTimeoutSeconds });
+                assert.ok(
+                    rows.every((r) => !r.engaged && r.cues.length === 0),
+                    `allow ${holdTimeoutSeconds} s, ${ceilingBehaviour}: the guard paused a primary that was already stopped`
+                );
+            }
+        }
+    });
+});
+
+describe('the Ruin clock and the guard rules, one by one', () => {
+    it('tickRuin: counts the ride only in Ruin and only on the mark, then locks, then holds', () => {
+        let clock = { rideSeconds: 0, lockSeconds: 0, spent: false };
+        clock = tickRuin(clock, { active: false, isEdged: true });
+        assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: 0, spent: false }, 'a game or another mode does not ride');
+        for (let s = 1; s < RUIN_RIDE_SECONDS; s += 1) {
+            clock = tickRuin(clock, { active: true, isEdged: true });
+            assert.deepEqual(clock, { rideSeconds: s, lockSeconds: 0, spent: false });
+        }
+        clock = tickRuin(clock, { active: true, isEdged: true });
+        assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: RUIN_LOCK_SECONDS, spent: true });
+        for (let s = RUIN_LOCK_SECONDS - 1; s >= 0; s -= 1) {
+            clock = tickRuin(clock, { active: s % 2 === 0, isEdged: true });
+            assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: s, spent: true }, 'the lockout runs down in any mode');
+        }
+        for (let s = 0; s < 100; s += 1) clock = tickRuin(clock, { active: true, isEdged: true });
+        assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: 0, spent: true }, 'and the ride does not come back on the mark');
+        clock = tickRuin(clock, { active: true, isEdged: false });
+        assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: 0, spent: false }, 'a release re-arms it');
+    });
+
+    it('tickRuin: a release keeps a running lockout, and garbage cannot stop the clock', () => {
+        const locked = { rideSeconds: 0, lockSeconds: 9, spent: true };
+        assert.deepEqual(tickRuin(locked, { active: true, isEdged: false }), { rideSeconds: 0, lockSeconds: 8, spent: false });
+        assert.deepEqual(
+            tickRuin({ rideSeconds: NaN, lockSeconds: 'x', spent: 0 }, { active: true, isEdged: true }),
+            { rideSeconds: 1, lockSeconds: 0, spent: false }
+        );
+        assert.equal(tickRuin({ rideSeconds: 0, lockSeconds: 9999, spent: true }, { active: true, isEdged: true }).lockSeconds, RUIN_LOCK_SECONDS - 1);
+        assert.deepEqual(tickRuin(undefined, undefined), { rideSeconds: 0, lockSeconds: 0, spent: false });
+    });
+
+    it('startRuinEdge: a new edge re-arms the ride and keeps a running lockout', () => {
+        assert.deepEqual(startRuinEdge({ rideSeconds: 7, lockSeconds: 11, spent: true }), { rideSeconds: 0, lockSeconds: 11, spent: false });
+        let clock = startRuinEdge({ rideSeconds: 0, lockSeconds: 3, spent: true });
+        for (let s = 0; s < 3; s += 1) clock = tickRuin(clock, { active: true, isEdged: true });
+        assert.deepEqual(clock, { rideSeconds: 0, lockSeconds: 0, spent: false });
+        clock = tickRuin(clock, { active: true, isEdged: true });
+        assert.equal(clock.rideSeconds, 1, 'the new edge rides once the lockout is over');
+    });
+
+    it('ruinRideSecondsLeft counts exactly the seconds tickRuin still rides', () => {
+        for (let ride = 0; ride < RUIN_RIDE_SECONDS; ride += 1) {
+            let clock = { rideSeconds: ride, lockSeconds: 0, spent: false };
+            const left = ruinRideSecondsLeft(clock, { active: true, isEdged: true });
+            let ticks = 0;
+            while (clock.lockSeconds === 0) {
+                clock = tickRuin(clock, { active: true, isEdged: true });
+                ticks += 1;
+            }
+            assert.equal(left, ticks, `from ${ride} s ridden`);
+        }
+        const riding = { rideSeconds: 4, lockSeconds: 0, spent: false };
+        assert.equal(ruinRideSecondsLeft(riding, { active: false, isEdged: true }), 0, 'not in Ruin');
+        assert.equal(ruinRideSecondsLeft(riding, { active: true, isEdged: false }), 0, 'not on the mark');
+        assert.equal(ruinRideSecondsLeft({ ...riding, lockSeconds: 5 }, { active: true, isEdged: true }), 0, 'locked');
+        assert.equal(ruinRideSecondsLeft({ ...riding, spent: true }, { active: true, isEdged: true }), 0, 'spent');
+    });
+
+    it('stallPauseSecondsLeft counts exactly the seconds tickStallGuard still pauses', () => {
+        for (let limit = 2; limit <= 60; limit += 1) {
+            for (let elapsed = 0; elapsed < limit; elapsed += 1) {
+                let guard = { holdSeconds: 5, pauseSeconds: elapsed, engaged: true };
+                const left = stallPauseSecondsLeft(guard, { pauseTimeoutSeconds: limit });
+                let ticks = 0;
+                while (guard.engaged) {
+                    guard = tickStallGuard(guard, { armed: true, isEdged: true, holdTimeoutSeconds: 20, pauseTimeoutSeconds: limit });
+                    ticks += 1;
+                }
+                assert.equal(left, ticks, `limit ${limit}, elapsed ${elapsed}`);
+            }
+        }
+        // A limit lowered below what has already run ends the pause next tick.
+        assert.equal(stallPauseSecondsLeft({ pauseSeconds: 7, engaged: true }, { pauseTimeoutSeconds: 3 }), 1);
+        assert.equal(stallPauseSecondsLeft({ pauseSeconds: 7, engaged: false }, { pauseTimeoutSeconds: 8 }), 0);
+    });
+
+    it('stallGuardArmed: Crawl, or a Ruin ride under either rule; never a game, Force Orgasm or the guard off', () => {
+        const base = { enabled: true, ceilingBehaviour: 'crawl', orgasmMode: false, activeMode: 'classic', ruinRiding: false, engaged: false };
+        assert.equal(stallGuardArmed(base), true);
+        assert.equal(stallGuardArmed({ ...base, ceilingBehaviour: 'stop' }), false, 'Full Stop parks the primary at 0%');
+        for (const ceilingBehaviour of ['crawl', 'stop']) {
+            const ruin = { ...base, activeMode: 'ruin', ceilingBehaviour };
+            assert.equal(stallGuardArmed({ ...ruin, ruinRiding: true }), true, `a ride under ${ceilingBehaviour}`);
+            assert.equal(stallGuardArmed(ruin), false, `the lockout under ${ceilingBehaviour}`);
+            assert.equal(stallGuardArmed({ ...ruin, engaged: true }), true, `a pause that began in the ride runs out (${ceilingBehaviour})`);
+            assert.equal(stallGuardArmed({ ...ruin, ruinRiding: true, orgasmMode: true }), false);
+            assert.equal(stallGuardArmed({ ...ruin, ruinRiding: true, enabled: false }), false);
+        }
+        for (const activeMode of GAME_MODES) {
+            assert.equal(stallGuardArmed({ ...base, activeMode, ruinRiding: true, engaged: true }), false, activeMode);
+        }
+        assert.equal(stallGuardArmed({ ...base, orgasmMode: true }), false);
+        assert.equal(stallGuardArmed({ ...base, enabled: false }), false);
+        assert.equal(stallGuardArmed(), false);
+    });
+
+    it('stallGuardCues: no crawl promised in Ruin, no "recovered" on the mark', () => {
+        assert.deepEqual(stallGuardCues({ justEngaged: true }, { activeMode: 'ruin', isEdged: true }), ['stallHalt']);
+        assert.deepEqual(stallGuardCues({ justResumed: true }, { activeMode: 'classic', isEdged: true }), ['stallResume']);
+        assert.deepEqual(stallGuardCues({ justResumed: true }, { activeMode: 'ruin', isEdged: true }), []);
+        assert.deepEqual(stallGuardCues({ justReleased: true }, { activeMode: 'classic', isEdged: false }), ['stallRecover']);
+        assert.deepEqual(stallGuardCues({ justReleased: true }, { activeMode: 'classic', isEdged: true }), [], 'disarmed on the mark is not a recovery');
+        assert.deepEqual(stallGuardCues(), []);
+    });
+
+    it('describeStallPauseNotice: the ride comes back only if it outlasts the pause', () => {
+        for (const ceilingBehaviour of ['crawl', 'stop']) {
+            assert.equal(describeStallPauseNotice({ mode: 'ruin', ceilingBehaviour, rideSecondsLeft: 6, pauseSecondsLeft: 5 }), RIDE_TEXT);
+            assert.equal(
+                describeStallPauseNotice({ mode: 'ruin', ceilingBehaviour, rideSecondsLeft: 5, pauseSecondsLeft: 5 }),
+                LOCKOUT_TEXT,
+                'on the tick they both run out the ride ends first'
+            );
+            assert.equal(describeStallPauseNotice({ mode: 'ruin', ceilingBehaviour, rideSecondsLeft: 0, pauseSecondsLeft: 3 }), LOCKOUT_TEXT);
+        }
+        // Outside Ruin the ride clock means nothing.
+        assert.equal(
+            describeStallPauseNotice({ mode: 'classic', ceilingBehaviour: 'crawl', rideSecondsLeft: 9, pauseSecondsLeft: 1 }),
+            'STALL PAUSE: PRIMARY HALTED — CRAWL RESUMES AFTER THE PAUSE'
+        );
     });
 });
 

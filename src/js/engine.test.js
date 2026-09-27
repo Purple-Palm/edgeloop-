@@ -1451,6 +1451,97 @@ describe('Survival Mode and Ruin & Leak are the documented exceptions to the cei
         }
     });
 
+    it('Ruin & Leak holds the stop after the lockout for as long as the pulse stays on the mark', () => {
+        // `ruinSpent`: this edge has had its ride. The lockout is over, the
+        // pulse is still on the mark, and the primary stays at 0% with the
+        // secondary at the lockout level - whichever ceiling rule is set.
+        // 1.1.0 had no such state and simply started the ride again.
+        for (const ceilingBehaviour of ['stop', 'crawl']) {
+            for (let sessionSeconds = 0; sessionSeconds < 60; sessionSeconds += 1) {
+                const held = calculateEngineOutputs({
+                    ...running, activeMode: 'ruin', hr: 145, edgeHr: 145, isEdged: true,
+                    ruinHoldSeconds: 0, ruinSpent: true, sessionSeconds, ceilingBehaviour
+                });
+                assert.equal(held.primaryPercent, 0, `${ceilingBehaviour} t=${sessionSeconds}`);
+                assert.equal(held.secondaryPercent, 18);
+                assert.equal(held.isEdged, true);
+            }
+        }
+        // It holds until the edge RELEASES, on the engine's own release band:
+        // a pulse still inside the band is still on the edge...
+        const inBand = calculateEngineOutputs({
+            ...running, activeMode: 'ruin', hr: 140 - EDGE_RELEASE_BPM, edgeHr: 140 - EDGE_RELEASE_BPM, isEdged: true, ruinSpent: true
+        });
+        assert.equal(inBand.isEdged, true);
+        assert.equal(inBand.primaryPercent, 0);
+        // ...and the moment it drops out of it Ruin teases again, on that
+        // same call, not a second later.
+        const released = calculateEngineOutputs({
+            ...running, activeMode: 'ruin', hr: 140 - EDGE_RELEASE_BPM - 1, edgeHr: 140 - EDGE_RELEASE_BPM - 1, isEdged: true, ruinSpent: true
+        });
+        assert.equal(released.isEdged, false);
+        assert.ok(released.primaryPercent > 0);
+        // Force Orgasm still overrides it. Since 1.1.1 that is a ramp over
+        // 28 s from what the toy was doing, so over a spent edge it starts
+        // from the dead stop the toy is in - exactly the ramp it runs over the
+        // lockout - never from a fresh ride on its first tick. The working
+        // ceiling climbs 1 BPM a second under it, as app.js raises it.
+        const forced = (orgasmBoost, clock) => calculateEngineOutputs({
+            ...running, activeMode: 'ruin', hr: 145, edgeHr: 145, isEdged: true, orgasmMode: true,
+            orgasmBoost, maxHr: 140 + orgasmBoost, sessionSeconds: 400 + orgasmBoost, ...clock
+        });
+        const spentEdge = { ruinHoldSeconds: 0, ruinSpent: true };
+        const lockout = { ruinHoldSeconds: 10, ruinSpent: true };
+        assert.equal(forced(0, spentEdge).primaryPercent, 0);
+        for (let orgasmBoost = 0; orgasmBoost <= 30; orgasmBoost += 1) {
+            assert.deepEqual(forced(orgasmBoost, spentEdge), forced(orgasmBoost, lockout), `Force Orgasm at ${orgasmBoost} s`);
+        }
+        assert.ok(forced(1, spentEdge).primaryPercent > 0);
+        assert.ok(forced(28, spentEdge).primaryPercent >= 70);
+        // And so do the stall guard and a stopped session, during a ride.
+        const ride = { ...running, activeMode: 'ruin', hr: 145, edgeHr: 145, isEdged: true, ruinSpent: false, sessionSeconds: 3 };
+        assert.ok(calculateEngineOutputs(ride).primaryPercent > 0);
+        assert.equal(calculateEngineOutputs({ ...ride, stallGuardEngaged: true }).primaryPercent, 0);
+        for (const sessionStatus of ['IDLE', 'PAUSED']) {
+            assert.equal(calculateEngineOutputs({ ...ride, sessionStatus }).primaryPercent, 0, sessionStatus);
+        }
+    });
+
+    it('a game borrows Ruin & Leak\'s stroke, never its lockout', () => {
+        // The Ruin clock now survives a game being switched on (a game toggle
+        // used to zero it and hand out a fresh ride). The game must still
+        // run exactly as it did: Ruin's ending belongs to Ruin as the active
+        // mode, not to the stroke a game borrows from it.
+        const subStates = {
+            oracle: { key: 'oracleState', values: ['APPROACH', 'HOLD', 'PURGATORY', 'DENIAL'] },
+            survival: { key: 'unused', values: [null] },
+            edgetrain: { key: 'trainingState', values: ['climb', 'hold', 'recover'] }
+        };
+        let compared = 0;
+        for (const [activeMode, sub] of Object.entries(subStates)) {
+            for (const value of sub.values) {
+                for (const hr of [100, 130, 145]) {
+                    for (let sessionSeconds = 0; sessionSeconds < 20; sessionSeconds += 1) {
+                        const game = {
+                            ...running, activeMode, strokeMode: 'ruin', [sub.key]: value,
+                            hr, edgeHr: hr, isEdged: hr >= 140, sessionSeconds, handyHwMin: 10, handyHwMax: 90
+                        };
+                        const fresh = calculateEngineOutputs({ ...game, ruinHoldSeconds: 0, ruinSpent: false });
+                        for (const clock of [{ ruinHoldSeconds: 11 }, { ruinSpent: true }, { ruinHoldSeconds: 3, ruinSpent: true }]) {
+                            assert.deepEqual(
+                                calculateEngineOutputs({ ...game, ...clock }),
+                                fresh,
+                                `${activeMode}/${value} at ${hr} t=${sessionSeconds} with ${JSON.stringify(clock)}`
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(compared > 0);
+    });
+
     it('the Guards text, both mode cards and the README name BOTH exceptions', () => {
         const read = (name) => readFileSync(new URL(`../../${name}`, import.meta.url), 'utf8');
         const guards = read('index.html');

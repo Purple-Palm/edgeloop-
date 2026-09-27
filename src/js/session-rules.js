@@ -1,12 +1,15 @@
 // Pure session rules shared by the cockpit: the effective heart-rate ceiling
 // (typed limit minus every safety offset), HR-limit sanitising, duration
-// parsing and the Survival breach counter. No DOM and no storage, so all of
-// it runs under node:test.
+// parsing, the Survival climb, the stall guard and Ruin & Leak's one-ride
+// clock. No DOM and no storage, so all of it runs under node:test.
 
-// The one thing this file reads from the engine: the crawl level, so the
-// cockpit banner can tell a crawling motor from a running one with the same
-// number the engine sends.
-import { CRAWL_PERCENT, resolveCeilingBehaviour } from './engine.js';
+// What this file reads from the engine: the crawl level, so the cockpit
+// banner can tell a crawling motor from a running one with the same number
+// the engine sends, and which modes are games, where the stall guard has
+// nothing of its own to cut. Ruin & Leak's timings come from the patterns
+// that draw its ride and its lockout.
+import { CRAWL_PERCENT, GAME_MODES, resolveCeilingBehaviour } from './engine.js';
+import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
 
 // The effective ceiling can never be pushed closer than this to the resting
 // HR, otherwise the tease band collapses into a permanent cut-off.
@@ -56,6 +59,13 @@ function toInt(value) {
 
 function clamp(value, lo, hi) {
     return Math.max(lo, Math.min(hi, value));
+}
+
+// A clock value as whole seconds, never negative. The clocks below are only
+// ever written by this file, but a NaN in one would stop it forever.
+function wholeSeconds(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
 }
 
 // Parse the two typed HR limits. A field that does not parse falls back to
@@ -393,6 +403,168 @@ export function tickStallGuard(
     };
 }
 
+// How many more 1 s ticks the current stall pause lasts before tickStallGuard
+// hands the primary back; 0 when the guard is not engaged. A pause that has
+// already run past a limit the wearer has just lowered ends on the very next
+// tick, so an engaged guard always has at least one second left.
+export function stallPauseSecondsLeft({ pauseSeconds = 0, engaged = false } = {}, { pauseTimeoutSeconds } = {}) {
+    if (!engaged) return 0;
+    return Math.max(1, clampStallPauseSeconds(pauseTimeoutSeconds) - wholeSeconds(pauseSeconds));
+}
+
+// ---- Ruin & Leak: one ride per edge ----------------------------------------
+
+// Ruin & Leak keeps stroking through the edge for RUIN_RIDE_SECONDS, then
+// stops dead for RUIN_LOCK_SECONDS with the secondary dropped low, so the
+// wearer can leak without a full orgasm. That is ONE ride per edge. 1.1.0
+// and 1.1.2 start the ride again the moment the lockout runs out, so a pulse
+// that simply stays on the mark - which is what a pulse does in the minute
+// after a ruined orgasm - gets 12 s at up to 74% (100% at full intensity)
+// out of every 30, for as long as it stays there; since 1.1.1 each of those
+// rides is a steady 59-74%. Before 1.1.0 the mode sent 0% whenever the
+// wearer was edged.
+//
+// So the ride belongs to the edge. Once this edge has had it (`spent`), the
+// primary stays at 0% after the lockout until the edge RELEASES - the pulse
+// falls below the release point the engine already uses, which is exactly
+// when the engine's own edge flag clears - and only then may a new edge ride.
+// It is session state, not mode state: re-selecting Ruin, switching to
+// another mode and back, a game toggle or a partner's MODE_CHANGE all used to
+// zero it, so one tap during the lockout cancelled the dead stop and started
+// a fresh ride. Only a release re-arms the ride (a lockout already running
+// still runs out), and only STOP, Reset or a new session clears the clock.
+//
+// One 1 s tick of a RUNNING session. `active`: Ruin & Leak is the active
+// mode (a game only borrows Ruin's stroke, so the ride clock does not run
+// under one). `isEdged`: the engine's edge flag this second.
+export function tickRuin(
+    { rideSeconds = 0, lockSeconds = 0, spent = false } = {},
+    { active = false, isEdged = false } = {}
+) {
+    let ride = Math.min(RUIN_RIDE_SECONDS, wholeSeconds(rideSeconds));
+    const lock = Math.min(RUIN_LOCK_SECONDS, wholeSeconds(lockSeconds));
+    let used = Boolean(spent);
+    // A release re-arms the ride for the NEXT edge. It does not shorten a
+    // lockout that is already running: those 18 s of dead stop are the ruin
+    // itself, and a pulse that dips during them has not earned the stroker
+    // back early.
+    if (!isEdged) {
+        ride = 0;
+        used = false;
+    }
+    // The lockout runs down in every mode, so a wearer who leaves Ruin for a
+    // minute does not come back to 18 s of dead stop they had already served.
+    // Whether the primary is still held after it is the `spent` flag's job.
+    if (lock > 0) return { rideSeconds: ride, lockSeconds: lock - 1, spent: used };
+    if (active && isEdged && !used) {
+        ride += 1;
+        if (ride >= RUIN_RIDE_SECONDS) return { rideSeconds: 0, lockSeconds: RUIN_LOCK_SECONDS, spent: true };
+    }
+    return { rideSeconds: ride, lockSeconds: lock, spent: used };
+}
+
+// The engine has just counted a new edge. It only ever counts one after a
+// release, and a release is what re-arms the ride. The 1 s tick sees most
+// releases itself, but a pulse that drops through the release point and
+// crosses the mark again between two ticks reads to the tick as one unbroken
+// edge; this is the engine's own word that it was two. A lockout that is
+// already running is kept: the new edge rides once it has been served.
+export function startRuinEdge({ lockSeconds = 0 } = {}) {
+    return { rideSeconds: 0, lockSeconds: Math.min(RUIN_LOCK_SECONDS, wholeSeconds(lockSeconds)), spent: false };
+}
+
+// How many more seconds the current ride runs if the pulse stays on the
+// mark: 0 unless Ruin & Leak is the active mode, the wearer is edged, no
+// lockout is running and this edge has not had its ride yet. The ride clock
+// keeps running through a stall pause (the guard can cut a ride short, never
+// make it longer), so this is also what decides whether a ride is still
+// there to come back when a pause ends.
+export function ruinRideSecondsLeft(
+    { rideSeconds = 0, lockSeconds = 0, spent = false } = {},
+    { active = false, isEdged = false } = {}
+) {
+    if (!active || !isEdged || spent || wholeSeconds(lockSeconds) > 0) return 0;
+    return Math.max(0, RUIN_RIDE_SECONDS - wholeSeconds(rideSeconds));
+}
+
+// Whether the stall guard is armed this second. It only arms where it has
+// something to cut: Crawl keeps the primary moving on the mark, so it arms
+// there; Full Stop already parks the primary at 0%, so it does not; a game
+// runs its own clock, and Force Orgasm overrides every guard.
+//
+// Ruin & Leak is governed by neither ceiling rule, so there the question is
+// whether its RIDE is on. The guard used to be keyed to Crawl alone, and Full
+// Stop disarmed it on the premise that the primary is parked at 0% - which a
+// Ruin ride is not - so with Full Stop nothing could cut a ride at all.
+// During the lockout, and the stop that holds after it, the primary is at 0%
+// already and the guard stands down. A pause that began during the ride
+// still runs its course when the ride ends underneath it, as a pause does in
+// any other mode: the banner told the wearer the primary is halted for it,
+// and switching to a crawling mode inside it must not bring the crawl back
+// early.
+export function stallGuardArmed({
+    enabled = false,
+    ceilingBehaviour,
+    orgasmMode = false,
+    activeMode,
+    ruinRiding = false,
+    engaged = false
+} = {}) {
+    if (!enabled || orgasmMode || GAME_MODES.includes(activeMode)) return false;
+    if (activeMode === 'ruin') return Boolean(ruinRiding) || Boolean(engaged);
+    return resolveCeilingBehaviour(ceilingBehaviour) === 'crawl';
+}
+
+// The cue ids the stall guard speaks on one tick. The factory lines for the
+// end of a pause promise a crawl ("Hold window reset. Crawl."), which only a
+// crawling mode gives back: in Ruin & Leak the primary goes back to the ride
+// or stays in the lockout, so that cue stays silent there. And the "left the
+// edge" cue ("Recovered. Resume.") is only spoken when the wearer really left
+// it. The guard is also released when it is disarmed with the pulse still on
+// the mark - switching from a Ruin ride to a Full Stop mode, Force Orgasm, the
+// toggle - and "recovered" there tells someone still on the edge to climb.
+export function stallGuardCues(
+    { justEngaged = false, justResumed = false, justReleased = false } = {},
+    { activeMode, isEdged = false } = {}
+) {
+    const cues = [];
+    if (justEngaged) cues.push('stallHalt');
+    if (justResumed && activeMode !== 'ruin') cues.push('stallResume');
+    if (justReleased && !isEdged) cues.push('stallRecover');
+    return cues;
+}
+
+// One 1 s tick of Ruin & Leak's clock and the stall guard together, in the
+// order that matters: the Ruin clock first, so the guard is armed by THIS
+// second's ride - on the second the ride runs out the primary is already
+// back at 0%, and a guard armed by last second's ride would start a pause
+// with nothing left to cut - then the guard, then the cues it earned.
+export function tickRuinAndStallGuard(
+    { ruin = {}, guard = {} } = {},
+    {
+        activeMode,
+        isEdged = false,
+        orgasmMode = false,
+        stallGuard = false,
+        ceilingBehaviour,
+        holdTimeoutSeconds,
+        pauseTimeoutSeconds
+    } = {}
+) {
+    const active = activeMode === 'ruin';
+    const nextRuin = tickRuin(ruin, { active, isEdged });
+    const armed = stallGuardArmed({
+        enabled: stallGuard,
+        ceilingBehaviour,
+        orgasmMode,
+        activeMode,
+        ruinRiding: ruinRideSecondsLeft(nextRuin, { active, isEdged }) > 0,
+        engaged: Boolean(guard.engaged)
+    });
+    const nextGuard = tickStallGuard(guard, { armed, isEdged, holdTimeoutSeconds, pauseTimeoutSeconds });
+    return { ruin: nextRuin, guard: nextGuard, cues: stallGuardCues(nextGuard, { activeMode, isEdged }) };
+}
+
 export function isSurvivalDefeated(breachTicks) {
     return (breachTicks || 0) >= SURVIVAL_BREACH_TICKS;
 }
@@ -619,17 +791,30 @@ export function describeGameNotice({
 // The cockpit's stall-pause banner, as pure text. The banner used to be one
 // fixed sentence in index.html - CRAWL RESUMES AFTER THE PAUSE - painted
 // whatever mode was running. In Ruin & Leak the primary is parked at 0% by
-// the mode's own lockout for as long as the pulse sits on the mark, so the
-// wearer held at the pullback mark on the defaults was promised a crawl in 8
-// seconds that the mode can never give: the premise of Ruin & Leak is cutting
-// penile input cold. The same sentence is wrong wherever the primary is not
-// coming back to a crawl, so the banner now names what the ACTIVE mode and
-// the "At the ceiling" setting will really do when the pause ends.
-export function describeStallPauseNotice({ mode, ceilingBehaviour } = {}) {
+// the mode's own lockout once its ride is over, so the wearer held at the
+// pullback mark on the defaults was promised a crawl in 8 seconds that the
+// mode can never give: the premise of Ruin & Leak is cutting penile input
+// cold. The same sentence is wrong wherever the primary is not coming back to
+// a crawl, so the banner now names what the ACTIVE mode and the "At the
+// ceiling" setting will really do when the pause ends.
+//
+// `rideSecondsLeft` / `pauseSecondsLeft` (ruinRideSecondsLeft and
+// stallPauseSecondsLeft) matter in Ruin & Leak only.
+export function describeStallPauseNotice({ mode, ceilingBehaviour, rideSecondsLeft = 0, pauseSecondsLeft = 0 } = {}) {
     const halted = 'STALL PAUSE: PRIMARY HALTED';
-    // Ruin & Leak parks the primary at 0% at the mark whichever ceiling rule
-    // is set, so the pause ending changes nothing the wearer will feel.
-    if (mode === 'ruin') return `${halted} — RUIN LOCKOUT HOLDS IT AT 0%`;
+    // Ruin & Leak is governed by neither ceiling rule. The guard is armed
+    // during its ride, and the ride's clock runs on through the pause, so the
+    // ride only comes back if it still has time left when the pause ends; on
+    // the tick they both run out the ride ends first. Otherwise the lockout,
+    // and the stop that holds after it until the edge releases, keeps the
+    // primary at 0%. This banner used to say the lockout held it at 0% in
+    // every case - over a ride that came back as the pause ended, and over a
+    // lockout that was about to run out into a fresh ride.
+    if (mode === 'ruin') {
+        return rideSecondsLeft > pauseSecondsLeft
+            ? `${halted} — RUIN RIDE RESUMES AFTER THE PAUSE`
+            : `${halted} — RUIN LOCKOUT HOLDS IT AT 0%`;
+    }
     // Survival never parks on the mark: its speed climbs on its own clock,
     // and the "At the ceiling" setting does not govern it either - so this
     // is asked BEFORE the Full Stop rule, which would otherwise promise a

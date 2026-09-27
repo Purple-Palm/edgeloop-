@@ -70,8 +70,13 @@ export const state = {
     prostateSpeed: 0,
     strokeMin: 0,
     strokeMax: 100,
+    // Ruin & Leak's one ride per edge (session-rules.js tickRuin): seconds
+    // of lockout left, seconds this edge has ridden, and whether this edge
+    // has had its ride. Session state, not mode state: only a release of the
+    // edge, STOP, Reset or a new session clears it, never a mode or game tap.
     ruinHoldSeconds: 0,
     ruinRideSeconds: 0,
+    ruinSpent: false,
     edgeStallSeconds: 0,
     stallPauseElapsed: 0,
     stallGuardEngaged: false,

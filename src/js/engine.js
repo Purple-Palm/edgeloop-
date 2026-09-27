@@ -210,7 +210,10 @@ export function calculateEngineOutputs({
     stallGuardEngaged = false,
     ceilingBehaviour = 'crawl',
     edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,
+    // Ruin & Leak's own clock (session-rules.js tickRuin): seconds of
+    // lockout left, and whether the current edge has already had its ride.
     ruinHoldSeconds = 0,
+    ruinSpent = false,
     strokeMode,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30,
@@ -306,6 +309,19 @@ export function calculateEngineOutputs({
 
     // Stall guard only ever cuts the PRIMARY stroker: the secondary
     // channel keeps whatever the mode gives it at the ceiling.
+    //
+    // Ruin's lockout belongs to Ruin as the ACTIVE mode. A game only borrows
+    // Ruin's stroke; the Ruin clock now survives a game being switched on
+    // (so switching one on and off again cannot hand out a second ride), and
+    // passing it through here would have given that game Ruin's ending too.
+    //
+    // A spent edge holds its stop for as long as the edge flag says the
+    // wearer is still on it, and the flag is what gates it, not `atPeak`:
+    // Force Orgasm clears `atPeak` (the ramp blends from the mode's output),
+    // so gating on it handed the ramp a fresh ride on its first tick - 0% to
+    // about 43% - where over the lockout it climbs from the stop. Without
+    // Force Orgasm the two are the same thing.
+    const ruinActive = mode === 'ruin';
     const teaseArgs = {
         mode: teaseMode,
         rawProgress: clamp((hr - minHr) / span, 0, 1),
@@ -316,7 +332,8 @@ export function calculateEngineOutputs({
         crawlPercent,
         stallGuardEngaged,
         seconds,
-        ruinHoldSeconds
+        ruinHoldSeconds: ruinActive ? ruinHoldSeconds : 0,
+        ruinSpent: ruinActive && Boolean(ruinSpent) && nextIsEdged
     };
     const stroke = teaseFrame(teaseArgs);
     const isGame = mode === 'oracle' || mode === 'survival' || mode === 'edgetrain';

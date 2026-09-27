@@ -21,7 +21,10 @@ import {
     survivalDrive,
     clampStallGuardSeconds,
     clampStallPauseSeconds,
-    tickStallGuard,
+    tickRuinAndStallGuard,
+    stallPauseSecondsLeft,
+    startRuinEdge,
+    ruinRideSecondsLeft,
     endgameKeepsOrgasmLatch,
     describeGameNotice,
     describeCutoffNotice,
@@ -40,7 +43,6 @@ import { describeBluetoothSupport, describeBleError } from './hardware/ble-proto
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed } from './hardware/handy-protocol.js';
-import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
@@ -887,6 +889,7 @@ function updateEngine() {
         ceilingBehaviour: advancedSettings.ceilingBehaviour,
         edgeHoldPercent: advancedSettings.edgeHoldPercent,
         ruinHoldSeconds: state.ruinHoldSeconds,
+        ruinSpent: state.ruinSpent,
         oracleState: state.oracleState,
         survivalSpeedFloor: state.survivalSpeedFloor,
         trainingState: state.trainState
@@ -896,6 +899,8 @@ function updateEngine() {
         state.edges += 1;
         const edgeEl = document.getElementById('edgeCount');
         if (edgeEl) edgeEl.textContent = state.edges;
+        // A new edge, and only a new edge, earns Ruin & Leak another ride.
+        applyRuinClock(startRuinEdge(readRuinClock()));
         reverseIntifaceRotation('edge');
         cueVoice('edge');
     }
@@ -938,10 +943,19 @@ function updateEngine() {
 
     const stallNotice = document.getElementById('stallGuardNotice');
     if (stallNotice) {
+        // In Ruin & Leak the banner says whether the ride is still there when
+        // the pause ends, from the same two clocks that decide it.
+        const rideLeft = ruinRideSecondsLeft(readRuinClock(), { active: state.activeMode === 'ruin', isEdged: state.isEdged });
+        const pauseLeft = stallPauseSecondsLeft(
+            { pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged },
+            { pauseTimeoutSeconds: advancedSettings.stallPauseSeconds }
+        );
         if (state.stallGuardEngaged) {
             stallNotice.textContent = describeStallPauseNotice({
                 mode: state.activeMode,
-                ceilingBehaviour: advancedSettings.ceilingBehaviour
+                ceilingBehaviour: advancedSettings.ceilingBehaviour,
+                rideSecondsLeft: rideLeft,
+                pauseSecondsLeft: pauseLeft
             });
         } else if (stallNotice.textContent !== '') {
             // Emptied as well as hidden: a banner that is not engaged has
@@ -1168,6 +1182,11 @@ function resetSessionCounters() {
     state.pauses = 0;
     state.peakHr = Number.isFinite(state.hrCurrent) ? state.hrCurrent : 70;
     state.isEdged = false;
+    // Ruin & Leak's clock belongs to the edge, so it is cleared with the edge
+    // flag: here, on STOP, Reset and START, and never by a mode card, a game
+    // toggle or a partner's MODE_CHANGE. A release of the edge re-arms the
+    // ride on its own (tickRuin).
+    applyRuinClock({ rideSeconds: 0, lockSeconds: 0, spent: false });
     state.orgasmBoost = 0;
     clearMicBoost(state);
     state.rampdownSecondsLeft = 45;
@@ -1212,35 +1231,29 @@ function resetGameState() {
     state.edgeStallSeconds = 0;
     state.stallPauseElapsed = 0;
     state.stallGuardEngaged = false;
-    state.ruinHoldSeconds = 0;
-    state.ruinRideSeconds = 0;
+    // Ruin & Leak's clock is deliberately NOT reset here. This runs on every
+    // game toggle - including one a partner sends - and zeroing the clock
+    // there cancelled a running 18 s dead stop and started a fresh ride.
+    // resetSessionCounters clears it with the edge flag it belongs to.
     state.lastSpokenPrompt = '';
     document.getElementById('stallGuardNotice')?.classList.add('hidden');
     document.getElementById('gameNotice')?.classList.add('hidden');
 }
 
+// Ruin & Leak's clock lives in three state fields; these move it in and out
+// of the shape session-rules.js works on.
+function readRuinClock() {
+    return { rideSeconds: state.ruinRideSeconds, lockSeconds: state.ruinHoldSeconds, spent: state.ruinSpent };
+}
+
+function applyRuinClock(clock) {
+    state.ruinRideSeconds = clock.rideSeconds;
+    state.ruinHoldSeconds = clock.lockSeconds;
+    state.ruinSpent = clock.spent;
+}
+
 function tickSessionGuardsAndGames() {
     if (state.sessionStatus !== 'RUNNING') return;
-
-    // Ruin keeps stroking through the edge. The dead stop starts only after
-    // the pulse has stayed on the mark long enough to be past a casual touch,
-    // then holds for RUIN_LOCK_SECONDS. A game does not use this ending; it
-    // only borrows Ruin's stroke when that is the selected mode.
-    if (state.activeMode === 'ruin') {
-        if (state.ruinHoldSeconds > 0) state.ruinHoldSeconds -= 1;
-        else if (state.isEdged) {
-            state.ruinRideSeconds += 1;
-            if (state.ruinRideSeconds >= RUIN_RIDE_SECONDS) {
-                state.ruinHoldSeconds = RUIN_LOCK_SECONDS;
-                state.ruinRideSeconds = 0;
-            }
-        } else {
-            state.ruinRideSeconds = 0;
-        }
-    } else if (state.ruinHoldSeconds > 0 || state.ruinRideSeconds > 0) {
-        state.ruinHoldSeconds = 0;
-        state.ruinRideSeconds = 0;
-    }
 
     // Guards and games judge against the SAME ceiling the engine used on its
     // last tick (after dual-stim / decay / learned offsets), never the raw
@@ -1250,29 +1263,39 @@ function tickSessionGuardsAndGames() {
     const hr = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
     const nearCeiling = hr >= (ceiling - 2);
 
-    // The stall guard only has something to cut in Crawl mode: with Full
-    // Stop the primary is already parked at 0% at the ceiling. Whenever its
-    // preconditions are not met (guard off, Full Stop, orgasm, a game mode)
-    // an engaged guard is released at once, even with the pulse still parked
-    // at the ceiling.
-    const crawlAtCeiling = advancedSettings.ceilingBehaviour !== 'stop';
-    const guardArmed = Boolean(advancedSettings.stallGuard) && crawlAtCeiling && !state.orgasmMode
-        && state.activeMode !== 'oracle' && state.activeMode !== 'survival' && state.activeMode !== 'edgetrain';
-    const guard = tickStallGuard(
-        { holdSeconds: state.edgeStallSeconds, pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged },
+    // Ruin keeps stroking through the edge, once: RUIN_RIDE_SECONDS on the
+    // mark, then a dead stop of RUIN_LOCK_SECONDS that holds until the edge
+    // releases. A game does not use this ending; it only borrows Ruin's
+    // stroke when that is the selected mode, so the ride clock only runs with
+    // Ruin itself active.
+    //
+    // The stall guard only arms where it has something to cut: Crawl on the
+    // mark, or a Ruin & Leak ride whichever ceiling rule is set. Whenever its
+    // preconditions are not met (guard off, Full Stop, orgasm, a game mode,
+    // Ruin's lockout) an engaged guard is released at once, even with the
+    // pulse still parked at the ceiling - except a pause that began during a
+    // Ruin ride, which runs its course. Both clocks tick in one call because
+    // the order is part of the rule (see tickRuinAndStallGuard).
+    const step = tickRuinAndStallGuard(
         {
-            armed: guardArmed,
+            ruin: readRuinClock(),
+            guard: { holdSeconds: state.edgeStallSeconds, pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged }
+        },
+        {
+            activeMode: state.activeMode,
             isEdged: state.isEdged,
+            orgasmMode: state.orgasmMode,
+            stallGuard: Boolean(advancedSettings.stallGuard),
+            ceilingBehaviour: advancedSettings.ceilingBehaviour,
             holdTimeoutSeconds: advancedSettings.stallGuardSeconds,
             pauseTimeoutSeconds: advancedSettings.stallPauseSeconds
         }
     );
-    state.edgeStallSeconds = guard.holdSeconds;
-    state.stallPauseElapsed = guard.pauseSeconds;
-    state.stallGuardEngaged = guard.engaged;
-    if (guard.justEngaged) cueVoice('stallHalt');
-    if (guard.justResumed) cueVoice('stallResume');
-    if (guard.justReleased) cueVoice('stallRecover');
+    applyRuinClock(step.ruin);
+    state.edgeStallSeconds = step.guard.holdSeconds;
+    state.stallPauseElapsed = step.guard.pauseSeconds;
+    state.stallGuardEngaged = step.guard.engaged;
+    step.cues.forEach((cue) => cueVoice(cue));
 
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
     if (warmupSeconds > 0 && state.sessionSeconds === warmupSeconds) {
@@ -2047,7 +2070,7 @@ const MODE_DETAILS = {
     shortener: 'Full strokes until your pulse is close to the heart rate you set, then the stroke shortens to the base. It stays quicker than Classic. The secondary channel stays low.',
     headplay: 'Full strokes until your pulse is close to the heart rate you set, then the stroke climbs toward the head. Speed eases off with your pulse, and the stroke opens back up when your pulse drops.',
     ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast. Stops and short bursts wait until your pulse is close to the heart rate you set. The internal toy follows the same chapters.',
-    ruin: 'The stroker keeps moving through the edge. After about 12 seconds on the mark it stops dead for 18 seconds and the other toy drops low, so it can leak without a full orgasm. "At the ceiling" does not govern the ride or that stop.',
+    ruin: 'The stroker keeps moving through the edge, once. After about 12 seconds on the mark it stops dead and the other toy drops low, so it can leak without a full orgasm. The stop lasts at least 18 seconds, and until the edge releases 5 BPM below the mark; only the next edge rides again. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
     survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. Check Calibration when this run should set your Climax HR, then tap Finished me when you come. The stroke range is the tease mode you selected.',
     edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
@@ -2092,9 +2115,11 @@ function applyModeSelection(mode, enabled) {
             state.gameMode = mode;
         }
     } else {
+        // Ruin & Leak's clock is left alone: it belongs to the edge, not to
+        // the card. Zeroing it here let one tap during the lockout - even on
+        // the Ruin card itself, or a partner's MODE_CHANGE - cancel the 18 s
+        // dead stop and start a fresh ride on a pulse still on the mark.
         state.teaseMode = mode;
-        state.ruinHoldSeconds = 0;
-        state.ruinRideSeconds = 0;
     }
     state.activeMode = state.gameMode || state.teaseMode;
     highlightModeCard();

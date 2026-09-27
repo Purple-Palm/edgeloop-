@@ -7,6 +7,10 @@
 // percent of the range the wearer already set, and placeStroke() can only
 // shrink inside the window it was given.
 
+// Ruin & Leak rides each edge once, for RUIN_RIDE_SECONDS, then stops dead
+// for at least RUIN_LOCK_SECONDS with the secondary dropped to
+// RUIN_LOCK_SECONDARY. The clock that decides which of the two the wearer is
+// in lives in session-rules.js (tickRuin); this file only draws each of them.
 export const RUIN_RIDE_SECONDS = 12;
 export const RUIN_LOCK_SECONDS = 18;
 export const RUIN_LOCK_SECONDARY = 18;
@@ -159,7 +163,8 @@ export function teaseFrame({
     crawlPercent = 0,
     stallGuardEngaged = false,
     seconds = 0,
-    ruinHoldSeconds = 0
+    ruinHoldSeconds = 0,
+    ruinSpent = false
 }) {
     const raw = clamp(rawProgress, 0, 1);
     const shaped = clamp(shapedProgress, 0, 1);
@@ -235,7 +240,15 @@ export function teaseFrame({
     }
 
     if (mode === 'ruin') {
-        if (ruinHoldSeconds > 0) {
+        // The dead stop: the lockout itself, and then for as long as the
+        // pulse stays on the mark after it. `ruinSpent` means this edge has
+        // had its ride and the wearer is still on it (the engine hands it on
+        // only while the edge flag is set); before it existed the ride simply
+        // started again when the lockout ran out, so a pulse parked on the
+        // mark got 12 s at up to 74% out of every 30 for as long as it stayed
+        // there. Force Orgasm ramps from this stop, as it does from the
+        // lockout.
+        if (ruinHoldSeconds > 0 || ruinSpent) {
             return { primary: 0, secondary: RUIN_LOCK_SECONDARY, strokeMin: 0, strokeMax: 100 };
         }
         // The ride keeps a real stroke on the mark. The near-stop weave is
