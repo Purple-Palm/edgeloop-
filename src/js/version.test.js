@@ -34,16 +34,14 @@ describe('parseChangelog', () => {
         assert.equal(sections[1].blocks[0].text, 'The footer gained Discord.');
     });
 
-    it('reads the real changelog as 1.1.0 over 1.0.0', () => {
+    it('reads the real changelog as the current version, then 1.1.0, then 1.0.0', () => {
         const text = readFileSync(new URL('../../CHANGELOG.md', import.meta.url), 'utf8');
         const sections = parseChangelog(text);
         const titles = sections.map((section) => section.title);
-        const patterns = titles.indexOf('1.1.0');
-        const previous = titles.indexOf('1.0.0');
-        assert.ok(patterns >= 0 && previous > patterns, titles.join(', '));
-        assert.ok(sections[patterns].blocks.some((block) => /PATTERNS/.test(block.text)));
-        if (titles[0] === 'Unreleased') {
-            assert.ok(sections[0].blocks.some((block) => /Force Orgasm/.test(block.text)));
-        }
+        assert.equal(titles[0], APP_VERSION);
+        assert.equal(titles[1], '1.1.0');
+        assert.equal(titles[2], '1.0.0');
+        assert.ok(sections[0].blocks.some((block) => /Force Orgasm/.test(block.text)));
+        assert.ok(sections[1].blocks.some((block) => /PATTERNS/.test(block.text)));
     });
 });
