@@ -171,10 +171,16 @@ describe('engine modes', () => {
         assert.ok(classicNoCrawl.secondaryPercent > 0);
     });
 
-    it('shortener contracts the envelope toward the base', () => {
-        const result = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 120 });
-        assert.ok(result.strokeMaxPercent < 100);
-        assert.equal(result.strokeMinPercent, 0);
+    it('shortener contracts the envelope toward the base once the pulse is close', () => {
+        const early = [];
+        for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+            early.push(calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 120, sessionSeconds }));
+        }
+        assert.ok(Math.max(...early.map((sample) => sample.strokeMaxPercent)) >= 90, 'at 120 the window is still the full range');
+        assert.ok(early.every((sample) => sample.strokeMinPercent === 0));
+        const close = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 136 });
+        assert.ok(close.strokeMaxPercent < 70, `strokeMax ${close.strokeMaxPercent}`);
+        assert.equal(close.strokeMinPercent, 0);
     });
 
     it('shortener runs full length at rest and lands on base micro-strokes 0-35% at the ceiling', () => {
@@ -190,7 +196,7 @@ describe('engine modes', () => {
         // less of it some seconds and almost all of it on others.
         assert.ok(Math.max(...rest) >= 90, `rest tops ${Math.max(...rest)}`);
         assert.ok(Math.min(...rest) <= 70, `rest tops ${Math.min(...rest)}`);
-        const mid = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 125 });
+        const mid = calculateEngineOutputs({ ...running, activeMode: 'shortener', hr: 136 });
         assert.ok(mid.strokeMaxPercent < 100);
         assert.equal(mid.strokeMinPercent, 0);
         for (const sessionSeconds of [0, 7, 20, 33]) {
@@ -208,10 +214,16 @@ describe('engine modes', () => {
         }
     });
 
-    it('headplay contracts the envelope toward the glans', () => {
-        const result = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 120 });
-        assert.ok(result.strokeMinPercent > 0);
-        assert.equal(result.strokeMaxPercent, 100);
+    it('headplay climbs toward the glans once the pulse is close', () => {
+        const early = [];
+        for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+            early.push(calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 120, sessionSeconds }));
+        }
+        assert.ok(Math.min(...early.map((sample) => sample.strokeMinPercent)) <= 15, 'at 120 the stroke still starts near the base');
+        assert.ok(early.every((sample) => sample.strokeMaxPercent === 100));
+        const close = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 136 });
+        assert.ok(close.strokeMinPercent >= 40, `strokeMin ${close.strokeMinPercent}`);
+        assert.equal(close.strokeMaxPercent, 100);
     });
 
     it('milker cross-fades secondary up as HR rises', () => {
@@ -287,12 +299,12 @@ describe('engine modes', () => {
         assert.ok(sameBeat.length < 20, 'an 8 second loop would match almost every sample');
     });
 
-    it('head play starts narrowing around the middle of the band', () => {
+    it('head play stays on the shaft until the pulse is close to the mark', () => {
         const mid = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 105, sessionSeconds: 0 });
-        // Halfway up the band is linear, not the squared curve, so the stroke
-        // has already climbed well off the base.
-        assert.ok(mid.strokeMinPercent >= 30, `strokeMin ${mid.strokeMinPercent}`);
+        assert.ok(mid.strokeMinPercent < 20, `strokeMin ${mid.strokeMinPercent}`);
         assert.equal(mid.strokeMaxPercent, 100);
+        const close = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 136, sessionSeconds: 0 });
+        assert.ok(close.strokeMinPercent >= 40, `strokeMin ${close.strokeMinPercent}`);
     });
 
     it('oracle approach pulls instead of teasing down', () => {
@@ -448,6 +460,45 @@ describe('engine modes', () => {
         });
         assert.ok(boxed.strokeMinPercent >= 15);
         assert.ok(boxed.strokeMaxPercent <= 80);
+    });
+
+    it('every tease mode keeps the stroker working until the pulse is close to the mark', () => {
+        const modes = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
+        for (const mode of modes) {
+            for (const hr of [100, 120, 125]) {
+                let low = 100;
+                let reach = 100;
+                for (let sessionSeconds = 0; sessionSeconds < 40; sessionSeconds += 1) {
+                    const sample = calculateEngineOutputs({
+                        ...running,
+                        activeMode: mode,
+                        hr,
+                        edgeHr: hr,
+                        isEdged: false,
+                        ceilingBehaviour: 'crawl',
+                        sessionSeconds
+                    });
+                    assert.equal(sample.isEdged, false, `${mode} at ${hr}`);
+                    low = Math.min(low, sample.primaryPercent);
+                    reach = Math.min(reach, sample.strokeMaxPercent - sample.strokeMinPercent);
+                }
+                assert.ok(low > 25, `${mode} at ${hr} dropped to ${low}`);
+                assert.ok(reach >= 55, `${mode} at ${hr} shortest stroke was ${reach}`);
+            }
+            const atMark = calculateEngineOutputs({
+                ...running,
+                activeMode: mode,
+                hr: 140,
+                edgeHr: 140,
+                isEdged: true,
+                ceilingBehaviour: 'crawl'
+            });
+            if (mode === 'ruin') {
+                assert.ok(atMark.primaryPercent > CRAWL_PERCENT, 'ruin keeps stroking on the mark');
+            } else {
+                assert.equal(atMark.primaryPercent, CRAWL_PERCENT, `${mode} crawls at the mark`);
+            }
+        }
     });
 
     it('ultimate keeps stroking until the pulse is close to the mark', () => {

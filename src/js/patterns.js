@@ -20,10 +20,17 @@ function wobble(seconds, period, phase) {
     return 0.5 + 0.5 * Math.sin(t * Math.PI * 2);
 }
 
-// How close the measured pulse is to the pullback mark before the weave is
-// allowed to really drop the toys. Below this, heart rate is the backoff and
-// the pattern only colors it. 0.94 of a 70–140 band is about 136 BPM.
+// How close the measured pulse is to the pullback mark before a mode is
+// allowed to shorten, climb off the shaft, or really drop the toys.
+// 0.80 of a 70–140 band is about 126 BPM. Below that, every mode rides the
+// same heart-rate curve on a long stroke.
+const CHARACTER_START = 0.80;
+// The last few BPM, where a weave may actually dip. 0.94 is about 136 BPM.
 const CLOSE_START = 0.94;
+
+function bandCharacter(nearness) {
+    return clamp((clamp(nearness, 0, 1) - CHARACTER_START) / (1 - CHARACTER_START), 0, 1);
+}
 
 function edgeClose(nearness) {
     return clamp((clamp(nearness, 0, 1) - CLOSE_START) / (1 - CLOSE_START), 0, 1);
@@ -138,11 +145,15 @@ export function teaseFrame({
     const climb = clamp(climbProgress, 0, 1);
     if (mode === 'shortener') {
         const beat = motion(seconds, 1.4, sensor);
-        const falling = (1 - raw * 0.5) * 100;
-        const primary = atPeak ? atCeiling(crawlPercent) : roundPct(falling * beat.speed);
-        const top = Math.max(35, Math.round(100 - shaped * 65));
-        // At the ceiling the window is the base. On the way there the length
-        // keeps changing inside that window.
+        // Quicker than the shared curve, and never slower than it, so the
+        // shorter stroke does not arrive as a stall in the middle of the band.
+        const shared = (1 - shaped) * 100;
+        const quicker = (1 - raw * 0.5) * 100;
+        const primary = atPeak ? atCeiling(crawlPercent) : roundPct(Math.max(shared, quicker) * beat.speed);
+        // The window stays the full range until the pulse is close, then
+        // closes on the base. At the mark it is the bottom 35%.
+        const bite = atPeak ? 1 : bandCharacter(sensor);
+        const top = Math.max(35, Math.round(100 - bite * 65));
         const stroke = placeStroke(0, top, atPeak ? 1 : beat.depth, 'low');
         const secondary = roundPct(6 + beat.secondary * 16);
         return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
@@ -150,9 +161,17 @@ export function teaseFrame({
 
     if (mode === 'headplay') {
         const beat = motion(seconds, 3.1, sensor);
-        const falling = (1 - raw) * 100;
+        // Same backoff as the other modes. A linear drop used to leave this
+        // one at a crawl around 120 BPM, while the stroke had already climbed
+        // off the shaft.
+        const falling = (1 - shaped) * 100;
         const primary = atPeak ? atCeiling(crawlPercent) : roundPct(falling * beat.speed);
-        const stroke = placeStroke(Math.round(raw * 75), 100, atPeak ? 1 : beat.depth, 'high');
+        const bite = atPeak ? 1 : bandCharacter(sensor);
+        // Until the climb starts, a short weave would pin the stroke at the
+        // head (high align keeps the top). Hold the length open so it still
+        // covers the shaft.
+        const depth = bite > 0 ? beat.depth : Math.max(beat.depth, 0.85);
+        const stroke = placeStroke(Math.round(bite * 75), 100, atPeak ? 1 : depth, 'high');
         const secondary = atPeak ? primary : roundPct(primary * (0.45 + 0.55 * beat.secondary));
         return { primary, secondary, strokeMin: stroke.min, strokeMax: stroke.max };
     }
@@ -197,7 +216,9 @@ export function teaseFrame({
         if (ruinHoldSeconds > 0) {
             return { primary: 0, secondary: RUIN_LOCK_SECONDARY, strokeMin: 0, strokeMax: 100 };
         }
-        const beat = motion(seconds, 6.6, sensor);
+        // The ride keeps a real stroke on the mark. The near-stop weave is
+        // for the tease modes; this one cuts later, on its own lockout.
+        const beat = motion(seconds, 6.6, 0);
         const base = atPeak ? 74 : 48 + (1 - shaped) * 52;
         const secondaryBase = 28 + climb * 42;
         const stroke = placeStroke(0, 100, beat.depth, 'low');
