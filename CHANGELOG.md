@@ -6,6 +6,9 @@ credited by username.
 
 ## Unreleased
 
+### Site
+- **beta.edgeloop.app.** A separate copy for development. Pushes to the `beta` branch publish there. `main` still publishes edgeloop.app. The footer shows BETA on that host. Settings and pairings on the beta site are its own, not the live site's.
+
 ## 1.1.2
 
 Survival, shipped as a patch so it can be tested. The next feature release still bumps the middle number.
