@@ -11,6 +11,10 @@ import {
     applyEndMargin,
     normalizeSlideRange,
     normalizeEnvelope,
+    isFinishedNumber,
+    envelopeWhileTyping,
+    envelopeFieldEvent,
+    endMarginFieldEvent,
     classifyHandyResponse,
     describeSlideAdjustment,
     isHampModeError,
@@ -20,6 +24,7 @@ import {
     HANDY_MIN_VELOCITY,
     handyTargetSpeed
 } from './handy-protocol.js';
+import { fieldEventOf } from './handy-fields.js';
 
 describe('handy mode constants', () => {
     it('matches the v2 spec numbering', () => {
@@ -102,6 +107,266 @@ describe('normalizeEnvelope', () => {
     });
     it('uses defaults for empty input', () => {
         assert.deepEqual(normalizeEnvelope('', ''), { min: 0, max: 100 });
+    });
+});
+
+// The page hands every event on a Travel Envelope field to envelopeFieldEvent,
+// with the text the field held when the event arrived, and puts in effect
+// whatever it returns. These replay what a wearer really does to the field,
+// event by event, and keep what was in effect after each. The field starts
+// out holding the bound in effect, as it does when it gains focus.
+function replayEnvelope(current, changed, events, focusText = String(current[changed])) {
+    let env = { ...current };
+    let before = focusText;
+    return events.map(([event, raw]) => {
+        const next = envelopeFieldEvent(env, changed, raw, event, { before });
+        if (next) env = next;
+        // A commit repaints the field with the bound it put in effect.
+        before = next && event !== 'input' ? String(next[changed]) : raw;
+        return { event, raw, env: { ...env }, acted: next !== null };
+    });
+}
+
+// The 'input' events of typing `text` into a field whose number is selected,
+// so the first key replaces it: "85" is "8", then "85".
+const typing = (text) => [...text].map((_, i) => ['input', text.slice(0, i + 1)]);
+
+// Enter, as the page hands it to the field: its keydown, mapped by fieldEventOf
+// (handy-fields.js).
+const enter = (raw) => [fieldEventOf({ type: 'keydown', key: 'Enter', isComposing: false }), raw];
+
+describe('isFinishedNumber', () => {
+    it('is not finished while one more digit could still be a number the field takes', () => {
+        // Upper Guard, 10-100: every single digit and "10" can still grow.
+        for (let n = 0; n <= 10; n++) assert.equal(isFinishedNumber(String(n), 100), false, `${n} of an Upper Guard`);
+        for (let n = 11; n <= 100; n++) assert.equal(isFinishedNumber(String(n), 100), true, `${n} of an Upper Guard`);
+        // Lower Guard, 0-90: "9" can still become 90.
+        for (let n = 0; n <= 9; n++) assert.equal(isFinishedNumber(String(n), 90), false, `${n} of a Lower Guard`);
+        for (let n = 10; n <= 90; n++) assert.equal(isFinishedNumber(String(n), 90), true, `${n} of a Lower Guard`);
+        // End-Stop Margin, 0-10: "1" can still become 10.
+        assert.equal(isFinishedNumber('0', HANDY_MAX_END_MARGIN), false);
+        assert.equal(isFinishedNumber('1', HANDY_MAX_END_MARGIN), false);
+        for (let n = 2; n <= 10; n++) assert.equal(isFinishedNumber(String(n), HANDY_MAX_END_MARGIN), true, `margin ${n}`);
+    });
+    it('is never finished for anything but whole digits', () => {
+        // What a number field can hold mid-edit, or hand back when it holds
+        // nothing it can parse.
+        for (const raw of ['', null, undefined, '85.5', '8.', '-5', '8e1', '1e2', '+50', '.5', ' 85', '85 ', 'abc']) {
+            assert.equal(isFinishedNumber(raw, 100), false, JSON.stringify(raw));
+        }
+        // A leading zero changes nothing: "085" is 85, and 85 is finished.
+        assert.equal(isFinishedNumber('085', 100), true);
+        assert.equal(isFinishedNumber('05', 100), false);
+    });
+});
+
+describe('typing into the Travel Envelope', () => {
+    it('never collapses the stroke or rewrites the Lower Guard on the way to an Upper Guard', () => {
+        // The reported sequence: 40-85, select the Upper Guard, type 8 then 5.
+        // The first key used to put 0-10 in effect - sent to the device as
+        // PUT /slide 0-10 mid-session - and the Lower Guard of 40 never came
+        // back: the second key only moved the Upper Guard. Chromium fires no
+        // 'change' when the field ends on the number it started with, so the
+        // edit ends on 'blur'.
+        const seen = replayEnvelope({ min: 40, max: 85 }, 'max', [...typing('85'), ['blur', '85']]);
+        for (const step of seen) {
+            assert.deepEqual(step.env, { min: 40, max: 85 }, `after ${step.event} "${step.raw}"`);
+        }
+        assert.ok(seen.every((step) => !step.acted), 'nothing had anything to put in effect');
+    });
+
+    it('never widens the stroke on the way to a narrower Lower Guard', () => {
+        // Typing 45 over 40 passed through 4 and put 4-90 in effect.
+        const seen = replayEnvelope({ min: 40, max: 90 }, 'min', typing('45'));
+        assert.deepEqual(seen[0].env, { min: 40, max: 90 }, '"4" must not reach the device');
+        // 45 narrows the envelope and is finished, so it takes effect on the
+        // keystroke that finishes it.
+        assert.deepEqual(seen[1].env, { min: 45, max: 90 });
+    });
+
+    it('lowers the Upper Guard the moment the number is finished', () => {
+        // The wearer pulling the guard in mid-session wants it now, not on
+        // Enter: a narrower envelope is the safe direction.
+        const seen = replayEnvelope({ min: 40, max: 85 }, 'max', typing('70'));
+        assert.deepEqual(seen.map((s) => s.env.max), [85, 70]);
+        assert.ok(seen.every((s) => s.env.min === 40), 'the Lower Guard is never touched');
+    });
+
+    it('waits on a number that could still grow, even when it would narrow', () => {
+        // "10" narrows 0-90 and is a legal pair on its own - but it is also
+        // the way to 100, and a stroke collapsed to 0-10 is not what anyone
+        // typing 100 asked for.
+        const seen = replayEnvelope({ min: 0, max: 90 }, 'max', [...typing('100'), ['change', '100']]);
+        assert.deepEqual(seen.map((s) => s.env.max), [90, 90, 90, 100]);
+        // A Lower Guard of 60 over 5 passes through 6, which would narrow too.
+        const lower = replayEnvelope({ min: 5, max: 100 }, 'min', typing('60'));
+        assert.deepEqual(lower.map((s) => s.env.min), [5, 60]);
+    });
+
+    it('holds a wider envelope until Enter or leaving the field', () => {
+        const seen = replayEnvelope({ min: 40, max: 85 }, 'max', [...typing('95'), ['change', '95']]);
+        assert.deepEqual(seen.map((s) => s.env), [
+            { min: 40, max: 85 },
+            { min: 40, max: 85 },
+            { min: 40, max: 95 }
+        ]);
+        const lower = replayEnvelope({ min: 40, max: 85 }, 'min', [...typing('25'), ['blur', '25']]);
+        assert.deepEqual(lower.map((s) => s.env.min), [40, 40, 25]);
+    });
+
+    it('leaves a pair only the commit can reconcile to the commit, which reconciles it as before', () => {
+        // 45 over a Lower Guard of 40 is not a full stroke as typed. While
+        // typing nothing moves; committed, the typed number is honoured and
+        // the other bound makes room, exactly as it always has.
+        const seen = replayEnvelope({ min: 40, max: 85 }, 'max', [...typing('45'), ['change', '45']]);
+        assert.deepEqual(seen.map((s) => s.env), [
+            { min: 40, max: 85 },
+            { min: 40, max: 85 },
+            { min: 35, max: 45 }
+        ]);
+    });
+
+    it('settles on leaving the field an edit no change event will report', () => {
+        // 80 narrows at once; typing 85 again waits (it widens); the field
+        // now holds the number it had on focus, so Chromium fires no 'change'
+        // - measured - and only 'blur' can put 85 back in effect.
+        const events = [...typing('80'), ...typing('85'), ['blur', '85']];
+        const seen = replayEnvelope({ min: 40, max: 85 }, 'max', events);
+        assert.deepEqual(seen.map((s) => s.env.max), [85, 80, 80, 80, 85]);
+        // Enter has the same gap - measured: no 'change' follows it either -
+        // and the panel promises a waiting number takes effect on Enter. The
+        // page hands Enter over as the commit it is, and 85 is back in effect
+        // with the field still focused.
+        const pressed = replayEnvelope({ min: 40, max: 85 }, 'max', [...typing('80'), ...typing('85'), enter('85')]);
+        assert.deepEqual(pressed.map((s) => s.env.max), [85, 80, 80, 80, 85]);
+        assert.equal(pressed[4].acted, true, 'Enter put the number in effect');
+        // Chromium's own 'change', when it does follow Enter, repeats the
+        // commit and changes nothing more; so does leaving the field.
+        const repeated = replayEnvelope({ min: 40, max: 85 }, 'max', [...typing('95'), enter('95'), ['change', '95'], ['blur', '95']]);
+        assert.deepEqual(repeated.map((s) => s.env), [
+            { min: 40, max: 85 }, { min: 40, max: 85 }, { min: 40, max: 95 }, { min: 40, max: 95 }, { min: 40, max: 95 }
+        ]);
+        assert.equal(repeated[4].acted, false, 'nothing left to settle on leaving');
+        // Leaving a field that shows what is in effect does nothing at all.
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '85', 'blur'), null);
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'min', '40', 'blur'), null);
+        // Leaving an emptied field hands back what is in effect, to repaint it.
+        assert.deepEqual(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '', 'blur'), { min: 40, max: 85 });
+        assert.deepEqual(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '', 'change'), { min: 40, max: 85 });
+    });
+
+    it('commits exactly as the envelope always has', () => {
+        // The commit path is untouched: whatever a committed number did
+        // before, it still does, other bound and all.
+        for (let lo = 0; lo <= 90; lo += 15) {
+            for (let hi = lo + 10; hi <= 100; hi += 15) {
+                for (const raw of ['0', '5', '8', '10', '45', '85', '95', '100', '150', '-5', '85.5', '']) {
+                    for (const changed of ['min', 'max']) {
+                        const typed = raw === '' ? null : raw;
+                        const always = normalizeEnvelope(
+                            changed === 'min' && typed !== null ? typed : lo,
+                            changed === 'max' && typed !== null ? typed : hi,
+                            changed
+                        );
+                        const now = envelopeFieldEvent({ min: lo, max: hi }, changed, raw, 'change');
+                        assert.deepEqual(now, always, `${lo}-${hi} ${changed} "${raw}"`);
+                    }
+                }
+            }
+        }
+    });
+
+    it('waits on a narrower number that was not typed onto the end', () => {
+        // Replacing the 7 of 75 on the way to 68 leaves a finished, narrower
+        // 65 in the field for one keystroke - measured in Chromium: Home,
+        // Shift+Right, 6 raises one 'input' holding "65". Taken as typed, 65
+        // would reach the device, and 68, being wider than 65, would then
+        // wait for the commit with the stroke held at 65 meanwhile.
+        const inPlace = replayEnvelope({ min: 40, max: 75 }, 'max', [
+            ['input', '65'], ['input', '68'], ['change', '68']
+        ]);
+        assert.deepEqual(inPlace.map((s) => s.env.max), [75, 75, 68]);
+        // Pasting over the whole number is the same: one 'input', no typing.
+        const pasted = replayEnvelope({ min: 40, max: 85 }, 'max', [['input', '70'], ['blur', '70']]);
+        assert.deepEqual(pasted.map((s) => s.env.max), [85, 70]);
+        // Backspacing a number the field does not take back to one it does
+        // is not typing it either: 150 is refused, and 15 waits.
+        const back = replayEnvelope({ min: 0, max: 90 }, 'max', [...typing('150'), ['input', '15']]);
+        assert.equal(back[3].acted, false);
+        // Typed onto the end of an emptied field, a finished number acts.
+        const emptied = replayEnvelope({ min: 40, max: 85 }, 'max', [['input', ''], ...typing('70')]);
+        assert.deepEqual(emptied.map((s) => s.env.max), [85, 85, 70]);
+    });
+
+    it('acts on no keystroke whose starting text is unknown', () => {
+        // The page takes the field's text when it gains focus. Without it
+        // nothing can show the number was typed, so the keystroke waits.
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '70', 'input'), null);
+        assert.equal(envelopeWhileTyping({ min: 40, max: 85 }, 'max', '70', { before: null }), null);
+        assert.deepEqual(envelopeWhileTyping({ min: 40, max: 85 }, 'max', '70', { before: '7' }), { min: 40, max: 70 });
+    });
+
+    it('never lets any keystroke move the other bound, widen, or act before the number is finished', () => {
+        // Every digit string a field can hold on the way anywhere - typed
+        // from the left, edited in the middle, backspaced - over every
+        // envelope on a 5% grid. Each is offered as typed into an emptied
+        // field, the one starting text every string can be typed onto.
+        const texts = [];
+        for (let n = 0; n <= 999; n++) {
+            texts.push(String(n));
+            if (n < 100) texts.push(String(n).padStart(2, '0'));
+        }
+        texts.push('', '85.5', '-5', '8e1', '1e2');
+        let acted = 0;
+        for (let lo = 0; lo <= 90; lo += 5) {
+            for (let hi = lo + 10; hi <= 100; hi += 5) {
+                for (const changed of ['min', 'max']) {
+                    const other = changed === 'min' ? 'max' : 'min';
+                    for (const raw of texts) {
+                        const next = envelopeFieldEvent({ min: lo, max: hi }, changed, raw, 'input', { before: '' });
+                        if (next === null) continue;
+                        acted += 1;
+                        const where = `${lo}-${hi} ${changed} "${raw}" -> ${next.min}-${next.max}`;
+                        assert.equal(next[other], changed === 'min' ? hi : lo, `moved the other bound: ${where}`);
+                        assert.ok(next.min >= lo && next.max <= hi, `widened: ${where}`);
+                        assert.ok(next.max - next.min >= HANDY_MIN_SLIDE_GAP, `less than a full stroke: ${where}`);
+                        assert.equal(next[changed], Number(raw), `not what was typed: ${where}`);
+                        assert.ok(isFinishedNumber(raw, changed === 'min' ? 90 : 100), `acted before it was finished: ${where}`);
+                    }
+                }
+            }
+        }
+        assert.ok(acted > 1000, 'the narrowing path must actually be exercised');
+    });
+
+    it('never lets a keystroke on the way to a number act on anything but that number', () => {
+        // Typing from the left, every number either field accepts, over every
+        // envelope on a 5% grid: no proper prefix ever takes effect, so the
+        // only thing a keystroke can send is the finished number itself.
+        for (let lo = 0; lo <= 90; lo += 5) {
+            for (let hi = lo + 10; hi <= 100; hi += 5) {
+                for (const [changed, first, last] of [['min', 0, 90], ['max', 10, 100]]) {
+                    for (let target = first; target <= last; target++) {
+                        const text = String(target);
+                        const seen = replayEnvelope({ min: lo, max: hi }, changed, typing(text));
+                        seen.slice(0, -1).forEach((step) => {
+                            assert.equal(step.acted, false, `${lo}-${hi}: "${step.raw}" acted on the way to ${text}`);
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    it('ignores an event or a bound it does not know', () => {
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '70', 'keyup', { before: '7' }), null);
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '70', 'keydown', { before: '7' }), null);
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'max', '70', null, { before: '7' }), null);
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'middle', '70', 'input', { before: '7' }), null);
+        assert.equal(envelopeFieldEvent({ min: 40, max: 85 }, 'middle', '70', 'change'), null);
+        assert.equal(envelopeWhileTyping({ min: 40, max: 85 }, undefined, '70', { before: '7' }), null);
+        // A missing envelope reads as full travel rather than throwing.
+        assert.deepEqual(envelopeWhileTyping(null, 'max', '70', { before: '7' }), { min: 0, max: 70 });
     });
 });
 
@@ -252,6 +517,90 @@ describe('applyEndMargin', () => {
     });
     it('defaults to the shipped margin', () => {
         assert.deepEqual(applyEndMargin({ min: 0, max: 100 }), { min: HANDY_DEFAULT_END_MARGIN, max: 100 - HANDY_DEFAULT_END_MARGIN });
+    });
+    it('never sends a wider range for a larger margin', () => {
+        // What lets a keystroke that RAISES the margin take effect at once:
+        // for every range, a larger margin is never wider than a smaller one.
+        for (let lo = 0; lo <= 100; lo += 1) {
+            for (let hi = lo; hi <= 100; hi += 1) {
+                let prev = applyEndMargin({ min: lo, max: hi }, 0);
+                for (let m = 1; m <= HANDY_MAX_END_MARGIN; m += 1) {
+                    const out = applyEndMargin({ min: lo, max: hi }, m);
+                    assert.ok(out.min >= prev.min && out.max <= prev.max, `${lo}-${hi}: margin ${m} sent ${out.min}-${out.max}, wider than ${prev.min}-${prev.max}`);
+                    prev = out;
+                }
+            }
+        }
+    });
+});
+
+describe('typing into the End-Stop Margin', () => {
+    // The page hands every event on the margin field to endMarginFieldEvent.
+    function replayMargin(current, events) {
+        let margin = current;
+        return events.map(([event, raw]) => {
+            const next = endMarginFieldEvent(margin, raw, event);
+            if (next !== null) margin = next;
+            return margin;
+        });
+    }
+
+    it('never passes through 1 on the way from 5 to 10', () => {
+        // The reported sequence: "1" used to put a margin of 1 in effect,
+        // and a full-travel stroke went out as 1-99 until the 0 was typed.
+        assert.deepEqual(replayMargin(5, [...typing('10'), ['change', '10']]), [5, 10, 10]);
+    });
+
+    it('raises the margin the moment the number is finished', () => {
+        assert.deepEqual(replayMargin(5, typing('8')), [8]);
+        assert.deepEqual(replayMargin(0, typing('5')), [5]);
+    });
+
+    it('holds a smaller margin until Enter or leaving the field', () => {
+        // Lowering it moves the carriage back toward the end stops: that is
+        // a decision, and 0 - the margin off - most of all.
+        assert.deepEqual(replayMargin(5, [...typing('2'), ['change', '2']]), [5, 2]);
+        assert.deepEqual(replayMargin(5, [...typing('0'), ['blur', '0']]), [5, 0]);
+    });
+
+    it('leaves a number the field does not take to the commit, which clamps it as before', () => {
+        assert.deepEqual(replayMargin(5, [...typing('15'), ['change', '15']]), [5, 5, 10]);
+        assert.equal(endMarginFieldEvent(5, '-3', 'change'), 0);
+        assert.equal(endMarginFieldEvent(5, '4.4', 'change'), 4);
+        // An emptied field is repainted with the margin in effect.
+        assert.equal(endMarginFieldEvent(7, '', 'change'), 7);
+        assert.equal(endMarginFieldEvent(7, '', 'blur'), 7);
+        assert.equal(endMarginFieldEvent(7, '4.4', 'input'), null);
+    });
+
+    it('settles on leaving the field an edit no change event will report', () => {
+        // 8 takes effect at once; typing 5 again waits; the field is back on
+        // the number it had on focus, so Chromium fires no 'change'.
+        assert.deepEqual(replayMargin(5, [...typing('8'), ...typing('5'), ['blur', '5']]), [8, 8, 5]);
+        // Nor for Enter, which the page hands over as a commit itself: the
+        // margin in effect was 8 while the field read 5 until the wearer left.
+        assert.deepEqual(replayMargin(5, [...typing('8'), ...typing('5'), enter('5')]), [8, 8, 5]);
+        // Enter on a smaller margin that differs from the focus text, followed
+        // by the 'change' Chromium then fires: one commit, made twice.
+        assert.deepEqual(replayMargin(5, [...typing('2'), enter('2'), ['change', '2'], ['blur', '2']]), [5, 2, 2, 2]);
+        assert.equal(endMarginFieldEvent(5, '5', 'blur'), null, 'nothing to settle');
+        assert.equal(endMarginFieldEvent(5, '5', 'input'), null, 'nothing to change');
+        assert.equal(endMarginFieldEvent(5, '8', 'keyup'), null, 'an event it does not know');
+    });
+
+    it('never lets a keystroke lower the margin or act before the number is finished', () => {
+        for (let current = 0; current <= HANDY_MAX_END_MARGIN; current++) {
+            for (let n = 0; n <= 199; n++) {
+                for (const raw of [String(n), String(n).padStart(2, '0')]) {
+                    const next = endMarginFieldEvent(current, raw, 'input');
+                    if (next === null) continue;
+                    assert.ok(next > current, `margin ${current}: "${raw}" lowered it to ${next}`);
+                    assert.ok(next <= HANDY_MAX_END_MARGIN, `margin ${current}: "${raw}" put ${next} in effect`);
+                    assert.equal(next, Number(raw));
+                    assert.ok(isFinishedNumber(raw, HANDY_MAX_END_MARGIN), `margin ${current}: "${raw}" acted unfinished`);
+                }
+            }
+        }
     });
 });
 

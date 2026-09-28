@@ -51,6 +51,7 @@ import {
 import { createScreenWakeLock } from './screen-wake-lock.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed } from './hardware/handy-protocol.js';
+import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
@@ -640,15 +641,16 @@ function updateHandySlideDisplay() {
         + (stillOnEnd ? ' - this Travel Envelope is too narrow for the margin to move the stroke off the end.' : '');
 }
 
-// Validate the typed end-stop margin (0-10; 0 sends the range untouched) and
-// persist it. Same shape as the envelope inputs: while typing, a half-typed
-// number is left alone; on commit the corrected value is written back.
-function applyHandyEndMarginInput(commit = false) {
+// Put an end-stop margin (0-10; 0 sends the range untouched) in effect and
+// persist it. The field is bound through handy-fields.js, which decides what
+// each keystroke or commit may do: a keystroke can raise the margin once the
+// number is finished, never lower it, so typing 10 over 5 no longer sends
+// strokes out to 1% on the way. A commit writes the corrected value back into
+// the field.
+function putHandyEndMargin(margin, commit) {
     const el = document.getElementById('handyEndMarginInput');
-    if (!el) return;
-    const margin = clampEndMargin(el.value === '' ? advancedSettings.handyEndMargin : el.value);
     advancedSettings.handyEndMargin = margin;
-    if (commit && String(el.value) !== String(margin)) el.value = margin;
+    if (commit && el && String(el.value) !== String(margin)) el.value = margin;
     persistSettings();
     updateHandySlideDisplay();
     updateEngine();
@@ -672,17 +674,13 @@ function syncHwEnvelopeInputs() {
     updateHwEnvelopeDisplay();
 }
 
-// Validate the typed envelope: clamp to 0-100, keep at least a 10% stroke by
-// moving the bound the user did NOT just edit, then write the corrected values
-// back into every input (both modals) and the persisted settings. `changed`
-// is 'min' or 'max'; `source` is the input being edited (defaults to the
-// first input of that bound).
-function applyHwEnvelopeInput(changed, commit = false, source = null) {
-    const edited = source || hwEnvelopeInputs(changed)[0] || null;
-    const typed = edited && edited.value !== '' ? edited.value : null;
-    const rawMin = changed === 'min' && typed !== null ? typed : advancedSettings.handyHwMin;
-    const rawMax = changed === 'max' && typed !== null ? typed : advancedSettings.handyHwMax;
-    const env = normalizeEnvelope(rawMin, rawMax, changed);
+// Put a Travel Envelope in effect: the persisted settings, every input (both
+// modals) and the engine. The fields are bound through handy-fields.js, which
+// decides what each event on them may do: a keystroke only ever narrows,
+// exactly as typed, and never touches the other bound; a commit clamps to
+// 0-100 and keeps at least a 10% stroke by moving the bound the wearer did
+// NOT edit. `edited` is the input being typed into, if any.
+function putHwEnvelope(env, commit, edited = null) {
     advancedSettings.handyHwMin = env.min;
     advancedSettings.handyHwMax = env.max;
     // While typing, only rewrite the inputs the user is NOT focused on so a
@@ -696,6 +694,21 @@ function applyHwEnvelopeInput(changed, commit = false, source = null) {
     persistSettings();
     updateHwEnvelopeDisplay();
     updateEngine();
+}
+
+// Every typed field of the Handy and TCode panels: the four envelope inputs
+// and the end-stop margin.
+function handyPanelFields() {
+    return [...hwEnvelopeInputs('min'), ...hwEnvelopeInputs('max'), document.getElementById('handyEndMarginInput')].filter(Boolean);
+}
+
+// Put back a number still waiting in a Handy panel field when the panel is
+// about to be hidden while the field still has the focus: the Handy link or a
+// heart-rate monitor finishing its connection closes the modal under a wearer
+// who is typing, and the browser would commit the field it hides
+// (settleFocusedField says why, and what it does instead).
+function settleHandyPanelInputs() {
+    settleFocusedField(handyPanelFields(), document.activeElement, syncHwEnvelopeInputs);
 }
 
 // The Handy Role, Speed Cap & Physical Travel Envelope Controls
@@ -717,12 +730,19 @@ function initHandyRoleUI() {
         });
     }
 
+    // Every typed field in this panel is bound through handy-fields.js, which
+    // turns what the browser reports - a keystroke, its own commit, Enter, the
+    // wearer leaving the field, the window losing the focus - into what may be
+    // put in effect, and asks the document whether the page has the focus.
     // The value itself is painted by syncHwEnvelopeInputs (below, and again
     // after every settings import).
     const marginInput = document.getElementById('handyEndMarginInput');
     if (marginInput) {
-        marginInput.addEventListener('input', () => applyHandyEndMarginInput(false));
-        marginInput.addEventListener('change', () => applyHandyEndMarginInput(true));
+        bindEndMarginField(marginInput, {
+            page: document,
+            margin: () => advancedSettings.handyEndMargin,
+            put: putHandyEndMargin
+        });
     }
 
     // Envelope inputs live in the Handy AND the TCode modal, all bound to the
@@ -730,8 +750,11 @@ function initHandyRoleUI() {
     syncHwEnvelopeInputs();
     ['min', 'max'].forEach((bound) => {
         hwEnvelopeInputs(bound).forEach((el) => {
-            el.addEventListener('input', () => applyHwEnvelopeInput(bound, false, el));
-            el.addEventListener('change', () => applyHwEnvelopeInput(bound, true, el));
+            bindEnvelopeField(el, bound, {
+                page: document,
+                envelope: () => ({ min: advancedSettings.handyHwMin, max: advancedSettings.handyHwMax }),
+                put: (env, commit) => putHwEnvelope(env, commit, el)
+            });
         });
     });
 
@@ -2329,6 +2352,8 @@ function openModal(type) {
 }
 
 function closeModal() {
+    // Before the overlay is hidden: hiding is what would commit the field.
+    settleHandyPanelInputs();
     overlay?.classList.add('hidden');
     if (state.isTestingMic && !advancedSettings.micEnabled) {
         stopMicMonitor(state);

@@ -94,6 +94,93 @@ export function normalizeEnvelope(min, max, changed = 'max', minGap = HANDY_MIN_
     return { min: lo, max: hi };
 }
 
+// Whether a number typed into one of the Handy panel's fields is finished:
+// whole digits only, and already so large that one more digit could not
+// still be a number the field accepts (`most` is the largest it takes). "8"
+// on its way to "85" is not finished, and neither is "10" on its way to
+// "100": the field cannot tell a number the wearer is still typing from one
+// they meant, so neither may act as one. Anything else a number input can
+// hold mid-edit - nothing, a sign, a decimal point, an exponent - is not
+// finished either.
+export function isFinishedNumber(raw, most) {
+    const text = String(raw ?? '');
+    return /^\d+$/.test(text) && Number(text) * 10 > most;
+}
+
+// What one keystroke in a Travel Envelope field may do while the wearer is
+// still typing (the field's 'input' event). Returns the envelope to put in
+// effect now, or null when the keystroke changes nothing yet.
+//
+// Every keystroke used to go through the normalisation a committed number
+// gets, and that keeps a full stroke by moving the OTHER bound. Typing 85
+// into an Upper Guard over a Lower Guard of 40 passed through "8": the
+// envelope collapsed to 0-10, a running session sent PUT /slide 0-10 to the
+// device, and the Lower Guard was rewritten to 0 for good, because the next
+// keystroke only ever moved the Upper Guard back. Typing 45 into a Lower
+// Guard of 40 passed through "4" and widened the stroke to 4-90.
+//
+// So a keystroke may only take travel away, and only exactly as typed: the
+// number is finished, the other bound stays where it is and still leaves a
+// full stroke, and the result sits inside the envelope in effect. Narrowing
+// is the direction a wearer correcting a guard mid-session needs at once.
+// Everything else - a number that could still grow, a wider envelope, a pair
+// only the commit can reconcile - waits for Enter or for the wearer to leave
+// the field, where normalizeEnvelope applies exactly as it always has.
+//
+// The number must also have been typed onto the end of `before`, the text
+// the field held when the keystroke arrived. A number field keeps its caret
+// to itself, and replacing the 7 of 75 on the way to 68 leaves a finished,
+// narrower 65 in the field exactly as typing 6 and 5 does; so does pasting
+// 65 over the whole number. Only the typing is known to be finished, so the
+// other two wait for the commit, and so does anything whose `before` the
+// caller cannot vouch for.
+export function envelopeWhileTyping(current, changed, raw, { before, minGap = HANDY_MIN_SLIDE_GAP } = {}) {
+    if (changed !== 'min' && changed !== 'max') return null;
+    if (before === undefined || before === null) return null;
+    const text = String(raw ?? '');
+    const held = String(before);
+    if (text.length <= held.length || !text.startsWith(held)) return null;
+    const now = normalizeEnvelope(current ? current.min : 0, current ? current.max : 100, 'max', minGap);
+    if (!isFinishedNumber(text, changed === 'min' ? 100 - minGap : 100)) return null;
+    const typed = Number(text);
+    const next = changed === 'min' ? { min: typed, max: now.max } : { min: now.min, max: typed };
+    if (next.max > 100 || next.max - next.min < minGap) return null;
+    if (next.min < now.min || next.max > now.max) return null;
+    if (next.min === now.min && next.max === now.max) return null;
+    return next;
+}
+
+// One event on a Travel Envelope field, as the page wires it: 'input' for a
+// keystroke, 'change' for a commit (Enter, a spin-button or arrow-key step,
+// leaving a field whose number changed) and 'blur' for leaving the field.
+// `before` is the text the field held when the event arrived. Returns the
+// envelope to put in effect, or null when the event changes nothing. A
+// commit is normalised exactly as before: clamped to 0-100 and, where the
+// typed number collides with the other bound, the other bound moves,
+// because that number is the one the wearer chose to commit.
+//
+// 'blur' is there because 'change' is not a reliable end to an edit.
+// Chromium fires none when the field ends up holding the number it had on
+// focus, even though a keystroke in between took effect: typing 80 over 85
+// narrows at once, typing 85 again waits, and leaving the field then fires
+// nothing - the field would read 85 over an envelope of 80. Enter has the
+// same gap, so the page hands Enter over as a 'change' itself (fieldEventOf
+// in handy-fields.js, which also binds the fields).
+export function envelopeFieldEvent(current, changed, raw, event, { before, minGap = HANDY_MIN_SLIDE_GAP } = {}) {
+    if (changed !== 'min' && changed !== 'max') return null;
+    if (event === 'input') return envelopeWhileTyping(current, changed, raw, { before, minGap });
+    if (event !== 'change' && event !== 'blur') return null;
+    const now = normalizeEnvelope(current ? current.min : 0, current ? current.max : 100, 'max', minGap);
+    const typed = raw === '' || raw === null || raw === undefined ? null : raw;
+    if (event === 'blur' && typed !== null && String(typed) === String(now[changed])) return null;
+    return normalizeEnvelope(
+        changed === 'min' && typed !== null ? typed : now.min,
+        changed === 'max' && typed !== null ? typed : now.max,
+        changed,
+        minGap
+    );
+}
+
 export function clampVelocity(velocity) {
     return clampPercent(velocity, 0);
 }
@@ -141,6 +228,28 @@ export function handyTargetSpeed(role, primarySpeed, secondarySpeed, capPercent 
 export function clampEndMargin(value, fallback = HANDY_DEFAULT_END_MARGIN) {
     const n = toInt(value, fallback);
     return Math.max(0, Math.min(HANDY_MAX_END_MARGIN, n));
+}
+
+// The End-Stop Margin under the same discipline as the envelope, as the page
+// wires its field ('input', 'change', 'blur'). Returns the margin to put in
+// effect, or null when the event changes nothing.
+//
+// A larger margin can only ever send a narrower range (applyEndMargin), so a
+// keystroke that finishes a larger number takes effect at once. A smaller
+// one moves the carriage back toward its end stops and waits for the commit:
+// typing 10 over a margin of 5 used to pass through 1 and send strokes out
+// to 1% and 99% of travel on the way.
+export function endMarginFieldEvent(current, raw, event) {
+    const now = clampEndMargin(current);
+    if (event === 'input') {
+        if (!isFinishedNumber(raw, HANDY_MAX_END_MARGIN)) return null;
+        const typed = Number(raw);
+        return typed > now && typed <= HANDY_MAX_END_MARGIN ? typed : null;
+    }
+    if (event !== 'change' && event !== 'blur') return null;
+    const typed = raw === '' || raw === null || raw === undefined ? null : raw;
+    if (event === 'blur' && typed !== null && String(typed) === String(now)) return null;
+    return clampEndMargin(typed === null ? now : typed);
 }
 
 // Inset an already-normalised slide range away from 0 and 100 by `margin`.

@@ -50,6 +50,7 @@ const PRECACHE = [
     './src/js/hardware/ble-protocol.js',
     './src/js/hardware/handy.js',
     './src/js/hardware/handy-protocol.js',
+    './src/js/hardware/handy-fields.js',
     './src/js/hardware/intiface.js',
     './src/js/hardware/buttplug-protocol.js',
     './src/js/hardware/stroke-planner.js',
