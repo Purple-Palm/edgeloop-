@@ -136,13 +136,15 @@
             </div>
           </div>
 
-          <!-- Voice / Mindgame Prompts -->
+          <!-- Voice / Mindgame Prompts. Every cue lands here whether or not the
+               voice is on; app.js keeps the label beside it honest (Voice on /
+               Voice off / Voice failed). -->
           <div id="mindgameContainer" class="hidden bg-slate-950 p-2 rounded-xl border border-slate-800/80 flex items-center justify-between gap-2">
             <div class="flex items-center gap-1.5 min-w-0 flex-1">
               <span class="text-purple-400 text-xs shrink-0">💬</span>
               <span id="mindgamePromptText" class="text-[11px] text-slate-300 font-medium truncate italic">"Calm and steady. Breathe."</span>
             </div>
-            <span class="text-[9px] text-slate-500 font-mono shrink-0">Voice Active</span>
+            <span id="mindgameVoiceLabel" class="text-[9px] font-mono shrink-0 text-slate-500">Voice off</span>
           </div>
         </div>
 
@@ -927,7 +929,7 @@
             <div class="flex items-center justify-between">
               <div>
                 <label class="text-xs font-bold text-slate-200 block">Spoken Voice Guidance</label>
-                <p class="text-[9px] text-slate-400 leading-snug">Shows each cue on the dashboard and speaks it with the browser's local voice.</p>
+                <p class="text-[9px] text-slate-400 leading-snug">Speaks each cue with the browser's local voice, from the moment you switch it on. Every cue also shows on the dashboard, on or off.</p>
               </div>
               <label class="relative inline-flex items-center cursor-pointer shrink-0">
                 <input id="paramVoiceToggle" type="checkbox" class="sr-only peer">
@@ -940,6 +942,10 @@
               </select>
               <button id="paramVoicePreviewBtn" type="button" class="shrink-0 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-2 py-1 rounded-lg text-[10px] cursor-pointer">Preview</button>
             </div>
+            <!-- Filled by app.js (describeVoiceStatus): what the browser said
+                 when it could not speak, a saved voice it does not have, or
+                 that a preview was heard with the voice switched off. -->
+            <p id="voiceStatusNote" role="status" aria-live="polite" class="hidden text-[9px] leading-snug text-slate-400"></p>
             <p class="text-[9px] text-slate-400 leading-snug pt-1 border-t border-slate-900">
               One phrase per line. As many lines as you want for each event — a random unused line is picked each time. Empty a box and that cue is muted: it says nothing and paints nothing, and <strong>Export phrases</strong> carries the mute so <strong>Import phrases</strong> restores it. Tokens: <span class="font-mono text-purple-300">{hr}</span> <span class="font-mono text-purple-300">{maxHr}</span> <span class="font-mono text-purple-300">{minHr}</span> <span class="font-mono text-purple-300">{edges}</span> <span class="font-mono text-purple-300">{minutes}</span>.
             </p>

@@ -43,6 +43,7 @@ const PRECACHE = [
     './src/js/voice.js',
     './src/js/voice-queue.js',
     './src/js/voice-cues.js',
+    './src/js/voice-status.js',
     './src/js/webrtc.js',
     './src/js/peer-messages.js',
     './src/js/hardware/ble.js',

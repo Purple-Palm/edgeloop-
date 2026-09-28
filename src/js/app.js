@@ -35,7 +35,7 @@ import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './s
 import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
 import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
-import { planBannerUpdate, canClearBanner, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
+import { planBannerUpdate, canClearBanner, hiddenBannerState, mergeBannerMessage, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
@@ -113,11 +113,21 @@ import {
     sampleMicLevel,
     clearMicBoost,
     listSpeechVoices,
+    setSpeechObserver,
     clampMicGate,
     clampMicBoostBpm,
     micBoostFromLevel,
     micBoostedHr
 } from './voice.js';
+import {
+    createSpeechNotices,
+    describeMissingVoice,
+    describeVoiceIndicator,
+    describeVoiceStatus,
+    planCueDelivery,
+    resolveSpeechVoice,
+    voiceDisplayName
+} from './voice-status.js';
 import {
     VOICE_CUE_CATALOG,
     mergeVoiceCues,
@@ -1052,13 +1062,27 @@ function dashboardIdlePrompt() {
     return text;
 }
 
+// The prompt line is on screen whether or not the voice is on (see cueVoice).
+// A remote page runs no engine, so its line could only ever be this device's
+// own resting phrase, never the wearer's cue.
 function paintIdlePrompt() {
     const text = state.lastSpokenPrompt || dashboardIdlePrompt();
-    setMindgamePrompt(text, Boolean(advancedSettings.voiceEnabled && text));
+    setMindgamePrompt(text, Boolean(text) && !isRemotePage);
+    renderVoiceState();
 }
 
-// Queue a spoken cue. Voice guidance ON both paints the dashboard line and
-// speaks it. An `urgent` cue (signal lost, stop) jumps the TTS queue.
+// Deliver a cue; voice-status.js decides how. Every cue is painted on the
+// dashboard prompt line whether or not voice guidance is on: with the voice
+// off the line used to stay hidden, so a wearer without working speech got
+// no cue in any channel - a lost pulse or a stall pause included. Voice
+// guidance ON also speaks it, and an `urgent` cue (signal lost, stop) jumps
+// the TTS queue.
+//
+// "Muted" and "voice guidance off" are different states. An emptied phrase
+// bank resolves to '': that cue says nothing and paints nothing, and the
+// dashboard keeps whatever the last unmuted cue wrote. Hiding the box there
+// wiped a live edge warning one second after it appeared, every
+// encouragement interval, all session.
 function cueVoice(key, urgent = false) {
     const lastTemplate = state.lastCueTemplateById?.[key] || '';
     const { text, template } = resolveVoiceCue(
@@ -1067,21 +1091,17 @@ function cueVoice(key, urgent = false) {
         sessionVoiceVars(),
         { lastTemplate }
     );
-    // "Muted" and "voice guidance off" are different states. An emptied
-    // phrase bank resolves to '' with voice still ON: that cue simply says
-    // nothing this tick, so the dashboard must keep whatever the last unmuted
-    // cue wrote. Hiding the box there wiped a live edge warning one second
-    // after it appeared, every encouragement interval, all session.
-    if (!text) {
-        if (!advancedSettings.voiceEnabled) setMindgamePrompt('', false);
-        return;
-    }
-    if (!advancedSettings.voiceEnabled) {
-        setMindgamePrompt(text, false);
-        return;
-    }
     const now = Date.now();
-    if (!urgent && text === state.lastSpokenPrompt && (now - (state.lastSpokenAt || 0) < 7000)) return;
+    const plan = planCueDelivery({
+        text,
+        urgent,
+        voiceEnabled: advancedSettings.voiceEnabled,
+        remote: isRemotePage,
+        lastText: state.lastSpokenPrompt,
+        lastAt: state.lastSpokenAt || 0,
+        now
+    });
+    if (!plan.paint) return;
     state.lastSpokenPrompt = text;
     state.lastSpokenAt = now;
     if (template) {
@@ -1089,8 +1109,8 @@ function cueVoice(key, urgent = false) {
         state.lastCueTemplateById[key] = template;
     }
     setMindgamePrompt(text, true);
-    if (urgent) speakNow(text, advancedSettings.voiceURI);
-    else speakPrompt(true, text, advancedSettings.voiceURI);
+    if (plan.speak === 'now') speakNow(text, advancedSettings.voiceURI);
+    else if (plan.speak === 'queue') speakPrompt(true, text, advancedSettings.voiceURI);
 }
 
 function updateWarmupBadge() {
@@ -1325,10 +1345,11 @@ function tickSessionGuardsAndGames() {
         cueVoice('warmupDone');
     }
 
+    // A cue like any other: with the voice off it still reaches the prompt
+    // line. Its own timer (0 = off) is what switches it off.
     const encourageEvery = clampEncourageSeconds(advancedSettings.voiceEncourageSeconds);
     if (
-        advancedSettings.voiceEnabled
-        && encourageEvery > 0
+        encourageEvery > 0
         && state.sessionStatus === 'RUNNING'
         && !state.orgasmMode
         && state.sessionSeconds > 0
@@ -1830,6 +1851,9 @@ function startOrResumeSession() {
         resetGameState();
         state.chosenTargetSeconds = pickSessionTargetSeconds();
         updateTimerDisplay();
+        // A voice that fails is told about once per session, so a fresh
+        // session may tell it once more.
+        speechNotices.newSession();
         cueVoice('sessionStart');
     } else {
         // Resume into the rampdown where it left off, not back to RUNNING.
@@ -1930,7 +1954,8 @@ resetBtn?.addEventListener('click', () => {
     resetGameState();
     updateWarmupBadge();
     cancelSpeech();
-    setMindgamePrompt('', false);
+    // Back to the resting line, exactly as on a fresh load.
+    paintIdlePrompt();
     showIdleTransport();
     syncTelemetry();
     checkReadiness();
@@ -2586,10 +2611,122 @@ function syncParamsUI() {
     const boostCap = clampMicBoostBpm(advancedSettings.micBoostMaxBpm);
     if (boostInput) boostInput.value = boostCap;
     if (boostValue) boostValue.textContent = String(boostCap);
+    previewedWhileOff = false;
     populateVoiceSelect();
     renderVoiceCueEditor();
     paintIdlePrompt();
 }
+
+// What the wearer is told about the voice itself. Speech errors used to be
+// swallowed, so a voice that never worked looked exactly like one that did.
+// A failure now shows on the label beside the dashboard prompt line for as
+// long as it lasts, under Preview in Session Setup, and on the alert banner
+// once per session: a voice that fails fails on every cue, and one banner per
+// cue would bury the reports that matter more.
+const speechNotices = createSpeechNotices();
+let speechProblem = null;
+let previewedWhileOff = false;
+
+const VOICE_LABEL_TONES = {
+    on: 'text-purple-300',
+    off: 'text-slate-500',
+    warn: 'text-amber-300 font-bold'
+};
+
+function renderVoiceState() {
+    const label = document.getElementById('mindgameVoiceLabel');
+    if (label) {
+        const indicator = describeVoiceIndicator({
+            enabled: advancedSettings.voiceEnabled,
+            failing: Boolean(speechProblem)
+        });
+        label.textContent = indicator.text;
+        label.className = `text-[9px] font-mono shrink-0 ${VOICE_LABEL_TONES[indicator.tone]}`;
+    }
+    const note = document.getElementById('voiceStatusNote');
+    if (note) {
+        const status = describeVoiceStatus({
+            enabled: advancedSettings.voiceEnabled,
+            problem: speechProblem,
+            voiceURI: advancedSettings.voiceURI,
+            voices: listSpeechVoices(),
+            previewedWhileOff
+        });
+        note.textContent = status ? status.text : '';
+        note.className = `text-[9px] leading-snug ${status && status.tone === 'warn' ? 'text-amber-300' : 'text-slate-400'}`;
+        note.classList.toggle('hidden', !status);
+    }
+}
+
+// Is the note under Preview on screen right now? Then it already says it.
+function voiceNoteOnScreen() {
+    return paramsModalOpen() && !document.getElementById('paramsAudioSection')?.classList.contains('hidden');
+}
+
+function announceVoiceNotice(kind, message, source) {
+    if (voiceNoteOnScreen()) return;
+    if (!speechNotices.take(kind)) return;
+    // An advisory never replaces a safety report; the banner appends it. An
+    // advisory of the same rank would simply replace one already standing
+    // there, and until the voice reported anything the microphone was the
+    // only advisory there was: a lost microphone's sentence would vanish
+    // under a voice notice. So it is appended to that one too, and the
+    // standing notice keeps its owner, so clearing the voice's own notice
+    // later can never take the microphone's with it.
+    if (bannerState.visible && bannerState.severity === 'advisory' && bannerState.source !== source) {
+        showAlertBanner(mergeBannerMessage(bannerState.text, message), { severity: 'advisory', source: bannerState.source });
+        return;
+    }
+    showAlertBanner(message, { severity: 'advisory', source });
+}
+
+setSpeechObserver((event) => {
+    if (event.type === 'started') {
+        if (!speechProblem) return;
+        speechProblem = null;
+        hideAlertBanner('voice');
+        renderVoiceState();
+    } else if (event.type === 'failed') {
+        speechProblem = { kind: event.kind, message: event.message };
+        renderVoiceState();
+        announceVoiceNotice(event.kind, event.message, 'voice');
+    } else if (event.type === 'voice-missing') {
+        renderVoiceState();
+        announceVoiceNotice('voice-missing', describeMissingVoice(event.voiceURI), 'voice-choice');
+    }
+});
+
+// The switch takes effect the moment it moves and is saved at once, like the
+// microphone Test beside it. It used to wait for Apply, which sits below the
+// fold on this tab: a wearer could switch it on, hear Preview, close the
+// panel with the X and run a whole session in silence - and the panel then
+// showed the switch OFF again, with nothing saying why.
+//
+// A failure the browser already reported is kept across the switch: it
+// belongs to the browser and its voices, not to the switch, and clearing it
+// would show "Voice on" to a wearer whose browser was just seen unable to
+// speak. The next cue that really starts clears it.
+function setVoiceEnabled(on) {
+    const next = Boolean(on);
+    const changed = next !== Boolean(advancedSettings.voiceEnabled);
+    advancedSettings.voiceEnabled = next;
+    // Off means silent now, not after the cue that is playing.
+    if (!next) cancelSpeech();
+    if (!changed) return;
+    previewedWhileOff = false;
+    // Nothing is spoken with the voice off, so a banner about the voice has
+    // nothing left to warn about.
+    if (!next) {
+        hideAlertBanner('voice');
+        hideAlertBanner('voice-choice');
+    }
+}
+
+document.getElementById('paramVoiceToggle')?.addEventListener('change', (e) => {
+    setVoiceEnabled(e.target.checked);
+    persistSettings();
+    paintIdlePrompt();
+});
 
 function populateVoiceSelect() {
     const select = document.getElementById('paramVoiceSelect');
@@ -2604,11 +2741,19 @@ function populateVoiceSelect() {
         if (voice.voiceURI === current) option.selected = true;
         select.appendChild(option);
     });
+    // A saved voice this browser does not list stays in the picker, named for
+    // what it is. Showing "Browser default" in its place made the next Apply
+    // or Preview overwrite the saved choice - and Chrome lists no voice at all
+    // until it has loaded them, so that could happen to a voice that was about
+    // to appear.
     if (current && !voices.some((voice) => voice.voiceURI === current)) {
-        select.value = '';
-    } else {
-        select.value = current;
+        const option = document.createElement('option');
+        option.value = current;
+        option.textContent = `${voiceDisplayName(current)} (not in this browser's voice list)`;
+        select.appendChild(option);
     }
+    select.value = current;
+    renderVoiceState();
 }
 
 if (window.speechSynthesis) {
@@ -2616,11 +2761,21 @@ if (window.speechSynthesis) {
     window.speechSynthesis.addEventListener('voiceschanged', populateVoiceSelect);
 }
 
+// Preview and Speak play whatever the switch says, so a wearer can try a
+// voice before turning guidance on. Hearing one with the switch off is
+// exactly how the forum report went, so the panel says it was only a preview.
+function notePreview() {
+    previewedWhileOff = !advancedSettings.voiceEnabled;
+    renderVoiceState();
+}
+
 document.getElementById('paramVoicePreviewBtn')?.addEventListener('click', () => {
     const select = document.getElementById('paramVoiceSelect');
     if (select) advancedSettings.voiceURI = select.value;
     const { text } = resolveVoiceCue(currentVoiceCues().cues, 'preview', sessionVoiceVars());
-    if (text) speakNow(text, advancedSettings.voiceURI);
+    if (!text) return;
+    speakNow(text, advancedSettings.voiceURI);
+    notePreview();
 });
 
 function escapeAttr(value) {
@@ -2686,7 +2841,9 @@ document.getElementById('voiceCuesList')?.addEventListener('click', (e) => {
     const btn = e.target?.closest?.('[data-voice-preview]');
     if (!btn) return;
     const { text } = resolveVoiceCue(currentVoiceCues().cues, btn.getAttribute('data-voice-preview'), sessionVoiceVars());
-    if (text) speakNow(text, advancedSettings.voiceURI);
+    if (!text) return;
+    speakNow(text, advancedSettings.voiceURI);
+    notePreview();
 });
 
 document.getElementById('voiceCuesResetBtn')?.addEventListener('click', () => {
@@ -2757,8 +2914,15 @@ document.getElementById('voiceCuesImportFile')?.addEventListener('change', (e) =
     e.target.value = '';
 });
 
+// Live from the moment it is picked, as it always was, and now saved then too:
+// a reload used to forget the voice unless Apply happened to run.
 document.getElementById('paramVoiceSelect')?.addEventListener('change', (e) => {
     advancedSettings.voiceURI = e.target.value;
+    persistSettings();
+    if (resolveSpeechVoice(listSpeechVoices(), advancedSettings.voiceURI).status !== 'missing') {
+        hideAlertBanner('voice-choice');
+    }
+    renderVoiceState();
 });
 
 // Endgame selection inside Session Setup
@@ -3007,12 +3171,13 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     syncWatchdogSettings();
     const warmupParsed = parseInt(document.getElementById('warmupInput')?.value, 10);
     advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
-    advancedSettings.voiceEnabled = document.getElementById('paramVoiceToggle')?.checked ?? false;
+    // Already live from the switch itself; Apply commits the same value
+    // through the same rule (silence at once when it is off).
+    setVoiceEnabled(document.getElementById('paramVoiceToggle')?.checked ?? false);
     advancedSettings.voiceURI = document.getElementById('paramVoiceSelect')?.value || '';
     const voiceForm = currentVoiceCues();
     advancedSettings.voiceCues = voiceForm.cues;
     advancedSettings.voiceEncourageSeconds = voiceForm.encourageSeconds;
-    if (!advancedSettings.voiceEnabled) cancelSpeech();
     const micOn = document.getElementById('paramMicToggle')?.checked ?? false;
     advancedSettings.micSensitivityThreshold = clampMicGate(document.getElementById('micGateInput')?.value);
     advancedSettings.micBoostMaxBpm = clampMicBoostBpm(document.getElementById('micBoostBpmInput')?.value);
@@ -4482,7 +4647,6 @@ renderLearningStatus();
 syncParamsUI();
 // A persisted mic setting waits for a tap (browser gesture rule).
 if (advancedSettings.micEnabled && !isRemotePage) showMicReenable(true);
-if (advancedSettings.voiceEnabled) paintIdlePrompt();
 watchChartResize(document.getElementById('hrChart'), redrawChart);
 if (isRemotePage && remoteRoom) {
     lockRemoteLimitInputs();

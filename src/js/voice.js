@@ -7,10 +7,36 @@
  * and cancelSpeech() (STOP / Reset / voice turned off) interrupt speech.
  */
 import { createCueQueue } from './voice-queue.js';
+import { describeSpeechFailure, resolveSpeechVoice, SPEECH_UNSUPPORTED } from './voice-status.js';
 
 const queue = createCueQueue({ maxQueued: 3 });
 let activeToken = 0;
 let fallbackTimer = null;
+let speechObserver = null;
+
+// app.js listens here for what the browser really did with each cue:
+//   { type: 'started' }                       it is being spoken;
+//   { type: 'failed', kind, code, message }   the browser refused or failed;
+//   { type: 'voice-missing', voiceURI }       the chosen voice is not in this
+//                                             browser, so the default voice
+//                                             speaks instead.
+// Every one of these used to be swallowed: an error simply moved the queue
+// on, so a voice that never worked looked exactly like one that did.
+export function setSpeechObserver(observer) {
+    speechObserver = typeof observer === 'function' ? observer : null;
+}
+
+function report(event) {
+    if (!speechObserver) return;
+    try {
+        speechObserver(event);
+    } catch (e) { /* a broken observer must never stall the cue queue */ }
+}
+
+function reportFailure(code) {
+    const failure = describeSpeechFailure(code, { voiceCount: listSpeechVoices().length });
+    if (failure) report({ type: 'failed', ...failure });
+}
 
 // Tests replace these hooks to assert that speak() is actually called.
 export const speechHooks = {
@@ -27,10 +53,18 @@ function synth() {
     return speechHooks.getSynth();
 }
 
+// Every cue reads the list now (to choose its voice and to explain a
+// failure), so an engine that throws here must cost the cue its chosen voice,
+// never the cue itself and never the queue behind it.
 export function listSpeechVoices() {
     const s = synth();
     if (!s) return [];
-    return s.getVoices() || [];
+    try {
+        const voices = s.getVoices();
+        return voices ? Array.from(voices) : [];
+    } catch (e) {
+        return [];
+    }
 }
 
 function clearFallbackTimer() {
@@ -46,35 +80,61 @@ function clearFallbackTimer() {
 function utter(text, voiceURI) {
     const s = synth();
     const Utterance = speechHooks.UtteranceCtor();
-    if (!s || !Utterance) return;
+    if (!s || !Utterance) {
+        // Nothing can be spoken here, ever. The queue is emptied so it cannot
+        // sit on this cue forever and swallow every later one, and the
+        // silence is reported instead of being left for the wearer to notice.
+        queue.clear();
+        reportFailure(SPEECH_UNSUPPORTED);
+        return;
+    }
     const token = ++activeToken;
     clearFallbackTimer();
     const utterance = new Utterance(text);
     utterance.rate = 0.95;
     utterance.pitch = 0.92;
-    if (voiceURI) {
-        const match = listSpeechVoices().find((voice) => voice.voiceURI === voiceURI);
-        if (match) utterance.voice = match;
-    }
+    // A saved voice this browser does not list (a backup from another device,
+    // an uninstalled voice) is never a reason to say nothing: the utterance
+    // keeps the browser's default voice and the wearer is told. An empty list
+    // is not evidence either way - Chrome lists no voice until it has loaded
+    // them - so it gets the default voice and no report.
+    const choice = resolveSpeechVoice(listSpeechVoices(), voiceURI);
+    if (choice.voice) utterance.voice = choice.voice;
+    else if (choice.status === 'missing') report({ type: 'voice-missing', voiceURI });
     const done = () => {
         if (token !== activeToken) return;
         clearFallbackTimer();
         const next = queue.next();
         if (next) utter(next, voiceURI);
     };
+    utterance.onstart = () => {
+        if (token === activeToken) report({ type: 'started' });
+    };
     utterance.onend = done;
-    utterance.onerror = done;
+    utterance.onerror = (event) => {
+        // A cue this page cancelled itself (STOP, Reset, an urgent cue, the
+        // voice switched off) ends with `interrupted` or `canceled`, or with
+        // an error that lands after its token was retired. Neither says
+        // anything about the voice, so only the live utterance may report.
+        if (token === activeToken) reportFailure(event?.error);
+        done();
+    };
     fallbackTimer = setTimeout(done, 3000 + text.length * 120);
     try {
         s.speak(utterance);
     } catch (e) {
+        if (token === activeToken) reportFailure('');
         done();
     }
 }
 
 // Enqueue a cue. Nothing already speaking is interrupted.
 export function speakPrompt(enabled, text, voiceURI = '') {
-    if (!enabled || !text || !synth()) return;
+    if (!enabled || !text) return;
+    if (!synth()) {
+        reportFailure(SPEECH_UNSUPPORTED);
+        return;
+    }
     if (!queue.enqueue(text)) return;
     if (queue.isIdle()) {
         const next = queue.next();
@@ -86,7 +146,11 @@ export function speakPrompt(enabled, text, voiceURI = '') {
 // speaks `text` immediately.
 export function speakNow(text, voiceURI = '') {
     const s = synth();
-    if (!text || !s) return;
+    if (!text) return;
+    if (!s) {
+        reportFailure(SPEECH_UNSUPPORTED);
+        return;
+    }
     activeToken += 1;
     const mine = activeToken;
     clearFallbackTimer();
