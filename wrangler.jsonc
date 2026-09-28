@@ -1,6 +1,6 @@
 {
   // Production. `edgeloop.app` is attached in the Cloudflare dashboard and
-  // deploys from `main`. This file does not list that hostname, so a beta
+  // deploys from `main`. This file does not list that hostname, so a dev
   // deploy cannot replace it.
   "name": "edgeloop",
   "compatibility_date": "2026-09-01",
@@ -9,12 +9,12 @@
     "not_found_handling": "single-page-application"
   },
   "env": {
-    // A second Worker. `npx wrangler deploy --env beta` publishes it and
-    // creates the beta.edgeloop.app DNS record in the Cloudflare zone.
-    "beta": {
-      "name": "edgeloop-beta",
+    // A second Worker. `npx wrangler deploy --env dev` publishes it and
+    // creates the dev.edgeloop.app DNS record in the Cloudflare zone.
+    "dev": {
+      "name": "edgeloop-dev",
       "routes": [
-        { "pattern": "beta.edgeloop.app", "custom_domain": true }
+        { "pattern": "dev.edgeloop.app", "custom_domain": true }
       ]
     }
   }

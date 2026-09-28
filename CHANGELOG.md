@@ -7,7 +7,7 @@ credited by username.
 ## Unreleased
 
 ### Site
-- **beta.edgeloop.app.** A separate copy for development. Pushes to the `beta` branch publish there. `main` still publishes edgeloop.app. The footer shows BETA on that host. Settings and pairings on the beta site are its own, not the live site's.
+- **dev.edgeloop.app.** A separate copy for development. Pushes to the `dev` branch publish there. `main` still publishes edgeloop.app. The footer shows DEV on that host. Settings and pairings on the dev site are its own, not the live site's.
 
 ## 1.1.2
 

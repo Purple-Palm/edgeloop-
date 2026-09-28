@@ -42,7 +42,7 @@ describe('parseChangelog', () => {
         assert.equal(titles[1], APP_VERSION);
         assert.equal(titles[2], '1.1.1');
         assert.equal(titles[3], '1.1.0');
-        assert.ok(sections[0].blocks.some((block) => /beta\.edgeloop\.app/.test(block.text)));
+        assert.ok(sections[0].blocks.some((block) => /dev\.edgeloop\.app/.test(block.text)));
         assert.ok(sections[1].blocks.some((block) => /Survival/.test(block.text)));
         assert.ok(sections[2].blocks.some((block) => /Force Orgasm/.test(block.text)));
         assert.ok(sections[3].blocks.some((block) => /PATTERNS/.test(block.text)));

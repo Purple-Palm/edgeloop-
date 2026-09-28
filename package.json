@@ -9,6 +9,6 @@
     "test": "node --test \"src/js/**/*.test.js\"",
     "smoke": "node tools/smoke.js",
     "start": "python3 -m http.server 8000",
-    "deploy:beta": "npx wrangler deploy --env beta"
+    "deploy:dev": "npx wrangler deploy --env dev"
   }
 }

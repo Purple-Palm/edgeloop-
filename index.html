@@ -461,7 +461,7 @@
         <span>© 2026 EdgeLoop.app</span>
         <span>•</span>
         <span id="appVersion" class="font-mono">v1.1.2</span>
-        <span id="betaHostBadge" class="hidden font-bold text-amber-300">BETA</span>
+        <span id="devHostBadge" class="hidden font-bold text-amber-300">DEV</span>
         <span>•</span>
         <button id="footerChangelogBtn" type="button" class="hover:text-slate-300 transition underline cursor-pointer">Changelog</button>
         <span>•</span>
@@ -1210,8 +1210,8 @@ python3 -m http.server 8787</pre>
         try { window.localStorage.setItem(key, value); return true; } catch (e) { return false; }
       }
 
-      if (location.hostname === 'beta.edgeloop.app') {
-        document.getElementById('betaHostBadge')?.classList.remove('hidden');
+      if (location.hostname === 'dev.edgeloop.app') {
+        document.getElementById('devHostBadge')?.classList.remove('hidden');
       }
 
       if (fileProtocol && fileNotice) fileNotice.classList.remove('hidden');
