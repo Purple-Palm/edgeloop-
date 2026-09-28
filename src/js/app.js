@@ -41,6 +41,14 @@ import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
+import {
+    supervisionGapLimitMs,
+    createSupervisionClock,
+    createPageAwayTracker,
+    describeSupervisionGap,
+    describePageAway
+} from './supervision.js';
+import { createScreenWakeLock } from './screen-wake-lock.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed } from './hardware/handy-protocol.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
@@ -364,6 +372,20 @@ function triggerDisconnectAlert(message, source = 'device') {
     checkReadiness();
 }
 
+// Screen Wake Lock (screen-wake-lock.js). A phone that locks its screen hides
+// the page, and a hidden page is throttled and then frozen, so while a
+// session is RUNNING or RAMPDOWN the screen is kept on. Every transport
+// change syncs it and the master clock re-asserts it once a second; a
+// browser without the API, or one that refuses it, changes nothing else.
+const screenWakeLock = createScreenWakeLock({
+    getWakeLock: () => navigator.wakeLock,
+    isVisible: () => document.visibilityState === 'visible'
+});
+
+function syncScreenWakeLock() {
+    screenWakeLock.update(!isRemotePage && (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN'));
+}
+
 // Pause a RUNNING or RAMPDOWN session, remembering which one so RESUME goes
 // back into the rampdown where it left off. Motors are stopped immediately.
 // Returns false when there was nothing to pause.
@@ -377,6 +399,7 @@ function pauseSession(voiceText = 'Paused.') {
     renderTransport('PAUSED');
     clearMicBoost(state);
     dispatchHardware(0, 0, 0, 100, true);
+    syncScreenWakeLock();
     if (voiceText) cueVoice('paused');
     return true;
 }
@@ -1463,6 +1486,11 @@ setInterval(() => {
 // (35-250) updates the displayed pulse, the history and the engine, so a
 // 0 BPM "no contact" packet holds the last value instead of dropping to 0.
 function recordHrReading(bpm, sensorContact = null, now = Date.now()) {
+    // Packets are events, not timers, so they keep arriving in a background
+    // tab whose master clock the browser holds back to once a minute. Each
+    // one checks that the clock is still keeping up: the gap is caught a few
+    // seconds in, not a minute later when the late tick finally runs.
+    haltIfUnsupervised(now);
     const valid = hrWatchdog.recordPacket(now, bpm, sensorContact);
     state.hrNoContact = !valid || sensorContact === false;
     document.getElementById('hrContactHint')?.classList.toggle('hidden', !state.hrNoContact);
@@ -1622,12 +1650,45 @@ function redrawChart() {
     drawTelemetryChart(chartEl, state.history, state.effectiveMinHr, state.effectiveMaxHr, triggerHr);
 }
 
+// Supervision of the master clock itself (supervision.js). The clock counted
+// ticks, not time: a browser holding a background tab to one wake-up a
+// minute, a frozen page or a sleeping laptop left the toys on their last
+// command with no watchdog and no guard, and the session carried on from the
+// late tick as if nothing had happened. Each tick now measures the wall
+// clock since the last one; a live session whose clock went quiet for longer
+// than supervisionGapLimitMs() is stopped and paused, never picked up where
+// it was. The gap is not added to the session clock: the per-second rules
+// only count seconds they actually watched.
+const supervisionClock = createSupervisionClock();
+
+// Stop and pause a RUNNING / RAMPDOWN session whose clock has fallen behind.
+// Asked by every tick and by every heart-rate packet between ticks. Returns
+// true when it halted the session.
+function haltIfUnsupervised(now = Date.now()) {
+    if (isRemotePage) return false;
+    if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'RAMPDOWN') return false;
+    const verdict = supervisionClock.check(now, {
+        limitMs: supervisionGapLimitMs(advancedSettings.hrStaleSeconds),
+        hidden: document.visibilityState === 'hidden'
+    });
+    if (!verdict.lost) return false;
+    // A forced zero dispatch to every driver and the pause, in one step.
+    triggerDisconnectAlert(describeSupervisionGap(verdict), 'supervision');
+    return true;
+}
+
 // 1-Second Master Clock
 setInterval(() => {
     if (isRemotePage) {
         renderRemoteClock();
         return;
     }
+
+    // Before anything else reads the session: a tick that arrives long after
+    // the last one pauses the session instead of counting a second.
+    const now = Date.now();
+    haltIfUnsupervised(now);
+    supervisionClock.beat(now, { hidden: document.visibilityState === 'hidden' });
 
     if (state.sessionStatus === 'RUNNING') {
         state.sessionSeconds += 1;
@@ -1691,6 +1752,10 @@ setInterval(() => {
     syncTelemetry();
     updateEngine();
     redrawChart();
+    // Every transport change syncs the screen lock itself; this catches any
+    // path that did not, so the lock never outlives the session by more than
+    // a second or fails to follow it into a new one.
+    syncScreenWakeLock();
 }, 1000);
 
 function handleTargetTimeReached() {
@@ -1772,9 +1837,14 @@ function startOrResumeSession() {
     }
     state.sessionStatus = resumingRampdown ? 'RAMPDOWN' : 'RUNNING';
     state.resumeStatus = null;
+    // Supervision starts now. The clock may not have ticked for a while (a
+    // pulse returning to a watchdog pause in a background tab), and that
+    // quiet stretch belongs to the pause, not to this session.
+    supervisionClock.beat(Date.now(), { hidden: document.visibilityState === 'hidden' });
     clearHrSignalPause();
     document.getElementById('rampdownNotice')?.classList.toggle('hidden', !resumingRampdown);
     renderTransport(state.sessionStatus);
+    syncScreenWakeLock();
     return true;
 }
 
@@ -1823,6 +1893,7 @@ function stopSession(outcome = "Stopped", voiceText = null) {
     state.strokerSpeed = 0;
     state.prostateSpeed = 0;
     dispatchHardware(0, 0, 0, 100, true);
+    syncScreenWakeLock();
     setOrgasmMode(false);
     clearHrSignalPause();
     try {
@@ -1852,6 +1923,7 @@ resetBtn?.addEventListener('click', () => {
     state.sessionStatus = 'IDLE';
     state.resumeStatus = null;
     dispatchHardware(0, 0, 0, 100, true);
+    syncScreenWakeLock();
     setOrgasmMode(false);
     clearHrSignalPause();
     resetSessionCounters();
@@ -3524,12 +3596,6 @@ document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', as
     }
 });
 
-// Best effort: a keepalive stop to The Handy when the page goes away or is
-// frozen. The motor is driven through the cloud and cannot notice that the
-// app is gone, so this is the only stop it would ever get.
-window.addEventListener('pagehide', () => { stopHandyOnUnload(); });
-document.addEventListener('freeze', () => { stopHandyOnUnload(); });
-
 // Intiface Central WebSocket. The driver reports its state through
 // onStatus; the modal label, the summary badge and the buttons follow it.
 const intifaceStatusColors = {
@@ -3602,9 +3668,6 @@ document.getElementById('modalIntifaceSaveBtn')?.addEventListener('click', () =>
     syncTelemetry();
     if (saved) setTimeout(closeModal, 600);
 });
-
-// Best effort: stop every Intiface toy when the page goes away.
-window.addEventListener('pagehide', () => { stopAllIntiface(); });
 
 window.setDeviceRole = (devIdx, axisIdx, role) => {
     setAxisRole(devIdx, axisIdx, role);
@@ -3809,9 +3872,6 @@ document.getElementById('modalTCodeDisconnectBtn')?.addEventListener('click', ()
     disconnectTCode().catch(() => {});
 });
 
-// Best effort: rest every axis when the page goes away.
-window.addEventListener('pagehide', () => { stopTCode(); });
-
 window.setTCodeRole = (axisIdx, role) => {
     setTCodeAxisRole(axisIdx, role);
     renderTCodeDevice();
@@ -3899,6 +3959,77 @@ function renderTCodeSummaryBadge() {
     if (assigned === 0) nameLabel += ' (all OFF)';
     setBadgeState('TCode', 'connected', nameLabel, null);
 }
+
+// Page lifecycle. A page that goes away (pagehide) or that the browser
+// freezes in the background (freeze) runs nothing afterwards, and no toy
+// notices: The Handy is driven through the cloud, an Intiface or T-Code axis
+// keeps the speed it was given. So both events send every toy the last stop
+// it will get - a keepalive request to The Handy (a plain one is cancelled
+// with a document that goes away, and does not leave a frozen one until it
+// is resumed), StopAllDevices to Intiface Central, the rest line to the
+// T-Code device. Freeze used to stop The Handy alone, and pagehide does not
+// fire for a frozen page, so a frozen tab left an Intiface or T-Code toy
+// running with no engine and no watchdog behind it.
+//
+// A live session is paused there and then, while the page still runs. A
+// frozen page is resumed with its timers intact, and the next tick would
+// otherwise restart every toy where it left off, with nobody having watched
+// the wearer in between. The banner saying so goes up when the page is back.
+const pageAway = createPageAwayTracker();
+
+function stopEveryToyOnPageAway() {
+    // One at a time, so a driver that throws cannot keep the stop from the others.
+    try { stopHandyOnUnload(); } catch (e) {}
+    try { stopAllIntiface(); } catch (e) {}
+    try { stopTCode(); } catch (e) {}
+}
+
+function handlePageAway(kind) {
+    stopEveryToyOnPageAway();
+    if (isRemotePage) return;
+    const running = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
+    // A watchdog pause with auto-resume on restarts the toys by itself on the
+    // first reading after the page is back. After a stretch nobody watched,
+    // that is the wearer's call, so it becomes an ordinary pause.
+    const selfResuming = state.sessionStatus === 'PAUSED' && state.hrSignalPaused && advancedSettings.hrAutoResume;
+    if (!running && !selfResuming) return;
+    pageAway.leave(kind, Date.now(), { wasRunning: running });
+    if (running) pauseSession(null);
+    if (selfResuming) clearHrSignalPause();
+    checkReadiness();
+    syncTelemetry();
+}
+
+function handlePageBack() {
+    if (isRemotePage) return;
+    const trip = pageAway.back(Date.now());
+    if (!trip) return;
+    showAlertBanner(describePageAway(trip), { severity: 'safety', source: 'supervision' });
+    checkReadiness();
+    syncTelemetry();
+}
+
+window.addEventListener('pagehide', (event) => handlePageAway(event.persisted ? 'bfcache' : 'unload'));
+document.addEventListener('freeze', () => handlePageAway('freeze'));
+// Chrome fires resume and then pageshow for a page back from the
+// back/forward cache; the banner goes up once.
+document.addEventListener('resume', handlePageBack);
+window.addEventListener('pageshow', (event) => { if (event.persisted) handlePageBack(); });
+
+// A page that is hidden is not paused for it: a video in another tab is not
+// a reason to stop. What is tracked is whether the clock kept up meanwhile,
+// and back in view the page settles that first, then asks for the screen
+// lock again (the browser dropped it when the page was hidden).
+document.addEventListener('visibilitychange', () => {
+    if (isRemotePage) return;
+    if (document.visibilityState === 'hidden') {
+        supervisionClock.noteHidden();
+        return;
+    }
+    haltIfUnsupervised();
+    screenWakeLock.visibilityChanged();
+    syncScreenWakeLock();
+});
 
 // Session History & Funscript Downloader Hook
 function saveSessionToHistory(outcome) {
