@@ -7,10 +7,17 @@
  * and an edge is only released once the pulse has clearly come back down.
  */
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
-import { teaseFrame, warmupShape, placeStroke, orgasmFrame, roundSpeed } from './patterns.js';
+import { teaseFrame, warmupShape, combineWake, placeStroke, orgasmFrame, roundSpeed } from './patterns.js';
 
 export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
 export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
+
+// The modes in which a cool-down after an edge is allowed to ease the toys
+// back in. Ruin & Leak is left out because its premise is a cold cut and a
+// timed lockout of its own, and the games are left out because they run their
+// own speeds against the pulse: a cool-down slowing the Oracle's approach or
+// a Survival floor would change what the game promised.
+export const COOLDOWN_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate'];
 
 export function resolveTeaseMode(strokeMode, activeMode) {
     if (TEASE_MODES.includes(strokeMode)) return strokeMode;
@@ -115,6 +122,24 @@ export function resolveEngineMode(mode) {
     return ENGINE_MODES.includes(mode) ? mode : 'classic';
 }
 
+// The cool-down's wake-up factors: the session warm-up curve, restarted at
+// the edge. `cooldownSeconds` is how far into the cool-down this tick is and
+// `cooldownMinutes` its length; null seconds or zero minutes means there is
+// no cool-down, and the factors are 1 so the output is exactly today's.
+//
+// The gate is strict on purpose. warmupShape reads a NaN or negative second
+// as second zero, its SLOWEST point, so a caller that handed over a stale or
+// broken clock would pin the toys at 16% speed with no cool-down running and
+// nothing on the cockpit to say why. Only a finite second at or after the
+// start, a positive length and a mode that allows a cool-down count.
+export function cooldownShape(mode, cooldownSeconds, cooldownMinutes) {
+    const none = { speed: 1, depth: 1 };
+    if (!COOLDOWN_MODES.includes(mode)) return none;
+    if (!Number.isFinite(cooldownSeconds) || cooldownSeconds < 0) return none;
+    if (!Number.isFinite(cooldownMinutes) || cooldownMinutes <= 0) return none;
+    return warmupShape(cooldownSeconds, cooldownMinutes);
+}
+
 // Does the microphone boost reach a motor in this mode? The boost rides on
 // `hr`, which drives the falling tease curve and the stroke-depth
 // contraction that shares it; every term that RISES with arousal reads the
@@ -217,7 +242,11 @@ export function calculateEngineOutputs({
     strokeMode,
     oracleState = 'IDLE',
     survivalSpeedFloor = 30,
-    trainingState = 'climb'
+    trainingState = 'climb',
+    // Seconds into the cool-down that follows an edge (null: none running)
+    // and the length the wearer chose (0: Off). See cooldownShape.
+    cooldownSeconds = null,
+    cooldownMinutes = 0
 }) {
     const mode = resolveEngineMode(activeMode);
     const teaseMode = resolveTeaseMode(strokeMode, mode);
@@ -397,9 +426,30 @@ export function calculateEngineOutputs({
     // warm-up held at 139 BPM on a 70/140 band sent The Handy 17-19 stop /
     // start pairs. A stop decided above (the stall guard, Full Stop) is 0
     // and stays 0.
+    //
+    // A cool-down after an edge is the same easing, restarted at the edge:
+    // the pulse has just been at the pullback mark, and full speed on the
+    // first tick after it is what tips a wearer over. The two shapes are
+    // combined by the smaller factor, so a cool-down can only slow the toys
+    // and shorten the stroke, never speed anything up, and with no cool-down
+    // running the factors are the warm-up's own. The edge flag was decided
+    // above and is not read here, so the cool-down can never move it.
+    let warmZone = null;
     if (!orgasmMode && sessionStatus === 'RUNNING') {
-        const wake = warmupShape(seconds, warmupMinutes);
+        const warm = warmupShape(seconds, warmupMinutes);
+        const cool = cooldownShape(mode, cooldownSeconds, cooldownMinutes);
+        const wake = combineWake(warm, cool);
         if (wake.depth < 1 || wake.speed < 1) {
+            // Where the cool-down is the tighter shape, keep the zone the
+            // warm-up alone would have given: the cooled zone is held inside
+            // it once both are settled below. With no cool-down running, or
+            // one looser than the warm-up, nothing is kept and the zone is
+            // exactly today's.
+            if (cool.depth < warm.depth) {
+                warmZone = (warm.depth < 1 || warm.speed < 1)
+                    ? placeStroke(strokeMinPercent, strokeMaxPercent, warm.depth, 'low')
+                    : { min: strokeMinPercent, max: strokeMaxPercent };
+            }
             const woken = placeStroke(strokeMinPercent, strokeMaxPercent, wake.depth, 'low');
             strokeMinPercent = woken.min;
             strokeMaxPercent = woken.max;
@@ -411,10 +461,7 @@ export function calculateEngineOutputs({
     // Optional stored stroke-depth contraction. Default depth is the full
     // window, so this is a no-op until a backup carries a smaller value.
     // It reads the boosted curve, so a louder room can only shorten travel.
-    if (depthContractAmount > 0) {
-        const cut = progress * depthContractAmount;
-        strokeMaxPercent = Math.max(strokeMinPercent, Math.round(strokeMaxPercent - cut));
-    }
+    const contraction = depthContractAmount > 0 ? progress * depthContractAmount : null;
 
     // Global Intensity scales both channels by 0.5-1.5x. Like the warm-up it
     // may slow a motion down but never round it into a stop.
@@ -422,16 +469,29 @@ export function calculateEngineOutputs({
     primaryPercent = roundSpeed(primaryPercent * intensityScale);
     secondaryPercent = roundSpeed(secondaryPercent * intensityScale);
 
-    // Zone sanity: whatever the mode and warm-up cap did, the zone must stay
-    // ordered and at least MIN_ZONE_WIDTH wide. The cap (upper bound) wins,
-    // so the lower bound is pulled down first; only when the cap itself sits
-    // below the minimum width is it raised.
-    strokeMinPercent = clamp(Math.round(finiteOr(strokeMinPercent, 0)), 0, 100);
-    strokeMaxPercent = clamp(Math.round(finiteOr(strokeMaxPercent, 100)), 0, 100);
-    if (strokeMaxPercent - strokeMinPercent < MIN_ZONE_WIDTH) {
-        strokeMinPercent = Math.max(0, strokeMaxPercent - MIN_ZONE_WIDTH);
+    const settled = settleZone(strokeMinPercent, strokeMaxPercent, contraction);
+    strokeMinPercent = settled.min;
+    strokeMaxPercent = settled.max;
+
+    // A cool-down may only ever shorten the stroke the wearer would have had
+    // without it, and settling the cooled zone on its own does not promise
+    // that: placeStroke rounds the window's ends before it shrinks, so a
+    // factor within half a percent of 1 can hand back a top a fraction ABOVE
+    // the unrounded one, which the contraction then rounds into a whole
+    // percent; and the width floor pulls a zone that came out too narrow
+    // DOWN, so the cooled zone sits at a different height than the warm-up's
+    // and the rounding onto a narrow travel envelope can make it a physical
+    // percent longer. So the cooled zone is held inside the zone the warm-up
+    // alone gives, settled the same way, and widened UPWARD inside it when
+    // the floor asks. Inside that zone every percent of travel is one the
+    // wearer would have been stroked over anyway, and a zone inside another
+    // stays inside it through the rounding onto the envelope below.
+    if (warmZone) {
+        const bound = settleZone(warmZone.min, warmZone.max, contraction);
+        strokeMinPercent = Math.max(strokeMinPercent, bound.min);
+        strokeMaxPercent = Math.min(strokeMaxPercent, bound.max);
         if (strokeMaxPercent - strokeMinPercent < MIN_ZONE_WIDTH) {
-            strokeMaxPercent = Math.min(100, strokeMinPercent + MIN_ZONE_WIDTH);
+            strokeMaxPercent = Math.min(bound.max, strokeMinPercent + MIN_ZONE_WIDTH);
         }
     }
 
@@ -452,6 +512,26 @@ export function calculateEngineOutputs({
         newEdgeTriggered,
         resolvedMode: mode
     };
+}
+
+// One stroke zone, in percent of the envelope, brought to its final shape:
+// the stored stroke-depth contraction (`contraction` is the cut in percent,
+// or null when the depth is the full window), then the zone sanity. Whatever
+// the mode and the wake-up did, the zone must stay ordered and at least
+// MIN_ZONE_WIDTH wide. The cap (upper bound) wins, so the lower bound is
+// pulled down first; only when the cap itself sits below the minimum width is
+// it raised.
+function settleZone(min, max, contraction) {
+    let lo = min;
+    let hi = max;
+    if (contraction !== null) hi = Math.max(lo, Math.round(hi - contraction));
+    lo = clamp(Math.round(finiteOr(lo, 0)), 0, 100);
+    hi = clamp(Math.round(finiteOr(hi, 100)), 0, 100);
+    if (hi - lo < MIN_ZONE_WIDTH) {
+        lo = Math.max(0, hi - MIN_ZONE_WIDTH);
+        if (hi - lo < MIN_ZONE_WIDTH) hi = Math.min(100, lo + MIN_ZONE_WIDTH);
+    }
+    return { min: lo, max: hi };
 }
 
 function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeconds, crawlPercent = CRAWL_PERCENT) {

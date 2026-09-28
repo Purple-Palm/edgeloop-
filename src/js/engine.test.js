@@ -19,9 +19,12 @@ import {
     MAX_EDGE_HOLD_PERCENT,
     gameEdgeReleased,
     micBoostReachesMotors,
-    TEASE_MODES
+    TEASE_MODES,
+    COOLDOWN_MODES,
+    GAME_MODES,
+    cooldownShape
 } from './engine.js';
-import { MIN_MOVING_PERCENT } from './patterns.js';
+import { MIN_MOVING_PERCENT, warmupShape, roundSpeed } from './patterns.js';
 
 const running = {
     hr: 95,
@@ -1739,6 +1742,448 @@ describe('0% reaches the motors only as a stop the engine decided on', () => {
                     assert.equal(idle.secondaryPercent, 0);
                 }
             }
+        }
+    });
+});
+
+describe('cool-down after edges', () => {
+    // A small seeded generator, so a failing case can be re-run by number.
+    function mulberry32(seed) {
+        let a = seed >>> 0;
+        return () => {
+            a = (a + 0x6D2B79F5) >>> 0;
+            let t = a;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+    const pick = (rnd, list) => list[Math.floor(rnd() * list.length)];
+    const between = (rnd, lo, hi) => lo + Math.floor(rnd() * (hi - lo + 1));
+
+    // One random engine input. Every field the engine reads is drawn, junk
+    // included, so a sweep covers the silent paths as well as the moving ones.
+    function seededInput(rnd) {
+        const minHr = between(rnd, 40, 110);
+        const maxHr = rnd() < 0.05 ? between(rnd, 30, minHr) : between(rnd, minHr + 1, 200);
+        const hr = rnd() < 0.03 ? NaN : between(rnd, minHr - 10, maxHr + 15);
+        // Narrow envelopes too: 45, 25 and 33 percent of travel round the
+        // engine's ten-percent floor onto a fraction of a physical percent.
+        const envelope = pick(rnd, [
+            [0, 100], [0, 100], [15, 80], [90, 10], [50, 52], [NaN, NaN],
+            [15, 60], [20, 45], [30, 63], [between(rnd, 0, 60), between(rnd, 40, 100)]
+        ]);
+        return {
+            hr,
+            edgeHr: rnd() < 0.2 ? undefined : (rnd() < 0.05 ? NaN : hr + between(rnd, -25, 5)),
+            minHr: rnd() < 0.02 ? NaN : minHr,
+            maxHr: rnd() < 0.02 ? NaN : maxHr,
+            activeMode: rnd() < 0.03 ? 'ghost' : pick(rnd, ENGINE_MODES),
+            strokeMode: pick(rnd, [undefined, undefined, 'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin']),
+            sessionStatus: pick(rnd, ['RUNNING', 'RUNNING', 'RUNNING', 'RUNNING', 'RAMPDOWN', 'PAUSED', 'IDLE']),
+            rampdownSecondsLeft: between(rnd, 0, 45),
+            isEdged: rnd() < 0.35,
+            orgasmMode: rnd() < 0.15,
+            gamma: pick(rnd, [0.5, 1, 2, 2, 3, NaN]),
+            intensityValue: rnd() < 0.05 ? NaN : between(rnd, 0, 100),
+            edgeStrokeDepth: pick(rnd, [100, 100, 100, 40, 70, NaN]),
+            handyHwMin: envelope[0],
+            handyHwMax: envelope[1],
+            sessionSeconds: between(rnd, 0, 900),
+            warmupMinutes: pick(rnd, [0, 0, 1, 5, 10, NaN]),
+            cadenceBreathing: rnd() < 0.5,
+            milkingWave: rnd() < 0.5,
+            stallGuardEngaged: rnd() < 0.2,
+            ceilingBehaviour: pick(rnd, ['stop', 'crawl', 'garbage']),
+            edgeHoldPercent: pick(rnd, [90, 95, 100, 100, NaN]),
+            ruinHoldSeconds: pick(rnd, [0, 0, 3, 8]),
+            oracleState: pick(rnd, ['IDLE', 'APPROACH', 'HOLD', 'PURGATORY', 'CLIMAX', 'DENIAL']),
+            survivalSpeedFloor: between(rnd, 5, 100),
+            trainingState: pick(rnd, ['climb', 'hold', 'recover', 'finish']),
+            // Ruin & Leak's one ride per edge: once spent, the mark locks
+            // instead of riding again until the edge releases.
+            ruinSpent: rnd() < 0.3,
+            // Seconds since Force Orgasm was armed: its ramp reads them. Drawn
+            // LAST, so every draw above keeps its place in the stream. Without
+            // it the sweep only ever saw the ramp at its first second.
+            orgasmBoost: pick(rnd, [0, 0, 1, 3, 14, 27, 28, 40, 60, NaN])
+        };
+    }
+
+    function fnv1a(text, hash) {
+        let h = hash >>> 0;
+        for (let i = 0; i < text.length; i += 1) {
+            h ^= text.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return h >>> 0;
+    }
+
+    // The digest of one seeded sweep of the engine. The cool-down fields are
+    // drawn from their OWN generator, so the engine inputs are the same
+    // stream whether or not a patch is applied.
+    function digestSweep(seed, count, patch) {
+        const rnd = mulberry32(seed);
+        const cool = mulberry32(seed ^ 0x5bd1e995);
+        let h = 0x811c9dc5;
+        for (let i = 0; i < count; i += 1) {
+            const input = seededInput(rnd);
+            const r = calculateEngineOutputs(patch ? { ...input, ...patch(cool) } : input);
+            h = fnv1a(JSON.stringify([
+                r.primaryPercent, r.secondaryPercent, r.strokeMinPercent, r.strokeMaxPercent,
+                r.isEdged, r.newEdgeTriggered, r.resolvedMode
+            ]), h);
+        }
+        return h.toString(16).padStart(8, '0');
+    }
+
+    const NONE = { speed: 1, depth: 1 };
+    const FIRST_SECOND = { speed: 0.16, depth: 0.28 };
+    const LENGTHS = [1, 2, 3, 5];
+    const span = (r) => r.strokeMaxPercent - r.strokeMinPercent;
+
+    it('runs only in the five tease modes: not in Ruin & Leak, not in a game', () => {
+        assert.deepEqual(COOLDOWN_MODES, ['classic', 'milker', 'shortener', 'headplay', 'ultimate']);
+        for (const mode of COOLDOWN_MODES) {
+            assert.ok(ENGINE_MODES.includes(mode) && !GAME_MODES.includes(mode) && mode !== 'ruin', mode);
+        }
+    });
+
+    it('cooldownShape is the warm-up curve restarted at the edge, and reads junk as no cool-down', () => {
+        for (const mode of COOLDOWN_MODES) {
+            for (const minutes of LENGTHS) {
+                for (const seconds of [0, 0.5, 1, 30, 59, 60, 119, 120, 179, 180, 299, 300, 301, 1000]) {
+                    assert.deepEqual(cooldownShape(mode, seconds, minutes), warmupShape(seconds, minutes), `${mode} ${seconds}s of ${minutes} min`);
+                }
+                assert.deepEqual(cooldownShape(mode, minutes * 60, minutes), NONE, `${mode}: exactly at its length the cool-down is over`);
+            }
+            for (const seconds of [NaN, -3, -0.001, Infinity, -Infinity, null, undefined, '5', '', true]) {
+                assert.deepEqual(cooldownShape(mode, seconds, 2), NONE, `${mode} seconds ${seconds}`);
+            }
+            for (const minutes of [0, -1, NaN, Infinity, -Infinity, null, undefined, '2', true]) {
+                assert.deepEqual(cooldownShape(mode, 10, minutes), NONE, `${mode} minutes ${minutes}`);
+            }
+        }
+        for (const mode of ['ruin', ...GAME_MODES, 'ghost', undefined, null]) {
+            assert.deepEqual(cooldownShape(mode, 0, 2), NONE, `${mode} never cools down`);
+        }
+        // Why the gate is strict: the curve itself reads a NaN or negative
+        // second as second zero, its SLOWEST point. Handed a broken clock
+        // unchecked, the engine would pin the toys at 16% speed with no
+        // cool-down running and nothing on the cockpit to say why.
+        assert.deepEqual(warmupShape(NaN, 2), FIRST_SECOND);
+        assert.deepEqual(warmupShape(-3, 2), FIRST_SECOND);
+    });
+
+    it('at the first second the factors are 0.16 (speed) and 0.28 (depth)', () => {
+        for (const mode of COOLDOWN_MODES) {
+            for (const minutes of LENGTHS) {
+                assert.deepEqual(cooldownShape(mode, 0, minutes), FIRST_SECOND, `${mode} ${minutes} min`);
+            }
+        }
+        // In the engine, with Global Intensity at 50 (a scale of exactly 1)
+        // the two factors can be read straight off the output: the speeds
+        // are 16% of the open ones, rounded the way every speed is (a motion
+        // slowed down crawls at 1% instead of rounding into a stop), and the
+        // stroke is 28% of the open stroke (never under the MIN_ZONE_WIDTH
+        // floor). Classic Tease keeps the stroke at the bottom of the window,
+        // so strokeMin stays 0.
+        for (const hr of [70, 80, 95, 110, 125, 135]) {
+            for (const sessionSeconds of [3, 20, 47, 128, 300]) {
+                const base = { ...running, activeMode: 'classic', hr, sessionSeconds, intensityValue: 50, warmupMinutes: 0 };
+                const open = calculateEngineOutputs(base);
+                const cooled = calculateEngineOutputs({ ...base, cooldownSeconds: 0, cooldownMinutes: 2 });
+                const at = `hr ${hr} t=${sessionSeconds}`;
+                assert.equal(cooled.primaryPercent, roundSpeed(open.primaryPercent * 0.16), `${at} primary ${open.primaryPercent}`);
+                assert.equal(cooled.secondaryPercent, roundSpeed(open.secondaryPercent * 0.16), `${at} secondary ${open.secondaryPercent}`);
+                assert.equal(cooled.strokeMinPercent, 0, at);
+                assert.equal(cooled.strokeMaxPercent, Math.max(MIN_ZONE_WIDTH, Math.round(open.strokeMaxPercent * 0.28)), `${at} stroke ${open.strokeMaxPercent}`);
+            }
+        }
+        // Parked at the ceiling on Crawl: the 10% crawl becomes 2%, the full
+        // stroke becomes 28%, and the edge flag is exactly what it was.
+        const parked = calculateEngineOutputs({
+            ...running,
+            activeMode: 'classic',
+            hr: 140,
+            isEdged: true,
+            ceilingBehaviour: 'crawl',
+            intensityValue: 50,
+            cooldownSeconds: 0,
+            cooldownMinutes: 2
+        });
+        assert.deepEqual(parked, {
+            primaryPercent: 2,
+            secondaryPercent: 2,
+            strokeMinPercent: 0,
+            strokeMaxPercent: 28,
+            isEdged: true,
+            newEdgeTriggered: false,
+            resolvedMode: 'classic'
+        });
+        // A cool-down's first second IS a warm-up's first second, bit for bit.
+        for (const mode of COOLDOWN_MODES) {
+            for (const hr of [75, 100, 130]) {
+                const base = { ...running, activeMode: mode, hr, sessionSeconds: 0 };
+                assert.deepEqual(
+                    calculateEngineOutputs({ ...base, warmupMinutes: 0, cooldownSeconds: 0, cooldownMinutes: 3 }),
+                    calculateEngineOutputs({ ...base, warmupMinutes: 5 }),
+                    `${mode} hr ${hr}`
+                );
+            }
+        }
+    });
+
+    it('eases every tease mode from its first second and lets go exactly at its length', () => {
+        for (const mode of COOLDOWN_MODES) {
+            for (const minutes of LENGTHS) {
+                const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 45 };
+                const open = calculateEngineOutputs(base);
+                const start = calculateEngineOutputs({ ...base, cooldownSeconds: 0, cooldownMinutes: minutes });
+                const at = `${mode} ${minutes} min`;
+                assert.ok(open.primaryPercent > 0, `${at}: the fixture must be moving`);
+                assert.ok(start.primaryPercent < open.primaryPercent, `${at}: primary ${start.primaryPercent} vs ${open.primaryPercent}`);
+                assert.ok(span(start) < span(open), `${at}: stroke ${span(start)} vs ${span(open)}`);
+                assert.ok(span(start) >= MIN_ZONE_WIDTH, `${at}: the zone never jams`);
+                const mid = calculateEngineOutputs({ ...base, cooldownSeconds: minutes * 30, cooldownMinutes: minutes });
+                assert.ok(start.primaryPercent <= mid.primaryPercent && mid.primaryPercent <= open.primaryPercent, `${at}: half way`);
+                assert.ok(span(start) <= span(mid) && span(mid) <= span(open), `${at}: half way stroke`);
+                const done = calculateEngineOutputs({ ...base, cooldownSeconds: minutes * 60, cooldownMinutes: minutes });
+                assert.deepEqual(done, open, `${at}: identical once the length has run`);
+                const past = calculateEngineOutputs({ ...base, cooldownSeconds: minutes * 60 + 500, cooldownMinutes: minutes });
+                assert.deepEqual(past, open, `${at}: and long after`);
+            }
+        }
+    });
+
+    it('with the warm-up still running, the smaller factor of the two wins', () => {
+        for (const mode of COOLDOWN_MODES) {
+            const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 60 };
+            // A cool-down at its start under a warm-up a fifth of the way
+            // in: the cool-down is slower, and the result is the cool-down
+            // alone. It never speeds a warm-up up.
+            assert.deepEqual(
+                calculateEngineOutputs({ ...base, warmupMinutes: 5, cooldownSeconds: 0, cooldownMinutes: 2 }),
+                calculateEngineOutputs({ ...base, warmupMinutes: 0, cooldownSeconds: 0, cooldownMinutes: 2 }),
+                `${mode}: the cool-down is the slower shape`
+            );
+            // A cool-down at its last second under that same warm-up: the
+            // warm-up is slower, and the result is the warm-up alone. It
+            // never cuts a warm-up short.
+            assert.deepEqual(
+                calculateEngineOutputs({ ...base, warmupMinutes: 5, cooldownSeconds: 119, cooldownMinutes: 2 }),
+                calculateEngineOutputs({ ...base, warmupMinutes: 5 }),
+                `${mode}: the warm-up is the slower shape`
+            );
+        }
+    });
+
+    it('has no effect in the games, Ruin & Leak, Force Orgasm, RAMPDOWN, PAUSED, or with NaN, -3 or Infinity inputs', () => {
+        const unchanged = (patch, why) => {
+            for (const hr of [70, 100, 139, 141]) {
+                for (const sessionSeconds of [0, 7, 61, 300]) {
+                    for (const isEdged of [false, true]) {
+                        const base = { ...running, hr, sessionSeconds, isEdged, ceilingBehaviour: 'crawl', ...patch };
+                        const plain = calculateEngineOutputs(base);
+                        for (const cool of [
+                            { cooldownSeconds: 0, cooldownMinutes: 2 },
+                            { cooldownSeconds: 30, cooldownMinutes: 5 },
+                            { cooldownSeconds: null, cooldownMinutes: 2 }
+                        ]) {
+                            assert.deepEqual(
+                                calculateEngineOutputs({ ...base, ...cool }),
+                                plain,
+                                `${why}: ${JSON.stringify({ hr, sessionSeconds, isEdged, ...cool })}`
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        for (const mode of GAME_MODES) {
+            for (const strokeMode of [undefined, 'classic', 'headplay']) {
+                unchanged({ activeMode: mode, strokeMode }, `${mode} borrowing ${strokeMode}`);
+            }
+        }
+        for (const oracleState of ['IDLE', 'APPROACH', 'HOLD', 'PURGATORY', 'CLIMAX', 'DENIAL']) {
+            unchanged({ activeMode: 'oracle', oracleState }, `oracle ${oracleState}`);
+        }
+        for (const trainingState of ['climb', 'hold', 'recover', 'finish']) {
+            unchanged({ activeMode: 'edgetrain', trainingState }, `edgetrain ${trainingState}`);
+        }
+        unchanged({ activeMode: 'survival', survivalSpeedFloor: 60 }, 'survival');
+        unchanged({ activeMode: 'ruin' }, 'ruin');
+        unchanged({ activeMode: 'ruin', ruinHoldSeconds: 8 }, 'ruin lockout');
+        for (const mode of COOLDOWN_MODES) {
+            unchanged({ activeMode: mode, orgasmMode: true }, `${mode} Force Orgasm`);
+            unchanged({ activeMode: mode, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 30 }, `${mode} RAMPDOWN`);
+            unchanged({ activeMode: mode, sessionStatus: 'PAUSED' }, `${mode} PAUSED`);
+            unchanged({ activeMode: mode, sessionStatus: 'IDLE' }, `${mode} IDLE`);
+            unchanged({ activeMode: mode, sessionStatus: 'STOPPED' }, `${mode} STOPPED`);
+        }
+        // Junk in either field is no cool-down, in the very state where a
+        // real one would bite hardest.
+        for (const mode of COOLDOWN_MODES) {
+            const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 20 };
+            const plain = calculateEngineOutputs(base);
+            assert.notDeepEqual(calculateEngineOutputs({ ...base, cooldownSeconds: 0, cooldownMinutes: 2 }), plain, `${mode}: the control case must move`);
+            for (const cooldownSeconds of [NaN, -3, -0.001, Infinity, -Infinity, '5', null, undefined, true]) {
+                for (const cooldownMinutes of LENGTHS) {
+                    assert.deepEqual(calculateEngineOutputs({ ...base, cooldownSeconds, cooldownMinutes }), plain, `${mode} seconds ${cooldownSeconds} of ${cooldownMinutes} min`);
+                }
+            }
+            for (const cooldownMinutes of [NaN, -3, Infinity, -Infinity, 0, '2', null, undefined, true]) {
+                for (const cooldownSeconds of [0, 30]) {
+                    assert.deepEqual(calculateEngineOutputs({ ...base, cooldownSeconds, cooldownMinutes }), plain, `${mode} ${cooldownSeconds}s of minutes ${cooldownMinutes}`);
+                }
+            }
+        }
+    });
+
+    it('property: over 100 000 seeded inputs a cool-down never raises primary, secondary or the stroke span, and never moves the edge flags', () => {
+        // INV-13. The cool-down is decided after the edge flag and composed
+        // into the wake-up by the smaller factor, so whatever the mode, the
+        // status, the game state, the guards or the junk in the input, the
+        // toys with a cool-down are never faster or longer than without one,
+        // and the edge detector never sees it.
+        const rnd = mulberry32(31337);
+        const cool = mulberry32(1);
+        let eased = 0;
+        for (let i = 0; i < 100000; i += 1) {
+            const input = seededInput(rnd);
+            const patch = {
+                cooldownSeconds: cool() < 0.2 ? 0 : between(cool, 0, 400),
+                cooldownMinutes: pick(cool, LENGTHS)
+            };
+            const plain = calculateEngineOutputs({ ...input, cooldownSeconds: null });
+            const cooled = calculateEngineOutputs({ ...input, ...patch });
+            // Messages are built only on failure: 100 000 eager strings
+            // would cost more than the engine calls they describe. Each
+            // comparison is written so that a NaN output fails it too.
+            const fail = (what) => assert.fail(
+                `${what}: case ${i} ${JSON.stringify(input)} with ${JSON.stringify(patch)}\n`
+                + `  plain  ${JSON.stringify(plain)}\n  cooled ${JSON.stringify(cooled)}`
+            );
+            if (!(cooled.primaryPercent <= plain.primaryPercent)) fail('the primary rose');
+            if (!(cooled.secondaryPercent <= plain.secondaryPercent)) fail('the secondary rose');
+            if (!(span(cooled) <= span(plain))) fail('the stroke span grew');
+            if (!(cooled.strokeMaxPercent <= plain.strokeMaxPercent)) fail('the stroke top rose');
+            if (!(cooled.strokeMinPercent <= plain.strokeMinPercent)) fail('the stroke bottom rose');
+            // The zone is never collapsed, and inside the full travel
+            // envelope it keeps the engine's own floor. A narrower envelope
+            // maps that floor onto fewer physical percent, exactly as today.
+            if (!(cooled.strokeMaxPercent > cooled.strokeMinPercent)) fail('the zone collapsed');
+            const fullEnvelope = !(Number.isFinite(input.handyHwMin) && Number.isFinite(input.handyHwMax))
+                || (input.handyHwMin === 0 && input.handyHwMax === 100);
+            if (fullEnvelope && !(span(cooled) >= MIN_ZONE_WIDTH)) fail(`the zone is under ${MIN_ZONE_WIDTH} wide`);
+            if (cooled.isEdged !== plain.isEdged) fail('isEdged moved');
+            if (cooled.newEdgeTriggered !== plain.newEdgeTriggered) fail('newEdgeTriggered moved');
+            if (cooled.resolvedMode !== plain.resolvedMode) fail('resolvedMode moved');
+            if (cooled.primaryPercent < plain.primaryPercent || span(cooled) < span(plain)) eased += 1;
+        }
+        // Roughly a quarter of the sweep is a running tease mode outside
+        // Force Orgasm, and about half of those draw a cool-down still in
+        // progress: the bound below is a guard against a vacuous sweep, not
+        // a measurement.
+        assert.ok(eased >= 5000, `the sweep must exercise the cool-down, not only its silent paths (${eased} of 100000 eased)`);
+    });
+
+    it('golden: cooldownSeconds null or cooldownMinutes 0 is bit-identical to the engine without a cool-down, over every mode', () => {
+        // INV-16. The digests below were taken from the engine as it was just
+        // before the cool-down arrived, which had none at all, over exactly
+        // this sweep: 20 000 seeded inputs per seed, every mode, every status,
+        // junk included. A wearer who never turns the cool-down on gets that
+        // engine to the last digit. A deliberate change to the engine's
+        // numbers has to record new digests here and say so in its commit.
+        // History, so the next person to move them knows what moved them
+        // before. Over this sweep, which also draws ruinSpent (Ruin & Leak's
+        // one-ride flag) and, last, orgasmBoost (the clock 1.1.1's Force
+        // Orgasm ramp reads), release 1.1.2 gives bb2167ce and 52342959. Two
+        // deliberate engine changes moved them: a pattern near-stop crawls at
+        // 1% instead of rounding into a stop (39084f87 and 4322c050), and
+        // Ruin & Leak rides each edge once - a game borrows its stroke but
+        // never its lockout, and Force Orgasm over a spent edge ramps from the
+        // stop - which gives the digests below. An engine that ignored either
+        // drawn field gives different digests, so both are pinned here too.
+        // Release 1.1.0 gave ebd8f3f8 and 853ecdc8 over the sweep as it stood
+        // then, before it drew either field.
+        const GOLDEN = [[20260927, 'b2ebc162'], [424242, '553ece13']];
+        for (const [seed, digest] of GOLDEN) {
+            assert.equal(digestSweep(seed, 20000), digest, `seed ${seed}: the engine with no cool-down fields`);
+            assert.equal(
+                digestSweep(seed, 20000, (cool) => ({ cooldownSeconds: null, cooldownMinutes: pick(cool, LENGTHS) })),
+                digest,
+                `seed ${seed}: cooldownSeconds null`
+            );
+            assert.equal(
+                digestSweep(seed, 20000, (cool) => ({ cooldownSeconds: between(cool, 0, 400), cooldownMinutes: 0 })),
+                digest,
+                `seed ${seed}: cooldownMinutes 0`
+            );
+            assert.notEqual(
+                digestSweep(seed, 20000, (cool) => ({ cooldownSeconds: between(cool, 0, 400), cooldownMinutes: pick(cool, LENGTHS) })),
+                digest,
+                `seed ${seed}: a running cool-down must change the output, or this digest proves nothing`
+            );
+        }
+        // The sweep visits every mode.
+        const rnd = mulberry32(20260927);
+        const seen = new Set();
+        for (let i = 0; i < 20000; i += 1) seen.add(resolveEngineMode(seededInput(rnd).activeMode));
+        assert.deepEqual([...seen].sort(), [...ENGINE_MODES].sort());
+    });
+
+    it('golden, readable: the 1.1.2 numbers for every mode through the warm-up, cool-down Off', () => {
+        // The same promise in numbers a reviewer can read: the fixture above
+        // with the warm-up on at 20 s (the code path this change touches)
+        // and Crawl at the ceiling, as release 1.1.2 computes it; the engine
+        // just before this change gives the same numbers at these points.
+        // Each row is [mode, hr, primary, secondary, strokeMin, strokeMax,
+        // isEdged, newEdgeTriggered]; the pulse at 140 is parked on the mark.
+        const GOLDEN_ROWS = [
+            ['classic', 80, 14, 13, 0, 26, false, false],
+            ['classic', 120, 7, 6, 0, 26, false, false],
+            ['classic', 140, 2, 2, 0, 29, true, false],
+            ['milker', 80, 16, 3, 0, 23, false, false],
+            ['milker', 120, 8, 9, 0, 23, false, false],
+            ['milker', 140, 2, 5, 0, 12, true, false],
+            ['shortener', 80, 15, 3, 0, 24, false, false],
+            ['shortener', 120, 10, 3, 0, 24, false, false],
+            ['shortener', 140, 2, 3, 0, 10, true, false],
+            ['headplay', 80, 16, 15, 15, 40, false, false],
+            ['headplay', 120, 8, 7, 15, 40, false, false],
+            ['headplay', 140, 2, 2, 75, 85, true, false],
+            ['ultimate', 80, 15, 3, 0, 25, false, false],
+            ['ultimate', 120, 8, 8, 0, 24, false, false],
+            ['ultimate', 140, 2, 8, 0, 14, true, false],
+            ['ruin', 80, 16, 4, 0, 27, false, false],
+            ['ruin', 120, 12, 7, 0, 27, false, false],
+            ['ruin', 140, 12, 10, 0, 27, true, false],
+            ['oracle', 80, 8, 5, 0, 26, false, false],
+            ['oracle', 120, 13, 10, 0, 26, false, false],
+            ['oracle', 140, 2, 7, 0, 29, true, false],
+            ['survival', 80, 7, 5, 0, 26, false, false],
+            ['survival', 120, 7, 5, 0, 26, false, false],
+            ['survival', 140, 7, 5, 0, 29, true, false],
+            ['edgetrain', 80, 8, 5, 0, 26, false, false],
+            ['edgetrain', 120, 13, 10, 0, 26, false, false],
+            ['edgetrain', 140, 2, 7, 0, 29, true, false]
+        ];
+        assert.deepEqual([...new Set(GOLDEN_ROWS.map(([mode]) => mode))], ENGINE_MODES, 'every mode has its rows');
+        for (const [mode, hr, primary, secondary, strokeMin, strokeMax, isEdged, newEdgeTriggered] of GOLDEN_ROWS) {
+            const input = { ...running, activeMode: mode, hr, isEdged: hr >= 140, warmupMinutes: 5, sessionSeconds: 20, ceilingBehaviour: 'crawl' };
+            const expected = {
+                primaryPercent: primary,
+                secondaryPercent: secondary,
+                strokeMinPercent: strokeMin,
+                strokeMaxPercent: strokeMax,
+                isEdged,
+                newEdgeTriggered,
+                resolvedMode: mode
+            };
+            assert.deepEqual(calculateEngineOutputs(input), expected, `${mode} hr ${hr}: no cool-down fields`);
+            assert.deepEqual(calculateEngineOutputs({ ...input, cooldownSeconds: null, cooldownMinutes: 5 }), expected, `${mode} hr ${hr}: cooldownSeconds null`);
+            assert.deepEqual(calculateEngineOutputs({ ...input, cooldownSeconds: 12, cooldownMinutes: 0 }), expected, `${mode} hr ${hr}: cooldownMinutes 0`);
         }
     });
 });

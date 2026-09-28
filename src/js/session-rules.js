@@ -5,10 +5,12 @@
 
 // What this file reads from the engine: the crawl level, so the cockpit
 // banner can tell a crawling motor from a running one with the same number
-// the engine sends, and which modes are games, where the stall guard has
-// nothing of its own to cut. Ruin & Leak's timings come from the patterns
-// that draw its ride and its lockout.
-import { CRAWL_PERCENT, GAME_MODES, resolveCeilingBehaviour } from './engine.js';
+// the engine sends, which modes are games, where the stall guard has
+// nothing of its own to cut, and the modes in which a cool-down may run, so
+// the counter here and the easing there can never disagree about where it
+// applies. Ruin & Leak's timings come from the patterns that draw its ride
+// and its lockout.
+import { CRAWL_PERCENT, GAME_MODES, COOLDOWN_MODES, resolveCeilingBehaviour } from './engine.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
 
 // The effective ceiling can never be pushed closer than this to the resting
@@ -822,6 +824,100 @@ export function describeStallPauseNotice({ mode, ceilingBehaviour, rideSecondsLe
     if (mode === 'survival') return `${halted} — SPEED RESUMES AFTER THE PAUSE`;
     if (resolveCeilingBehaviour(ceilingBehaviour) !== 'crawl') return `${halted} — FULL STOP HOLDS IT AT 0%`;
     return `${halted} — CRAWL RESUMES AFTER THE PAUSE`;
+}
+
+// ---- Cool-down after edges -------------------------------------------------
+
+// The Guards choices: how long the cool-down after an edge lasts (0 is Off)
+// and after every how-manieth edge it starts. The engine restarts the session
+// warm-up curve over that length; the rules below only decide WHEN.
+export const COOLDOWN_MINUTES_OPTIONS = [0, 1, 2, 3, 5];
+export const COOLDOWN_EVERY_OPTIONS = [1, 2, 3];
+export const DEFAULT_COOLDOWN_MINUTES = 0;
+export const DEFAULT_COOLDOWN_EVERY_EDGES = 2;
+
+// The two things that count as an edge for the cool-down: the pulse leaving
+// the pullback mark, and the wearer resuming after an edge pause.
+export const COOLDOWN_EVENTS = ['release', 'edgeResume'];
+
+// The cool-down's length in seconds, or null when it is Off or the stored
+// value is not one the wearer could have chosen. A length nobody picked must
+// not hold the toys slow, so junk reads as Off here and in cooldownSecondsFor.
+function cooldownLength(minutes) {
+    return COOLDOWN_MINUTES_OPTIONS.includes(minutes) && minutes > 0 ? minutes * 60 : null;
+}
+
+// May an edge start a cool-down right now? Only in a running tease mode the
+// engine eases (COOLDOWN_MODES), never during Force Orgasm - the wearer asked
+// for full speed - and never in a soft landing or a pause, where the toys are
+// already teasing down or stopped and a cool-down clock would run unseen.
+export function cooldownEligible({ activeMode, orgasmMode = false, sessionStatus } = {}) {
+    return sessionStatus === 'RUNNING' && !orgasmMode && COOLDOWN_MODES.includes(activeMode);
+}
+
+// One event of the cool-down counter, called on every edge release, on every
+// resume from an edge pause and once a second with no event, to expire it.
+// `prev` is { count, startedAt }: the edges counted this session and the
+// session second the running cool-down began, or null. A counted edge that
+// lands on the chosen rhythm starts a cool-down at this second, restarting
+// one already running: the pulse was just at the mark again, so the easing
+// begins again from its slowest point. The count is kept whatever the
+// length setting says, so the rhythm the wearer chose is measured from the
+// first edge of the session and not from the moment a cool-down first ran.
+export function tickCooldown(
+    prev,
+    { event = null, countsAsEdge = true, sessionSeconds, minutes, every, eligible = false } = {}
+) {
+    const count0 = prev && Number.isFinite(prev.count) ? Math.max(0, Math.round(prev.count)) : 0;
+    const t = Number.isFinite(sessionSeconds) ? sessionSeconds : null;
+    const length = cooldownLength(minutes);
+    let startedAt = prev && Number.isFinite(prev.startedAt) ? prev.startedAt : null;
+
+    // Expire: the cool-down has run its length, or nothing can say where it
+    // stands (Off, a stored start after the present, no clock). A cool-down
+    // with an end nobody can compute is dropped rather than left to hold the
+    // toys slow, and one stamped in the future is dropped rather than kept
+    // to spring on the wearer minutes later.
+    if (startedAt !== null && (length === null || t === null || t < startedAt || t - startedAt >= length)) {
+        startedAt = null;
+    }
+
+    let count = count0;
+    let justStarted = false;
+    if (COOLDOWN_EVENTS.includes(event) && countsAsEdge && eligible) {
+        count += 1;
+        const rhythm = COOLDOWN_EVERY_OPTIONS.includes(every) ? every : DEFAULT_COOLDOWN_EVERY_EDGES;
+        if (count % rhythm === 0 && length !== null && t !== null) {
+            startedAt = t;
+            justStarted = true;
+        }
+    }
+    return { count, startedAt, justStarted };
+}
+
+// How far into the running cool-down this second is: the number the engine
+// takes as `cooldownSeconds`. null means no cool-down is in force, which the
+// engine reads as "the factors are 1". It is null, and never a guess, when
+// there is no start, when the length is Off or junk, when the start lies
+// after the present, and once the length has run out - so the engine is
+// never handed a second that warmupShape would read as its slowest point.
+export function cooldownSecondsFor({ startedAt, sessionSeconds, minutes } = {}) {
+    const length = cooldownLength(minutes);
+    if (length === null || !Number.isFinite(startedAt) || !Number.isFinite(sessionSeconds)) return null;
+    const elapsed = sessionSeconds - startedAt;
+    if (elapsed < 0 || elapsed >= length) return null;
+    return elapsed;
+}
+
+// The cockpit badge, as pure text: the time the cool-down has left, in the
+// warm-up badge's own m:ss form, or '' when none is running so the caller
+// hides it. It never reads 0:00 - the second the length runs out the
+// cool-down is over and the badge is gone.
+export function describeCooldownBadge({ startedAt, sessionSeconds, minutes } = {}) {
+    const elapsed = cooldownSecondsFor({ startedAt, sessionSeconds, minutes });
+    if (elapsed === null) return '';
+    const left = Math.ceil(minutes * 60 - elapsed);
+    return `COOL-DOWN ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
 }
 
 // ---- Persisted Session Setup values ---------------------------------------

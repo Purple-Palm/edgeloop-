@@ -55,9 +55,18 @@ import {
     DEFAULT_FIXED_MINUTES,
     DEFAULT_RANGE_MIN_MINUTES,
     DEFAULT_RANGE_MAX_MINUTES,
-    DEFAULT_ENDGAME_TYPE
+    DEFAULT_ENDGAME_TYPE,
+    COOLDOWN_MINUTES_OPTIONS,
+    COOLDOWN_EVERY_OPTIONS,
+    DEFAULT_COOLDOWN_MINUTES,
+    DEFAULT_COOLDOWN_EVERY_EDGES,
+    COOLDOWN_EVENTS,
+    cooldownEligible,
+    tickCooldown,
+    cooldownSecondsFor,
+    describeCooldownBadge
 } from './session-rules.js';
-import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM } from './engine.js';
+import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM, COOLDOWN_MODES, ENGINE_MODES } from './engine.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS, RUIN_LOCK_SECONDARY } from './patterns.js';
 
 describe('sanitizeHrLimits', () => {
@@ -1759,5 +1768,242 @@ describe('app.js persists and restores the typed session limits', () => {
         assert.ok(/highlightEndgameCard\(/.test(body), 'the endgame trigger is not restored on boot');
         assert.ok(/isRemotePage/.test(body), 'a remote page must keep the host limits it is shown');
         assert.ok(src.lastIndexOf('syncParamsUI();') > at, 'syncParamsUI must run at boot');
+    });
+});
+
+describe('cool-down after edges', () => {
+    const tease = ['classic', 'milker', 'shortener', 'headplay', 'ultimate'];
+
+    it('the choices are the Guards options, and the defaults are Off and every 2nd edge', () => {
+        assert.deepEqual(COOLDOWN_MINUTES_OPTIONS, [0, 1, 2, 3, 5]);
+        assert.deepEqual(COOLDOWN_EVERY_OPTIONS, [1, 2, 3]);
+        assert.equal(DEFAULT_COOLDOWN_MINUTES, 0);
+        assert.equal(DEFAULT_COOLDOWN_EVERY_EDGES, 2);
+        assert.ok(COOLDOWN_MINUTES_OPTIONS.includes(DEFAULT_COOLDOWN_MINUTES));
+        assert.ok(COOLDOWN_EVERY_OPTIONS.includes(DEFAULT_COOLDOWN_EVERY_EDGES));
+        assert.deepEqual(COOLDOWN_EVENTS, ['release', 'edgeResume']);
+        assert.deepEqual(COOLDOWN_MODES, tease);
+    });
+
+    it('is eligible only in a running tease mode, and never during Force Orgasm', () => {
+        for (const activeMode of [...ENGINE_MODES, 'ghost', undefined]) {
+            for (const sessionStatus of ['RUNNING', 'RAMPDOWN', 'PAUSED', 'IDLE', undefined]) {
+                for (const orgasmMode of [false, true]) {
+                    const expected = sessionStatus === 'RUNNING' && !orgasmMode && tease.includes(activeMode);
+                    assert.equal(
+                        cooldownEligible({ activeMode, orgasmMode, sessionStatus }),
+                        expected,
+                        `${activeMode} ${sessionStatus} orgasm=${orgasmMode}`
+                    );
+                }
+            }
+        }
+        assert.equal(cooldownEligible(), false);
+        assert.equal(cooldownEligible({ activeMode: 'classic', sessionStatus: 'RUNNING' }), true, 'orgasmMode defaults to off');
+    });
+
+    // Drive the counter through a series of edges, every one eligible.
+    const edgesAt = (every, minutes, times, event = 'release') => {
+        let cd = Object.freeze({ count: 0, startedAt: null });
+        const log = [];
+        for (const t of times) {
+            cd = Object.freeze(tickCooldown(cd, { event, sessionSeconds: t, minutes, every, eligible: true }));
+            log.push(cd);
+        }
+        return log;
+    };
+
+    for (const every of COOLDOWN_EVERY_OPTIONS) {
+        it(`with "every ${every}" a cool-down starts on edges ${every}, ${2 * every}, ${3 * every}...`, () => {
+            // 30 s apart with a 5 min length, so none has run out between
+            // two edges on the rhythm: the start moves only when the
+            // rhythm lands, and stays put on the edges between.
+            const times = [10, 40, 70, 100, 130, 160, 190];
+            for (const event of COOLDOWN_EVENTS) {
+                const log = edgesAt(every, 5, times, event);
+                log.forEach((cd, i) => {
+                    const n = i + 1;
+                    assert.equal(cd.count, n, `${event} ${n}: count`);
+                    assert.equal(cd.justStarted, n % every === 0, `${event} ${n}: justStarted`);
+                    const lastOnRhythm = Math.floor(n / every) * every;
+                    assert.equal(cd.startedAt, lastOnRhythm === 0 ? null : times[lastOnRhythm - 1], `${event} ${n}: startedAt`);
+                });
+            }
+        });
+    }
+
+    it('a tick with no event, an edge that does not count, or an ineligible one changes nothing but expiry', () => {
+        const running = Object.freeze({ count: 3, startedAt: 100 });
+        for (const args of [
+            { event: null, eligible: true },
+            { eligible: true },
+            { event: 'foo', eligible: true },
+            { event: 'RELEASE', eligible: true },
+            { event: 'release', countsAsEdge: false, eligible: true },
+            { event: 'edgeResume', countsAsEdge: false, eligible: true },
+            { event: 'release', eligible: false },
+            { event: 'release' }
+        ]) {
+            const out = tickCooldown(running, { sessionSeconds: 150, minutes: 2, every: 1, ...args });
+            assert.deepEqual(out, { count: 3, startedAt: 100, justStarted: false }, JSON.stringify(args));
+        }
+        // The same tick with a counted, eligible edge is the control.
+        assert.deepEqual(
+            tickCooldown(running, { sessionSeconds: 150, minutes: 2, every: 1, event: 'release', eligible: true }),
+            { count: 4, startedAt: 150, justStarted: true }
+        );
+    });
+
+    it('Off, or a length nobody could choose, never starts a cool-down but still counts the edges', () => {
+        for (const minutes of [0, 4, 6, 0.5, -1, NaN, Infinity, '2', null, undefined]) {
+            let cd = { count: 0, startedAt: null };
+            for (const t of [10, 40, 70, 100]) {
+                cd = tickCooldown(cd, { event: 'release', sessionSeconds: t, minutes, every: 1, eligible: true });
+                assert.equal(cd.startedAt, null, `minutes ${minutes} at ${t}`);
+                assert.equal(cd.justStarted, false, `minutes ${minutes} at ${t}`);
+            }
+            assert.equal(cd.count, 4, `minutes ${minutes}: the rhythm is still measured from the first edge`);
+            // A start left over from a valid length is dropped the moment
+            // the length is not one: nothing may hold the toys slow for a
+            // time nobody chose.
+            assert.equal(tickCooldown({ count: 2, startedAt: 90 }, { sessionSeconds: 100, minutes, every: 2 }).startedAt, null, `minutes ${minutes}`);
+        }
+    });
+
+    it('a rhythm nobody could choose falls back to the factory one instead of silencing a cool-down that is on', () => {
+        for (const every of [0, 4, -1, NaN, '2', null, undefined]) {
+            const log = edgesAt(every, 2, [10, 40, 70, 100]);
+            assert.deepEqual(log.map((cd) => cd.justStarted), [false, true, false, true], `every ${every}`);
+        }
+    });
+
+    it('expires exactly at its length, and a later edge on the rhythm starts it again', () => {
+        for (const minutes of [1, 2, 3, 5]) {
+            const length = minutes * 60;
+            const start = tickCooldown({ count: 1, startedAt: null }, { event: 'release', sessionSeconds: 100, minutes, every: 2, eligible: true });
+            assert.deepEqual(start, { count: 2, startedAt: 100, justStarted: true });
+            const lastSecond = tickCooldown(start, { sessionSeconds: 100 + length - 1, minutes, every: 2 });
+            assert.deepEqual(lastSecond, { count: 2, startedAt: 100, justStarted: false }, `${minutes} min: still running one second before the end`);
+            const over = tickCooldown(start, { sessionSeconds: 100 + length, minutes, every: 2 });
+            assert.deepEqual(over, { count: 2, startedAt: null, justStarted: false }, `${minutes} min: over at the length`);
+            // Edge 3 is off the rhythm; edge 4 is on it, whichever kind it is.
+            const third = tickCooldown(over, { event: 'release', sessionSeconds: 100 + length + 30, minutes, every: 2, eligible: true });
+            assert.deepEqual(third, { count: 3, startedAt: null, justStarted: false });
+            const fourth = tickCooldown(third, { event: 'edgeResume', sessionSeconds: 100 + length + 60, minutes, every: 2, eligible: true });
+            assert.deepEqual(fourth, { count: 4, startedAt: 100 + length + 60, justStarted: true });
+        }
+    });
+
+    it('an edge on the rhythm during a running cool-down restarts it from the slowest point', () => {
+        const first = tickCooldown({ count: 0, startedAt: null }, { event: 'release', sessionSeconds: 50, minutes: 2, every: 1, eligible: true });
+        assert.deepEqual(first, { count: 1, startedAt: 50, justStarted: true });
+        assert.equal(cooldownSecondsFor({ ...first, sessionSeconds: 80, minutes: 2 }), 30);
+        const again = tickCooldown(first, { event: 'release', sessionSeconds: 80, minutes: 2, every: 1, eligible: true });
+        assert.deepEqual(again, { count: 2, startedAt: 80, justStarted: true });
+        assert.equal(cooldownSecondsFor({ ...again, sessionSeconds: 80, minutes: 2 }), 0);
+    });
+
+    it('a start after the present, or a missing clock, is dropped rather than kept', () => {
+        assert.equal(tickCooldown({ count: 2, startedAt: 500 }, { sessionSeconds: 100, minutes: 2, every: 2 }).startedAt, null);
+        for (const sessionSeconds of [NaN, undefined, null, '100', Infinity]) {
+            const out = tickCooldown({ count: 1, startedAt: 40 }, { event: 'release', sessionSeconds, minutes: 2, every: 2, eligible: true });
+            assert.equal(out.startedAt, null, `clock ${sessionSeconds}`);
+            assert.equal(out.justStarted, false, `clock ${sessionSeconds}`);
+            assert.equal(out.count, 2, 'the edge is still counted');
+        }
+    });
+
+    it('a junk counter starts fresh, and never throws', () => {
+        for (const prev of [null, undefined, {}, { count: NaN, startedAt: 'x' }, { count: -4, startedAt: NaN }, 'junk', 7, []]) {
+            const out = tickCooldown(prev, { sessionSeconds: 10, minutes: 2, every: 2 });
+            assert.deepEqual(out, { count: 0, startedAt: null, justStarted: false }, JSON.stringify(prev));
+        }
+        assert.equal(tickCooldown({ count: 2.6 }, { sessionSeconds: 10, minutes: 2, every: 2 }).count, 3);
+        assert.deepEqual(tickCooldown(), { count: 0, startedAt: null, justStarted: false });
+    });
+
+    it('cooldownSecondsFor hands the engine the elapsed second only while a cool-down is in force', () => {
+        assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 100, minutes: 2 }), 0);
+        assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 101, minutes: 2 }), 1);
+        assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 219, minutes: 2 }), 119);
+        assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 220, minutes: 2 }), null);
+        assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 99, minutes: 2 }), null, 'a start after the present is not a cool-down');
+        assert.equal(cooldownSecondsFor({ startedAt: null, sessionSeconds: 100, minutes: 2 }), null);
+        for (const minutes of [0, 4, NaN, '2', undefined]) {
+            assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds: 110, minutes }), null, `minutes ${minutes}`);
+        }
+        for (const sessionSeconds of [NaN, undefined, Infinity, '110']) {
+            assert.equal(cooldownSecondsFor({ startedAt: 100, sessionSeconds, minutes: 2 }), null, `clock ${sessionSeconds}`);
+        }
+        for (const startedAt of [NaN, undefined, '100', -Infinity]) {
+            assert.equal(cooldownSecondsFor({ startedAt, sessionSeconds: 110, minutes: 2 }), null, `start ${startedAt}`);
+        }
+        assert.equal(cooldownSecondsFor(), null);
+        // Whatever comes back is a second the engine's gate accepts: finite,
+        // at or after the start and short of the length. warmupShape reads a
+        // NaN or negative second as its SLOWEST point, so a wrong answer here
+        // would pin the toys at 16% with no cool-down running.
+        for (let t = 0; t < 400; t += 1) {
+            const s = cooldownSecondsFor({ startedAt: 50, sessionSeconds: t, minutes: 3 });
+            assert.ok(s === null || (Number.isFinite(s) && s >= 0 && s < 180), `t=${t} gave ${s}`);
+            assert.equal(s === null, t < 50 || t >= 230, `t=${t}`);
+        }
+    });
+
+    it('the badge counts the time left down in m:ss and is gone the second it runs out', () => {
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 100, minutes: 2 }), 'COOL-DOWN 2:00');
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 101, minutes: 2 }), 'COOL-DOWN 1:59');
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 160, minutes: 2 }), 'COOL-DOWN 1:00');
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 219, minutes: 2 }), 'COOL-DOWN 0:01');
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 220, minutes: 2 }), '');
+        assert.equal(describeCooldownBadge({ startedAt: 0, sessionSeconds: 0, minutes: 5 }), 'COOL-DOWN 5:00');
+        assert.equal(describeCooldownBadge({ startedAt: 0, sessionSeconds: 0, minutes: 1 }), 'COOL-DOWN 1:00');
+        assert.equal(describeCooldownBadge({ startedAt: 0, sessionSeconds: 125, minutes: 3 }), 'COOL-DOWN 0:55');
+        assert.equal(describeCooldownBadge({ startedAt: null, sessionSeconds: 10, minutes: 2 }), '');
+        assert.equal(describeCooldownBadge({ startedAt: 100, sessionSeconds: 110, minutes: 0 }), '');
+        assert.equal(describeCooldownBadge(), '');
+        for (let t = 0; t < 400; t += 1) {
+            const text = describeCooldownBadge({ startedAt: 30, sessionSeconds: t, minutes: 3 });
+            assert.ok(text === '' || /^COOL-DOWN [0-3]:[0-5]\d$/.test(text), text);
+            assert.notEqual(text, 'COOL-DOWN 0:00');
+            assert.equal(
+                text === '',
+                cooldownSecondsFor({ startedAt: 30, sessionSeconds: t, minutes: 3 }) === null,
+                `t=${t}: the badge and the engine input agree on whether one is running`
+            );
+        }
+    });
+
+    it('a session: releases count, a resume from the pause on that same edge does not, and the clock expires it', () => {
+        // The wiring calls this on every release, on every resume from an
+        // edge pause (countsAsEdge false when that edge was already the
+        // pullback the release counted) and once a second with no event.
+        const args = { minutes: 1, every: 2 };
+        const eligible = cooldownEligible({ activeMode: 'milker', orgasmMode: false, sessionStatus: 'RUNNING' });
+        let cd = Object.freeze({ count: 0, startedAt: null });
+        cd = tickCooldown(cd, { ...args, event: 'release', sessionSeconds: 120, eligible });
+        assert.deepEqual(cd, { count: 1, startedAt: null, justStarted: false });
+        cd = tickCooldown(cd, { ...args, event: 'edgeResume', countsAsEdge: false, sessionSeconds: 140, eligible });
+        assert.deepEqual(cd, { count: 1, startedAt: null, justStarted: false }, 'the resume from the pause on that same edge is not a second edge');
+        cd = tickCooldown(cd, { ...args, event: 'edgeResume', countsAsEdge: true, sessionSeconds: 200, eligible });
+        assert.deepEqual(cd, { count: 2, startedAt: 200, justStarted: true }, 'an edge pause no pullback covered is the second edge');
+        const secondsIntoIt = [];
+        for (let t = 200; t <= 262; t += 1) {
+            cd = tickCooldown(cd, { ...args, event: null, sessionSeconds: t, eligible });
+            secondsIntoIt.push(cooldownSecondsFor({ ...cd, sessionSeconds: t, minutes: 1 }));
+        }
+        assert.equal(secondsIntoIt[0], 0);
+        assert.equal(secondsIntoIt[59], 59);
+        assert.equal(secondsIntoIt[60], null, 'over after 60 s');
+        assert.deepEqual(cd, { count: 2, startedAt: null, justStarted: false });
+        // During Force Orgasm the release is not an edge for the cool-down
+        // at all: the wearer asked for full speed.
+        const overdrive = tickCooldown(cd, {
+            ...args,
+            event: 'release',
+            sessionSeconds: 300,
+            eligible: cooldownEligible({ activeMode: 'milker', orgasmMode: true, sessionStatus: 'RUNNING' })
+        });
+        assert.deepEqual(overdrive, { count: 2, startedAt: null, justStarted: false });
     });
 });

@@ -4,7 +4,7 @@
 // with PUT /hamp/start, and the T-Code and Intiface planners park the sleeve.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { roundSpeed, MIN_MOVING_PERCENT, teaseFrame, motion, RUIN_LOCK_SECONDARY } from './patterns.js';
+import { roundSpeed, MIN_MOVING_PERCENT, teaseFrame, motion, RUIN_LOCK_SECONDARY, combineWake, warmupShape } from './patterns.js';
 import { TEASE_MODES, CRAWL_PERCENT } from './engine.js';
 
 // One pattern frame on the way up the band, below the pullback mark. The
@@ -125,5 +125,80 @@ describe('the near-stop is a crawl, never a stop', () => {
             assert.equal(lock.primary, 0, 'the Ruin lock is a dead stop');
             assert.equal(lock.secondary, RUIN_LOCK_SECONDARY);
         }
+    });
+});
+
+// The cool-down after an edge shares the warm-up's shape; the two are
+// combined by the smaller factor.
+
+// A small seeded generator, so a failing case can be re-run by number.
+function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+describe('combineWake', () => {
+    const NONE = { speed: 1, depth: 1 };
+
+    it('takes the smaller factor of each pair, so a second shape can only slow and shorten', () => {
+        assert.deepEqual(combineWake({ speed: 0.5, depth: 0.9 }, { speed: 0.7, depth: 0.3 }), { speed: 0.5, depth: 0.3 });
+        assert.deepEqual(combineWake({ speed: 0.16, depth: 0.28 }, NONE), { speed: 0.16, depth: 0.28 });
+        assert.deepEqual(combineWake(NONE, NONE), NONE);
+    });
+
+    it('is the same shape whichever side the cool-down is on', () => {
+        const rnd = mulberry32(7);
+        for (let i = 0; i < 2000; i += 1) {
+            const a = { speed: rnd(), depth: rnd() };
+            const b = { speed: rnd(), depth: rnd() };
+            assert.deepEqual(combineWake(a, b), combineWake(b, a));
+        }
+    });
+
+    it('the neutral shape leaves the warm-up exactly as it was, at every second of every length', () => {
+        // The engine hands this the warm-up and a cool-down that reads
+        // { speed: 1, depth: 1 } whenever none is running. Anything but
+        // bit-identity here would change every session that never uses the
+        // cool-down, which the wearer was promised cannot happen.
+        for (const minutes of [0, 1, 2, 3, 5, 10]) {
+            for (let seconds = 0; seconds <= minutes * 60 + 5; seconds += 1) {
+                const warm = warmupShape(seconds, minutes);
+                assert.deepEqual(combineWake(warm, NONE), warm, `minutes ${minutes} second ${seconds}`);
+                assert.deepEqual(combineWake(NONE, warm), warm, `minutes ${minutes} second ${seconds}`);
+            }
+        }
+    });
+
+    it('never returns a factor above either input', () => {
+        const rnd = mulberry32(11);
+        for (let i = 0; i < 5000; i += 1) {
+            const a = warmupShape(rnd() * 400, [0, 1, 2, 3, 5][Math.floor(rnd() * 5)]);
+            const b = warmupShape(rnd() * 400, [0, 1, 2, 3, 5][Math.floor(rnd() * 5)]);
+            const out = combineWake(a, b);
+            assert.ok(out.speed <= a.speed && out.speed <= b.speed, `speed ${out.speed} from ${a.speed} and ${b.speed}`);
+            assert.ok(out.depth <= a.depth && out.depth <= b.depth, `depth ${out.depth} from ${a.depth} and ${b.depth}`);
+            assert.ok(out.speed >= 0.16 && out.depth >= 0.28, 'a warm-up factor never drops below its own floor');
+        }
+    });
+
+    it('a factor that is not a number is no instruction: the other shape stands', () => {
+        // Neither a stop nor full speed may come out of a missing number. The
+        // warm-up factor in force is the one thing a broken caller can get.
+        const warm = { speed: 0.4, depth: 0.6 };
+        assert.deepEqual(combineWake(warm, { speed: NaN, depth: NaN }), warm);
+        assert.deepEqual(combineWake(warm, { speed: undefined, depth: '0.2' }), warm);
+        assert.deepEqual(combineWake(warm, {}), warm);
+        assert.deepEqual(combineWake(warm, null), warm);
+        assert.deepEqual(combineWake(warm, undefined), warm);
+        assert.deepEqual(combineWake(null, warm), warm);
+        assert.deepEqual(combineWake(undefined, undefined), { speed: 1, depth: 1 });
+        // A finite factor on one channel still counts when the other is junk.
+        assert.deepEqual(combineWake(warm, { speed: 0.2, depth: NaN }), { speed: 0.2, depth: 0.6 });
     });
 });

@@ -145,6 +145,23 @@ export function roundSpeed(value) {
     return clamp(Math.max(MIN_MOVING_PERCENT, Math.round(n)), 0, 100);
 }
 
+// Two wake-up shapes at once: the session warm-up and the cool-down that
+// follows an edge. Each factor is the smaller of the two, so a second shape
+// can only ever slow the toys further and shorten the stroke, never undo the
+// other's easing. A factor that is not a number is no instruction at all and
+// the other shape's factor stands: a broken caller reproduces today's
+// warm-up instead of freeing the toys or stopping them.
+export function combineWake(a, b) {
+    return {
+        speed: Math.min(wakeFactor(a && a.speed), wakeFactor(b && b.speed)),
+        depth: Math.min(wakeFactor(a && a.depth), wakeFactor(b && b.depth))
+    };
+}
+
+function wakeFactor(value) {
+    return Number.isFinite(value) ? value : 1;
+}
+
 function atCeiling(crawlPercent) {
     return crawlPercent;
 }
