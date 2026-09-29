@@ -35,6 +35,7 @@ import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './s
 import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
 import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
+import { cancelWheelWhileFocused, releaseFocusOnCommit, releaseFocusOnPointerUp } from './input-hygiene.js';
 import { planBannerUpdate, planBannerHide, hiddenBannerState, mergeBannerMessage, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
@@ -611,6 +612,10 @@ intensitySlider?.addEventListener('input', (e) => {
     updateEngine();
     syncTelemetry();
 });
+// A pointer drag would leave the slider holding the keyboard focus, so the
+// arrow, Home, End and Page keys pressed afterwards kept moving a motor speed
+// long after the hand had left the mouse. Keyboard use keeps the focus.
+releaseFocusOnPointerUp(intensitySlider);
 
 // The hardware travel envelope is ONE persisted setting (advancedSettings
 // handyHwMin / handyHwMax) that bounds The Handy and every TCode linear axis,
@@ -2267,7 +2272,16 @@ orgasmBtn?.addEventListener('click', () => {
         updateEdgeHoldPreview();
     };
     input?.addEventListener('input', () => edited(false));
-    input?.addEventListener('change', () => edited(true));
+    // A committed value lets go of the field, so the next key pressed goes to
+    // the page and not into the Climax HR; the 'change' a window or tab
+    // switch fires while the page has no focus still stores the limits but
+    // keeps the field, which the wearer comes back to. And the wheel never
+    // steps the field, which Chromium does one beat per wheel event while it
+    // is focused and the input handler above would persist: the wheel is
+    // cancelled while the field is focused, and one that can no longer be
+    // cancelled lets go of the field instead (input-hygiene.js).
+    releaseFocusOnCommit(input, () => edited(true));
+    cancelWheelWhileFocused(input);
 });
 
 // Experience Modes vs Games Tab Switching
