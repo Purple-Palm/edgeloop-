@@ -35,7 +35,7 @@ import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './s
 import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
 import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
-import { planBannerUpdate, canClearBanner, hiddenBannerState, mergeBannerMessage, BANNER_OWNER_ANY } from './alert-banner.js';
+import { planBannerUpdate, planBannerHide, hiddenBannerState, mergeBannerMessage, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
@@ -49,9 +49,10 @@ import {
     describePageAway
 } from './supervision.js';
 import { createScreenWakeLock } from './screen-wake-lock.js';
-import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers } from './hardware/handy.js';
-import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed } from './hardware/handy-protocol.js';
+import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected } from './hardware/handy.js';
+import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
+import { createStartGate } from './start-gate.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
@@ -272,6 +273,10 @@ const resetBtn = document.getElementById('sessionResetBtn');
 const cameEarlyBtn = document.getElementById('cameEarlyBtn');
 const orgasmBtn = document.getElementById('orgasmBtn');
 const orgasmBtnText = document.getElementById('orgasmBtnText');
+// START / RESUME wait here while The Handy is asked whether it is online
+// (see startOrResumeWhenReady); STOP, Reset and the page going away
+// (handlePageAway) cancel the wait.
+const startGate = createStartGate();
 
 // Age Verification Handlers
 const ageOverlay = document.getElementById('ageOverlay');
@@ -355,7 +360,9 @@ document.getElementById('ageConfirmBtn')?.addEventListener('click', () => {
 //
 // One banner carries every report, so it is ranked (see alert-banner.js): an
 // advisory can never overwrite a safety report, and a banner is only hidden
-// again by whoever raised it or by the wearer.
+// again by whoever raised it or by the wearer. A sentence appended under
+// someone else's report is taken back by whoever appended it, and the
+// report stays.
 let bannerState = hiddenBannerState();
 
 document.getElementById('dismissBannerBtn')?.addEventListener('click', () => {
@@ -363,17 +370,26 @@ document.getElementById('dismissBannerBtn')?.addEventListener('click', () => {
 });
 
 function showAlertBanner(message, { severity = 'safety', source = 'device' } = {}) {
-    const banner = document.getElementById('disconnectBanner');
-    const msg = document.getElementById('disconnectMsg');
     bannerState = planBannerUpdate(bannerState, { message, severity, source });
-    if (msg) msg.textContent = bannerState.text;
-    if (banner) banner.classList.remove('hidden');
+    renderAlertBanner();
 }
 
+// Hides the banner when `owner` owns it, or takes back only the sentences
+// `owner` appended to someone else's report.
 function hideAlertBanner(owner) {
-    if (!canClearBanner(bannerState, owner)) return;
-    bannerState = hiddenBannerState();
-    document.getElementById('disconnectBanner')?.classList.add('hidden');
+    bannerState = planBannerHide(bannerState, owner);
+    renderAlertBanner();
+}
+
+// The only place that writes the banner: its text and whether it shows.
+function renderAlertBanner() {
+    if (!bannerState.visible) {
+        document.getElementById('disconnectBanner')?.classList.add('hidden');
+        return;
+    }
+    const msg = document.getElementById('disconnectMsg');
+    if (msg) msg.textContent = bannerState.text;
+    document.getElementById('disconnectBanner')?.classList.remove('hidden');
 }
 
 function triggerDisconnectAlert(message, source = 'device') {
@@ -538,6 +554,9 @@ function pulseIsLive(now = Date.now()) {
 // frozen heart rate would drive the toys for a full tick (or the whole
 // signal-loss timeout) before the watchdog re-paused.
 function transportWaitingReason(now = Date.now()) {
+    // One START at a time: the button stays disabled while The Handy is
+    // being asked, so a second press cannot queue a second start behind it.
+    if (startGate.isPending()) return "CHECKING THE HANDY";
     const { hrReady, toyReady } = hardwareReadiness();
     if (!hrReady && !toyReady) return "WAITING FOR HR SENSOR & TOY";
     if (!hrReady) return "WAITING FOR HR SENSOR";
@@ -1634,16 +1653,26 @@ function holdAfterSignalReturn() {
     checkReadiness();
 }
 
+// The same RESUME as the button, Handy check included: a pulse coming back
+// says nothing about whether the toy is still there.
 function resumeAfterSignalReturn() {
     state.hrSignalPaused = false;
-    if (!startOrResumeSession()) return;
-    // Only the signal-loss banner this function raised. A standing report
-    // about a device that may still be moving is not the pulse's to clear.
-    hideAlertBanner('hrSignal');
-    cueVoice('signalRestored');
-    showHrSignalBadge('SIGNAL RESTORED, RESUMED', 6000);
-    syncTelemetry();
-    updateEngine();
+    startOrResumeWhenReady().then((resumed) => {
+        if (resumed) {
+            cueVoice('signalRestored');
+            showHrSignalBadge('SIGNAL RESTORED, RESUMED', 6000);
+            syncTelemetry();
+            updateEngine();
+            return;
+        }
+        // The pulse is back but the session stays paused: The Handy did not
+        // answer that it is online (the refusal is on the banner, under the
+        // signal-loss report) or a toy has gone meanwhile. Hold exactly as
+        // with auto-resume off, so the overlay drops and the badge says what
+        // to do. Not after STOP or Reset during the check: they have cleared
+        // everything already, and the badge would name a RESUME there is not.
+        if (state.sessionStatus === 'PAUSED') holdAfterSignalReturn();
+    });
 }
 
 // One watchdog verdict per clock tick while the session is live. The
@@ -1865,6 +1894,21 @@ function startOrResumeSession() {
         checkReadiness();
         return false;
     }
+    // Nothing below declines: the session runs from here on, from the button
+    // as from the partner's controller or the auto-resume. So the line a
+    // refused START or RESUME left has nothing more to say, and neither has
+    // the watchdog's "motors paused for safety", which used to be hidden by
+    // the auto-resume alone: a RESUME pressed by hand after a refused one ran
+    // the motors under a banner still saying they were paused and the
+    // session not resumed. Each takes back only its own words, as a standing
+    // report about a device that may still be moving is neither's to clear.
+    // Both go before the cue below: a cue can put a voice notice on the
+    // banner (a saved voice this browser does not have, a voice that cannot
+    // speak here), appended under the watchdog's report or folded into the
+    // refusal's line, and taken back after it they took the notice along
+    // before it was ever shown, with its once-only latch already spent.
+    withdrawStartRefusal();
+    hideAlertBanner('hrSignal');
     let resumingRampdown = false;
     if (state.sessionStatus === 'IDLE') {
         // A fresh run never inherits time, edges or samples from the last one.
@@ -1895,6 +1939,70 @@ function startOrResumeSession() {
     return true;
 }
 
+// The line a refused START or RESUME put on the banner is about that one
+// press, so it is taken back as soon as it has nothing left to say: when a
+// later START or RESUME runs, or is refused and says why in its place; when
+// The Handy is connected again, since what the line said about the link no
+// longer holds; and when STOP or Reset starts over, leaving nothing to press
+// again. Being an advisory, the line is appended under whatever report
+// stands - always under the offline report when the check itself found the
+// device offline, and under "The Handy disconnected." or the watchdog's
+// pause as often. That report owns the banner and only its owner or the
+// wearer may hide it, so hiding the banner would leave the line in place:
+// once the wearer had connected the device again and pressed START, the
+// motors ran under "The session was not started: The Handy is offline".
+// The line is taken back from under the report instead, and the report
+// stays until its owner or the wearer clears it, as before.
+function withdrawStartRefusal() {
+    hideAlertBanner('handyCheck');
+}
+
+// START and RESUME, from the button, the partner's controller and the
+// watchdog's auto-resume alike. A connected Handy is asked whether it is
+// online (GET /connected) first, and the session only starts on a yes: the
+// poll can be up to 30 s behind a device that was switched off, and START
+// on a dead Handy used to run the session for several seconds before the
+// failed commands paused it again. Anything else that is not ready is
+// refused before the question is asked, and the answer is checked against
+// the whole readiness gate again, since the pulse or a toy can go in the
+// meantime. Resolves whether the session started.
+function startOrResumeWhenReady() {
+    if (state.sessionStatus !== 'IDLE' && state.sessionStatus !== 'PAUSED') return Promise.resolve(false);
+    if (transportWaitingReason()) {
+        checkReadiness();
+        return Promise.resolve(false);
+    }
+    const resuming = state.sessionStatus === 'PAUSED';
+    const started = startGate.run({
+        ask: handyConnected
+            ? () => pollHandyConnected().then((answer) => ({ ok: answer.state === 'online', answer }))
+            : null,
+        start: startOrResumeSession,
+        // An advisory: a start that did not happen moves nothing, and a
+        // standing safety report (a motor that may still be moving) must
+        // keep its place above it. It takes the place of the line an
+        // earlier refusal left instead of stacking under it: only the
+        // latest press is news.
+        refuse: (verdict) => {
+            withdrawStartRefusal();
+            showAlertBanner(describeStartRefusal(verdict && verdict.answer, resuming), {
+                severity: 'advisory',
+                source: 'handyCheck'
+            });
+        }
+    });
+    // Paints CHECKING THE HANDY while the question is out.
+    checkReadiness();
+    // The lines a running session outdates are taken back inside the start
+    // itself, before its cue (see startOrResumeSession).
+    return started.catch(() => false).then((ok) => {
+        checkReadiness();
+        syncTelemetry();
+        updateEngine();
+        return ok;
+    });
+}
+
 // Session Controls Handlers
 playPauseBtn?.addEventListener('click', () => {
     if (isRemoteViewer) return;
@@ -1905,7 +2013,7 @@ playPauseBtn?.addEventListener('click', () => {
         return;
     }
     if (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') {
-        startOrResumeSession();
+        startOrResumeWhenReady();
     } else if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         pauseSession('Paused.');
     }
@@ -1934,7 +2042,10 @@ function showIdleTransport() {
 function stopSession(outcome = "Stopped", voiceText = null) {
     const wasActive = state.sessionStatus !== 'IDLE';
     // Status and motors FIRST: nothing below (history, storage, voice) may
-    // leave the session running if it throws.
+    // leave the session running if it throws. A START still waiting for The
+    // Handy's answer is dropped with them: STOP means no session, whatever
+    // the answer turns out to be.
+    startGate.cancel();
     state.sessionStatus = 'IDLE';
     state.resumeStatus = null;
     state.strokerSpeed = 0;
@@ -1952,6 +2063,7 @@ function stopSession(outcome = "Stopped", voiceText = null) {
         resetGameState();
         updateWarmupBadge();
         showIdleTransport();
+        withdrawStartRefusal();
         // STOP silences every queued cue; the outcome is the one thing said.
         cancelSpeech();
         cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'sessionStop'), true);
@@ -1967,6 +2079,7 @@ resetBtn?.addEventListener('click', () => {
         sendPeerCommand({ type: 'SESSION_RESET' });
         return;
     }
+    startGate.cancel();
     state.sessionStatus = 'IDLE';
     state.resumeStatus = null;
     dispatchHardware(0, 0, 0, 100, true);
@@ -1980,6 +2093,7 @@ resetBtn?.addEventListener('click', () => {
     // Back to the resting line, exactly as on a fresh load.
     paintIdlePrompt();
     showIdleTransport();
+    withdrawStartRefusal();
     syncTelemetry();
     checkReadiness();
     if (!isRemotePage) updateEngine();
@@ -3744,6 +3858,7 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
         handyConnectedLabel = result.description ? `Connected (${result.description})` : 'Connected';
         setHandyStatus(handyConnectedLabel, 'ok');
         setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
+        withdrawStartRefusal();
         document.getElementById('modalHandyDisconnectBtn')?.classList.remove('hidden');
         closeModal();
         syncTelemetry();
@@ -4177,6 +4292,11 @@ function stopEveryToyOnPageAway() {
 function handlePageAway(kind) {
     stopEveryToyOnPageAway();
     if (isRemotePage) return;
+    // A START or RESUME still waiting for The Handy's answer (see
+    // startOrResumeWhenReady) is dropped too, the auto-resume's included:
+    // its answer would land once the page is back and start the toys after
+    // a stretch nobody watched. Pressing it again asks again.
+    if (startGate.cancel()) checkReadiness();
     const running = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
     // A watchdog pause with auto-resume on restarts the toys by itself on the
     // first reading after the page is back. After a stretch nobody watched,

@@ -7,12 +7,17 @@ import {
     bannerRank,
     mergeBannerMessage,
     planBannerUpdate,
+    planBannerHide,
     canClearBanner,
     hiddenBannerState
 } from './alert-banner.js';
 
 const MOTOR_ALERT = 'The Handy did not confirm a stop and may still be moving: check the device. (timeout)';
 const MIC_ALERT = 'The microphone stopped (revoked, unplugged or taken by another app).';
+// The report The Handy's driver raises when GET /connected says the device
+// is gone, and the line app.js appends when that answer refused a START.
+const OFFLINE_REPORT = 'The Handy reports it is no longer connected to Wi-Fi.';
+const START_REFUSAL = 'The session was not started: The Handy is offline. Check the device, then connect it again in The Handy panel.';
 
 describe('alert banner ranking', () => {
     it('ranks nothing below an advisory below a safety report', () => {
@@ -119,24 +124,136 @@ describe('alert banner clearing', () => {
     });
 
     it('hiddenBannerState is really hidden', () => {
-        assert.deepEqual(hiddenBannerState(), { visible: false, severity: 'none', source: 'none', text: '' });
+        assert.deepEqual(hiddenBannerState(), { visible: false, severity: 'none', source: 'none', text: '', lines: [] });
+    });
+});
+
+describe('alert banner: taking back an appended sentence', () => {
+    // The sequence from the field: START asks The Handy whether it is
+    // online, the answer is no, the driver raises its offline report, and
+    // the refusal is appended under it. The wearer connects the device again
+    // and presses START; the session runs. The refusal's owner could not
+    // hide a banner the offline report owned, so the motors ran under "The
+    // session was not started: The Handy is offline".
+    const offline = planBannerUpdate(hiddenBannerState(), {
+        message: OFFLINE_REPORT, severity: 'safety', source: 'device'
+    });
+    const refused = planBannerUpdate(offline, {
+        message: START_REFUSAL, severity: 'advisory', source: 'handyCheck'
+    });
+
+    it('the refusal under the offline report is taken back, and the report stays', () => {
+        assert.equal(refused.text, `${OFFLINE_REPORT} Also: ${START_REFUSAL}`);
+        const after = planBannerHide(refused, 'handyCheck');
+        assert.equal(after.visible, true, 'the offline report is still up');
+        assert.equal(after.text, OFFLINE_REPORT, 'and it is all the banner says');
+        assert.equal(after.severity, 'safety');
+        assert.equal(after.source, 'device', 'still owned by the report, so only it or the wearer can hide it');
+        assert.equal(canClearBanner(after, 'handyCheck'), false);
+    });
+
+    it('nothing else can take the refusal back, and nobody but its owner can take back the report', () => {
+        for (const owner of ['hrSignal', 'mic', 'remote', 'none', '', undefined, null]) {
+            const after = planBannerHide(refused, owner);
+            assert.equal(after.visible, true);
+            assert.equal(after.text, refused.text, `"${String(owner)}" changed the banner`);
+        }
+        const offlineOnly = planBannerHide(offline, 'handyCheck');
+        assert.equal(offlineOnly.visible, true);
+        assert.equal(offlineOnly.text, OFFLINE_REPORT, 'a report nobody appended to has nothing to take back');
+    });
+
+    it('the banner\'s owner, and the wearer, still hide all of it', () => {
+        assert.equal(planBannerHide(refused, 'device').visible, false);
+        assert.equal(planBannerHide(refused, BANNER_OWNER_ANY).visible, false);
+        // A refusal alone on the banner is its own report: its owner hides it.
+        const alone = planBannerUpdate(hiddenBannerState(), {
+            message: START_REFUSAL, severity: 'advisory', source: 'handyCheck'
+        });
+        assert.equal(planBannerHide(alone, 'handyCheck').visible, false);
+    });
+
+    it('takes back only its own sentence: everyone else\'s stay, in the order they came', () => {
+        const three = planBannerUpdate(
+            planBannerUpdate(offline, { message: START_REFUSAL, severity: 'advisory', source: 'handyCheck' }),
+            { message: MIC_ALERT, severity: 'advisory', source: 'mic' }
+        );
+        assert.equal(three.text, `${OFFLINE_REPORT} Also: ${START_REFUSAL} Also: ${MIC_ALERT}`);
+        const noRefusal = planBannerHide(three, 'handyCheck');
+        assert.equal(noRefusal.text, `${OFFLINE_REPORT} Also: ${MIC_ALERT}`);
+        assert.equal(planBannerHide(noRefusal, 'mic').text, OFFLINE_REPORT);
+        // And a sentence appended after one was taken back still lands after
+        // what is left, and can be taken back in its turn.
+        const again = planBannerUpdate(noRefusal, { message: START_REFUSAL, severity: 'advisory', source: 'handyCheck' });
+        assert.equal(again.text, `${OFFLINE_REPORT} Also: ${MIC_ALERT} Also: ${START_REFUSAL}`);
+        assert.equal(planBannerHide(again, 'handyCheck').text, `${OFFLINE_REPORT} Also: ${MIC_ALERT}`);
+    });
+
+    it('an owner that repeats a sentence is shown and recorded once, so one withdrawal takes it back', () => {
+        let state = refused;
+        for (let i = 0; i < 5; i++) {
+            state = planBannerUpdate(state, { message: START_REFUSAL, severity: 'advisory', source: 'handyCheck' });
+        }
+        assert.equal(state.text, refused.text);
+        assert.equal(state.lines.length, refused.lines.length, 'a repeat does not pile up behind the banner');
+        assert.equal(planBannerHide(state, 'handyCheck').text, OFFLINE_REPORT);
+        // Nor does a notice with nothing to say.
+        const empty = planBannerUpdate(state, { message: '   ', severity: 'advisory', source: 'mic' });
+        assert.equal(empty.text, state.text);
+        assert.equal(empty.lines.length, state.lines.length);
+    });
+
+    it('a sentence two owners reported stays until both have taken it back', () => {
+        // The wearer reads it once; the first owner to take it back must not
+        // take it away from the other, who still stands by it.
+        const both = planBannerUpdate(refused, { message: START_REFUSAL, severity: 'advisory', source: 'mic' });
+        assert.equal(both.text, refused.text, 'shown once');
+        const oneLeft = planBannerHide(both, 'handyCheck');
+        assert.equal(oneLeft.text, `${OFFLINE_REPORT} Also: ${START_REFUSAL}`);
+        assert.equal(planBannerHide(oneLeft, 'mic').text, OFFLINE_REPORT);
+        assert.equal(planBannerHide(planBannerHide(both, 'mic'), 'handyCheck').text, OFFLINE_REPORT);
+    });
+
+    it('a later report of the same rank replaces the banner, appended sentences with it', () => {
+        const replaced = planBannerUpdate(refused, { message: MOTOR_ALERT, severity: 'safety', source: 'device' });
+        assert.equal(replaced.text, MOTOR_ALERT);
+        assert.deepEqual(replaced.lines, [{ source: 'device', text: MOTOR_ALERT }], 'nothing of the old banner is kept behind the new one');
+        assert.equal(planBannerHide(replaced, 'handyCheck').text, MOTOR_ALERT, 'the refusal went with the old report');
+    });
+
+    it('a banner whose sentences cannot be told apart is one sentence of its owner\'s', () => {
+        // Built by hand, or lines that no longer add up to the text: nobody
+        // but the owner and the wearer may take back any of it, so a safety
+        // report can never lose a word to a stray withdrawal.
+        const byHand = { visible: true, severity: 'safety', source: 'device', text: refused.text };
+        assert.equal(planBannerHide(byHand, 'handyCheck').text, refused.text);
+        const tampered = { ...refused, lines: [{ source: 'device', text: OFFLINE_REPORT }, { source: 'handyCheck', text: 'something else' }] };
+        assert.equal(planBannerHide(tampered, 'handyCheck').text, refused.text);
+        const ownerless = { ...refused, lines: [{ source: 'handyCheck', text: OFFLINE_REPORT }, { source: 'handyCheck', text: START_REFUSAL }] };
+        assert.equal(planBannerHide(ownerless, 'handyCheck').text, refused.text, 'the first sentence must be the owner\'s');
+        assert.equal(planBannerHide(byHand, 'device').visible, false, 'its owner still hides it');
+    });
+
+    it('taking back from a hidden banner leaves it hidden', () => {
+        assert.deepEqual(planBannerHide(hiddenBannerState(), 'handyCheck'), hiddenBannerState());
     });
 });
 
 describe('app.js routes every banner write through the ranking', () => {
     const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 
-    it('nothing writes #disconnectMsg or unhides the banner behind showAlertBanner()', () => {
+    it('nothing writes #disconnectMsg or shows or hides the banner behind renderAlertBanner()', () => {
         // One banner carries heart-rate loss, a dropped monitor, an offline
         // Handy, a dead remote link, "the Handy may still be moving" and the
         // microphone advisory. A direct write is how one of them silently
-        // replaced another.
+        // replaced another. renderAlertBanner() only draws the state that
+        // showAlertBanner() and hideAlertBanner() planned.
         const writes = src.match(/getElementById\('disconnectMsg'\)/g) || [];
-        assert.equal(writes.length, 1, 'only showAlertBanner() may write the banner text');
+        assert.equal(writes.length, 1, 'only renderAlertBanner() may write the banner text');
         const unhides = src.match(/disconnectBanner'\)[\s\S]{0,40}?classList\.remove\('hidden'\)/g) || [];
-        assert.ok(unhides.length <= 1, 'only showAlertBanner() may reveal the banner');
+        assert.ok(unhides.length <= 1, 'only renderAlertBanner() may reveal the banner');
         const hides = src.match(/disconnectBanner'\)\??\.classList\.add\('hidden'\)/g) || [];
-        assert.equal(hides.length, 1, 'only hideAlertBanner() may hide the banner');
+        assert.equal(hides.length, 1, 'only renderAlertBanner() may hide the banner');
     });
 
     it('the microphone reports at advisory level and the safety paths at safety level', () => {

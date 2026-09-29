@@ -34,6 +34,7 @@ const PRECACHE = [
     './src/js/hr-watchdog.js',
     './src/js/supervision.js',
     './src/js/screen-wake-lock.js',
+    './src/js/start-gate.js',
     './src/js/funscript.js',
     './src/js/storage.js',
     './src/js/write-coalescer.js',

@@ -19,6 +19,8 @@ import {
     describeSlideAdjustment,
     isHampModeError,
     describeDeviceStop,
+    describeStartRefusal,
+    isDeviceNotConnectedError,
     parseBatteryLevel,
     describeHandyInfo,
     HANDY_MIN_VELOCITY,
@@ -695,5 +697,81 @@ describe('handyTargetSpeed', () => {
         assert.equal(handyTargetSpeed('primary', 37, 0, undefined), 37);
         assert.equal(handyTargetSpeed('primary', 37, 0, null), 37);
         assert.equal(handyTargetSpeed('primary', 250, 0, 100), 100);
+    });
+});
+
+describe('describeStartRefusal', () => {
+    it('says the session did not start, and what to do next', () => {
+        const offline = describeStartRefusal({ state: 'offline', reason: 'The Handy reports it is no longer connected to Wi-Fi.' });
+        assert.match(offline, /^The session was not started: The Handy is offline\./);
+        assert.match(offline, /connect it again in The Handy panel/);
+        // The device's own reason is already on the banner, one line up.
+        assert.ok(!/Wi-Fi/.test(offline), offline);
+
+        const unreachable = describeStartRefusal({ state: 'unreachable', reason: 'Network error (/connected)' });
+        assert.match(unreachable, /^The session was not started: EdgeLoop could not reach The Handy API/);
+        assert.match(unreachable, /\(Network error \(\/connected\)\)/);
+        assert.match(unreachable, /press START again\.$/);
+
+        assert.match(describeStartRefusal({ state: 'stale' }), /changed while it was being checked\. Press START again\.$/);
+
+        // With the link gone START may be waiting for a toy: no "press again".
+        const lost = describeStartRefusal({ state: 'lost', reason: 'The Handy connection was lost while it was being checked.' });
+        assert.equal(lost, 'The session was not started: The Handy connection was lost while it was being checked.');
+    });
+
+    it('names RESUME for a paused session', () => {
+        const msg = describeStartRefusal({ state: 'unreachable', reason: 'Request timed out (/connected)' }, true);
+        assert.match(msg, /^The session was not resumed: /);
+        assert.match(msg, /press RESUME again\.$/);
+        assert.match(describeStartRefusal({ state: 'offline' }, true), /^The session was not resumed: The Handy is offline\./);
+    });
+
+    it('sends the wearer to the network, not the device, when the API could not be reached', () => {
+        // The third miss in a row drops the link, and the check that made it
+        // answers offline. The device may be fine: it is the connection
+        // that needs checking before The Handy is connected again.
+        const api = describeStartRefusal({ state: 'offline', reason: 'The Handy API is unreachable.', cause: 'api' });
+        assert.equal(api, 'The session was not started: The Handy API could not be reached, so the connection was dropped. Check the connection, then connect again in The Handy panel.');
+        assert.ok(!/Check the device/.test(api), api);
+        assert.match(describeStartRefusal({ state: 'offline', cause: 'api' }, true), /^The session was not resumed: The Handy API could not be reached/);
+        // The device's own word is still a device to check, and so is an
+        // offline answer that does not say why.
+        for (const cause of ['device', undefined, 'bogus']) {
+            assert.match(describeStartRefusal({ state: 'offline', cause }), /The Handy is offline\. Check the device, then connect it again in The Handy panel\.$/, String(cause));
+        }
+    });
+
+    it('is a refusal whatever it is handed', () => {
+        for (const answer of [null, undefined, {}, 'offline', 42, { state: 'online' }, { state: 'unreachable' }]) {
+            const msg = describeStartRefusal(answer);
+            assert.match(msg, /^The session was not started: /, String(answer));
+            assert.ok(!/undefined|null|\(\)/.test(msg), msg);
+        }
+    });
+});
+
+describe('isDeviceNotConnectedError', () => {
+    it('recognises the API saying the device was not connected, by name and flag', () => {
+        // The spec's own example.
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected', connected: false } }), true);
+        // The enum's spelling of the same name, under the other number.
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1002, name: 'DEVICE_NOT_CONNECTED', message: 'Device not connected', connected: false } }), true);
+    });
+
+    it('is not read from the code: the spec numbers its two device errors both ways round', () => {
+        // The example's DeviceTimeout carries 1002; the enum says 1002 is
+        // DEVICE_NOT_CONNECTED. Neither number may pass a timeout - a command
+        // the device may have carried out - off as one it never received.
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1002, name: 'DeviceTimeout', message: 'Device timeout', connected: true } }), false);
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1001, name: 'DeviceTimeout', message: 'Device timeout', connected: false } }), false);
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1002, message: 'Device not connected', connected: false } }), false, 'no name, no verdict');
+    });
+
+    it('needs the connected flag to agree, and an error object at all', () => {
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected', connected: true } }), false);
+        assert.equal(isDeviceNotConnectedError({ error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected' } }), false);
+        const notIt = [null, undefined, {}, { result: -1 }, { error: 'Device not connected' }, { error: { code: 1000, name: 'Error', message: 'Unspecified error', connected: false } }];
+        for (const body of notIt) assert.equal(isDeviceNotConnectedError(body), false, JSON.stringify(body));
     });
 });

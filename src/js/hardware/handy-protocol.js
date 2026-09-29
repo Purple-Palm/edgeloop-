@@ -309,6 +309,60 @@ export function describeDeviceStop(cause = '') {
     return `${lead}The Handy's firmware stops the slider when it reads as blocked, which includes being driven hard into the ends of its travel. Check the sleeve and the rails for an obstruction, then narrow the Travel Envelope or raise the End-stop margin in the Handy panel.`;
 }
 
+// The banner line for a START or RESUME refused because The Handy did not
+// answer that it is online. `answer` is what the driver's pollHandyConnected
+// resolved: { state, reason, cause }. When the check took the link offline,
+// the offline report is already on the banner above this line (it outranks
+// this one and keeps its place), so this says what did not happen and what
+// to do next rather than why all over again. What to do next depends on
+// why the link went (`cause`): a device that said it is not connected
+// needs checking, but when the API could not be reached for the third time
+// in a row the device may be fine and it is the network that needs
+// checking. "Check the device" there would send the wearer to a toy that
+// was never the problem while the connection stayed down.
+export function describeStartRefusal(answer, resuming = false) {
+    const what = resuming ? 'resumed' : 'started';
+    const press = resuming ? 'RESUME' : 'START';
+    const state = answer && typeof answer === 'object' ? answer.state : null;
+    const reason = answer && typeof answer.reason === 'string' ? answer.reason.trim() : '';
+    if (state === 'offline' && answer.cause === 'api') {
+        return `The session was not ${what}: The Handy API could not be reached, so the connection was dropped. Check the connection, then connect again in The Handy panel.`;
+    }
+    if (state === 'offline') {
+        return `The session was not ${what}: The Handy is offline. Check the device, then connect it again in The Handy panel.`;
+    }
+    if (state === 'unreachable') {
+        const detail = reason ? ` (${reason})` : '';
+        return `The session was not ${what}: EdgeLoop could not reach The Handy API to check that the device is online${detail}. Check the connection and press ${press} again.`;
+    }
+    // No "press again" here: with the link gone, START may now be waiting
+    // for a toy, and the report of why the link went is already above.
+    if (state === 'lost') {
+        return `The session was not ${what}: The Handy connection was lost while it was being checked.`;
+    }
+    if (state === 'stale') {
+        return `The session was not ${what}: The Handy connection changed while it was being checked. Press ${press} again.`;
+    }
+    return `The session was not ${what}: The Handy could not be checked. Press ${press} again.`;
+}
+
+// Whether an API error says the command never reached the device. The v2
+// spec's DEVICE_NOT_CONNECTED means the API found no device on the key's
+// link and forwarded nothing, so the motor did not turn on this command.
+// Every other failure leaves that open: its DEVICE_TIMEOUT is "a response
+// from the device was not received within the maximum timeout", which is a
+// command that may have been carried out, and an unspecified or server
+// error says nothing either way. The spec's enum and its own examples
+// disagree about which of 1001 and 1002 is which error, so the number is
+// not trusted: the name has to say it, and the error's `connected` flag
+// (which the schema requires on every error) has to agree.
+export function isDeviceNotConnectedError(body) {
+    const err = body && typeof body === 'object' ? body.error : null;
+    if (!err || typeof err !== 'object') return false;
+    const name = typeof err.name === 'string' ? err.name.replace(/[^a-z]/gi, '').toLowerCase() : '';
+    return name === 'devicenotconnected' && err.connected === false;
+}
+
 // Classify one API reply. `body` is the parsed JSON (or null when the body was
 // not JSON). Returns { ok, message, code }. Failure is any of: non-2xx HTTP
 // status, a body carrying an `error` object, or `result === -1`.
