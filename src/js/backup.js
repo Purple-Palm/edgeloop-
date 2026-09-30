@@ -94,7 +94,18 @@ export const NOTE_KEY_UNUSABLE = 'This file does NOT contain your Handy connecti
 // defaults and read by nothing at all, so every backup written before it
 // was removed carries it, and telling those users a field "was skipped"
 // would be a warning about nothing on the commonest upgrade path there is.
-export const RETIRED_SETTING_KEYS = ['customProfiles'];
+//
+// `cadenceBreathing` and `milkingWave` are the same story one release later.
+// They switched two fixed waves on: an 8 s swell on the primary and a 6 s
+// one on the secondary. 1.1.0 (PATTERNS) replaced both with overlapping
+// cycles "so a steady heart rate does not settle into one beat you can
+// count", and from then on the engine read neither - yet both still sat in
+// the defaults, rode in every backup, and an import counted them among the
+// Session Setup values it had "restored". No build ever gave them a control,
+// so there is none to take away, and wiring them back would lay exactly the
+// countable beat over the patterns that 1.1.0 set out to remove. Every
+// backup written before this carries both, at their factory `true`.
+export const RETIRED_SETTING_KEYS = ['customProfiles', 'cadenceBreathing', 'milkingWave'];
 
 export const RESERVED_SETTING_KEYS = [
     'format',
@@ -254,6 +265,25 @@ export function pruneReservedKeys(settings) {
     if (!isPlainObject(settings)) return [];
     const removed = [];
     for (const name of RESERVED_SETTING_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(settings, name)) {
+            delete settings[name];
+            removed.push(name);
+        }
+    }
+    return removed;
+}
+
+// Delete the retired names from a settings object the app is about to load,
+// and return the names removed. A file drops them on the way in (see
+// filterSettings), but the settings store in this browser was written by
+// the build that still had them, boot merges the whole stored blob into the
+// live settings, and every later save writes it back out - so without this
+// every existing install would carry the two dead wave switches for ever,
+// whatever this list says.
+export function pruneRetiredKeys(settings) {
+    if (!isPlainObject(settings)) return [];
+    const removed = [];
+    for (const name of RETIRED_SETTING_KEYS) {
         if (Object.prototype.hasOwnProperty.call(settings, name)) {
             delete settings[name];
             removed.push(name);

@@ -149,8 +149,6 @@ export const SETTING_SANITIZERS = {
     edgeStrokeDepth: fixedAtFactory('edgeStrokeDepth'),
 
     warmupMinutes: wholeNumber('warmupMinutes', 0, 10),
-    cadenceBreathing: boolean('cadenceBreathing'),
-    milkingWave: boolean('milkingWave'),
 
     // Likewise the travel envelope: normalizeEnvelope clamps both ends to
     // 0-100 AND keeps them a minimum gap apart in the right order, which

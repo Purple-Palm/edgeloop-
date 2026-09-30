@@ -255,8 +255,6 @@ export function calculateEngineOutputs({
     handyHwMax = 100,
     sessionSeconds = 0,
     warmupMinutes = 0,
-    cadenceBreathing = false,
-    milkingWave = false,
     stallGuardEngaged = false,
     ceilingBehaviour = 'crawl',
     edgeHoldPercent = DEFAULT_EDGE_HOLD_PERCENT,

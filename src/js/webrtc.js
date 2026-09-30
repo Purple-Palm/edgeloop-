@@ -10,8 +10,23 @@
  *
  * Nothing here touches window.Peer at import time, so the module loads
  * under node:test; the library is looked up when a peer is created.
+ *
+ * Every message this side sends carries PEER_PROTOCOL_VERSION, and both
+ * sides refuse a mode or game command across pages that do not speak the
+ * same version (see peer-messages.js): the host by the version the command
+ * carries, a controller by the version the host's telemetry carries. The
+ * app is told the other page's version through onPeerProtocol, so both
+ * people can be told which page needs a reload.
  */
-import { sanitizeCommand, sanitizeTelemetry } from './peer-messages.js';
+import {
+    sanitizeCommand,
+    sanitizeTelemetry,
+    stampProtocol,
+    readPeerProtocol,
+    peerProtocolMatches,
+    peerCommandAllowed,
+    PEER_PROTOCOL_VERSION
+} from './peer-messages.js';
 
 // A remote page pings every PING_MS; the host drops a link that has been
 // silent for STALE_PEER_MS (pruneStalePeers is called from its clock).
@@ -26,6 +41,12 @@ const viewerConns = new Set(); // host: live viewers
 const lastSeen = new Map();    // host: DataConnection -> last inbound timestamp
 let hostConn = null;           // remote page: the link to the host
 let pingTimer = null;
+// The version the other page speaks, as it last said: the host's view of
+// its controller, and a remote page's view of the host. Undefined while it
+// is not known, and for a page from before versions, which never says.
+let controllerProtocol;
+let hostProtocol;
+let hostProtocolKnown = false;
 
 export function peerLibraryAvailable() {
     return typeof window !== 'undefined' && typeof window.Peer === 'function';
@@ -122,13 +143,23 @@ function dropHostConn(conn, reason, err = null) {
     const wasController = conn === controllerConn;
     const wasViewer = viewerConns.has(conn);
     lastSeen.delete(conn);
-    if (wasController) controllerConn = null;
+    if (wasController) {
+        controllerConn = null;
+        controllerProtocol = undefined;
+    }
     viewerConns.delete(conn);
     safeClose(conn);
     if (!wasController && !wasViewer) return;
     if (wasController) call('onControllerDisconnected', reason, err);
     if (wasViewer) call('onViewerDisconnected', reason, err);
     call('onCountsChanged', getPeerCounts());
+}
+
+// Tell the app which version the live controller speaks, once per change.
+function noteControllerProtocol(protocol, force = false) {
+    if (!force && protocol === controllerProtocol) return;
+    controllerProtocol = protocol;
+    call('onPeerProtocol', { peer: 'controller', protocol, matches: peerProtocolMatches(protocol) });
 }
 
 function acceptHostConnection(conn) {
@@ -145,6 +176,11 @@ function acceptHostConnection(conn) {
                 safeClose(previous);
             }
             call('onPartnerConnected');
+            // A controller says which version it speaks as it connects, and
+            // one from before versions says nothing - which is the answer,
+            // so the wearer is told at once rather than at the first ping.
+            const metadata = conn.metadata && typeof conn.metadata === 'object' ? conn.metadata : {};
+            noteControllerProtocol(readPeerProtocol(metadata.protocol), true);
         } else {
             viewerConns.add(conn);
             call('onViewerConnected');
@@ -154,7 +190,18 @@ function acceptHostConnection(conn) {
     conn.on('data', (raw) => {
         lastSeen.set(conn, Date.now());
         const cmd = sanitizeCommand(raw, role);
-        if (!cmd || cmd.type === 'PING') return;
+        if (!cmd) return;
+        if (conn === controllerConn) noteControllerProtocol(cmd.protocol);
+        if (cmd.type === 'PING') return;
+        // Judged by the version the command itself carries. A mode or game
+        // change from a page on another version can mean something else
+        // there than it does here, so it is refused rather than obeyed; the
+        // app says so and re-sends the host's real mode, which puts the
+        // partner's cards back where the session really is.
+        if (!peerCommandAllowed(cmd, cmd.protocol)) {
+            call('onCommandRefused', cmd);
+            return;
+        }
         call('onCommandReceived', cmd);
     });
     conn.on('close', () => dropHostConn(conn, 'closed'));
@@ -179,6 +226,7 @@ export function initHostPeer(h) {
     }
     localRole = 'host';
     controllerConn = null;
+    controllerProtocol = undefined;
     viewerConns.clear();
     lastSeen.clear();
     peer = new window.Peer();
@@ -204,11 +252,12 @@ export function pruneStalePeers(now = Date.now()) {
 // Host -> every remote. A send that throws marks that link dead.
 export function broadcastPeerTelemetry(payload) {
     if (localRole !== 'host') return;
+    const message = stampProtocol(payload);
     const targets = controllerConn ? [controllerConn, ...viewerConns] : [...viewerConns];
     for (const conn of targets) {
         if (!conn.open) continue;
         try {
-            conn.send(payload);
+            conn.send(message);
         } catch (e) {
             dropHostConn(conn, 'error', e);
         }
@@ -229,12 +278,21 @@ function startPing() {
     pingTimer = setInterval(() => {
         if (hostConn && hostConn.open) {
             try {
-                hostConn.send({ type: 'PING' });
+                hostConn.send(stampProtocol({ type: 'PING' }));
             } catch (e) {
                 dropRemoteLink('error', e);
             }
         }
     }, PING_MS);
+}
+
+// Tell the app which version the host speaks: on its first telemetry frame,
+// and again only if that ever changes.
+function noteHostProtocol(protocol) {
+    if (hostProtocolKnown && protocol === hostProtocol) return;
+    hostProtocolKnown = true;
+    hostProtocol = protocol;
+    call('onPeerProtocol', { peer: 'host', protocol, matches: peerProtocolMatches(protocol) });
 }
 
 function dropRemoteLink(reason, err = null) {
@@ -255,11 +313,16 @@ export function initRemotePeer(room, role, h) {
         return false;
     }
     localRole = role === 'viewer' ? 'viewer' : 'controller';
+    hostProtocol = undefined;
+    hostProtocolKnown = false;
     peer = new window.Peer();
     wirePeerLifecycle();
     peer.on('open', () => {
         if (hostConn) return;
-        const conn = peer.connect(room, { reliable: true, metadata: { app: 'edgeloop', role: localRole } });
+        const conn = peer.connect(room, {
+            reliable: true,
+            metadata: { app: 'edgeloop', role: localRole, protocol: PEER_PROTOCOL_VERSION }
+        });
         hostConn = conn;
         conn.on('open', () => {
             startPing();
@@ -267,7 +330,9 @@ export function initRemotePeer(room, role, h) {
         });
         conn.on('data', (raw) => {
             const telemetry = sanitizeTelemetry(raw);
-            if (telemetry) call('onTelemetryReceived', telemetry);
+            if (!telemetry) return;
+            noteHostProtocol(telemetry.protocol);
+            call('onTelemetryReceived', telemetry);
         });
         conn.on('close', () => dropRemoteLink('closed'));
         conn.on('error', (err) => dropRemoteLink('error', err));
@@ -278,16 +343,28 @@ export function initRemotePeer(room, role, h) {
     return true;
 }
 
-// Controller -> host. A viewer (or the host itself) never sends commands.
+// Controller -> host. A viewer (or the host itself) never sends commands,
+// and a mode or game change is never sent to a host that has not shown it
+// speaks this version: a host on another one can read it as something else
+// - a 1.0.0 host restarted the very game a 1.1.0 "game off" meant to stop.
 export function sendPeerCommand(cmd) {
     if (localRole !== 'controller' || !hostConn || !hostConn.open) return false;
+    if (!hostVersionAllows(cmd)) return false;
     try {
-        hostConn.send(cmd);
+        hostConn.send(stampProtocol(cmd));
         return true;
     } catch (e) {
         dropRemoteLink('error', e);
         return false;
     }
+}
+
+// Remote page: does what this page knows of the host's version let `cmd`
+// go to it? Nothing is known before the host's first telemetry frame, and
+// until then a mode change waits. The app asks before it shows a mode click
+// as made, since the host's next frame would only take it back.
+export function hostVersionAllows(cmd) {
+    return peerCommandAllowed(cmd, hostProtocolKnown ? hostProtocol : undefined);
 }
 
 export function isPeerLinkOpen() {

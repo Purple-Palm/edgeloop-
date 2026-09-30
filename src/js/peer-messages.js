@@ -5,6 +5,13 @@
 // speeds), a viewer may only ping, and the host's telemetry is coerced and
 // clamped before it touches the remote page's state. Anything else is
 // dropped, never partially applied.
+//
+// The two pages are also not always the same build. A PWA keeps running the
+// code it loaded until it is reloaded, so after a release the wearer's page
+// and the partner's can be a version apart for as long as either tab stays
+// open. Every message therefore says which version of these messages its
+// sender speaks, and the commands whose meaning changed between versions are
+// refused between pages that do not speak the same one.
 import { ENGINE_MODES, TEASE_MODES, GAME_MODES, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT } from './engine.js';
 import {
     MIN_TRAIN_HOLD_SECONDS,
@@ -14,6 +21,89 @@ import {
     MAX_FORCE_ORGASM_SECONDS,
     FORCE_ORGASM_REFUSALS
 } from './session-rules.js';
+
+// The version of the messages in this file. It goes up whenever a message
+// changes what it MEANS, not only when its shape changes, because a page
+// that reads the old meaning cannot tell the difference on its own. That is
+// exactly what happened to MODE_CHANGE: in 1.0.0 it selected a mode, in
+// 1.1.0 a game card toggles, and the two builds kept sending each other the
+// same message for opposite things - an old controller's click on the game
+// that was running turned it OFF on a 1.1.0 host, and a 1.1.0 controller's
+// "game off" restarted the game from zero on a 1.0.0 host. Neither build
+// sent a version at all, so a message without one is from before this
+// number existed, and counts as older.
+export const PEER_PROTOCOL_VERSION = 2;
+
+// Anything past this is not a version but junk in the field.
+const MAX_PEER_PROTOCOL = 1000;
+
+// The commands whose meaning has changed between versions, and so the only
+// ones two pages on different versions may not exchange. Transport, Reset
+// and Force Orgasm have meant the same thing in every build, and a partner's
+// STOP must never be refused over a version number. A release that changes
+// what another command means bumps the version AND adds the command here:
+// the newer page applies this list on both ends of a link - refusing what
+// an older controller sends, and not sending to an older host - so an older
+// page never has to know what changed after it.
+export const VERSIONED_COMMANDS = ['MODE_CHANGE'];
+
+// What a message says about the version its sender speaks: a whole number,
+// or undefined when it says nothing usable - which is what every build from
+// before PEER_PROTOCOL_VERSION says. A string or a fraction is not a version.
+export function readPeerProtocol(value) {
+    return Number.isInteger(value) && value >= 1 && value <= MAX_PEER_PROTOCOL ? value : undefined;
+}
+
+export function peerProtocolMatches(protocol) {
+    return protocol === PEER_PROTOCOL_VERSION;
+}
+
+// 'same', 'older' or 'newer', seen from this page. A page that sent no
+// version is older: versions started with this one.
+export function peerProtocolRelation(protocol) {
+    if (peerProtocolMatches(protocol)) return 'same';
+    return Number.isInteger(protocol) && protocol > PEER_PROTOCOL_VERSION ? 'newer' : 'older';
+}
+
+// Every message this build sends says which version it speaks.
+export function stampProtocol(message) {
+    return { ...message, protocol: PEER_PROTOCOL_VERSION };
+}
+
+// May `cmd` cross between this page and one that speaks `peerProtocol`?
+// The host asks it of every command with the version the command itself
+// carries; a controller asks it before sending, with the version the host's
+// telemetry carries - and before the first frame it knows none, so a mode
+// click then waits rather than risk a host that could misread it.
+export function peerCommandAllowed(cmd, peerProtocol) {
+    if (!isPlainObject(cmd) || typeof cmd.type !== 'string') return false;
+    if (!VERSIONED_COMMANDS.includes(cmd.type)) return true;
+    return peerProtocolMatches(peerProtocol);
+}
+
+// The notice each person sees when the other page speaks another version.
+// `role` is THIS page's: 'host', 'controller' or 'viewer'. Only the page on
+// the older version can fix it, by being reloaded; a reload of the host's
+// page ends the session running there and opens a new room, so it says so.
+export function describePeerVersionMismatch(role, peerProtocol) {
+    const newer = peerProtocolRelation(peerProtocol) === 'newer';
+    const why = 'Mode and game changes can mean different things in different versions';
+    const stillWorks = 'START, PAUSE, STOP, Reset and Force Orgasm still work.';
+    const hostReload = 'a reload ends the session running there and opens a new room with a new link';
+    if (role === 'host') {
+        return newer
+            ? `Your partner's controller runs a newer version of EdgeLoop than this page. ${why}, so this page refuses them from it. Reload this page between sessions to match it: a reload ends the session here and opens a new room, so your partner will need the new link. ${stillWorks}`
+            : `Your partner's controller runs an older version of EdgeLoop. ${why}, so this page refuses them from it. Ask your partner to reload their page. ${stillWorks}`;
+    }
+    if (role === 'viewer') {
+        return newer
+            ? 'The host runs a newer version of EdgeLoop than this page, so some of what it sends may not show here as it should. Reload this page to match it.'
+            : `The host runs an older version of EdgeLoop than this page, so some of what it sends may not show here as it should. The host's page needs a reload to match it, between sessions: ${hostReload}.`;
+    }
+    return newer
+        ? `The host runs a newer version of EdgeLoop than this page. ${why}, so this page does not send them. Reload this page to match it. ${stillWorks}`
+        : `The host runs an older version of EdgeLoop. ${why}, so this page does not send them. The host's page needs a reload to match this one, between sessions: ${hostReload}. ${stillWorks}`;
+}
 
 export const PEER_ROLES = ['controller', 'viewer'];
 
@@ -48,8 +138,18 @@ function oneOf(value, allowed) {
     return allowed.includes(value) ? value : undefined;
 }
 
-// Controller / viewer -> host. Returns the sanitized command or null.
+// Controller / viewer -> host. Returns the sanitized command or null. The
+// sender's version rides along as `protocol` when it sent a usable one and
+// is absent otherwise, so the host can judge the command by it.
 export function sanitizeCommand(raw, role = 'controller') {
+    const command = readCommand(raw, role);
+    if (!command) return null;
+    const protocol = readPeerProtocol(raw.protocol);
+    if (protocol !== undefined) command.protocol = protocol;
+    return command;
+}
+
+function readCommand(raw, role) {
     if (!isPlainObject(raw) || typeof raw.type !== 'string') return null;
     if (raw.type === 'PING') return { type: 'PING' };
     if (role !== 'controller') return null;
@@ -83,6 +183,8 @@ export function sanitizeTelemetry(raw) {
     if (!isPlainObject(raw) || raw.type !== 'TELEMETRY') return null;
     const out = { type: 'TELEMETRY' };
 
+    // The version the host speaks; undefined from a host too old to say.
+    out.protocol = readPeerProtocol(raw.protocol);
     out.hr = clampNumber(raw.hr, 0, HR_MAX_BPM, true);
     out.seconds = clampNumber(raw.seconds, 0, SECONDS_MAX, true);
     out.chosenTargetSeconds = clampNumber(raw.chosenTargetSeconds, 0, SECONDS_MAX, true);

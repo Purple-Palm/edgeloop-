@@ -32,10 +32,12 @@ import {
     countDroppedOnMerge,
     backupNote,
     NOTE_KEY_NONE_SAVED,
-    NOTE_KEY_UNUSABLE
+    NOTE_KEY_UNUSABLE,
+    RETIRED_SETTING_KEYS,
+    pruneRetiredKeys
 } from './backup.js';
 import { advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
-import { sanitizeSetting } from './settings-schema.js';
+import { sanitizeSetting, SETTING_SANITIZERS } from './settings-schema.js';
 import { sanitizeSessionLimits } from './session-rules.js';
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 
@@ -1120,5 +1122,86 @@ describe('app.js routes the backup through this module', () => {
         const writes = src.match(write) || [];
         assert.equal(writes.length, 2, 'the key is written by the Connect button and by a restore, nowhere else');
         assert.ok(/if \(result\.keyPresent\)/.test(src), 'the restore writes the key only when the file carried one');
+    });
+});
+
+describe('the two wave switches 1.1.0 stopped reading are retired', () => {
+    // cadenceBreathing and milkingWave switched on an 8 s swell of the
+    // primary and a 6 s swell of the secondary. PATTERNS replaced both with
+    // overlapping cycles in 1.1.0 and the engine read neither again, yet
+    // they stayed in the defaults, rode in every backup, and every import
+    // counted them among the values it had restored.
+    const WAVES = ['cadenceBreathing', 'milkingWave'];
+
+    // What a 1.1.0 install exported: its settings store carried both
+    // switches at their factory `true`.
+    const FROM_110 = {
+        format: BACKUP_FORMAT,
+        version: BACKUP_VERSION,
+        settings: { minHr: 66, maxHr: 150, cadenceBreathing: true, milkingWave: true }
+    };
+
+    it('are no longer settings, and have no sanitizer left to keep them alive', () => {
+        for (const name of WAVES) {
+            assert.ok(RETIRED_SETTING_KEYS.includes(name), `${name} must be on the retired list`);
+            assert.ok(!SETTING_KEYS.includes(name), `${name} is still a setting`);
+            assert.equal(name in SETTING_DEFAULTS, false, `${name} still has a factory value`);
+            assert.equal(typeof SETTING_SANITIZERS[name], 'undefined', `${name} still has a sanitizer`);
+        }
+    });
+
+    it('a 1.1.0 backup imports without them, and says nothing about them', () => {
+        const read = readBackup(FROM_110);
+        assert.equal(read.ok, true);
+        assert.deepEqual([...read.retiredSettingKeys].sort(), [...WAVES].sort());
+        assert.deepEqual(read.unknownSettingKeys, [], 'a retired name is not an unrecognised one');
+        for (const name of WAVES) {
+            assert.equal(name in read.settings, false, `${name} would be stored`);
+            assert.equal(name in read.requested, false, `${name} would be counted`);
+        }
+        const text = describeBackupImport(read, {});
+        // The two values the engine uses were restored; the two it does not
+        // use are not claimed as a restore of anything.
+        assert.match(text, /Settings imported: 2 Session Setup values\./);
+        assert.ok(!/not a setting this version has/.test(text), 'the commonest upgrade would warn about nothing');
+        assert.ok(!/outside what this app accepts/.test(text), 'nothing was refused - there was nothing to take');
+    });
+
+    it('whatever value a file gives them', () => {
+        // No build ever had a control for them, but a file is anyone's to edit.
+        for (const value of [false, 'false', 0, null, 'yes', { on: true }]) {
+            const read = readBackup({ minHr: 70, maxHr: 140, cadenceBreathing: value, milkingWave: value });
+            assert.deepEqual(read.unknownSettingKeys, []);
+            assert.equal('cadenceBreathing' in read.settings, false);
+            assert.equal('milkingWave' in read.settings, false);
+            assert.match(describeBackupImport(read, {}), /Settings imported: 2 Session Setup values\./);
+        }
+    });
+
+    it('an export from a store that still holds them does not write them', () => {
+        const file = buildBackup({ settings: { minHr: 70, maxHr: 140, cadenceBreathing: true, milkingWave: false } }, { now: NOW });
+        assert.deepEqual(Object.keys(file.settings).sort(), ['maxHr', 'minHr']);
+    });
+
+    it('the store in this browser sheds them at boot, and nothing else', () => {
+        // Boot merges the stored blob into the live settings and every later
+        // save writes it back out: without the prune, every install from
+        // before this one would carry the two switches for ever.
+        const stored = { minHr: 64, maxHr: 151, cadenceBreathing: true, milkingWave: true, customProfiles: {}, stallGuard: false };
+        const removed = pruneRetiredKeys(stored);
+        assert.deepEqual([...removed].sort(), ['cadenceBreathing', 'customProfiles', 'milkingWave']);
+        assert.deepEqual(stored, { minHr: 64, maxHr: 151, stallGuard: false });
+        assert.deepEqual(pruneRetiredKeys(stored), [], 'a clean store has nothing to prune');
+        assert.deepEqual(pruneRetiredKeys(null), []);
+        assert.deepEqual(pruneRetiredKeys(['cadenceBreathing']), []);
+    });
+
+    it('app.js prunes the stored blob before it merges it', () => {
+        // The prune above is only worth anything if boot runs it on the blob
+        // it is about to merge; the behaviour itself is proven there.
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const prune = src.indexOf('pruneRetiredKeys(parsed)');
+        const merge = src.indexOf('Object.assign(advancedSettings, parsed)');
+        assert.ok(prune >= 0 && merge > prune, 'boot must prune the retired names before the merge');
     });
 });

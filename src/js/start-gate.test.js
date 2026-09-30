@@ -175,15 +175,15 @@ describe('the page drops a waiting START on STOP, Reset and the page going away'
 });
 
 // A session that runs outdates two lines on the banner: the one a refused
-// START or RESUME left, and the watchdog's "motors paused for safety". The
-// start takes both back, and it has to before its own cue: the cue can put a
-// voice notice on the banner - a saved voice this browser does not have, a
-// voice that cannot speak here - appended under the watchdog's report, or
-// folded into the refusal's line as a voice notice is folded into any
-// advisory already standing. Taken back after that cue, the two lines took
-// the notice with them in the same tick, before it was ever shown, and its
-// latch (once a session, once a page for a missing voice) kept it from being
-// told again.
+// START or RESUME left, and the watchdog's signal-loss report. The start
+// takes both back before its own cue: the cue can put a voice notice on the
+// banner - a saved voice this browser does not have, a voice that cannot
+// speak here - and its latch (once a session, once a page for a missing
+// voice) keeps it from being told again. Every notice is its own source's
+// now (alert-banner.js), so neither take-back can take that one along; when
+// it was appended under the watchdog's report or folded into the refusal's
+// line, the two lines taken back after the cue took it with them in the
+// same tick, before it was ever shown.
 describe('a START takes back the lines it outdates before its own cue', () => {
     it('only once nothing can decline, and before any cue', () => {
         const body = bodyFrom('function startOrResumeSession(').replace(/\/\/.*$/gm, '');

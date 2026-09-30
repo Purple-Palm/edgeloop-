@@ -337,6 +337,23 @@ describe('engine modes', () => {
         assert.ok(sameBeat.length < 20, 'an 8 second loop would match almost every sample');
     });
 
+    it('the retired wave switches reach nothing, whatever a caller passes', () => {
+        // cadenceBreathing laid an 8 s swell over the primary and milkingWave
+        // a 6 s one over the secondary - exactly the countable beat the
+        // patterns replaced in 1.1.0. They are retired (backup.js), and the
+        // engine must not quietly start reading them again.
+        for (const activeMode of ENGINE_MODES) {
+            for (const sessionSeconds of [0, 2, 4, 7, 11, 30]) {
+                for (const hr of [80, 110, 130]) {
+                    const base = { ...running, activeMode, hr, edgeHr: hr, sessionSeconds };
+                    const off = calculateEngineOutputs({ ...base, cadenceBreathing: false, milkingWave: false });
+                    const on = calculateEngineOutputs({ ...base, cadenceBreathing: true, milkingWave: true });
+                    assert.deepEqual(on, off, `${activeMode} t=${sessionSeconds} hr=${hr}`);
+                }
+            }
+        }
+    });
+
     it('head play stays on the shaft until the pulse is close to the mark', () => {
         const mid = calculateEngineOutputs({ ...running, activeMode: 'headplay', hr: 105, sessionSeconds: 0 });
         assert.ok(mid.strokeMinPercent < 20, `strokeMin ${mid.strokeMinPercent}`);
@@ -1896,7 +1913,7 @@ describe('the microphone boost can never raise either channel', () => {
                                     for (const extras of [
                                         {},
                                         { warmupMinutes: 5, sessionSeconds: 60 },
-                                        { cadenceBreathing: true, milkingWave: true, sessionSeconds: 7 },
+                                        { sessionSeconds: 7 },
                                         { stallGuardEngaged: true },
                                         { intensityValue: 100 },
                                         { edgeStrokeDepth: 40, ruinHoldSeconds: 3 }

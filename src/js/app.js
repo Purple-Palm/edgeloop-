@@ -41,11 +41,11 @@ import {
     sanitizeSessionLimits
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
-import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys } from './backup.js';
+import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys, pruneRetiredKeys } from './backup.js';
 import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
 import { cancelWheelWhileFocused, releaseFocusOnCommit, releaseFocusOnPointerUp } from './input-hygiene.js';
-import { planBannerUpdate, planBannerHide, hiddenBannerState, mergeBannerMessage, BANNER_OWNER_ANY } from './alert-banner.js';
+import { planBannerUpdate, planBannerClear, planBannerRevise, planBannerPauseEnded, hiddenBannerState, BANNER_OWNER_ANY } from './alert-banner.js';
 import { pushSample, buildFunscripts, toFunscript } from './funscript.js';
 import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './chart.js';
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
@@ -61,9 +61,10 @@ import {
 } from './supervision.js';
 import { createScreenWakeLock } from './screen-wake-lock.js';
 import { createTickDispatch, guardEngagedBy } from './tick-dispatch.js';
-import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected } from './hardware/handy.js';
+import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected, getHandyKey } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
+import { createHandyStopReport } from './hardware/handy-stop-report.js';
 import { createStartGate } from './start-gate.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
@@ -113,10 +114,12 @@ import {
     initRemotePeer,
     broadcastPeerTelemetry,
     sendPeerCommand,
+    hostVersionAllows,
     pruneStalePeers,
     getPeerCounts,
     peerLibraryAvailable
 } from './webrtc.js';
+import { describePeerVersionMismatch, peerProtocolRelation } from './peer-messages.js';
 import {
     speakPrompt,
     speakNow,
@@ -187,6 +190,10 @@ if (storedSettings && typeof storedSettings === 'object' && !Array.isArray(store
             : 100;
         migrated = true;
     }
+    // Names this build retired (backup.js) leave the store as well as the
+    // backup file: nothing reads them, and a merge would otherwise write
+    // them back on every save for as long as the install lives.
+    if (pruneRetiredKeys(parsed).length) migrated = true;
     Object.assign(advancedSettings, parsed);
     if (migrated) persistSettings();
 }
@@ -390,41 +397,79 @@ document.getElementById('ageConfirmBtn')?.addEventListener('click', () => {
 // Disconnect / Watchdog Alert Banner
 //
 // One banner carries every report, so it is ranked (see alert-banner.js): an
-// advisory can never overwrite a safety report, and a banner is only hidden
-// again by whoever raised it or by the wearer. A sentence appended under
-// someone else's report is taken back by whoever appended it, and the
-// report stays.
+// advisory can never overwrite a safety report, no report takes another
+// source's sentence off the banner, and each sentence leaves only when its
+// own source withdraws it or the wearer dismisses the banner. So whatever
+// raises a report here withdraws it again the moment what it reports is
+// over; nothing else will.
 let bannerState = hiddenBannerState();
 
 document.getElementById('dismissBannerBtn')?.addEventListener('click', () => {
     hideAlertBanner(BANNER_OWNER_ANY);
 });
 
-function showAlertBanner(message, { severity = 'safety', source = 'device' } = {}) {
-    bannerState = planBannerUpdate(bannerState, { message, severity, source });
-    renderAlertBanner();
-}
-
-// Hides the banner when `owner` owns it, or takes back only the sentences
-// `owner` appended to someone else's report.
-function hideAlertBanner(owner) {
-    bannerState = planBannerHide(bannerState, owner);
-    renderAlertBanner();
-}
-
-// The only place that writes the banner: its text and whether it shows.
+// The one place that writes the banner element: whatever the planned state
+// says is shown, in full, or nothing.
 function renderAlertBanner() {
-    if (!bannerState.visible) {
-        document.getElementById('disconnectBanner')?.classList.add('hidden');
-        return;
-    }
     const msg = document.getElementById('disconnectMsg');
     if (msg) msg.textContent = bannerState.text;
-    document.getElementById('disconnectBanner')?.classList.remove('hidden');
+    const banner = document.getElementById('disconnectBanner');
+    if (!banner) return;
+    if (bannerState.visible) banner.classList.remove('hidden');
+    else banner.classList.add('hidden');
 }
 
-function triggerDisconnectAlert(message, source = 'device') {
-    showAlertBanner(message, { severity: 'safety', source });
+// `motorsPaused` ends the report with "Motors paused for safety." until the
+// pause is over (retractMotorsPaused).
+function showAlertBanner(message, { severity = 'safety', source = 'device', motorsPaused = false } = {}) {
+    bannerState = planBannerUpdate(bannerState, { message, severity, source, motorsPaused });
+    renderAlertBanner();
+}
+
+// `owner` is the source that raised what it now withdraws, or
+// BANNER_OWNER_ANY for the wearer's Dismiss. A source takes out its own
+// sentence and nothing else, whether or not it leads the banner.
+function hideAlertBanner(owner) {
+    const next = planBannerClear(bannerState, owner);
+    const unchanged = next.visible === bannerState.visible && next.text === bannerState.text;
+    bannerState = next;
+    // Every heart-rate reading withdraws the signal-loss report, once a
+    // second; a banner that reads the same is not written again.
+    if (!unchanged) renderAlertBanner();
+}
+
+// `source` rewords the sentence it has standing, in place. A report whose
+// cause has partly ended says what is left of it, and one the wearer
+// dismissed stays dismissed: nothing new has happened.
+function reviseAlertBanner(message, { severity = 'safety', source = 'device' } = {}) {
+    const next = planBannerRevise(bannerState, { message, severity, source });
+    const unchanged = next.visible === bannerState.visible && next.text === bannerState.text;
+    bannerState = next;
+    if (!unchanged) renderAlertBanner();
+}
+
+// The session is no longer paused: it runs again, or STOP or Reset ended it.
+// No report goes on saying the motors are paused; each keeps the rest of
+// what it says, in its place (planBannerPauseEnded).
+function retractMotorsPaused() {
+    const next = planBannerPauseEnded(bannerState);
+    const unchanged = next.visible === bannerState.visible && next.text === bannerState.text;
+    bannerState = next;
+    if (!unchanged) renderAlertBanner();
+}
+
+// A safety report that also stops every toy and pauses the session.
+// `source` names the one condition the report is about, and withdraws it
+// when that condition is over: two conditions reported under one source
+// would replace each other's sentences, so an unconfirmed stop and a lost
+// link are two sources even on the same device. A report that tells the
+// wearer the motors were paused passes `motorsPaused` rather than writing
+// the clause into its message, because the clause ends before the report
+// does: a device that was lost is still gone after RESUME on the other toys.
+// With no session there is nothing to pause, and the report does not say
+// there was.
+function triggerDisconnectAlert(message, source = 'device', { motorsPaused = false } = {}) {
+    showAlertBanner(message, { severity: 'safety', source, motorsPaused: motorsPaused && state.sessionStatus !== 'IDLE' });
 
     if (pauseSession(null)) syncTelemetry();
     checkReadiness();
@@ -827,6 +872,8 @@ function initHandyRoleUI() {
             else if (role === 'secondary') { badge.textContent = "Secondary (Milker)"; badge.className = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-purple-950 text-purple-300 border border-purple-800"; }
             else { badge.textContent = "Disabled (OFF)"; badge.className = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-900 text-amber-400 border border-slate-700"; }
         }
+        // A running session drives the Handy from here in this role.
+        if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') settleDrivenHandyStop();
         updateEngine();
     };
 
@@ -1001,8 +1048,6 @@ function updateEngine() {
         handyHwMax: advancedSettings.handyHwMax,
         sessionSeconds: state.sessionSeconds,
         warmupMinutes: advancedSettings.warmupMinutes,
-        cadenceBreathing: advancedSettings.cadenceBreathing,
-        milkingWave: advancedSettings.milkingWave,
         stallGuardEngaged: state.stallGuardEngaged,
         ceilingBehaviour: advancedSettings.ceilingBehaviour,
         edgeHoldPercent: advancedSettings.edgeHoldPercent,
@@ -1682,6 +1727,14 @@ function recordHrReading(bpm, sensorContact = null, now = Date.now()) {
     // Remembered before the engine runs on it, so the reading the engine
     // judges is always the last one in the list.
     edgeReadings = rememberEdgeReading(edgeReadings, now, bpm);
+    // The watchdog's report says no valid reading is arriving, and one just
+    // did, so it goes now, whatever the session does next: an auto-resume
+    // that cannot run (no toy left to drive, or The Handy not answering that
+    // it is online) leaves the session paused under the reports that say
+    // why, not under one about a pulse that is back. Until then it stays,
+    // even past STOP or a page that went away, because it is still true:
+    // nothing is reading a pulse.
+    hideAlertBanner('hrSignal');
     if (state.hrSignalPaused) handleHrSignalReturned();
     updateEngine();
     syncTelemetry();
@@ -1697,7 +1750,7 @@ function describeHrLoss(verdict) {
         : verdict.noContact
             ? 'the sensor is transmitting but reports no pulse; check skin contact'
             : 'no packets received';
-    return `${name}: no valid heart-rate reading for ${secs} s (${why}). Motors paused for safety.`;
+    return `${name}: no valid heart-rate reading for ${secs} s (${why}).`;
 }
 
 // Overlay on the chart, the "holding" hint and the "no skin contact" hint.
@@ -1774,7 +1827,9 @@ function holdAfterSignalReturn() {
 }
 
 // The same RESUME as the button, Handy check included: a pulse coming back
-// says nothing about whether the toy is still there.
+// says nothing about whether the toy is still there. The signal-loss report
+// is already down (recordHrReading), and only that one: a standing report
+// about a device that may still be moving is not the pulse's to clear.
 function resumeAfterSignalReturn() {
     state.hrSignalPaused = false;
     startOrResumeWhenReady().then((resumed) => {
@@ -1786,11 +1841,11 @@ function resumeAfterSignalReturn() {
             return;
         }
         // The pulse is back but the session stays paused: The Handy did not
-        // answer that it is online (the refusal is on the banner, under the
-        // signal-loss report) or a toy has gone meanwhile. Hold exactly as
-        // with auto-resume off, so the overlay drops and the badge says what
-        // to do. Not after STOP or Reset during the check: they have cleared
-        // everything already, and the badge would name a RESUME there is not.
+        // answer that it is online (the refusal says so on the banner) or a
+        // toy has gone meanwhile. Hold exactly as with auto-resume off, so
+        // the overlay drops and the badge says what to do. Not after STOP or
+        // Reset during the check: they have cleared everything already, and
+        // the badge would name a RESUME there is not.
         if (state.sessionStatus === 'PAUSED') holdAfterSignalReturn();
     });
 }
@@ -1821,7 +1876,7 @@ function evaluateHrWatchdog(now = Date.now()) {
     if (verdict.status === 'stale' && !state.hrSignalPaused) {
         state.hrSignalPaused = true;
         dispatchHardware(0, 0, 0, 100, true);
-        triggerDisconnectAlert(describeHrLoss(verdict), 'hrSignal');
+        triggerDisconnectAlert(describeHrLoss(verdict), 'hrSignal', { motorsPaused: true });
         cueVoice('signalLost', true);
     }
 }
@@ -2059,20 +2114,36 @@ function startOrResumeSession() {
         return false;
     }
     // Nothing below declines: the session runs from here on, from the button
-    // as from the partner's controller or the auto-resume. So the line a
-    // refused START or RESUME left has nothing more to say, and neither has
-    // the watchdog's "motors paused for safety", which used to be hidden by
-    // the auto-resume alone: a RESUME pressed by hand after a refused one ran
-    // the motors under a banner still saying they were paused and the
-    // session not resumed. Each takes back only its own words, as a standing
-    // report about a device that may still be moving is neither's to clear.
-    // Both go before the cue below: a cue can put a voice notice on the
-    // banner (a saved voice this browser does not have, a voice that cannot
-    // speak here), appended under the watchdog's report or folded into the
-    // refusal's line, and taken back after it they took the notice along
-    // before it was ever shown, with its once-only latch already spent.
+    // as from the partner's controller or the auto-resume, and a session that
+    // runs is paused for nothing. So the line a refused START or RESUME left
+    // has nothing more to say. The signal-loss report is down already, since
+    // a session only starts on a fresh reading and every reading takes it
+    // down, and "Every toy was stopped and the session paused; press RESUME
+    // when you are ready" has had its RESUME: the session runs again under
+    // the page's own supervision. Each takes back only its own words: a
+    // standing report about a device that may still be moving is none of
+    // theirs to clear.
     withdrawStartRefusal();
     hideAlertBanner('hrSignal');
+    hideAlertBanner('supervision');
+    // And no report may go on saying "Motors paused for safety." over motors
+    // that run. The rest of a report can still be true: an Intiface or
+    // T-Code device that was lost, or a Handy lost while reconnecting, is
+    // still gone while the session runs on the toys that are left, so its
+    // report stays where it stands, without the clause. Left in, it told the
+    // wearer the motors were paused while the Handy stroked, and after a
+    // signal loss the auto-resume brought it back into view still saying so.
+    retractMotorsPaused();
+    // "The Handy did not confirm a stop" stands until the device it is about
+    // is accounted for, and a session that drives that Handy from here
+    // accounts for it; a Handy on Off, or any other key, still owes its stop.
+    settleDrivenHandyStop();
+    // All of this comes before the cue below, which can put a voice notice on
+    // the banner (a saved voice this browser does not have, a voice that
+    // cannot speak here) that is told once only. That notice is the voice's
+    // own and none of these take it back; when it was folded into the
+    // refusal's line or appended under the watchdog's report, taking those
+    // back after the cue took it along before it was ever shown.
     let resumingRampdown = false;
     if (state.sessionStatus === 'IDLE') {
         // A fresh run never inherits time, edges or samples from the last one.
@@ -2116,15 +2187,11 @@ function startOrResumeSession() {
 // later START or RESUME runs, or is refused and says why in its place; when
 // The Handy is connected again, since what the line said about the link no
 // longer holds; and when STOP or Reset starts over, leaving nothing to press
-// again. Being an advisory, the line is appended under whatever report
-// stands - always under the offline report when the check itself found the
-// device offline, and under "The Handy disconnected." or the watchdog's
-// pause as often. That report owns the banner and only its owner or the
-// wearer may hide it, so hiding the banner would leave the line in place:
-// once the wearer had connected the device again and pressed START, the
-// motors ran under "The session was not started: The Handy is offline".
-// The line is taken back from under the report instead, and the report
-// stays until its owner or the wearer clears it, as before.
+// again. Being an advisory, it is read under whatever safety report stands -
+// always under the offline report when the check itself found the device
+// offline, and under "The Handy disconnected." as often - and, like every
+// notice, it is its own source's to take back (alert-banner.js): that report
+// neither takes it along when it goes nor goes with it.
 function withdrawStartRefusal() {
     hideAlertBanner('handyCheck');
 }
@@ -2226,6 +2293,11 @@ function stopSession(outcome = "Stopped", voiceText = null) {
     syncScreenWakeLock();
     setOrgasmMode(false);
     clearHrSignalPause();
+    // No paused session is left for a supervision report to ask a RESUME of,
+    // nor for any report to call the motors paused: a device that was lost,
+    // or a pulse that is still not read, is reported on in its own words.
+    hideAlertBanner('supervision');
+    retractMotorsPaused();
     try {
         if (wasActive && state.sessionSeconds >= 10 && !isRemotePage) saveSessionToHistory(outcome);
     } catch (e) {
@@ -2258,6 +2330,9 @@ resetBtn?.addEventListener('click', () => {
     syncScreenWakeLock();
     setOrgasmMode(false);
     clearHrSignalPause();
+    // As after STOP: no paused session is left to resume, or to report.
+    hideAlertBanner('supervision');
+    retractMotorsPaused();
     resetSessionCounters();
     resetGameState();
     updateWarmupBadge();
@@ -2689,8 +2764,19 @@ modeCards.forEach(card => {
         if (isRemoteViewer) return;
         const mode = card.getAttribute('data-mode');
         const enabled = GAME_CARD_MODES.includes(mode) ? state.gameMode !== mode : true;
+        const command = { type: 'MODE_CHANGE', mode, enabled };
+        // A host on another version can read this message as something
+        // else - a 1.0.0 host restarts the very game that "game off" means
+        // to stop - so the click is refused here (as it is before the host's
+        // first frame has said which version it runs), and not shown as made
+        // either: the host's next frame would only take it back. The notice
+        // says why.
+        if (isRemoteController && !hostVersionAllows(command)) {
+            showPeerVersionNotice();
+            return;
+        }
         applyModeSelection(mode, enabled);
-        if (isRemoteController) sendPeerCommand({ type: 'MODE_CHANGE', mode, enabled });
+        if (isRemoteController) sendPeerCommand(command);
         else syncTelemetry();
     });
 });
@@ -3119,17 +3205,14 @@ function voiceNoteOnScreen() {
 function announceVoiceNotice(kind, message, source) {
     if (voiceNoteOnScreen()) return;
     if (!speechNotices.take(kind)) return;
-    // An advisory never replaces a safety report; the banner appends it. An
-    // advisory of the same rank would simply replace one already standing
-    // there, and until the voice reported anything the microphone was the
-    // only advisory there was: a lost microphone's sentence would vanish
-    // under a voice notice. So it is appended to that one too, and the
-    // standing notice keeps its owner, so clearing the voice's own notice
-    // later can never take the microphone's with it.
-    if (bannerState.visible && bannerState.severity === 'advisory' && bannerState.source !== source) {
-        showAlertBanner(mergeBannerMessage(bannerState.text, message), { severity: 'advisory', source: bannerState.source });
-        return;
-    }
+    // An advisory: it never replaces a safety report, and it stands beside
+    // any other advisory rather than in its place (alert-banner.js), so a
+    // lost microphone's sentence stays up next to it. It is the voice's own
+    // sentence, too, and leaves when the voice speaks again, when the voice
+    // is switched off or when a voice this browser has is picked. Written
+    // into the microphone's sentence, as it was, it could leave with
+    // neither: it stayed up under the microphone's name after the voice had
+    // spoken again.
     showAlertBanner(message, { severity: 'advisory', source });
 }
 
@@ -3410,6 +3493,16 @@ function showMicReenable(visible) {
 }
 micReenableBtn?.addEventListener('click', () => { applyMicSetting(true); });
 
+// The report that the microphone stopped, and the control that offers it
+// back, are over once the session's microphone listens again or the wearer
+// settles on none (Session Setup applied with it off). Nothing but this
+// source takes that report down: left up, it went on telling the wearer the
+// microphone was gone while it was listening.
+function settleMicReport() {
+    showMicReenable(false);
+    hideAlertBanner('mic');
+}
+
 // Must run from a click handler (see startMicMonitor).
 async function applyMicSetting(enabled) {
     advancedSettings.micEnabled = Boolean(enabled);
@@ -3421,6 +3514,7 @@ async function applyMicSetting(enabled) {
         badge?.classList.add('hidden');
         clearMicBoost(state);
         paintMicMeter(0);
+        settleMicReport();
         return;
     }
     try {
@@ -3428,6 +3522,9 @@ async function applyMicSetting(enabled) {
         badge?.classList.remove('hidden');
         paintMicMeter(0);
         startMicMeterLoop();
+        // Only while the monitor is still live: a track that died during the
+        // start has already reported again, and that report is true.
+        if (state.micAnalyser) settleMicReport();
     } catch (e) {
         advancedSettings.micEnabled = false;
         const toggle = document.getElementById('paramMicToggle');
@@ -3645,7 +3742,10 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
         await applyMicSetting(micOn);
     } else {
         advancedSettings.micEnabled = micOn;
-        if (!micOn) showMicReenable(false);
+        // Ticked while Test microphone had it running, that monitor goes on
+        // as the session's and the microphone is listening again; left off,
+        // the wearer has settled on none. The report is over either way.
+        settleMicReport();
     }
     paintIdlePrompt();
 
@@ -4010,10 +4110,10 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
                 if (!state.simEngaged) document.getElementById('hrWarningTag')?.classList.remove('hidden');
                 const sessionLive = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
                 if (intentional) {
-                    if (sessionLive) triggerDisconnectAlert(`${name} (heart-rate monitor) was disconnected. Motors paused for safety.`);
+                    if (sessionLive) triggerDisconnectAlert(`${name} (heart-rate monitor) was disconnected.`, 'hrMonitor', { motorsPaused: true });
                 } else {
                     const silentMs = Math.max(0, Date.now() - (hrWatchdog.lastValidAt || Date.now()));
-                    triggerDisconnectAlert(`${name} (heart-rate monitor) dropped and did not answer ${attempts} reconnect attempts; no reading for ${Math.round(silentMs / 1000)} s. Motors paused for safety.`);
+                    triggerDisconnectAlert(`${name} (heart-rate monitor) dropped and did not answer ${attempts} reconnect attempts; no reading for ${Math.round(silentMs / 1000)} s.`, 'hrMonitor', { motorsPaused: true });
                     // A drop is a signal loss too: once the sensor is paired
                     // again and readings return, the session may auto-resume.
                     if (sessionLive && state.sessionStatus === 'PAUSED') {
@@ -4036,6 +4136,10 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
         document.getElementById('hrWarningTag')?.classList.add('hidden');
         document.getElementById('simActiveTag')?.classList.add('hidden');
         state.simEngaged = false;
+        // A pulse source is linked again, so the report that the last one
+        // was lost is over. What the session does next is the watchdog's:
+        // it stays paused until RESUME, or until auto-resume sees a reading.
+        hideAlertBanner('hrMonitor');
         // Fresh grace window: the first packet may take a few seconds.
         hrWatchdog.reset(Date.now());
         state.hrNoContact = false;
@@ -4063,7 +4167,7 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
             if (!state.simEngaged) {
                 document.getElementById('hrWarningTag')?.classList.remove('hidden');
                 if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
-                    triggerDisconnectAlert(`${state.hrDeviceName || 'Heart-rate monitor'} was released for a new pairing that failed (${described.message}). Motors paused for safety.`);
+                    triggerDisconnectAlert(`${state.hrDeviceName || 'Heart-rate monitor'} was released for a new pairing that failed (${described.message}).`, 'hrMonitor', { motorsPaused: true });
                 }
             }
             checkReadiness();
@@ -4087,6 +4191,9 @@ document.getElementById('modalEngageSimBtn')?.addEventListener('click', () => {
     disconnectBle({ silent: true });
     state.simEngaged = true;
     state.hrDeviceName = 'Simulator';
+    // The simulator is the pulse source now: a monitor lost before it is
+    // no longer what the session is waiting for.
+    hideAlertBanner('hrMonitor');
     hrWatchdog.reset(Date.now());
     edgeReadings = [];
     renderHrSignal(null);
@@ -4125,6 +4232,38 @@ function handyBatteryLabel() {
     return state.handyBattery !== null && state.handyBattery !== undefined ? `🔋 ${state.handyBattery}%` : null;
 }
 
+// The Handy reports on the banner under two sources, because they end at
+// different times: 'handyLink' for a link that is gone (offline, lost while
+// reconnecting, disconnected), which is over once the Handy is connected
+// again, and 'handyStop' for a stop the API never confirmed, which is over
+// only once the device that owes it is accounted for. A Handy that went
+// offline may still be moving, and one reported offline again must not take
+// "may still be moving" off the banner with its own report.
+//
+// Every Handy that owes a confirmed stop, by the key the stop was sent to
+// (handy-stop-report.js): the one connected now, one that was disconnected
+// or replaced, one that went offline.
+const handyStopReport = createHandyStopReport();
+
+// Put what handyStopReport says on the banner. A stop that was not confirmed
+// is a new report: like every safety report it pauses the session and stops
+// every toy. A stop that was, or a session driving that Handy again, only
+// takes the report down or, while another Handy still owes its stop, says
+// what is left.
+function reportOwedHandyStops({ fresh = false } = {}) {
+    const sentence = handyStopReport.sentence();
+    if (!sentence) hideAlertBanner('handyStop');
+    else if (fresh) triggerDisconnectAlert(sentence, 'handyStop');
+    else reviseAlertBanner(sentence, { severity: 'safety', source: 'handyStop' });
+}
+
+// A live session drives the Handy connected now, in the role it has now:
+// asked at START and RESUME, and when the wearer gives it a role while the
+// session runs (handy-stop-report.js).
+function settleDrivenHandyStop() {
+    if (handyStopReport.sessionDrives({ connected: handyConnected, key: getHandyKey(), role: state.handyRole })) reportOwedHandyStops();
+}
+
 setHandyHandlers({
     isSessionActive: () => state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN',
     onError: (message) => {
@@ -4143,8 +4282,10 @@ setHandyHandlers({
         setHandyStatus('Offline', 'error');
         setBadgeState('Handy', 'disconnected', 'Offline');
         document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
-        // Pauses the session and issues a stop to every other toy.
-        triggerDisconnectAlert(reason || 'The Handy went offline. Motors paused for safety.');
+        // Pauses the session and issues a stop to every other toy. The
+        // driver names what happened; a report it gave no reason for falls
+        // back to saying the Handy went offline and the motors were paused.
+        triggerDisconnectAlert(reason || 'The Handy went offline.', 'handyLink', { motorsPaused: !reason });
     },
     // Something the device told us that is worth reading and is not a fault.
     onNotice: (message) => {
@@ -4154,10 +4295,19 @@ setHandyHandlers({
     // Not gated on handyConnected: the Disconnect and offline paths drop the
     // link before their stop resolves, and an unconfirmed stop there is the
     // one thing the user must hear about.
-    onStopUnconfirmed: (message) => {
+    onStopUnconfirmed: (message, key) => {
         setHandyStatus(message, 'error');
         setBadgeState('Handy', handyConnected ? 'warning' : 'disconnected', 'Stop unconfirmed', handyConnected ? handyBatteryLabel() : null);
-        triggerDisconnectAlert(`The Handy did not confirm a stop and may still be moving: check the device. (${message})`);
+        handyStopReport.unconfirmed(key, message);
+        reportOwedHandyStops({ fresh: true });
+    },
+    // Whoever sent it: a pause retried until it went through, Disconnect,
+    // the background stop of an offline Handy, a reconnect stopping the old
+    // device, or the stop that verifies a key being connected. The driver
+    // says it only of a stop that brings that device's own record to rest,
+    // so not while a start to that device is still on its way.
+    onStopConfirmed: (key) => {
+        if (handyStopReport.confirmed(key)) reportOwedHandyStops();
     }
 });
 
@@ -4188,6 +4338,17 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
         setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
         withdrawStartRefusal();
         document.getElementById('modalHandyDisconnectBtn')?.classList.remove('hidden');
+        // Connected: whatever said the link was gone is over. A stop this
+        // key owed was settled already, by the stop that verified it
+        // (onStopConfirmed), unless a start to it was still on its way: then
+        // only by that start coming back having moved nothing, or by the
+        // stop sent after it. Another key is another device, and one that
+        // may still be moving stays reported. So does a Handy that went
+        // offline and was still being sent stops: no round of them follows
+        // this Connect, so the driver has reported its stop unconfirmed by
+        // now (onStopUnconfirmed), unless the first round had already or
+        // that Handy is known to be at rest.
+        hideAlertBanner('handyLink');
         closeModal();
         syncTelemetry();
     } catch (e) {
@@ -4201,7 +4362,7 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
             state.handyBattery = null;
             setHandyStatus(message, 'error');
             setBadgeState('Handy', 'disconnected', 'Offline');
-            if (wasConnected) triggerDisconnectAlert('The Handy connection was lost while reconnecting. Motors paused for safety.');
+            if (wasConnected) triggerDisconnectAlert('The Handy connection was lost while reconnecting.', 'handyLink', { motorsPaused: true });
         }
     } finally {
         handyConnectInFlight = false;
@@ -4210,13 +4371,15 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
 
 document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', async () => {
     // The link drops at once; the verified stop it sends is awaited so the
-    // modal can say whether the device confirmed it.
+    // modal can say whether the device confirmed it. The banner hears from
+    // the driver either way: a stop that fails is reported for this key, and
+    // one that is confirmed settles whatever this key still owed.
     const stopped = disconnectHandy();
     state.handyBattery = null;
     setHandyStatus('Stopping the device...', 'busy');
     setBadgeState('Handy', 'disconnected', 'Stopping...');
     document.getElementById('modalHandyDisconnectBtn')?.classList.add('hidden');
-    triggerDisconnectAlert("The Handy disconnected.");
+    triggerDisconnectAlert("The Handy disconnected.", 'handyLink');
     const ok = await stopped.catch(() => false);
     // Reconnected meanwhile: the new link owns the modal and the badge.
     if (handyConnected) return;
@@ -4265,7 +4428,12 @@ function renderIntifaceStatus(status) {
 document.getElementById('modalIntifaceConnectBtn')?.addEventListener('click', () => {
     const url = document.getElementById('modalIntifaceUrl')?.value.trim() || DEFAULT_INTIFACE_URL;
     connectIntifaceServer(url, {
-        onStatus: renderIntifaceStatus,
+        onStatus: (status) => {
+            // Connected again: the report that the last connection was lost
+            // or closed with toys in use is over.
+            if (status && status.state === 'connected') hideAlertBanner('intiface');
+            renderIntifaceStatus(status);
+        },
         onDevicesChanged: () => {
             renderIntifaceDevices();
             syncTelemetry();
@@ -4280,8 +4448,8 @@ document.getElementById('modalIntifaceConnectBtn')?.addEventListener('click', ()
             if (!wasConnected || assignedDevices === 0) return;
             const toys = `${assignedDevices} assigned toy${assignedDevices === 1 ? '' : 's'}`;
             triggerDisconnectAlert(intentional
-                ? `Intiface Central disconnected with ${toys} in use. Motors paused for safety.`
-                : `Intiface Central connection lost: ${toys} unreachable. Motors paused for safety.`);
+                ? `Intiface Central disconnected with ${toys} in use.`
+                : `Intiface Central connection lost: ${toys} unreachable.`, 'intiface', { motorsPaused: true });
         }
     });
 });
@@ -4475,7 +4643,12 @@ function renderTCodeStatus(status) {
 }
 
 setTCodeHandlers({
-    onStatus: renderTCodeStatus,
+    onStatus: (status) => {
+        // Connected again: the report that the device was lost or closed with
+        // axes in use is over.
+        if (status && status.state === 'connected') hideAlertBanner('tcode');
+        renderTCodeStatus(status);
+    },
     onDevicesChanged: () => {
         renderTCodeDevice();
         syncTelemetry();
@@ -4490,8 +4663,8 @@ setTCodeHandlers({
         if (!wasConnected || assignedAxes === 0) return;
         const axes = `${assignedAxes} assigned ax${assignedAxes === 1 ? 'is' : 'es'}`;
         triggerDisconnectAlert(intentional
-            ? `TCode Serial device disconnected with ${axes} in use. Motors paused for safety.`
-            : `TCode Serial device lost: ${axes} unreachable. Motors paused for safety.`);
+            ? `TCode Serial device disconnected with ${axes} in use.`
+            : `TCode Serial device lost: ${axes} unreachable.`, 'tcode', { motorsPaused: true });
     }
 });
 
@@ -4774,6 +4947,40 @@ function setPartnerStatus(text, tone = 'wait') {
         : 'font-bold text-amber-400';
 }
 
+// The version the other page speaks, as webrtc.js last reported it: the
+// controller's on the host, the host's on a remote page. Null while nothing
+// is known - no controller yet, or no telemetry yet.
+let peerVersion = null;
+
+// Both people are told when the two pages run different versions, because
+// each one alone sees only a click that did nothing (or, before, a game
+// that switched itself off). Only the older page can fix it, by a reload,
+// and the notice names which one that is.
+function showPeerVersionNotice() {
+    if (!peerVersion || peerVersion.matches) return;
+    const role = !isRemotePage ? 'host' : isRemoteViewer ? 'viewer' : 'controller';
+    showAlertBanner(describePeerVersionMismatch(role, peerVersion.protocol), { severity: 'advisory', source: 'peerVersion' });
+}
+
+// The notice describes the page connected right now, so it goes the moment
+// that page does, or a page on this version takes its place.
+function renderPeerVersion(report) {
+    peerVersion = report && typeof report === 'object'
+        ? { protocol: report.protocol, matches: report.matches === true }
+        : null;
+    if (peerVersion && !peerVersion.matches) showPeerVersionNotice();
+    else hideAlertBanner('peerVersion');
+    if (!isRemotePage && getPeerCounts().controllers > 0) renderControllerStatus();
+}
+
+function renderControllerStatus() {
+    if (peerVersion && !peerVersion.matches) {
+        setPartnerStatus(`Controller Connected - ${peerProtocolRelation(peerVersion.protocol)} version, its mode and game changes are refused`, 'error');
+    } else {
+        setPartnerStatus('Controller Connected', 'ok');
+    }
+}
+
 // Header badge ("1C+2V") and the Share modal's viewer list, counted apart.
 function renderPeerCounts() {
     const counts = getPeerCounts();
@@ -4812,16 +5019,30 @@ function setupPartnerHost() {
             if (share) share.value = `${window.location.origin}${window.location.pathname}?partner=${id}`;
             if (group) group.value = `${window.location.origin}${window.location.pathname}?group_sub=${id}`;
             // Also fires after a signalling reconnect: keep a live controller shown as such.
-            if (getPeerCounts().controllers > 0) setPartnerStatus('Controller Connected', 'ok');
+            if (getPeerCounts().controllers > 0) renderControllerStatus();
             else setPartnerStatus('Ready (Awaiting Controller)');
             renderPeerCounts();
         },
         onPartnerConnected: () => {
-            setPartnerStatus('Controller Connected', 'ok');
+            // A new controller: its version is reported right after this, and
+            // the notice about whichever page held the seat before goes with
+            // that page (a seat taken over is not a disconnect, so nothing
+            // else withdraws it).
+            renderPeerVersion(null);
             renderPeerCounts();
             syncTelemetry();
         },
+        onPeerProtocol: renderPeerVersion,
+        onCommandRefused: () => {
+            // The partner just tried to change the mode. Say why nothing
+            // happened, and send the session's real mode now, so their cards
+            // stop claiming a change the host did not make.
+            showPeerVersionNotice();
+            syncTelemetry();
+        },
         onControllerDisconnected: (reason) => {
+            // Whatever that page ran, it is gone, and so is the notice about it.
+            renderPeerVersion(null);
             setPartnerStatus(reason === 'timeout' ? 'Partner disconnected (no response)' : 'Partner disconnected', 'error');
             renderPeerCounts();
         },
@@ -4948,6 +5169,11 @@ function applyRemoteTelemetry(data) {
         remoteLinkLost = false;
         setRemoteRoleStatus('Live');
         hideAlertBanner('remote');
+        // The version notice stood under the link report, unless the banner
+        // was dismissed while the link was down; the link is back and the
+        // other version is not gone, so say it again (it replaces its own
+        // sentence rather than doubling it).
+        showPeerVersionNotice();
     }
     if (data.hr !== undefined) state.hrCurrent = data.hr;
     if (data.seconds !== undefined) state.sessionSeconds = data.seconds;
@@ -5142,6 +5368,7 @@ if (isRemotePage && remoteRoom) {
             hideAlertBanner('remote');
         },
         onTelemetryReceived: applyRemoteTelemetry,
+        onPeerProtocol: renderPeerVersion,
         onDisconnected: () => {
             remoteLinkUp = false;
             markRemoteLinkLost('Host disconnected. Reload this link once the host has reopened Share Control.');

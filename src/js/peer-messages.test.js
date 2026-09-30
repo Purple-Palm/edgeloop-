@@ -1,7 +1,19 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { sanitizeCommand, sanitizeTelemetry, HISTORY_LENGTH } from './peer-messages.js';
+import {
+    sanitizeCommand,
+    sanitizeTelemetry,
+    HISTORY_LENGTH,
+    PEER_PROTOCOL_VERSION,
+    VERSIONED_COMMANDS,
+    readPeerProtocol,
+    peerProtocolMatches,
+    peerProtocolRelation,
+    stampProtocol,
+    peerCommandAllowed,
+    describePeerVersionMismatch
+} from './peer-messages.js';
 
 describe('sanitizeCommand', () => {
     it('accepts the transport, orgasm and mode commands the controller UI exposes', () => {
@@ -197,5 +209,177 @@ describe('sanitizeTelemetry', () => {
         assert.deepEqual(t.hrSignal, { status: 'ok', noContact: true, silentMs: 2500 });
         const stale = sanitizeTelemetry({ type: 'TELEMETRY', hrSignal: { status: 'stale' } });
         assert.deepEqual(stale.hrSignal, { status: 'stale', noContact: false, silentMs: 0 });
+    });
+});
+
+describe('the two pages say which version they speak', () => {
+    // After a release the wearer's page and the partner's can run different
+    // builds for as long as either tab stays open. 1.0.0's MODE_CHANGE
+    // selected a mode and 1.1.0's toggles a game, so the same message did
+    // opposite things across them: an old controller's click on the running
+    // game turned it off on a new host, and a new controller's "game off"
+    // restarted the game on an old host. Neither sent a version.
+
+    // What the builds from before versions put on the wire, verbatim.
+    const OLD_SELECT = { type: 'MODE_CHANGE', mode: 'oracle' };               // 1.0.0
+    const OLD_TOGGLE = { type: 'MODE_CHANGE', mode: 'oracle', enabled: false }; // 1.1.0
+
+    it('reads a version only when it is a whole number', () => {
+        assert.equal(readPeerProtocol(PEER_PROTOCOL_VERSION), PEER_PROTOCOL_VERSION);
+        assert.equal(readPeerProtocol(7), 7);
+        for (const junk of [undefined, null, '', '2', 2.5, 0, -2, NaN, Infinity, 1e9, true, {}, [], [2]]) {
+            assert.equal(readPeerProtocol(junk), undefined, `${JSON.stringify(junk)} is not a version`);
+        }
+    });
+
+    it('a message without one is from an older page, never a matching or a newer one', () => {
+        assert.equal(peerProtocolMatches(undefined), false);
+        assert.equal(peerProtocolRelation(undefined), 'older');
+        assert.equal(peerProtocolRelation(PEER_PROTOCOL_VERSION), 'same');
+        assert.equal(peerProtocolRelation(PEER_PROTOCOL_VERSION - 1), 'older');
+        assert.equal(peerProtocolRelation(PEER_PROTOCOL_VERSION + 1), 'newer');
+    });
+
+    it('every message this build sends carries its version, and nothing else changes', () => {
+        const command = { type: 'MODE_CHANGE', mode: 'survival', enabled: true };
+        const stamped = stampProtocol(command);
+        assert.deepEqual(stamped, { ...command, protocol: PEER_PROTOCOL_VERSION });
+        assert.equal('protocol' in command, false, 'the caller\'s object is not touched');
+        // A page from before versions reads the same message it always did:
+        // the type and every field it knows are unchanged, and it drops a
+        // field it does not know - which is how both old sanitizers work.
+        assert.deepEqual(stampProtocol({ type: 'PING' }), { type: 'PING', protocol: PEER_PROTOCOL_VERSION });
+    });
+
+    it('the host sees the version a command carries, or sees that it carries none', () => {
+        assert.deepEqual(sanitizeCommand(stampProtocol(OLD_TOGGLE)), { ...OLD_TOGGLE, protocol: PEER_PROTOCOL_VERSION });
+        assert.deepEqual(sanitizeCommand(OLD_SELECT), OLD_SELECT, 'no version, no protocol field');
+        assert.deepEqual(sanitizeCommand({ type: 'PING', protocol: PEER_PROTOCOL_VERSION }, 'viewer'), { type: 'PING', protocol: PEER_PROTOCOL_VERSION });
+        assert.deepEqual(sanitizeCommand({ type: 'SESSION_STATE', status: 'IDLE', protocol: '2' }), { type: 'SESSION_STATE', status: 'IDLE' });
+        // A version does not smuggle a command past the other checks.
+        assert.equal(sanitizeCommand({ type: 'SET_LIMITS', maxHr: 250, protocol: PEER_PROTOCOL_VERSION }), null);
+        assert.equal(sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING', protocol: PEER_PROTOCOL_VERSION }, 'viewer'), null);
+    });
+
+    it('the remote page sees the version the host speaks, or sees that it says none', () => {
+        assert.equal(sanitizeTelemetry(stampProtocol({ type: 'TELEMETRY', hr: 100 })).protocol, PEER_PROTOCOL_VERSION);
+        // Exactly what a 1.1.0 host sends.
+        const old = sanitizeTelemetry({ type: 'TELEMETRY', hr: 100, activeMode: 'oracle', teaseMode: 'classic', gameMode: 'oracle' });
+        assert.equal(old.protocol, undefined);
+        assert.equal(old.gameMode, 'oracle', 'an old host is still rendered');
+        for (const junk of ['2', {}, -1, 2.5, null]) {
+            assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', protocol: junk }).protocol, undefined);
+        }
+    });
+
+    it('a mode or game change crosses only between pages on the same version', () => {
+        assert.deepEqual(VERSIONED_COMMANDS, ['MODE_CHANGE']);
+        assert.equal(peerCommandAllowed(sanitizeCommand(stampProtocol(OLD_TOGGLE)), PEER_PROTOCOL_VERSION), true);
+        // The host judges a command by the version it carries...
+        for (const raw of [OLD_SELECT, OLD_TOGGLE, { ...OLD_TOGGLE, protocol: PEER_PROTOCOL_VERSION + 1 }, { ...OLD_SELECT, protocol: '2' }]) {
+            const cmd = sanitizeCommand(raw);
+            assert.equal(peerCommandAllowed(cmd, cmd.protocol), false, `${JSON.stringify(raw)} must be refused`);
+        }
+        // ...and a controller judges the host by its telemetry. Before the
+        // first frame it knows nothing, and nothing is not a match.
+        assert.equal(peerCommandAllowed(OLD_TOGGLE, undefined), false);
+        assert.equal(peerCommandAllowed(OLD_TOGGLE, PEER_PROTOCOL_VERSION - 1), false);
+    });
+
+    it('never refuses transport, Reset, Force Orgasm or a ping over a version', () => {
+        // They mean the same in every build, and a partner's STOP must land.
+        for (const cmd of [
+            { type: 'SESSION_STATE', status: 'IDLE' },
+            { type: 'SESSION_STATE', status: 'PAUSED' },
+            { type: 'SESSION_STATE', status: 'RUNNING' },
+            { type: 'SESSION_RESET' },
+            { type: 'ORGASM_TOGGLE' },
+            { type: 'PING' }
+        ]) {
+            for (const protocol of [undefined, PEER_PROTOCOL_VERSION - 1, PEER_PROTOCOL_VERSION, PEER_PROTOCOL_VERSION + 1]) {
+                assert.equal(peerCommandAllowed(cmd, protocol), true, `${cmd.type}/${cmd.status || ''} from version ${protocol}`);
+            }
+        }
+        assert.equal(peerCommandAllowed(null, PEER_PROTOCOL_VERSION), false);
+        assert.equal(peerCommandAllowed({ mode: 'oracle' }, PEER_PROTOCOL_VERSION), false);
+    });
+
+    it('has decided on every command this build sends', () => {
+        // Every command app.js puts on the wire is either one whose meaning
+        // has changed between versions (VERSIONED_COMMANDS, held back across
+        // them) or one that means the same in every build and crosses any
+        // version; one added without that decision fails here. The host's
+        // telemetry and the remote page's ping are stamped in webrtc.js
+        // (webrtc.test.js), like every command.
+        const app = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const typeOf = (arg) => {
+            const literal = /^\{\s*type:\s*'([A-Z_]+)'/.exec(arg);
+            if (literal) return literal[1];
+            const named = new RegExp(`const ${arg} = \\{\\s*type:\\s*'([A-Z_]+)'`).exec(app);
+            return named ? named[1] : null;
+        };
+        const sends = [...app.matchAll(/sendPeerCommand\(([^)]*)\)/g)].map((m) => m[1].trim());
+        assert.ok(sends.length >= 5, `only ${sends.length} commands found`);
+        const types = sends.map((arg) => {
+            const type = typeOf(arg);
+            assert.ok(type, `a command whose type cannot be read: sendPeerCommand(${arg})`);
+            return type;
+        });
+        assert.deepEqual([...new Set(types)].sort(), ['MODE_CHANGE', 'ORGASM_TOGGLE', 'SESSION_RESET', 'SESSION_STATE']);
+        for (const type of new Set(types)) {
+            const cmd = sanitizeCommand({ type, status: 'IDLE', mode: 'classic' });
+            assert.ok(cmd, `${type} is not a command the host accepts`);
+            if (VERSIONED_COMMANDS.includes(type)) {
+                assert.equal(peerCommandAllowed(cmd, PEER_PROTOCOL_VERSION - 1), false, type);
+                assert.equal(peerCommandAllowed(cmd, undefined), false, type);
+                continue;
+            }
+            for (const protocol of [undefined, PEER_PROTOCOL_VERSION - 1, PEER_PROTOCOL_VERSION + 1]) {
+                assert.equal(peerCommandAllowed(cmd, protocol), true, `${type} from version ${protocol}`);
+            }
+        }
+        // The mode card asks before it shows a change the host would refuse.
+        assert.match(app, /if \(isRemoteController && !hostVersionAllows\(command\)\)/);
+    });
+
+    it('tells each person which page is out of date and what a reload costs', () => {
+        const older = PEER_PROTOCOL_VERSION - 1;
+        const newer = PEER_PROTOCOL_VERSION + 1;
+        const texts = {};
+        for (const role of ['host', 'controller', 'viewer']) {
+            for (const [name, protocol] of [['none', undefined], ['older', older], ['newer', newer]]) {
+                const text = describePeerVersionMismatch(role, protocol);
+                texts[`${role}/${name}`] = text;
+                assert.match(text, /version of EdgeLoop/, `${role}/${name} must say it is about the version`);
+                assert.match(text, /[Rr]eload/, `${role}/${name} must say what fixes it`);
+            }
+            // A page that sent no version is older, never newer.
+            assert.equal(texts[`${role}/none`], texts[`${role}/older`]);
+        }
+        // The wearer's page, facing an older controller: the partner reloads.
+        assert.match(texts['host/older'], /older version/);
+        assert.match(texts['host/older'], /refuses them from it/);
+        assert.match(texts['host/older'], /Ask your partner to reload their page/);
+        // Facing a newer one, the wearer's own page is the old one, and its
+        // reload ends the session and changes the link.
+        assert.match(texts['host/newer'], /newer version/);
+        assert.match(texts['host/newer'], /Reload this page between sessions/);
+        assert.match(texts['host/newer'], /ends the session here/);
+        assert.match(texts['host/newer'], /new link/);
+        // The partner's page, facing an older host, does not send them, and
+        // names the host's page as the one to reload - between sessions.
+        assert.match(texts['controller/older'], /this page does not send them/);
+        assert.match(texts['controller/older'], /host's page needs a reload/);
+        assert.match(texts['controller/older'], /between sessions/);
+        assert.match(texts['controller/newer'], /this page does not send them/);
+        assert.match(texts['controller/newer'], /Reload this page to match it/);
+        // The two pages that can command say what still works; a viewer
+        // commands nothing, so it is not told about commands at all.
+        for (const key of ['host/older', 'host/newer', 'controller/older', 'controller/newer']) {
+            assert.match(texts[key], /START, PAUSE, STOP, Reset and Force Orgasm still work/);
+        }
+        const viewerTexts = texts['viewer/older'] + texts['viewer/newer'];
+        assert.ok(!/mode and game changes/i.test(viewerTexts), viewerTexts);
+        assert.ok(!/STOP/.test(viewerTexts), viewerTexts);
     });
 });

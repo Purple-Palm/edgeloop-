@@ -3,32 +3,64 @@
  *
  * Every safety report in the app lands in the same `#disconnectBanner`:
  * heart-rate signal loss, a disconnected monitor, an offline Handy, a remote
- * link that died, and the worst of them, "the Handy did not confirm a stop
- * and may still be moving". Microphone advisories land there too. With no
- * rank, whichever fired LAST won and the earlier text was gone without trace,
- * so a microphone taken by another app a second later could erase the only
- * warning that a machine attached to the wearer might still be running.
+ * link that died, a page the browser stopped running, and the worst of them,
+ * "the Handy did not confirm a stop and may still be moving". Advisories
+ * land there too: the microphone, the voice, and the notice that the
+ * partner's page runs another version. With no rank, whichever fired LAST
+ * won and the earlier text was gone without trace, so a microphone taken by
+ * another app a second later could erase the only warning that a machine
+ * attached to the wearer might still be running.
  *
  * Three rules:
  *  - a lower-priority notice never overwrites a higher-priority one; it is
- *    appended, so neither message is lost;
- *  - a banner is only hidden again by whoever raised it, or by the wearer
- *    dismissing it by hand;
- *  - a notice appended to someone else's report can be taken back by
- *    whoever appended it, and only that sentence goes: the report it was
- *    appended to stays. A START refused because The Handy was offline
- *    appends its refusal to the offline report that the same check raised.
- *    Without this rule the sentence became part of that report's text for
- *    good, since only the report's owner could hide the banner: once the
- *    wearer had connected the device again and pressed START, the motors
- *    ran under "The session was not started: The Handy is offline".
+ *    read after it, so neither message is lost;
+ *  - a notice of the same or a higher priority is read first, and the one it
+ *    displaces stays on the banner under it. A displaced notice used to be
+ *    dropped, and so it left with whatever displaced it: a report of the
+ *    same rank took "the Handy may still be moving" away with it when its
+ *    own cause ended, and the version notice took "The microphone stopped"
+ *    away when the partner reloaded their old page, while the microphone
+ *    was still gone;
+ *  - every notice stays owned by the source that raised it, and leaves the
+ *    banner only when that source withdraws it or the wearer dismisses the
+ *    banner by hand. Only that source's sentence goes. A START refused
+ *    because The Handy was offline is read under the offline report that
+ *    the same check raised; when only a report's owner could take any of
+ *    its text down, that refusal outlived its cause: once the wearer had
+ *    connected the device again and pressed START, the motors ran under
+ *    "The session was not started: The Handy is offline".
+ *
+ * A source whose report has changed without ending rewords its own sentence
+ * where it stands (planBannerRevise), rather than raising it again.
+ *
+ * A report that tells the wearer the session was paused ends with "Motors
+ * paused for safety." (MOTORS_PAUSED), and that clause is over sooner than
+ * the rest of the report: the moment the session is no longer paused, because
+ * it runs again (RESUME on the toys that are left, START, the watchdog's
+ * auto-resume) or because STOP or Reset ended it (planBannerPauseEnded).
+ * An Intiface or T-Code device that was lost, or a Handy lost while
+ * reconnecting, is still gone while the session runs on the other toys, so
+ * its report stays, without the clause. Left in, the clause told the wearer
+ * the motors were paused while the Handy stroked, and a report displaced by
+ * the watchdog's came back after the auto-resume still saying it.
+ *
+ * Since nothing else takes a sentence off the banner, every source withdraws
+ * its own the moment what it reports is over (app.js): the pulse that came
+ * back, the Handy or the monitor connected again, the stop the API did
+ * confirm, a session the page supervises again. Left standing, a report
+ * whose cause had ended came back into view as soon as the report read above
+ * it was withdrawn: "The Handy disconnected." over a Handy that had been
+ * connected again and was being driven, "no valid heart-rate reading ...
+ * Motors paused for safety" over a session running on a live pulse.
  *
  * Pure: no DOM. app.js holds the current banner state and does the writes.
  *
- * A banner state is { visible, severity, source, text, lines }. `source`
- * owns the banner; `lines` holds every sentence on it with the owner that
- * put it there, the standing report first; `text` is what the wearer reads:
- * the lines joined by mergeBannerMessage.
+ * The state: `notices` is every notice standing on the banner, in the order
+ * it is read - the highest rank first and, within a rank, the newest first,
+ * the way a later report of the same rank has always led the banner. A
+ * notice is its source's own words (`text`) and whether it still ends with
+ * MOTORS_PAUSED (`motorsPaused`). `severity` and `source` are the first
+ * notice's; `text` is what the banner shows, every notice in that order.
  */
 
 // Lowest to highest. An 'advisory' is worth telling the wearer about but says
@@ -38,6 +70,10 @@ export const BANNER_SEVERITIES = ['none', 'advisory', 'safety'];
 
 // The owner token that clears any banner: the wearer's own Dismiss button.
 export const BANNER_OWNER_ANY = '*';
+
+// What a report that paused the session says about it, after its own words.
+// True only while that session stays paused.
+export const MOTORS_PAUSED = 'Motors paused for safety.';
 
 export function bannerRank(severity) {
     const i = BANNER_SEVERITIES.indexOf(severity);
@@ -55,92 +91,123 @@ export function mergeBannerMessage(currentText, incomingText) {
     return `${cur} Also: ${inc}`;
 }
 
-// What the banner reads for `lines`: each sentence merged onto the ones
-// before it, exactly as they were merged when they arrived.
-function joinLines(lines) {
-    return lines.reduce((text, line) => mergeBannerMessage(text, line.text), '');
-}
-
-function isLine(line) {
-    return Boolean(line) && typeof line === 'object'
-        && typeof line.source === 'string' && line.source !== ''
-        && typeof line.text === 'string';
-}
-
-// Who put which sentence on the banner. The list is only trusted while it
-// starts with the owner's own report and still adds up to the text the
-// wearer reads. Anything else, such as a state built by hand, counts as one
-// sentence that belongs to the banner's owner, so nobody but that owner and
-// the wearer can take back a word of it.
-function normalizeLines(lines, source, text) {
-    if (Array.isArray(lines) && lines.length > 0 && lines.every(isLine)
-        && lines[0].source === source && joinLines(lines) === text) {
-        return lines.map((line) => ({ source: line.source, text: line.text }));
-    }
-    return text ? [{ source, text }] : [];
-}
-
-function normalizeCurrent(current) {
-    const c = current && typeof current === 'object' ? current : {};
-    const source = typeof c.source === 'string' && c.source ? c.source : 'none';
-    const text = typeof c.text === 'string' ? c.text : '';
+function normalizeNotice(notice, fallbackSource = 'device') {
+    const n = notice && typeof notice === 'object' ? notice : {};
     return {
-        visible: Boolean(c.visible),
-        severity: BANNER_SEVERITIES.includes(c.severity) ? c.severity : 'none',
-        source,
-        text,
-        lines: normalizeLines(c.lines, source, text)
+        severity: BANNER_SEVERITIES.includes(n.severity) && n.severity !== 'none' ? n.severity : 'advisory',
+        source: typeof n.source === 'string' && n.source ? n.source : fallbackSource,
+        text: typeof n.text === 'string' ? n.text.trim() : '',
+        motorsPaused: n.motorsPaused === true
+    };
+}
+
+// The sentence a notice reads as on the banner.
+function noticeText(n) {
+    if (!n.motorsPaused) return n.text;
+    return n.text ? `${n.text} ${MOTORS_PAUSED}` : MOTORS_PAUSED;
+}
+
+// The notices standing on the banner `current` describes; none when it is
+// hidden, whatever else it carries.
+function standingNotices(current) {
+    const c = current && typeof current === 'object' ? current : {};
+    if (!c.visible) return [];
+    // A state from before the list carried one merged text: that text is the
+    // standing report, owned by whoever the state says.
+    if (!Array.isArray(c.notices)) return [normalizeNotice({ severity: c.severity, source: c.source, text: c.text }, 'none')];
+    return c.notices.map((n) => normalizeNotice(n));
+}
+
+// The state that a list of notices renders to. The planners already keep the
+// reading order; the sort (stable, so the newest stays first within a rank)
+// only makes sure that no list, however it was built, can put an advisory in
+// front of a safety report.
+function bannerFromNotices(notices) {
+    if (notices.length === 0) return hiddenBannerState();
+    const ordered = [...notices].sort((a, b) => bannerRank(b.severity) - bannerRank(a.severity));
+    return {
+        visible: true,
+        severity: ordered[0].severity,
+        source: ordered[0].source,
+        text: ordered.map(noticeText).reduce(mergeBannerMessage, ''),
+        notices: ordered
     };
 }
 
 // The banner state after `incoming` is reported over `current`.
+// `incoming.motorsPaused` is true for a report that tells the wearer the
+// session was paused: MOTORS_PAUSED is read after its words until the pause
+// ends (planBannerPauseEnded).
 export function planBannerUpdate(current, incoming = {}) {
-    const cur = normalizeCurrent(current);
+    const standing = standingNotices(current);
     const inc = incoming && typeof incoming === 'object' ? incoming : {};
-    const severity = BANNER_SEVERITIES.includes(inc.severity) && inc.severity !== 'none'
-        ? inc.severity
-        : 'advisory';
-    const source = typeof inc.source === 'string' && inc.source ? inc.source : 'device';
-    const text = typeof inc.message === 'string' ? inc.message.trim() : '';
-    if (!cur.visible || bannerRank(severity) >= bannerRank(cur.severity)) {
-        return { visible: true, severity, source, text, lines: [{ source, text }] };
-    }
-    // Outranked: the standing report keeps the banner, its severity and its
-    // owner, and the new sentence is added to it under its own owner, who
-    // can take it back later (see planBannerHide). The wearer reads each
-    // sentence once, but a sentence that two owners reported is kept for
-    // each of them, so the first one to take it back does not take it from
-    // the other. An owner that repeats itself is not recorded twice.
-    const known = cur.lines.some((line) => line.source === source && line.text === text);
-    return {
-        visible: true,
-        severity: cur.severity,
-        source: cur.source,
-        text: mergeBannerMessage(cur.text, text),
-        lines: text && !known ? [...cur.lines, { source, text }] : cur.lines
-    };
+    const notice = normalizeNotice({ severity: inc.severity, source: inc.source, text: inc.message, motorsPaused: inc.motorsPaused });
+    const rank = bannerRank(notice.severity);
+    // A source's new report replaces its own earlier sentence rather than
+    // doubling it (the refused click says the version notice again, an
+    // unconfirmed stop retried is reported again), except a sentence of its
+    // own that outranks it: a lower priority never takes down a higher one,
+    // not even the same source's. Every other source's notice stays.
+    const kept = standing.filter((n) => n.source !== notice.source || bannerRank(n.severity) > rank);
+    // Read first among its rank, behind anything of a higher rank.
+    const at = kept.findIndex((n) => bannerRank(n.severity) <= rank);
+    if (at < 0) return bannerFromNotices([...kept, notice]);
+    return bannerFromNotices([...kept.slice(0, at), notice, ...kept.slice(at)]);
 }
 
-// May `owner` hide what the banner is showing right now?
+// The banner state after `incoming.source` rewords the notice it has standing
+// at `incoming.severity`: the new words take the old ones' place in the
+// reading order. Rewording is not a new report, so a source with nothing
+// standing at that rank - never raised, withdrawn, or dismissed by the
+// wearer - stays off the banner, and an empty text changes nothing. A report
+// whose cause has partly ended (one of two Handys confirmed its stop) says
+// what is left, and neither jumps back in front of a newer report nor
+// reappears after the wearer dismissed it. Only the words change: whether
+// the notice still says the motors are paused is the session's to end
+// (planBannerPauseEnded), so a rewording neither drops MOTORS_PAUSED from a
+// paused session's report nor puts it back once the pause is over.
+export function planBannerRevise(current, incoming = {}) {
+    const standing = standingNotices(current);
+    const inc = incoming && typeof incoming === 'object' ? incoming : {};
+    const notice = normalizeNotice({ severity: inc.severity, source: inc.source, text: inc.message });
+    if (!notice.text) return bannerFromNotices(standing);
+    return bannerFromNotices(standing.map((n) => (
+        n.source === notice.source && n.severity === notice.severity ? { ...notice, motorsPaused: n.motorsPaused } : n
+    )));
+}
+
+// The banner state once the session is no longer paused - it runs again, or
+// it was stopped: no notice goes on saying the motors are paused, and each
+// keeps its own words and its place in the reading order, since what they
+// report (a device that is gone, a pulse that is not read, a stop that was
+// never confirmed) did not end with the pause. A notice that said nothing
+// else leaves with the clause.
+export function planBannerPauseEnded(current) {
+    return bannerFromNotices(standingNotices(current)
+        .filter((n) => n.text || !n.motorsPaused)
+        .map((n) => ({ ...n, motorsPaused: false })));
+}
+
+// The banner state after `owner` withdraws what it raised. The wearer's
+// Dismiss (BANNER_OWNER_ANY) clears everything. Any other source takes out
+// its own sentences and nothing else, whether or not it leads the banner:
+// what stood under a withdrawn report moves up and keeps the banner, since
+// the Handy may still be moving when the pulse comes back. A source with
+// nothing on the banner changes nothing.
+export function planBannerClear(current, owner) {
+    if (owner === BANNER_OWNER_ANY) return hiddenBannerState();
+    return bannerFromNotices(standingNotices(current).filter((n) => n.source !== owner));
+}
+
+// Does `owner` hold the report the banner leads with - the one whose rank it
+// shows? Withdrawing it hides the banner only when nothing else stands under
+// it; planBannerClear says what is left.
 export function canClearBanner(current, owner) {
     if (owner === BANNER_OWNER_ANY) return true;
-    const cur = normalizeCurrent(current);
-    if (!cur.visible) return true;
-    return cur.source === owner;
-}
-
-// The banner state after `owner` takes back what it put there. The banner's
-// owner, or the wearer (BANNER_OWNER_ANY), hides all of it, as before.
-// Anyone else takes back only the sentences they appended: the report those
-// were appended to, and every other owner's sentences, stay as they were.
-export function planBannerHide(current, owner) {
-    if (canClearBanner(current, owner)) return hiddenBannerState();
-    const cur = normalizeCurrent(current);
-    const kept = cur.lines.filter((line) => line.source !== owner);
-    if (kept.length === cur.lines.length) return cur;
-    return { ...cur, text: joinLines(kept), lines: kept };
+    const banner = bannerFromNotices(standingNotices(current));
+    return !banner.visible || banner.source === owner;
 }
 
 export function hiddenBannerState() {
-    return { visible: false, severity: 'none', source: 'none', text: '', lines: [] };
+    return { visible: false, severity: 'none', source: 'none', text: '', notices: [] };
 }

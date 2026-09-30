@@ -185,8 +185,6 @@ export const advancedSettings = {
     gammaCurve: 2.0,
     warmupMinutes: 5,
     edgeStrokeDepth: 100,
-    cadenceBreathing: true,
-    milkingWave: true,
     handyHwMin: 0,
     handyHwMax: 100,
     // Fresh installs need no legacy 15/85 envelope migration (see app.js).
