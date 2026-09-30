@@ -19,6 +19,8 @@ import {
     clampTrainHoldSeconds,
     clampTrainEdges,
     survivalDrive,
+    survivalEdgesAtSwitch,
+    survivalEdgesAfterEngine,
     clampStallGuardSeconds,
     clampStallPauseSeconds,
     tickRuinAndStallGuard,
@@ -42,6 +44,7 @@ import { drawTelemetryChart, shouldDrawPullbackLine, watchChartResize } from './
 import { connectBleHeartRate, disconnectBle, isBleConnected, isBleReconnecting } from './hardware/ble.js';
 import { describeBluetoothSupport, describeBleError } from './hardware/ble-protocol.js';
 import { createHrWatchdog, clampStaleSeconds } from './hr-watchdog.js';
+import { rememberEdgeReading } from './edge-confirm.js';
 import {
     supervisionGapLimitMs,
     createSupervisionClock,
@@ -224,6 +227,16 @@ function syncGuardSettings() {
 syncWatchdogSettings();
 syncGuardSettings();
 hrWatchdog.reset(Date.now());
+
+// The last few valid readings of the pulse source, { at, bpm }, oldest first
+// (edge-confirm.js). The engine pulls back on the first reading at the mark
+// but counts the edge only once the pulse has held there on two consecutive
+// readings, so it needs the readings before the current one. state.hrCurrent
+// cannot stand in for them: it is one number, and it reads 70 before any
+// monitor has spoken. Emptied when the source changes, because a reading
+// from one source and the next from another are not two readings of one
+// pulse.
+let edgeReadings = [];
 
 // Live funscript sample buffer: one 4 Hz timeline of { at, speed, secondary,
 // strokeMin, strokeMax }. Both channel scripts are built from it on export.
@@ -953,6 +966,11 @@ function updateEngine() {
         sessionStatus: state.sessionStatus,
         rampdownSecondsLeft: state.rampdownSecondsLeft,
         isEdged: state.isEdged,
+        edgePending: state.edgePending,
+        // Two readings further apart than the signal-loss timeout are not
+        // consecutive: across that gap the watchdog called the pulse lost.
+        recentReadings: edgeReadings,
+        readingGapMs: hrWatchdog.settings.staleMs,
         orgasmMode: state.orgasmMode,
         orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0,
         gamma: advancedSettings.gammaCurve,
@@ -975,17 +993,36 @@ function updateEngine() {
         trainingState: state.trainState
     });
 
+    // A new edge, and only a new edge, earns Ruin & Leak another ride. The
+    // ride is part of the pullback, so it starts with the flag, on the first
+    // reading at the mark, as it always did. Keyed to the count below, which
+    // comes a reading later, it would restart a ride already under way, and
+    // on a relay whose second reading came after the 12 s ride it would hand
+    // the same edge a second ride once its lockout ran out.
+    if (result.pullbackStarted) applyRuinClock(startRuinEdge(readRuinClock()));
+    // The edge itself - the counter, with Adaptive Ceiling Decay and
+    // Survival's climb reading it, the rotator and the edge cue - waits for
+    // the pulse to hold at the mark (edge-confirm.js).
     if (result.newEdgeTriggered) {
         state.edges += 1;
         const edgeEl = document.getElementById('edgeCount');
         if (edgeEl) edgeEl.textContent = state.edges;
-        // A new edge, and only a new edge, earns Ruin & Leak another ride.
-        applyRuinClock(startRuinEdge(readRuinClock()));
         reverseIntifaceRotation('edge');
         cueVoice('edge');
     }
+    // Survival steps its climb on the edges counted while it is on. The edge
+    // that was in progress when it was switched on is one from before the
+    // switch, and a count made for it here is seen instead of stepped
+    // (survivalEdgesAtSwitch).
+    const survivalSeen = survivalEdgesAfterEngine(
+        { edgesSeen: state.survivalEdgesSeen, owedEdgeSeen: state.survivalOwedEdgeSeen },
+        result
+    );
+    state.survivalEdgesSeen = survivalSeen.edgesSeen;
+    state.survivalOwedEdgeSeen = survivalSeen.owedEdgeSeen;
 
     state.isEdged = result.isEdged;
+    state.edgePending = result.edgePending;
     state.strokerSpeed = result.primaryPercent;
     state.prostateSpeed = result.secondaryPercent;
     state.strokeMin = result.strokeMinPercent;
@@ -1272,6 +1309,7 @@ function resetSessionCounters() {
     state.pauses = 0;
     state.peakHr = Number.isFinite(state.hrCurrent) ? state.hrCurrent : 70;
     state.isEdged = false;
+    state.edgePending = false;
     // Ruin & Leak's clock belongs to the edge, so it is cleared with the edge
     // flag: here, on STOP, Reset and START, and never by a mode card, a game
     // toggle or a partner's MODE_CHANGE. A release of the edge re-arms the
@@ -1311,8 +1349,12 @@ function resetGameState() {
     state.survivalTimer = 0;
     state.survivalEdges = 0;
     state.survivalOverdrive = 0;
-    // Edges already counted before Survival was switched on do not step it.
-    state.survivalEdgesSeen = state.edges || 0;
+    // Edges from before Survival was switched on do not step it: the ones
+    // already counted, and the edge in progress if its count is still owed,
+    // which updateEngine sees when that count is made.
+    const survivalSeen = survivalEdgesAtSwitch({ edges: state.edges, isEdged: state.isEdged, edgePending: state.edgePending });
+    state.survivalEdgesSeen = survivalSeen.edgesSeen;
+    state.survivalOwedEdgeSeen = survivalSeen.owedEdgeSeen;
     state.survivalBreachTicks = 0;
     state.survivalLastReadingAt = null;
     state.trainState = 'climb';
@@ -1421,13 +1463,21 @@ function tickSessionGuardsAndGames() {
         document.getElementById('micActiveBadge')?.classList.add('hidden');
     }
 
+    // A game's edge is an edge the engine has COUNTED. The flag goes up on the
+    // first reading at the mark, and every state of both games backs the
+    // motors off on it, but one reading - a glitch, the top of a posture
+    // spike - must not start an Oracle hold, whose roll 15 s later can arm
+    // Force Orgasm or end the session, nor an Edge Training hold that counts
+    // toward the set. The hold starts once the pulse has held at the mark.
+    const edgeCounted = state.isEdged && !state.edgePending;
+
     if (state.activeMode === 'oracle') {
         if (state.oracleState === 'IDLE' || state.oracleState === 'APPROACH') {
             if (state.oracleState !== 'APPROACH') {
                 state.oracleState = 'APPROACH';
                 cueVoice('oracleWatching');
             }
-            if (state.isEdged) {
+            if (edgeCounted) {
                 state.oracleState = 'HOLD';
                 state.oracleTimer = 15;
                 cueVoice('oracleHold');
@@ -1486,13 +1536,16 @@ function tickSessionGuardsAndGames() {
                 state.oracleState = 'APPROACH';
                 state.oracleTimer = 0;
                 state.isEdged = false;
+                state.edgePending = false;
                 cueVoice('oracleReset');
             }
         }
     } else if (state.activeMode === 'survival') {
-        // Edges counted before this game was switched on are ignored. Each
-        // new one raises the mark 1 BPM and the speed a step. The clock is
-        // slow on purpose: half an hour of it is still a build, not a finish.
+        // Edges from before this game was switched on are ignored, the one in
+        // progress at the switch too when it is counted after it
+        // (survivalEdgesAtSwitch). Each new one raises the mark 1 BPM and the
+        // speed a step. The clock is slow on purpose: half an hour of it is
+        // still a build, not a finish.
         const seen = state.survivalEdgesSeen || 0;
         const gained = Math.max(0, (state.edges || 0) - seen);
         state.survivalEdges = (state.survivalEdges || 0) + gained;
@@ -1505,7 +1558,7 @@ function tickSessionGuardsAndGames() {
         const next = tickEdgeTraining(
             { state: state.trainState, holdSeconds: state.trainHoldSeconds, edgesDone: state.trainEdgesDone },
             {
-                isEdged: state.isEdged,
+                isEdged: edgeCounted,
                 released: gameEdgeReleased(hr, ceiling, state.edgeTriggerHr, { orgasmMode: state.orgasmMode }),
                 holdGoal: advancedSettings.trainHoldSeconds,
                 edgesGoal: advancedSettings.trainEdges,
@@ -1567,6 +1620,9 @@ function recordHrReading(bpm, sensorContact = null, now = Date.now()) {
     state.lastHrTimestamp = now;
     state.history.push(bpm);
     if (state.history.length > 60) state.history.shift();
+    // Remembered before the engine runs on it, so the reading the engine
+    // judges is always the last one in the list.
+    edgeReadings = rememberEdgeReading(edgeReadings, now, bpm);
     if (state.hrSignalPaused) handleHrSignalReturned();
     updateEngine();
     syncTelemetry();
@@ -1767,6 +1823,16 @@ setInterval(() => {
     const now = Date.now();
     haltIfUnsupervised(now);
     supervisionClock.beat(now, { hidden: document.visibilityState === 'hidden' });
+
+    // The simulator's slider IS the pulse for as long as it is engaged, and a
+    // value left on it is a value held: every second it stays there is one
+    // more reading. Otherwise an edge set on the slider in one step - a click
+    // on the track, one arrow key - would pull back and then wait for the
+    // slider to move again before it counted. Not once a sensor is linked:
+    // while a new strap connects, the simulator is still flagged engaged but
+    // the pulse is the strap's, and repeating its reading here would hold
+    // one reading twice.
+    if (state.simEngaged && !isBleConnected()) edgeReadings = rememberEdgeReading(edgeReadings, now, state.hrCurrent);
 
     if (state.sessionStatus === 'RUNNING') {
         state.sessionSeconds += 1;
@@ -3662,8 +3728,18 @@ document.getElementById('modalBleScanBtn')?.addEventListener('click', async () =
     try {
         setBadgeState('Ble', 'connecting', 'Scanning...');
         setBleStatus('Pick your sensor in the browser chooser...', 'busy');
+        // The edge readings start again with this sensor's first packet. Its
+        // notifications can arrive before the connect below has finished
+        // (the battery is read after them), while the simulator may still be
+        // the engaged source, so clearing the list once the connect returns
+        // could pair a slider value with a strap reading.
+        let firstPacket = true;
         const dev = await connectBleHeartRate({
             onHrMeasurement: (bpm, info) => {
+                if (firstPacket) {
+                    firstPacket = false;
+                    edgeReadings = [];
+                }
                 recordHrReading(bpm, info ? info.sensorContact : null);
             },
             onBatteryLevel: (bat) => {
@@ -3775,6 +3851,7 @@ document.getElementById('modalEngageSimBtn')?.addEventListener('click', () => {
     state.simEngaged = true;
     state.hrDeviceName = 'Simulator';
     hrWatchdog.reset(Date.now());
+    edgeReadings = [];
     renderHrSignal(null);
     // A session the watchdog paused stays paused: the slider's first sample
     // is not a returning pulse, the user presses RESUME when ready.

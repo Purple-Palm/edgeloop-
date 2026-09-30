@@ -4,10 +4,12 @@
  *
  * Pure: no DOM, no I/O. Fail-safe by construction: any non-finite input
  * yields zero motor output, the stroke zone can never invert or collapse,
- * and an edge is only released once the pulse has clearly come back down.
+ * an edge is only released once the pulse has clearly come back down, and
+ * only counted once the pulse has held at the mark.
  */
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import { teaseFrame, warmupShape, combineWake, placeStroke, orgasmFrame, roundSpeed } from './patterns.js';
+import { isConfirmedEdge } from './edge-confirm.js';
 
 export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
 export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
@@ -219,6 +221,17 @@ export function calculateEngineOutputs({
     sessionStatus,
     rampdownSecondsLeft,
     isEdged,
+    // The edge flag is up, and the pullback with it, but the edge has not
+    // been counted yet: the pulse has not held at the mark (edge-confirm.js).
+    // Carried from call to call beside the flag. It defaults to false, so a
+    // caller that hands over an edge in progress without it hands over one
+    // already counted, and can never make the engine count it twice.
+    edgePending = false,
+    // The last few valid readings of the SENSOR, oldest first, as { at, bpm },
+    // and the signal-loss timeout in ms. Only the count reads them: no motor
+    // waits for them.
+    recentReadings = [],
+    readingGapMs,
     orgasmMode,
     // Seconds since Force Orgasm was armed. The ceiling already climbs 1 BPM
     // per second from this; the motors ramp on the same clock.
@@ -259,22 +272,30 @@ export function calculateEngineOutputs({
         strokeMinPercent: env.min,
         strokeMaxPercent: env.max,
         isEdged: false,
+        edgePending: false,
+        pullbackStarted: false,
         newEdgeTriggered: false,
         resolvedMode: mode
     };
+    // What a call that decides nothing hands back: the edge flag as it was,
+    // and a count still owed with it. Only an edge in progress can be owed
+    // a count.
+    const heldEdge = { isEdged: Boolean(isEdged), edgePending: Boolean(isEdged) && Boolean(edgePending) };
 
     // Motors are silent in every other status, but the edge flag is state,
     // not output: clearing it here would re-arm the detector, so the first
     // RUNNING tick after a pause (including every watchdog auto-resume) would
-    // count the edge the wearer is still sitting on as a brand-new one.
+    // count the edge the wearer is still sitting on as a brand-new one. An
+    // edge still waiting to be counted keeps waiting through the pause: held
+    // after it, it is counted then, and never twice.
     if (sessionStatus !== 'RUNNING' && sessionStatus !== 'RAMPDOWN') {
-        return { ...silent, isEdged: Boolean(isEdged) };
+        return { ...silent, ...heldEdge };
     }
 
     // Fail safe: a NaN heart rate or limit stops the motors and keeps the
     // edge flag as it was (bad data must never release an edge either).
     if (!Number.isFinite(hr) || !Number.isFinite(minHr) || !Number.isFinite(maxHr)) {
-        return { ...silent, isEdged: Boolean(isEdged) };
+        return { ...silent, ...heldEdge };
     }
 
     const gammaSafe = Number.isFinite(gamma) && gamma > 0 ? gamma : 2.0;
@@ -283,7 +304,9 @@ export function calculateEngineOutputs({
     const rampLeft = clamp(finiteOr(rampdownSecondsLeft, 0), 0, 45);
     const seconds = Math.max(0, finiteOr(sessionSeconds, 0));
 
-    let nextIsEdged = Boolean(isEdged);
+    let nextIsEdged = heldEdge.isEdged;
+    let nextPending = heldEdge.edgePending;
+    let pullbackStarted = false;
     let newEdgeTriggered = false;
 
     const triggerHr = resolveEdgeTriggerHr(maxHr, edgeHoldPercent, minHr);
@@ -301,11 +324,37 @@ export function calculateEngineOutputs({
     // first tick after a cancel judges it against the real ceiling again.
     if (edgeSource >= triggerHr) {
         if (!isEdged && !orgasmMode && sessionStatus !== 'RAMPDOWN') {
-            newEdgeTriggered = true;
+            pullbackStarted = true;
             nextIsEdged = true;
+            nextPending = true;
         }
     } else if (!orgasmMode && hasReleasedEdge(edgeSource, maxHr, triggerHr)) {
         nextIsEdged = false;
+        nextPending = false;
+    }
+
+    // The pullback starts above, on the first reading at the mark, exactly
+    // as it always has: every motor term below reads the flag. The EDGE is
+    // counted here, and only once the pulse has held at the mark - this
+    // reading and the one before it both at or above it, with no signal loss
+    // between them and no spike standing in for either (edge-confirm.js).
+    // One reading used to be enough, so a glitch or the top of a posture
+    // spike was an edge: a step of Adaptive Ceiling Decay for the rest of the
+    // session, a step of Survival's climb, a reversed rotator, the edge cue
+    // and a game's hold, for an edge that never happened. The count waits one
+    // more reading, and an edge whose flag is released first is never counted
+    // at all. It is only ever made where an edge can start: Force Orgasm
+    // freezes a count still owed along with the flag, to be judged against
+    // the real mark once it is cancelled, and a Soft Landing counts none.
+    if (
+        nextPending
+        && !orgasmMode
+        && sessionStatus !== 'RAMPDOWN'
+        && edgeSource >= triggerHr
+        && isConfirmedEdge(recentReadings, triggerHr, { maxGapMs: readingGapMs })
+    ) {
+        newEdgeTriggered = true;
+        nextPending = false;
     }
 
     // The tease band runs from the resting rate to the pullback mark, so the
@@ -509,6 +558,8 @@ export function calculateEngineOutputs({
         strokeMinPercent: physicalMin,
         strokeMaxPercent: Math.max(physicalMin, physicalMax),
         isEdged: nextIsEdged,
+        edgePending: nextPending,
+        pullbackStarted,
         newEdgeTriggered,
         resolvedMode: mode
     };

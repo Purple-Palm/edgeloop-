@@ -25,6 +25,31 @@ import {
     cooldownShape
 } from './engine.js';
 import { MIN_MOVING_PERCENT, warmupShape, roundSpeed } from './patterns.js';
+import { rememberEdgeReading } from './edge-confirm.js';
+
+// The readings a chest strap sent, one a second, oldest first, ending with
+// the current one: what app.js hands the engine as recentReadings.
+const readingsOf = (...bpms) => bpms.map((bpm, i) => ({ at: 1000 * (i + 1), bpm }));
+
+// The engine fed the way app.js feeds it: one reading every `gapMs`, each
+// remembered before the call, with the edge flag and a count still owed
+// carried from call to call. Returns a function taking the next reading.
+function strap(base, { gapMs = 1000 } = {}) {
+    let isEdged = false;
+    let edgePending = false;
+    let readings = [];
+    let at = 0;
+    return (bpm, extra = {}) => {
+        at += gapMs;
+        readings = rememberEdgeReading(readings, at, bpm);
+        const out = calculateEngineOutputs({
+            ...base, hr: bpm, edgeHr: bpm, isEdged, edgePending, recentReadings: readings, ...extra
+        });
+        isEdged = out.isEdged;
+        edgePending = out.edgePending;
+        return out;
+    };
+}
 
 const running = {
     hr: 95,
@@ -82,7 +107,9 @@ describe('engine modes', () => {
         // ceiling down. The heart-rate watchdog pauses and (with auto-resume,
         // the default) restarts the session by itself, so a strap that drops
         // one packet burst did this without the wearer touching anything.
-        const atMark = { ...running, activeMode: 'classic', hr: 140, isEdged: true };
+        // The pulse has held at the mark on both readings, so an engine that
+        // took the resumed flag for a new edge would count one here.
+        const atMark = { ...running, activeMode: 'classic', hr: 140, isEdged: true, recentReadings: readingsOf(140, 140) };
         const first = calculateEngineOutputs(atMark);
         assert.equal(first.isEdged, true);
 
@@ -93,8 +120,9 @@ describe('engine modes', () => {
             assert.equal(paused.newEdgeTriggered, false);
             assert.equal(paused.isEdged, true, `${status} must not release the edge`);
 
-            const resumed = calculateEngineOutputs({ ...atMark, isEdged: paused.isEdged });
+            const resumed = calculateEngineOutputs({ ...atMark, isEdged: paused.isEdged, edgePending: paused.edgePending });
             assert.equal(resumed.newEdgeTriggered, false, `resuming after ${status} must not count a new edge`);
+            assert.equal(resumed.pullbackStarted, false, `resuming after ${status} must not start a new pullback`);
         }
 
         // A session that was never edged still resumes un-edged.
@@ -554,8 +582,9 @@ describe('engine modes', () => {
         // pullback mark climbs away from a pulse that never moved. Releasing
         // the edge on that evidence meant the tick after the cancel counted a
         // brand-new edge: the counter, the spoken cue, a rotator reversal and
-        // Adaptive Ceiling Decay, all for an edge that never ended.
-        const edged = { ...running, activeMode: 'classic', isEdged: true, hr: 140, edgeHr: 140 };
+        // Adaptive Ceiling Decay, all for an edge that never ended. The pulse
+        // has held at 140 on both readings, so a count here would be live.
+        const edged = { ...running, activeMode: 'classic', isEdged: true, hr: 140, edgeHr: 140, recentReadings: readingsOf(140, 140) };
         const forcing = calculateEngineOutputs({ ...edged, orgasmMode: true, maxHr: 160 });
         assert.equal(forcing.isEdged, true, 'an inflated ceiling is not the pulse coming down');
         assert.equal(forcing.newEdgeTriggered, false);
@@ -797,20 +826,37 @@ describe('engine safety guards', () => {
         assert.ok(released.primaryPercent > 0);
     });
 
-    it('newEdgeTriggered fires exactly once per crossing', () => {
-        const first = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 141, isEdged: false });
-        assert.equal(first.newEdgeTriggered, true);
-        assert.equal(first.isEdged, true);
-        const second = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 145, isEdged: first.isEdged });
-        assert.equal(second.newEdgeTriggered, false);
+    it('newEdgeTriggered fires exactly once per crossing, on the reading that holds it', () => {
+        // This used to count the edge on `first`, the first reading at the
+        // mark: that is how one glitch, or the one reading of a posture spike
+        // that touched the mark, became an edge. The pullback still starts on
+        // that reading; the count waits for the next one to be at the mark
+        // too (edge-confirm.js).
+        const next = strap({ ...running, activeMode: 'classic' });
+        next(120);
+        const first = next(141);
+        assert.equal(first.isEdged, true, 'the pullback starts on the first reading');
+        assert.equal(first.pullbackStarted, true);
+        assert.equal(first.newEdgeTriggered, false, 'one reading is not an edge');
+        assert.equal(first.edgePending, true);
+        const second = next(145);
+        assert.equal(second.newEdgeTriggered, true, 'the second reading at the mark is');
+        assert.equal(second.edgePending, false);
+        assert.equal(second.pullbackStarted, false);
         assert.equal(second.isEdged, true);
-        const hovering = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 137, isEdged: second.isEdged });
+        assert.equal(next(146).newEdgeTriggered, false, 'and it is counted once');
+        const hovering = next(137);
         assert.equal(hovering.newEdgeTriggered, false);
         assert.equal(hovering.isEdged, true);
-        const back = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 120, isEdged: hovering.isEdged });
+        const onceMore = next(141);
+        assert.equal(onceMore.newEdgeTriggered, false, 'back on the mark inside the release band is the same edge');
+        assert.equal(onceMore.pullbackStarted, false);
+        const back = next(120);
         assert.equal(back.isEdged, false);
-        const again = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, isEdged: back.isEdged });
-        assert.equal(again.newEdgeTriggered, true);
+        const again = next(140);
+        assert.equal(again.pullbackStarted, true);
+        assert.equal(again.newEdgeTriggered, false);
+        assert.equal(next(140).newEdgeTriggered, true, 'the next crossing that holds is the next edge');
     });
 
     it('clamps hold percent and maps it onto a trigger HR', () => {
@@ -832,17 +878,18 @@ describe('engine safety guards', () => {
     it('a stored hold percent above 100 pulls back AT the typed ceiling', () => {
         // Settings saved before the range was corrected (or a hand-edited
         // backup) may still carry 115: it must behave exactly like 100%.
-        const atMax = calculateEngineOutputs({
-            ...running,
-            activeMode: 'classic',
-            hr: 140,
-            isEdged: false,
-            ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 115
-        });
+        // The pullback is on the first reading at 140; the edge is counted
+        // on the second, once the pulse has held there (this used to assert
+        // a count on the first reading alone).
+        const next = strap({ ...running, activeMode: 'classic', ceilingBehaviour: 'crawl', edgeHoldPercent: 115 });
+        next(130);
+        const atMax = next(140);
         assert.equal(atMax.isEdged, true, 'the typed max is the pullback mark');
-        assert.equal(atMax.newEdgeTriggered, true);
+        assert.equal(atMax.newEdgeTriggered, false);
         assert.equal(atMax.primaryPercent, CRAWL_PERCENT);
+        const held = next(140);
+        assert.equal(held.newEdgeTriggered, true, 'held at the typed max, the edge counts');
+        assert.equal(held.primaryPercent, CRAWL_PERCENT);
 
         const released = calculateEngineOutputs({
             ...running,
@@ -923,29 +970,28 @@ describe('engine safety guards', () => {
     });
 
     it('100% hold still edges at the typed climax', () => {
-        const hit = calculateEngineOutputs({
-            ...running,
-            activeMode: 'classic',
-            hr: 140,
-            isEdged: false,
-            ceilingBehaviour: 'stop',
-            edgeHoldPercent: 100
-        });
-        assert.equal(hit.newEdgeTriggered, true);
+        // Full Stop on the first reading at the mark, and the count on the
+        // reading that holds it (it used to be asserted on the first).
+        const next = strap({ ...running, activeMode: 'classic', ceilingBehaviour: 'stop', edgeHoldPercent: 100 });
+        next(128);
+        const hit = next(140);
         assert.equal(hit.primaryPercent, 0);
+        assert.equal(hit.newEdgeTriggered, false);
+        const held = next(140);
+        assert.equal(held.newEdgeTriggered, true);
+        assert.equal(held.primaryPercent, 0);
     });
 
     it('95% hold pulls back before the typed climax', () => {
-        const early = calculateEngineOutputs({
-            ...running,
-            activeMode: 'classic',
-            hr: 133,
-            isEdged: false,
-            ceilingBehaviour: 'crawl',
-            edgeHoldPercent: 95
-        });
-        assert.equal(early.newEdgeTriggered, true);
+        // The pullback at 133 is immediate; the edge is counted when the
+        // pulse holds there for a second reading (it used to be asserted on
+        // the first).
+        const next = strap({ ...running, activeMode: 'classic', ceilingBehaviour: 'crawl', edgeHoldPercent: 95 });
+        next(125);
+        const early = next(133);
         assert.equal(early.primaryPercent, CRAWL_PERCENT);
+        assert.equal(early.newEdgeTriggered, false);
+        assert.equal(next(134).newEdgeTriggered, true);
         const below = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
@@ -958,10 +1004,21 @@ describe('engine safety guards', () => {
     });
 
     it('does not count edges during orgasm mode or rampdown', () => {
-        const orgasm = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 150, orgasmMode: true });
+        // The pulse has held at the mark on both readings, so a refusal here
+        // is the rule and not a want of evidence: the same call with neither
+        // counts at once.
+        const held = { ...running, activeMode: 'classic', hr: 150, recentReadings: readingsOf(150, 150) };
+        assert.equal(calculateEngineOutputs(held).newEdgeTriggered, true);
+        const orgasm = calculateEngineOutputs({ ...held, orgasmMode: true });
         assert.equal(orgasm.newEdgeTriggered, false);
-        const ramp = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 150, sessionStatus: 'RAMPDOWN' });
+        assert.equal(orgasm.pullbackStarted, false);
+        const ramp = calculateEngineOutputs({ ...held, sessionStatus: 'RAMPDOWN' });
         assert.equal(ramp.newEdgeTriggered, false);
+        assert.equal(ramp.pullbackStarted, false);
+        // Nor is a count still owed from before either of them began.
+        const owed = { ...held, isEdged: true, edgePending: true };
+        assert.equal(calculateEngineOutputs({ ...owed, orgasmMode: true }).newEdgeTriggered, false);
+        assert.equal(calculateEngineOutputs({ ...owed, sessionStatus: 'RAMPDOWN' }).newEdgeTriggered, false);
     });
 
     it('rampdown scales linearly from 50% to 0% over 45 seconds', () => {
@@ -1032,12 +1089,14 @@ describe('edge detection source', () => {
     it('judges the edge on edgeHr while the speed curve follows hr', () => {
         // The microphone boost moves `hr` (the engine's speed input) but never
         // `edgeHr` (the sensor's own pulse), so a loud room cannot latch an edge.
+        // The readings are the sensor's too: they are what the count reads.
         const boosted = calculateEngineOutputs({
             ...running,
             activeMode: 'classic',
             hr: 140,
             edgeHr: 120,
-            isEdged: false
+            isEdged: false,
+            recentReadings: readingsOf(120, 120)
         });
         assert.equal(boosted.newEdgeTriggered, false, 'noise must not count an edge');
         assert.equal(boosted.isEdged, false);
@@ -1054,7 +1113,11 @@ describe('edge detection source', () => {
             'the boost must still move the speed curve'
         );
 
-        const real = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: false });
+        // A measured pulse at the mark pulls back at once; held there on the
+        // reading before as well, it is an edge (one reading used to be).
+        const real = calculateEngineOutputs({
+            ...running, activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: false, recentReadings: readingsOf(140, 140)
+        });
         assert.equal(real.newEdgeTriggered, true);
         assert.equal(real.isEdged, true);
     });
@@ -1080,10 +1143,230 @@ describe('edge detection source', () => {
     });
 
     it('falls back to hr when no edgeHr is given', () => {
-        const r = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, isEdged: false });
+        // Held at the mark on the reading before too, so the count is judged
+        // on the fallback as well as the pullback (it used to be one reading).
+        const held = readingsOf(140, 140);
+        const r = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, isEdged: false, recentReadings: held });
+        assert.equal(r.isEdged, true);
         assert.equal(r.newEdgeTriggered, true);
-        const bad = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, edgeHr: NaN, isEdged: false });
+        const bad = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 140, edgeHr: NaN, isEdged: false, recentReadings: held });
+        assert.equal(bad.isEdged, true);
         assert.equal(bad.newEdgeTriggered, true);
+    });
+});
+
+describe('an edge is counted once the pulse has held at the mark', () => {
+    // One reading at or above the pullback mark used to count an edge, and a
+    // count is what Adaptive Ceiling Decay, the rotator, the edge cue and the
+    // games act on: a wearer who sat up had his working ceiling lowered for
+    // the rest of the session by one reading of a posture spike. The
+    // pullback still starts on that first reading; the count waits.
+    const motors = (out) => [out.primaryPercent, out.secondaryPercent, out.strokeMinPercent, out.strokeMaxPercent];
+
+    it('does not delay the pullback: the first reading at the mark drives every motor as a counted edge does', () => {
+        // Every mode, every sub-state reachable on the mark, both ceiling
+        // rules: the reading that raises the flag with nothing held yet, and
+        // the one that raises it already held, send exactly what an edge
+        // counted long ago sends. The count moves no motor, so no motor
+        // waits for it.
+        const reachable = { oracle: ['APPROACH', 'HOLD', 'PURGATORY'], edgetrain: ['climb', 'hold', 'recover'] };
+        let compared = 0;
+        for (const activeMode of ENGINE_MODES) {
+            const key = activeMode === 'oracle' ? 'oracleState' : 'trainingState';
+            for (const sub of reachable[activeMode] || [undefined]) {
+                for (const ceilingBehaviour of ['stop', 'crawl']) {
+                    for (const hr of [140, 146]) {
+                        for (const sessionSeconds of [3, 40]) {
+                            const base = { ...running, activeMode, [key]: sub, ceilingBehaviour, hr, edgeHr: hr, sessionSeconds };
+                            const where = `${activeMode}/${sub || '-'} ${ceilingBehaviour} ${hr} t=${sessionSeconds}`;
+                            const first = calculateEngineOutputs({ ...base, isEdged: false, recentReadings: readingsOf(120, hr) });
+                            const counted = calculateEngineOutputs({ ...base, isEdged: true, recentReadings: readingsOf(120, hr) });
+                            const heldAtOnce = calculateEngineOutputs({ ...base, isEdged: false, recentReadings: readingsOf(hr, hr) });
+                            assert.equal(first.isEdged, true, `${where}: no pullback on the first reading`);
+                            assert.equal(first.pullbackStarted, true, where);
+                            assert.equal(first.newEdgeTriggered, false, `${where}: one reading counted`);
+                            assert.equal(heldAtOnce.newEdgeTriggered, true, `${where}: a held pulse was not counted`);
+                            assert.deepEqual(motors(first), motors(counted), `${where}: the motors waited for the count`);
+                            assert.deepEqual(motors(heldAtOnce), motors(counted), where);
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(compared > 50, `expected a real sweep, compared ${compared}`);
+    });
+
+    it('a posture spike, a glitch or a pulse hovering across the mark pulls back and counts nothing', () => {
+        const streams = {
+            // Sitting up: about 10 BPM for about 10 s, one reading on the mark.
+            'posture spike': [128, 130, 133, 136, 138, 140, 138, 135, 132, 130, 128],
+            'one glitch, 37 BPM above both neighbours': [125, 125, 162, 125, 125],
+            // The pulse touches the mark once and a glitch follows: the pair
+            // 141/170 alone would read as held at 141.
+            'a glitch right after one reading on the mark': [136, 138, 141, 170, 139, 135, 130],
+            'hovering, never on the mark twice running': [138, 139, 141, 137, 139, 140, 136, 139, 141, 137]
+        };
+        for (const [name, stream] of Object.entries(streams)) {
+            for (const ceilingBehaviour of ['stop', 'crawl']) {
+                const next = strap({ ...running, activeMode: 'classic', ceilingBehaviour });
+                let edges = 0;
+                for (const bpm of stream) {
+                    const out = next(bpm);
+                    if (out.newEdgeTriggered) edges += 1;
+                    if (bpm >= 140) {
+                        assert.equal(out.isEdged, true, `${name}: no pullback at ${bpm}`);
+                        assert.equal(out.primaryPercent, ceilingBehaviour === 'crawl' ? CRAWL_PERCENT : 0, `${name}: the primary kept going at ${bpm}`);
+                    }
+                }
+                assert.equal(edges, 0, `${name} (${ceilingBehaviour}) counted an edge`);
+            }
+        }
+    });
+
+    it('a sustained climb is counted once, one reading after its pullback', () => {
+        const next = strap({ ...running, activeMode: 'classic', ceilingBehaviour: 'crawl' });
+        const climb = [120, 126, 131, 135, 138, 140, 142, 144, 145, 145, 146, 144];
+        const outs = climb.map((bpm) => next(bpm));
+        const pulledBack = outs.findIndex((out) => out.isEdged);
+        assert.equal(climb[pulledBack], 140, 'the pullback is on the first reading at the mark');
+        assert.equal(outs[pulledBack].primaryPercent, CRAWL_PERCENT);
+        assert.deepEqual(outs.map((out) => out.pullbackStarted), climb.map((_, i) => i === pulledBack), 'and it starts once');
+        const counted = outs.map((out, i) => (out.newEdgeTriggered ? i : -1)).filter((i) => i >= 0);
+        assert.deepEqual(counted, [pulledBack + 1], 'the edge is counted once, on the next reading');
+    });
+
+    it('a strap sending one reading every 5 s is counted on its second reading at the mark', () => {
+        const next = strap({ ...running, activeMode: 'classic' }, { gapMs: 5000 });
+        const outs = [128, 134, 141, 143, 144].map((bpm) => next(bpm));
+        assert.equal(outs[2].isEdged, true, 'the pullback does not wait for the next reading');
+        assert.equal(outs[2].primaryPercent, 0);
+        assert.equal(outs[2].newEdgeTriggered, false);
+        assert.equal(outs[3].newEdgeTriggered, true, '5 s later is inside the 8 s signal-loss timeout');
+        assert.equal(outs[4].newEdgeTriggered, false);
+    });
+
+    it('a reading gap is not a confirmation, and the signal-loss timeout it is given is the gap', () => {
+        const owed = { ...running, activeMode: 'classic', hr: 142, edgeHr: 142, isEdged: true, edgePending: true };
+        // The mark at 1 s, then nothing until 12 s: longer than the 8 s
+        // timeout, so the watchdog called the pulse lost in between.
+        const afterGap = [{ at: 0, bpm: 130 }, { at: 1000, bpm: 141 }, { at: 12000, bpm: 142 }];
+        const first = calculateEngineOutputs({ ...owed, recentReadings: afterGap });
+        assert.equal(first.newEdgeTriggered, false, 'the first reading after the gap confirms nothing');
+        assert.equal(first.edgePending, true);
+        assert.equal(first.isEdged, true, 'and the pullback holds meanwhile');
+        const second = calculateEngineOutputs({ ...owed, recentReadings: [...afterGap, { at: 13000, bpm: 142 }] });
+        assert.equal(second.newEdgeTriggered, true, 'the second one does');
+        // A wearer with a slow relay raised the timeout; the same 11 s gap is
+        // then an ordinary interval.
+        assert.equal(calculateEngineOutputs({ ...owed, recentReadings: afterGap, readingGapMs: 12000 }).newEdgeTriggered, true);
+        assert.equal(calculateEngineOutputs({ ...owed, recentReadings: afterGap, readingGapMs: 8000 }).newEdgeTriggered, false);
+    });
+
+    it('a count still owed waits through a pause and is paid once; nothing is owed off the edge', () => {
+        const owed = { ...running, activeMode: 'classic', hr: 141, edgeHr: 141, isEdged: true, edgePending: true, recentReadings: readingsOf(141, 142, 141) };
+        for (const sessionStatus of ['PAUSED', 'IDLE']) {
+            const paused = calculateEngineOutputs({ ...owed, sessionStatus });
+            assert.equal(paused.newEdgeTriggered, false);
+            assert.equal(paused.isEdged, true);
+            assert.equal(paused.edgePending, true, `${sessionStatus} must not drop the count owed`);
+        }
+        const bad = calculateEngineOutputs({ ...owed, hr: NaN, edgeHr: NaN });
+        assert.equal(bad.edgePending, true, 'nor may bad data');
+        assert.equal(bad.newEdgeTriggered, false);
+        const resumed = calculateEngineOutputs(owed);
+        assert.equal(resumed.newEdgeTriggered, true, 'held after the pause, it is counted');
+        assert.equal(resumed.edgePending, false);
+        assert.equal(resumed.pullbackStarted, false, 'the pullback began before the pause');
+        const after = calculateEngineOutputs({ ...owed, isEdged: resumed.isEdged, edgePending: resumed.edgePending });
+        assert.equal(after.newEdgeTriggered, false, 'once');
+        // A count "owed" with no edge in progress is nothing at all.
+        const stray = calculateEngineOutputs({ ...owed, hr: 120, edgeHr: 120, isEdged: false, recentReadings: readingsOf(120, 120) });
+        assert.equal(stray.edgePending, false);
+        assert.equal(stray.newEdgeTriggered, false);
+        assert.equal(calculateEngineOutputs({ ...owed, isEdged: false, sessionStatus: 'PAUSED' }).edgePending, false);
+    });
+
+    it('Force Orgasm freezes a count still owed, and a cancel judges it against the real mark', () => {
+        const owed = { ...running, activeMode: 'classic', isEdged: true, edgePending: true };
+        const forcing = calculateEngineOutputs({ ...owed, hr: 150, edgeHr: 150, orgasmMode: true, maxHr: 160, recentReadings: readingsOf(150, 150) });
+        assert.equal(forcing.newEdgeTriggered, false, 'no edge is counted during a forced orgasm');
+        assert.equal(forcing.isEdged, true);
+        assert.equal(forcing.edgePending, true);
+        const heldAfter = calculateEngineOutputs({ ...owed, hr: 150, edgeHr: 150, recentReadings: readingsOf(150, 150) });
+        assert.equal(heldAfter.newEdgeTriggered, true, 'still held at the real mark after the cancel: counted, once');
+        const cameDown = calculateEngineOutputs({ ...owed, hr: 120, edgeHr: 120, recentReadings: readingsOf(125, 120) });
+        assert.equal(cameDown.isEdged, false, 'come down meanwhile: released');
+        assert.equal(cameDown.edgePending, false);
+        assert.equal(cameDown.newEdgeTriggered, false, 'and never counted');
+    });
+
+    it('a Soft Landing counts no edge, not even one whose pullback began before it', () => {
+        const owed = { ...running, activeMode: 'classic', hr: 145, edgeHr: 145, isEdged: true, edgePending: true, recentReadings: readingsOf(145, 145) };
+        const landing = calculateEngineOutputs({ ...owed, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 30 });
+        assert.equal(landing.newEdgeTriggered, false);
+        assert.equal(landing.isEdged, true);
+        assert.equal(landing.edgePending, true);
+        assert.equal(landing.primaryPercent, calculateEngineOutputs({ ...owed, isEdged: true, edgePending: false, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 30 }).primaryPercent);
+    });
+
+    it('judges the readings against its own pullback mark', () => {
+        const base = { ...running, activeMode: 'classic', hr: 134, edgeHr: 134, recentReadings: readingsOf(133, 134) };
+        assert.equal(calculateEngineOutputs({ ...base, edgeHoldPercent: 95 }).newEdgeTriggered, true, '95% of 140 is 133');
+        assert.equal(calculateEngineOutputs({ ...base, edgeHoldPercent: 100 }).newEdgeTriggered, false, 'under a 140 mark nothing is held');
+        assert.equal(calculateEngineOutputs({ ...base, edgeHoldPercent: 95, recentReadings: readingsOf(132, 134) }).newEdgeTriggered, false, 'the reading before was under it');
+        // The mark follows the working ceiling the engine is handed.
+        assert.equal(calculateEngineOutputs({ ...base, edgeHoldPercent: 100, maxHr: 134 }).newEdgeTriggered, false, 'the reading before sits under a 134 mark');
+        assert.equal(calculateEngineOutputs({ ...base, edgeHoldPercent: 100, maxHr: 133 }).newEdgeTriggered, true);
+    });
+
+    it('counts only while the measured pulse it is judging is on the mark', () => {
+        // app.js remembers each reading before it runs the engine, so the
+        // readings always end at the sensor pulse. Should they ever not, an
+        // old pair at the mark must not count an edge under a pulse that has
+        // come back down into the release band, and a microphone boost must
+        // not stand in for the sensor either.
+        const owed = { ...running, activeMode: 'classic', isEdged: true, edgePending: true, recentReadings: readingsOf(141, 142) };
+        const inBand = calculateEngineOutputs({ ...owed, hr: 136, edgeHr: 136 });
+        assert.equal(inBand.isEdged, true);
+        assert.equal(inBand.newEdgeTriggered, false);
+        assert.equal(inBand.edgePending, true, 'still owed while the flag is up');
+        const boosted = calculateEngineOutputs({ ...owed, hr: 140, edgeHr: 136 });
+        assert.equal(boosted.newEdgeTriggered, false, 'a boosted pulse on the mark is not the sensor on it');
+        assert.equal(calculateEngineOutputs({ ...owed, hr: 142, edgeHr: 142 }).newEdgeTriggered, true);
+    });
+
+    it('owes a count only while the flag is up, and counts nothing without readings', () => {
+        const next = strap({ ...running, activeMode: 'classic' });
+        next(125);
+        assert.equal(next(150).edgePending, true, 'a glitch raises the flag, and owes a count');
+        const released = next(125);
+        assert.equal(released.isEdged, false);
+        assert.equal(released.edgePending, false, 'the release takes the count owed with it');
+        let seen = 0;
+        for (const sessionStatus of ['RUNNING', 'RAMPDOWN', 'PAUSED', 'IDLE']) {
+            for (const orgasmMode of [false, true]) {
+                for (const isEdged of [false, true]) {
+                    for (const hr of [NaN, 100, 128, 136, 140, 150]) {
+                        const out = calculateEngineOutputs({
+                            ...running, activeMode: 'classic', sessionStatus, orgasmMode, isEdged, edgePending: true,
+                            hr, edgeHr: hr, recentReadings: readingsOf(145, 145)
+                        });
+                        const where = `${sessionStatus} orgasm=${orgasmMode} edged=${isEdged} hr=${hr}`;
+                        assert.ok(!(out.edgePending && !out.isEdged), `${where}: a count owed off the edge`);
+                        assert.ok(!(out.newEdgeTriggered && out.edgePending), `${where}: counted and still owed`);
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert.ok(seen > 50);
+        // A caller that hands over no readings has handed over no evidence.
+        for (const recentReadings of [undefined, [], null, 'junk', readingsOf(150)]) {
+            const out = calculateEngineOutputs({ ...running, activeMode: 'classic', hr: 150, edgeHr: 150, recentReadings });
+            assert.equal(out.isEdged, true, 'the pullback never waits for evidence');
+            assert.equal(out.newEdgeTriggered, false, `readings ${JSON.stringify(recentReadings)} counted an edge`);
+        }
     });
 });
 
@@ -1099,13 +1382,16 @@ describe('game-side edge release', () => {
         assert.equal(hasReleasedEdge(130, 140), true, 'what the 2-argument call wrongly answers');
         assert.equal(hasReleasedEdge(120, 140, trigger), true);
 
+        // The pulse has sat at 130 all along, so the readings hold it there:
+        // a flag cleared under it is raised again and counted at once.
         const phantom = calculateEngineOutputs({
             ...running,
             activeMode: 'oracle',
             oracleState: 'PURGATORY',
             hr: 130,
             isEdged: false,
-            edgeHoldPercent: 90
+            edgeHoldPercent: 90,
+            recentReadings: readingsOf(130, 130)
         });
         assert.equal(phantom.newEdgeTriggered, true, 'clearing the flag at 130 costs one phantom edge');
     });
@@ -1224,7 +1510,9 @@ describe('the microphone boost can never raise either channel', () => {
             const sub = modeStates[mode] || { key: 'unusedState', values: [null] };
             for (const subState of sub.values) {
                 for (const ceilingBehaviour of ['stop', 'crawl']) {
-                    for (const isEdged of [false, true]) {
+                    // Off the edge, on an edge already counted, and on one
+                    // whose count is still owed.
+                    for (const edge of [{ isEdged: false }, { isEdged: true }, { isEdged: true, edgePending: true }]) {
                         for (const orgasmMode of [false, true]) {
                             for (const sessionStatus of ['RUNNING', 'RAMPDOWN']) {
                                 for (const edgeHoldPercent of [90, 100]) {
@@ -1241,7 +1529,7 @@ describe('the microphone boost can never raise either channel', () => {
                                             activeMode: mode,
                                             [sub.key]: subState,
                                             ceilingBehaviour,
-                                            isEdged,
+                                            ...edge,
                                             orgasmMode,
                                             sessionStatus,
                                             edgeHoldPercent,
@@ -1306,15 +1594,19 @@ describe('the microphone boost can never raise either channel', () => {
                 // The boost is clamped to the working ceiling in app.js, so
                 // the loop never sees more than that.
                 for (const boost of [1, 5, 8, 20]) {
-                    const quiet = calculateEngineOutputs({ ...base, hr: sensorHr, edgeHr: sensorHr });
+                    // The measured pulse held on the reading before as well,
+                    // so the count is live wherever the rule allows one.
+                    const recentReadings = readingsOf(sensorHr, sensorHr);
+                    const quiet = calculateEngineOutputs({ ...base, hr: sensorHr, edgeHr: sensorHr, recentReadings });
                     const loud = calculateEngineOutputs({
                         ...base,
                         hr: Math.min(base.maxHr, sensorHr + boost),
-                        edgeHr: sensorHr
+                        edgeHr: sensorHr,
+                        recentReadings
                     });
                     const where = `${base.activeMode}/${base.oracleState || base.trainingState || '-'}`
                         + ` ${base.sessionStatus} ${base.ceilingBehaviour}`
-                        + ` edged=${base.isEdged} orgasm=${base.orgasmMode}`
+                        + ` edged=${base.isEdged}${base.edgePending ? ' (count owed)' : ''} orgasm=${base.orgasmMode}`
                         + ` hr=${sensorHr} +${boost}`;
                     assert.ok(
                         loud.primaryPercent <= quiet.primaryPercent,
@@ -1327,6 +1619,8 @@ describe('the microphone boost can never raise either channel', () => {
                     // A boost must not invent an edge or release one either.
                     assert.equal(loud.isEdged, quiet.isEdged, `${where}: boost moved the edge flag`);
                     assert.equal(loud.newEdgeTriggered, quiet.newEdgeTriggered, `${where}: boost counted an edge`);
+                    assert.equal(loud.edgePending, quiet.edgePending, `${where}: boost settled a count still owed`);
+                    assert.equal(loud.pullbackStarted, quiet.pullbackStarted, `${where}: boost started a pullback`);
                     checked += 1;
                 }
             }
@@ -1841,6 +2135,22 @@ describe('cool-down after edges', () => {
     const FIRST_SECOND = { speed: 0.16, depth: 0.28 };
     const LENGTHS = [1, 2, 3, 5];
     const span = (r) => r.strokeMaxPercent - r.strokeMinPercent;
+    // The output fields the literals below write out: the four motor
+    // numbers, the edge flag, the edge count and the mode, which was the
+    // engine's whole output when this suite was written. It hands back two
+    // more now, edgePending and pullbackStarted, both decided with the edge
+    // flag before any cool-down runs. A literal is compared on the fields it
+    // documents, and the property below checks that a cool-down never moves
+    // the two new ones either.
+    const documented = (r) => ({
+        primaryPercent: r.primaryPercent,
+        secondaryPercent: r.secondaryPercent,
+        strokeMinPercent: r.strokeMinPercent,
+        strokeMaxPercent: r.strokeMaxPercent,
+        isEdged: r.isEdged,
+        newEdgeTriggered: r.newEdgeTriggered,
+        resolvedMode: r.resolvedMode
+    });
 
     it('runs only in the five tease modes: not in Ruin & Leak, not in a game', () => {
         assert.deepEqual(COOLDOWN_MODES, ['classic', 'milker', 'shortener', 'headplay', 'ultimate']);
@@ -1912,7 +2222,7 @@ describe('cool-down after edges', () => {
             cooldownSeconds: 0,
             cooldownMinutes: 2
         });
-        assert.deepEqual(parked, {
+        assert.deepEqual(documented(parked), {
             primaryPercent: 2,
             secondaryPercent: 2,
             strokeMinPercent: 0,
@@ -2045,12 +2355,26 @@ describe('cool-down after edges', () => {
         // into the wake-up by the smaller factor, so whatever the mode, the
         // status, the game state, the guards or the junk in the input, the
         // toys with a cool-down are never faster or longer than without one,
-        // and the edge detector never sees it.
+        // and the edge detector never sees it: not the flag, not the start of
+        // a pullback, not the count and not a count still owed.
         const rnd = mulberry32(31337);
         const cool = mulberry32(1);
         let eased = 0;
+        let counted = 0;
         for (let i = 0; i < 100000; i += 1) {
-            const input = seededInput(rnd);
+            // The count's own inputs are derived from the draw, never drawn,
+            // so the stream is the one this sweep always ran: two readings of
+            // the measured pulse, which hold it wherever it is, and a count
+            // still owed on the edged inputs whose index is a multiple of
+            // three. Without them no edge is ever counted here, and the count
+            // would be compared for nothing.
+            const drawn = seededInput(rnd);
+            const pulse = Number.isFinite(drawn.edgeHr) ? drawn.edgeHr : drawn.hr;
+            const input = {
+                ...drawn,
+                edgePending: drawn.isEdged && i % 3 === 0,
+                recentReadings: [{ at: 1000, bpm: pulse }, { at: 2000, bpm: pulse }]
+            };
             const patch = {
                 cooldownSeconds: cool() < 0.2 ? 0 : between(cool, 0, 400),
                 cooldownMinutes: pick(cool, LENGTHS)
@@ -2077,37 +2401,47 @@ describe('cool-down after edges', () => {
                 || (input.handyHwMin === 0 && input.handyHwMax === 100);
             if (fullEnvelope && !(span(cooled) >= MIN_ZONE_WIDTH)) fail(`the zone is under ${MIN_ZONE_WIDTH} wide`);
             if (cooled.isEdged !== plain.isEdged) fail('isEdged moved');
+            if (cooled.pullbackStarted !== plain.pullbackStarted) fail('pullbackStarted moved');
+            if (cooled.edgePending !== plain.edgePending) fail('edgePending moved');
             if (cooled.newEdgeTriggered !== plain.newEdgeTriggered) fail('newEdgeTriggered moved');
             if (cooled.resolvedMode !== plain.resolvedMode) fail('resolvedMode moved');
             if (cooled.primaryPercent < plain.primaryPercent || span(cooled) < span(plain)) eased += 1;
+            if (plain.newEdgeTriggered) counted += 1;
         }
         // Roughly a quarter of the sweep is a running tease mode outside
         // Force Orgasm, and about half of those draw a cool-down still in
-        // progress: the bound below is a guard against a vacuous sweep, not
-        // a measurement.
+        // progress: the bounds below are guards against a vacuous sweep, not
+        // measurements.
         assert.ok(eased >= 5000, `the sweep must exercise the cool-down, not only its silent paths (${eased} of 100000 eased)`);
+        assert.ok(counted >= 3000, `the sweep must count edges, or the count is compared for nothing (${counted} of 100000 counted)`);
     });
 
     it('golden: cooldownSeconds null or cooldownMinutes 0 is bit-identical to the engine without a cool-down, over every mode', () => {
-        // INV-16. The digests below were taken from the engine as it was just
-        // before the cool-down arrived, which had none at all, over exactly
-        // this sweep: 20 000 seeded inputs per seed, every mode, every status,
-        // junk included. A wearer who never turns the cool-down on gets that
-        // engine to the last digit. A deliberate change to the engine's
-        // numbers has to record new digests here and say so in its commit.
-        // History, so the next person to move them knows what moved them
-        // before. Over this sweep, which also draws ruinSpent (Ruin & Leak's
-        // one-ride flag) and, last, orgasmBoost (the clock 1.1.1's Force
-        // Orgasm ramp reads), release 1.1.2 gives bb2167ce and 52342959. Two
-        // deliberate engine changes moved them: a pattern near-stop crawls at
-        // 1% instead of rounding into a stop (39084f87 and 4322c050), and
-        // Ruin & Leak rides each edge once - a game borrows its stroke but
-        // never its lockout, and Force Orgasm over a spent edge ramps from the
-        // stop - which gives the digests below. An engine that ignored either
-        // drawn field gives different digests, so both are pinned here too.
-        // Release 1.1.0 gave ebd8f3f8 and 853ecdc8 over the sweep as it stood
-        // then, before it drew either field.
-        const GOLDEN = [[20260927, 'b2ebc162'], [424242, '553ece13']];
+        // INV-16. The digests below are those of an engine with no cool-down
+        // at all, over exactly this sweep: 20 000 seeded inputs per seed,
+        // every mode, every status, junk included. A wearer who never turns
+        // the cool-down on gets that engine to the last digit. A deliberate
+        // change to the engine's numbers has to record new digests here and
+        // say so in its commit. History, so the next person to move them
+        // knows what moved them before. Over this sweep, which also draws
+        // ruinSpent (Ruin & Leak's one-ride flag) and, last, orgasmBoost (the
+        // clock 1.1.1's Force Orgasm ramp reads), release 1.1.2 gives bb2167ce
+        // and 52342959. Three deliberate engine changes moved them. A pattern
+        // near-stop crawls at 1% instead of rounding into a stop (39084f87
+        // and 4322c050). Ruin & Leak rides each edge once - a game borrows its
+        // stroke but never its lockout, and Force Orgasm over a spent edge
+        // ramps from the stop - which gives b2ebc162 and 553ece13: the engine
+        // just before the cool-down arrived, and the cool-down with nothing
+        // running left them there. And an edge is counted only once the pulse
+        // has held at the mark, which gives the digests below: this sweep
+        // hands the engine no readings, so a reading on the mark still raises
+        // the flag and pulls back, but no edge is counted (the count has its
+        // own suite above). The engine just before the cool-down, with that
+        // change made to it, gives the same two digests. An engine that
+        // ignored either drawn field gives different digests, so both are
+        // pinned here too. Release 1.1.0 gave ebd8f3f8 and 853ecdc8 over the
+        // sweep as it stood then, before it drew either field.
+        const GOLDEN = [[20260927, '3038b1b4'], [424242, '3b656b53']];
         for (const [seed, digest] of GOLDEN) {
             assert.equal(digestSweep(seed, 20000), digest, `seed ${seed}: the engine with no cool-down fields`);
             assert.equal(
@@ -2181,9 +2515,9 @@ describe('cool-down after edges', () => {
                 newEdgeTriggered,
                 resolvedMode: mode
             };
-            assert.deepEqual(calculateEngineOutputs(input), expected, `${mode} hr ${hr}: no cool-down fields`);
-            assert.deepEqual(calculateEngineOutputs({ ...input, cooldownSeconds: null, cooldownMinutes: 5 }), expected, `${mode} hr ${hr}: cooldownSeconds null`);
-            assert.deepEqual(calculateEngineOutputs({ ...input, cooldownSeconds: 12, cooldownMinutes: 0 }), expected, `${mode} hr ${hr}: cooldownMinutes 0`);
+            assert.deepEqual(documented(calculateEngineOutputs(input)), expected, `${mode} hr ${hr}: no cool-down fields`);
+            assert.deepEqual(documented(calculateEngineOutputs({ ...input, cooldownSeconds: null, cooldownMinutes: 5 })), expected, `${mode} hr ${hr}: cooldownSeconds null`);
+            assert.deepEqual(documented(calculateEngineOutputs({ ...input, cooldownSeconds: 12, cooldownMinutes: 0 })), expected, `${mode} hr ${hr}: cooldownMinutes 0`);
         }
     });
 });

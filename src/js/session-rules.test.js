@@ -22,6 +22,8 @@ import {
     countSurvivalBreach,
     isSurvivalDefeated,
     survivalDrive,
+    survivalEdgesAtSwitch,
+    survivalEdgesAfterEngine,
     SURVIVAL_START_FLOOR,
     SURVIVAL_OVERDRIVE_CAP,
     SURVIVAL_EDGE_BPM,
@@ -68,6 +70,7 @@ import {
 } from './session-rules.js';
 import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM, COOLDOWN_MODES, ENGINE_MODES } from './engine.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS, RUIN_LOCK_SECONDARY } from './patterns.js';
+import { rememberEdgeReading } from './edge-confirm.js';
 
 describe('sanitizeHrLimits', () => {
     it('parses typed strings', () => {
@@ -424,6 +427,174 @@ describe('survival climb', () => {
         const capped = survivalDrive({ seconds: 90 * 60, edges: 80 });
         assert.equal(capped.floor, 100);
         assert.equal(capped.overdriveBpm, SURVIVAL_OVERDRIVE_CAP);
+    });
+
+    it('steps only on an edge the engine counted, never on one reading at the mark', () => {
+        // Each edge the engine counts raises the mark 1 BPM and the speed a
+        // step, and 1.1.2 counted one reading at the mark: the top of a
+        // posture spike, or a single glitch, stepped the climb for the rest
+        // of the run. The count now waits for the pulse to hold there
+        // (edge-confirm.js), and the climb with it. A reading a second, the
+        // way app.js runs Survival: each reading remembered, the engine on
+        // the working ceiling the climb has reached, the climb stepped from
+        // the edges counted so far.
+        const run = (stream) => {
+            let isEdged = false;
+            let edgePending = false;
+            let readings = [];
+            let edges = 0;
+            let overdrive = 0;
+            return stream.map((bpm, i) => {
+                readings = rememberEdgeReading(readings, (i + 1) * 1000, bpm);
+                const { maxHr } = computeEffectiveCeiling({ minHr: 70, maxHr: 140, survivalOverdrive: overdrive });
+                const out = calculateEngineOutputs({
+                    hr: bpm, edgeHr: bpm, minHr: 70, maxHr, activeMode: 'survival', sessionStatus: 'RUNNING',
+                    isEdged, edgePending, recentReadings: readings
+                });
+                isEdged = out.isEdged;
+                edgePending = out.edgePending;
+                if (out.newEdgeTriggered) edges += 1;
+                overdrive = survivalDrive({ seconds: i + 1, edges }).overdriveBpm;
+                return { bpm, isEdged, edges, overdrive };
+            });
+        };
+        const spike = run([128, 132, 136, 138, 140, 138, 134, 130, 128]);
+        assert.ok(spike.some((s) => s.isEdged), 'the reading at the mark still raises the flag');
+        assert.ok(spike.every((s) => s.edges === 0 && s.overdrive === 0), 'a posture spike stepped the climb');
+        assert.ok(run([125, 125, 162, 125, 125]).every((s) => s.overdrive === 0), 'a glitch stepped the climb');
+        const held = run([130, 136, 140, 141, 141, 141]);
+        assert.deepEqual(held.map((s) => s.overdrive), [0, 0, 0, 1, 1, 1].map((n) => n * SURVIVAL_EDGE_BPM),
+            'one step, on the reading that holds the mark, and none for the mark it raised');
+    });
+
+    it('an edge from before it was switched on does not step it, however late it is counted', () => {
+        // 1.1.2: edges from before you switch Survival on do not count. The
+        // switch takes the edges counted so far as seen, and 1.1.2 counted an
+        // edge on the reading its pullback began on, so the edge in progress
+        // at the switch was always one of them. The count now comes a reading
+        // later (edge-confirm.js), so an edge whose pullback began before the
+        // switch can be counted after it, and the counter alone would step
+        // the climb for it for the rest of the run: the working ceiling to
+        // 141 and the speed floor a step up. A reading a second in Classic,
+        // then Survival switched on, the way app.js runs it: each reading
+        // remembered and the engine run on it, Survival's seen edges settled
+        // after every engine call, the switch taking them from the counter
+        // and the edge in progress and running the engine in the new mode,
+        // then each second of Survival stepping the climb for the edges
+        // counted since.
+        const run = (before, after) => {
+            let mode = 'classic';
+            let isEdged = false;
+            let edgePending = false;
+            let readings = [];
+            let edges = 0;
+            let seen = { edgesSeen: 0, owedEdgeSeen: false };
+            let survivalSeconds = 0;
+            let survivalEdges = 0;
+            let overdrive = 0;
+            let t = 0;
+            const engine = (bpm) => {
+                const { maxHr } = computeEffectiveCeiling({ minHr: 70, maxHr: 140, survivalOverdrive: overdrive });
+                const out = calculateEngineOutputs({
+                    hr: bpm, edgeHr: bpm, minHr: 70, maxHr, activeMode: mode, sessionStatus: 'RUNNING',
+                    isEdged, edgePending, recentReadings: readings
+                });
+                if (out.newEdgeTriggered) edges += 1;
+                seen = survivalEdgesAfterEngine(seen, out);
+                isEdged = out.isEdged;
+                edgePending = out.edgePending;
+            };
+            const rows = [];
+            const second = (bpm) => {
+                t += 1;
+                readings = rememberEdgeReading(readings, t * 1000, bpm);
+                engine(bpm);
+                if (mode === 'survival') {
+                    survivalSeconds += 1;
+                    survivalEdges += Math.max(0, edges - seen.edgesSeen);
+                    seen = { ...seen, edgesSeen: edges };
+                    overdrive = survivalDrive({ seconds: survivalSeconds, edges: survivalEdges }).overdriveBpm;
+                }
+                rows.push({ bpm, mode, isEdged, edgePending, edges, overdrive });
+            };
+            before.forEach(second);
+            seen = survivalEdgesAtSwitch({ edges, isEdged, edgePending });
+            mode = 'survival';
+            engine(before[before.length - 1]);
+            after.forEach(second);
+            return rows;
+        };
+        const survival = (rows) => rows.filter((r) => r.mode === 'survival');
+        const owedAtSwitch = (rows) => {
+            const last = rows.filter((r) => r.mode === 'classic').pop();
+            return last.isEdged && last.edgePending && last.edges === 0;
+        };
+
+        // A strap: the pullback on the 140 before the switch, the count on the
+        // 141 after it.
+        const strap = run([120, 128, 134, 138, 140], [141, 142, 142, 142]);
+        assert.ok(owedAtSwitch(strap), 'the edge was pulled back on and owed its count at the switch');
+        assert.equal(survival(strap)[0].edges, 1, 'counted after the switch');
+        assert.ok(strap.every((r) => r.overdrive === 0), 'an edge from before the switch stepped the climb');
+
+        // The pulse touches the mark, hovers under it above the release
+        // point, as it does after a Crawl pullback, and comes back to hold
+        // there only once Survival is on.
+        const hover = run([120, 130, 136, 140, 138, 138, 137, 138, 138], [139, 141, 142, 142]);
+        assert.ok(owedAtSwitch(hover));
+        assert.deepEqual(survival(hover).map((r) => r.edges), [0, 0, 1, 1]);
+        assert.ok(hover.every((r) => r.overdrive === 0), 'an edge from before the switch stepped the climb');
+
+        // Counted before the switch, as 1.1.2 always counted it.
+        const counted = run([120, 128, 134, 138, 140, 141], [142, 142, 142]);
+        assert.ok(counted.every((r) => r.overdrive === 0));
+
+        // Released before it was counted, the edge is never counted, and the
+        // next one, begun with Survival on, steps the climb once.
+        const released = run([120, 128, 134, 138, 140], [133, 130, 136, 140, 141, 141]);
+        assert.ok(owedAtSwitch(released));
+        assert.deepEqual(survival(released).map((r) => r.overdrive), [0, 0, 0, 0, 1, 1].map((n) => n * SURVIVAL_EDGE_BPM));
+        assert.equal(released[released.length - 1].edges, 1);
+
+        // Its count made after the switch, the next edge still steps it.
+        const next = run([120, 128, 134, 138, 140], [141, 142, 133, 130, 138, 140, 141, 141]);
+        assert.deepEqual(survival(next).map((r) => r.overdrive), [0, 0, 0, 0, 0, 0, 1, 1].map((n) => n * SURVIVAL_EDGE_BPM));
+        assert.equal(next[next.length - 1].edges, 2);
+    });
+
+    it('holds the count owed at the switch as seen until it is made, and forgets it when the flag releases', () => {
+        assert.deepEqual(survivalEdgesAtSwitch({ edges: 3, isEdged: true, edgePending: true }), { edgesSeen: 3, owedEdgeSeen: true });
+        assert.deepEqual(survivalEdgesAtSwitch({ edges: 3, isEdged: true, edgePending: false }), { edgesSeen: 3, owedEdgeSeen: false },
+            'an edge already counted is seen by the counter');
+        assert.deepEqual(survivalEdgesAtSwitch({ edges: 3, isEdged: false, edgePending: true }), { edgesSeen: 3, owedEdgeSeen: false },
+            'no count is owed without the flag');
+        assert.deepEqual(survivalEdgesAtSwitch({ edges: NaN }), { edgesSeen: 0, owedEdgeSeen: false });
+        const owed = { edgesSeen: 3, owedEdgeSeen: true };
+        assert.deepEqual(survivalEdgesAfterEngine(owed, { newEdgeTriggered: true, edgePending: false }), { edgesSeen: 4, owedEdgeSeen: false },
+            'made, the owed count is seen, not stepped');
+        assert.deepEqual(survivalEdgesAfterEngine(owed, { newEdgeTriggered: false, edgePending: true }), owed,
+            'still owed - no second reading yet, a pause, Force Orgasm - it is held');
+        assert.deepEqual(survivalEdgesAfterEngine(owed, { newEdgeTriggered: false, edgePending: false }), { edgesSeen: 3, owedEdgeSeen: false },
+            'the flag released first: that edge is never counted');
+        assert.deepEqual(survivalEdgesAfterEngine(owed, { pullbackStarted: true, edgePending: true }), { edgesSeen: 3, owedEdgeSeen: false },
+            'a pullback that starts is a new edge');
+        assert.deepEqual(survivalEdgesAfterEngine(owed, { pullbackStarted: true, newEdgeTriggered: true }), { edgesSeen: 3, owedEdgeSeen: false },
+            'a new edge counted on its first engine call steps the climb');
+        assert.deepEqual(survivalEdgesAfterEngine({ edgesSeen: 3, owedEdgeSeen: false }, { newEdgeTriggered: true }), { edgesSeen: 3, owedEdgeSeen: false },
+            'with nothing owed, a count is the climb\'s to step');
+    });
+
+    it('app.js takes the owed count at the switch and settles it after its one engine call', () => {
+        const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+        const reset = src.match(/function resetGameState\(\) \{[\s\S]*?\n\}/);
+        assert.ok(reset, 'resetGameState moved');
+        assert.match(reset[0], /survivalEdgesAtSwitch\(\{ edges: state\.edges, isEdged: state\.isEdged, edgePending: state\.edgePending \}\)/);
+        assert.match(reset[0], /state\.survivalOwedEdgeSeen = /);
+        const engine = src.match(/function updateEngine\(\) \{[\s\S]*?\n\}/);
+        assert.ok(engine, 'updateEngine moved');
+        assert.match(engine[0], /survivalEdgesAfterEngine\([^;]*\bresult\s*\)/);
+        assert.match(engine[0], /state\.survivalOwedEdgeSeen = /);
+        assert.equal((src.match(/calculateEngineOutputs\(/g) || []).length, 1, 'app.js runs the engine somewhere the owed count is not settled');
     });
 
     it('does not end the session when the pulse crosses the max', () => {
@@ -934,13 +1105,16 @@ describe('describeStallPauseNotice', () => {
 // ---- Ruin & Leak: one ride per edge ----------------------------------------
 
 // A session driven the way app.js drives it, one second at a time. The pulse
-// readings that arrived since the last tick come first (recordHrReading runs
-// the engine on each), then the 1 s master tick: the engine, then the Ruin
-// clock and the stall guard in the one step app.js calls, then the engine
-// again - whose output is what the toys hold until the next tick. A new edge
-// re-arms the ride on whichever engine call counts it, as updateEngine does.
-// Force Orgasm's clock runs the way app.js keeps it: back to 0 on every
-// toggle, +1 after the guards on every second it is on (capped at
+// readings that arrived since the last tick come first (recordHrReading
+// remembers each and runs the engine on it), then the 1 s master tick: the
+// engine, then the Ruin clock and the stall guard in the one step app.js
+// calls, then the engine again - whose output is what the toys hold until
+// the next tick. A new edge re-arms the ride on whichever engine call raises
+// its flag, and is counted on whichever call finds it held, as updateEngine
+// does. A second with no reading (`pulse` gives null) is a slow relay: the
+// ticks run on the last reading, and `readingGapMs` is the signal-loss
+// timeout. Force Orgasm's clock runs the way app.js keeps it: back to 0 on
+// every toggle, +1 after the guards on every second it is on (capped at
 // ORGASM_BOOST_CAP), and the working ceiling raised by it, so the ramp moves
 // exactly as it does in the page.
 // Each row is one second: what the toys were sent, and the state behind it.
@@ -953,9 +1127,13 @@ function driveSession({
     holdTimeoutSeconds = DEFAULT_STALL_GUARD_SECONDS,
     pauseTimeoutSeconds = DEFAULT_STALL_PAUSE_SECONDS,
     orgasm = () => false,
-    intensityValue = 50
+    intensityValue = 50,
+    readingGapMs
 }) {
     let isEdged = false;
+    let edgePending = false;
+    let readings = [];
+    let lastHr = NaN;
     let edges = 0;
     let ruin = { rideSeconds: 0, lockSeconds: 0, spent: false };
     let guard = { holdSeconds: 0, pauseSeconds: 0, engaged: false };
@@ -974,6 +1152,9 @@ function driveSession({
             strokeMode: TEASE_MODES.includes(activeMode) ? activeMode : 'ruin',
             sessionStatus: 'RUNNING',
             isEdged,
+            edgePending,
+            recentReadings: readings,
+            readingGapMs,
             orgasmMode,
             orgasmBoost: boost,
             sessionSeconds: t,
@@ -985,10 +1166,9 @@ function driveSession({
             ruinSpent: ruin.spent
         });
         isEdged = out.isEdged;
-        if (out.newEdgeTriggered) {
-            edges += 1;
-            ruin = startRuinEdge(ruin);
-        }
+        edgePending = out.edgePending;
+        if (out.pullbackStarted) ruin = startRuinEdge(ruin);
+        if (out.newEdgeTriggered) edges += 1;
         return out;
     };
     for (let t = 1; t <= seconds; t += 1) {
@@ -998,9 +1178,15 @@ function driveSession({
             orgasmOn = orgasmMode;
             orgasmBoost = 0;
         }
-        const readings = [].concat(pulse(t));
-        for (const bpm of readings) engine(t, bpm, activeMode, orgasmMode);
-        const hr = readings[readings.length - 1];
+        const packets = [].concat(pulse(t)).filter((bpm) => bpm !== null && bpm !== undefined);
+        packets.forEach((bpm, i) => {
+            // A strap's reading a second, and each packet of a busier second
+            // a millisecond after the one before it.
+            readings = rememberEdgeReading(readings, t * 1000 + i, bpm);
+            lastHr = bpm;
+            engine(t, bpm, activeMode, orgasmMode);
+        });
+        const hr = lastHr;
         engine(t, hr, activeMode, orgasmMode);
         const step = tickRuinAndStallGuard({ ruin, guard }, {
             activeMode, isEdged, orgasmMode, stallGuard, ceilingBehaviour, holdTimeoutSeconds, pauseTimeoutSeconds
@@ -1098,7 +1284,11 @@ describe('Ruin & Leak rides each edge once', () => {
         const released = rows.filter((r) => r.t >= 120 && r.t < 125);
         assert.ok(released.every((r) => !r.isEdged), 'the dip below the release point released the edge');
         assert.ok(released.some((r) => r.primary > 0), 'off the edge, Ruin teases again');
-        assert.equal(at(rows, 125).edges, 2, 'the next crossing is a new edge');
+        // The next crossing is a new edge. Its ride starts on the crossing
+        // itself; it is counted a reading later, once the pulse has held at
+        // the mark (this used to assert the count on the crossing).
+        assert.ok(at(rows, 125).isEdged && at(rows, 125).edges === 1, 'the crossing pulls back, and is not counted yet');
+        assert.equal(at(rows, 126).edges, 2, 'held for a second reading, the crossing is a new edge');
         const ride = rows.filter((r) => r.t >= 125 && r.t < second);
         assert.ok(ride.length > 0 && ride.length <= RUIN_RIDE_SECONDS);
         assert.ok(ride.every((r) => r.primary > 0), 'the new edge gets its ride');
@@ -1122,7 +1312,9 @@ describe('Ruin & Leak rides each edge once', () => {
             seconds: 120,
             pulse: (t) => (t >= lockAt + 4 && t < lockAt + 7 ? 120 : base(t))
         });
-        assert.equal(at(back, lockAt + 7).edges, 2, 'the climb back is a new edge');
+        // Counted on its second reading at the mark (it used to be the first).
+        assert.equal(at(back, lockAt + 7).edges, 1, 'one reading back on the mark is not an edge yet');
+        assert.equal(at(back, lockAt + 8).edges, 2, 'the climb back is a new edge');
         for (let t = lockAt; t < lockAt + RUIN_LOCK_SECONDS; t += 1) {
             assert.equal(at(back, t).primary, 0, `the new edge rode inside the lockout at t=${t}`);
         }
@@ -1135,8 +1327,11 @@ describe('Ruin & Leak rides each edge once', () => {
     });
 
     it('a pulse that releases and crosses back between two ticks still earns its ride; one that does not release does not', () => {
-        // The tick only reads the edge flag once a second. The engine counts
-        // the edge on the reading itself, and that is what re-arms the ride.
+        // The tick only reads the edge flag once a second. The engine raises
+        // the flag on the reading itself, and that is what re-arms the ride:
+        // the ride is part of the pullback, and does not wait for the count,
+        // which comes on the next reading (this used to assert the count at
+        // the crossing, when the count was what re-armed it).
         const run = (dip) => driveSession({
             seconds: 90,
             pulse: (t) => {
@@ -1146,12 +1341,38 @@ describe('Ruin & Leak rides each edge once', () => {
             }
         });
         const released = run(140 - EDGE_RELEASE_BPM - 1);
-        assert.equal(at(released, 60).edges, 2);
+        assert.equal(at(released, 60).edges, 1, 'one reading at the mark after the dip is not an edge yet');
         assert.ok(at(released, 60).primary > 0, 'the new edge rides');
+        assert.equal(at(released, 61).edges, 2, 'held on the next reading, it is counted');
         assert.equal(lockStarts(released).length, 2);
         const held = run(140 - EDGE_RELEASE_BPM);
         assert.equal(at(held, 60).edges, 1);
         assert.ok(held.filter((r) => r.t >= 60).every((r) => r.primary === 0), 'no release, no ride');
+    });
+
+    it("a slow relay's second reading neither starts the ride over nor gives the edge a second one", () => {
+        // An edge is counted a reading after its pullback, and on a relay app
+        // that sends a reading every 15 s (with the signal-loss timeout raised
+        // to 20 s, so the session runs at all) that reading comes after the
+        // 12 s ride has already ended in the lockout. The ride belongs to the
+        // pullback: re-armed on the count, it would have handed this one edge
+        // a second ride the moment its lockout ran out.
+        const rows = driveSession({
+            seconds: 120,
+            pulse: (t) => (t % 15 === 0 ? (t < 30 ? 100 : 145) : null),
+            readingGapMs: 20000
+        });
+        const onset = rows.find((r) => r.isEdged).t;
+        assert.equal(onset, 30);
+        assert.equal(at(rows, onset).edges, 0, 'one reading on the mark is not an edge yet');
+        assert.equal(at(rows, onset + 14).edges, 0);
+        assert.equal(at(rows, onset + 15).edges, 1, 'the second reading, 15 s on, counts it');
+        const [lockAt, ...more] = lockStarts(rows);
+        assert.equal(lockAt - onset + 1, RUIN_RIDE_SECONDS, 'the ride ran its 12 s from the pullback');
+        assert.ok(lockAt < onset + 15, 'and was over before the edge was counted');
+        assert.equal(more.length, 0, 'one lockout');
+        assert.ok(rows.filter((r) => r.t >= lockAt).every((r) => r.primary === 0), 'and no second ride on the same edge');
+        assert.equal(at(rows, 120).edges, 1);
     });
 
     it('switching modes, re-selecting Ruin or running a game does not hand out a second ride', () => {

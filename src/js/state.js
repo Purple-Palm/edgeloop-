@@ -22,6 +22,10 @@ export const state = {
     pauses: 0,
     peakHr: 70,
     isEdged: false,
+    // The edge flag is up - the pullback began on a reading at the mark - but
+    // the edge is not counted yet, because the pulse has not held there on a
+    // second reading (edge-confirm.js). Never true while isEdged is false.
+    edgePending: false,
     orgasmMode: false,
     // Force Orgasm raises the WORKING ceiling by 1 BPM/s (capped) instead of
     // rewriting the typed Climax HR input; cleared by stop/reset.
@@ -98,6 +102,11 @@ export const state = {
     survivalEdges: 0,
     survivalOverdrive: 0,
     survivalEdgesSeen: 0,
+    // True while the edge that was in progress when Survival was switched on
+    // is still owed its count (edge-confirm.js). It is an edge from before the
+    // switch, so that count is seen when it is made, not stepped
+    // (survivalEdgesAtSwitch).
+    survivalOwedEdgeSeen: false,
     survivalBreachTicks: 0,
     // Timestamp of the reading the last Survival tick judged, so a value held
     // across ticks by a slow source counts as one breach reading.

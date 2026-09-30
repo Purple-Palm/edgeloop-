@@ -465,12 +465,14 @@ export function tickRuin(
     return { rideSeconds: ride, lockSeconds: lock, spent: used };
 }
 
-// The engine has just counted a new edge. It only ever counts one after a
-// release, and a release is what re-arms the ride. The 1 s tick sees most
-// releases itself, but a pulse that drops through the release point and
-// crosses the mark again between two ticks reads to the tick as one unbroken
-// edge; this is the engine's own word that it was two. A lockout that is
-// already running is kept: the new edge rides once it has been served.
+// The engine has just raised its edge flag: a new edge's pullback has begun.
+// It only ever raises it after a release, and a release is what re-arms the
+// ride. The 1 s tick sees most releases itself, but a pulse that drops
+// through the release point and crosses the mark again between two ticks
+// reads to the tick as one unbroken edge; this is the engine's own word that
+// it was two. It is the flag and not the edge count, which waits a reading
+// longer (edge-confirm.js): the ride is part of the pullback. A lockout that
+// is already running is kept: the new edge rides once it has been served.
 export function startRuinEdge({ lockSeconds = 0 } = {}) {
     return { rideSeconds: 0, lockSeconds: Math.min(RUIN_LOCK_SECONDS, wholeSeconds(lockSeconds)), spent: false };
 }
@@ -583,6 +585,40 @@ export function survivalDrive({ seconds = 0, edges = 0 } = {}) {
     ), 5, 100);
     const overdriveBpm = clamp(n * SURVIVAL_EDGE_BPM, 0, SURVIVAL_OVERDRIVE_CAP);
     return { floor, overdriveBpm };
+}
+
+// Which counted edges step Survival's climb. Edges from before it was
+// switched on do not (1.1.2): the switch takes every edge counted so far as
+// seen, and each second of Survival steps the climb once for each edge
+// counted since, and sees those too (app.js). But an edge is counted a
+// reading after its pullback began, once the pulse has held at the mark
+// (edge-confirm.js) - 1.1.2 counted it on the reading the pullback began on -
+// so the edge in progress at the switch may still be owed its count. Its
+// pullback began before the switch, so it is an edge from before the switch
+// however late its count comes: `owedEdgeSeen` holds that count as seen
+// until it is made.
+export function survivalEdgesAtSwitch({ edges = 0, isEdged = false, edgePending = false } = {}) {
+    return {
+        edgesSeen: Math.max(0, Math.floor(Number(edges) || 0)),
+        owedEdgeSeen: Boolean(isEdged) && Boolean(edgePending)
+    };
+}
+
+// Survival's seen edges after one engine call. A count made while the owed
+// count is held as seen is that count - the flag has stayed up since the
+// switch - and it is seen, not stepped. Made, or never to be made because the
+// flag released first, it is owed no longer. A pullback that starts is a new
+// edge - the flag went down somewhere in between - so it forgets the owed
+// count too, and the new edge's count steps the climb.
+export function survivalEdgesAfterEngine(
+    { edgesSeen = 0, owedEdgeSeen = false } = {},
+    { newEdgeTriggered = false, edgePending = false, pullbackStarted = false } = {}
+) {
+    const owed = Boolean(owedEdgeSeen) && !pullbackStarted;
+    return {
+        edgesSeen: Math.max(0, Math.floor(Number(edgesSeen) || 0)) + (owed && newEdgeTriggered ? 1 : 0),
+        owedEdgeSeen: owed && !newEdgeTriggered && Boolean(edgePending)
+    };
 }
 
 // Edge Training: climb to the pullback mark, hold there for holdGoal
