@@ -170,6 +170,28 @@ describe('sanitizeTelemetry', () => {
         assert.ok(/isRemotePage \? '' :/.test(syncBody), 'a remote page must not show its own Edge Training numbers');
     });
 
+    it('carries the host\'s Force Orgasm countdown and why it would refuse to switch it on', () => {
+        const t = sanitizeTelemetry({ type: 'TELEMETRY', orgasmSecondsLeft: 61, orgasmRefusal: 'landing' });
+        assert.equal(t.orgasmSecondsLeft, 61);
+        assert.equal(t.orgasmRefusal, 'landing');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmRefusal: '' }).orgasmRefusal, '', 'nothing to refuse is a real answer');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmRefusal: 'idle' }).orgasmRefusal, 'idle');
+        // Never longer than the longest limit the host offers, never negative.
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmSecondsLeft: 99999 }).orgasmSecondsLeft, 180);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmSecondsLeft: -5 }).orgasmSecondsLeft, 0);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmSecondsLeft: '45.4' }).orgasmSecondsLeft, 45);
+        // Anything else leaves the partner's page as it was.
+        for (const junk of ['abc', null, true, {}]) {
+            assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmSecondsLeft: junk }).orgasmSecondsLeft, undefined, String(junk));
+        }
+        for (const junk of ['LANDING', 'forcing', 0, false, null, {}]) {
+            assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', orgasmRefusal: junk }).orgasmRefusal, undefined, String(junk));
+        }
+        const bare = sanitizeTelemetry({ type: 'TELEMETRY' });
+        assert.equal(bare.orgasmSecondsLeft, undefined);
+        assert.equal(bare.orgasmRefusal, undefined);
+    });
+
     it('normalises the watchdog block', () => {
         const t = sanitizeTelemetry({ type: 'TELEMETRY', hrSignal: { status: 'weird', noContact: 1, silentMs: '2500' } });
         assert.deepEqual(t.hrSignal, { status: 'ok', noContact: true, silentMs: 2500 });

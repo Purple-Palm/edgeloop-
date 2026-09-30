@@ -77,16 +77,18 @@ export function motion(seconds, salt = 0, nearness = 0) {
     };
 }
 
-// Force Orgasm. `boost` is seconds since the button (the same 1 BPM/s the
-// ceiling already climbs). The motors ease up over ORGASM_RAMP_SECONDS and
-// keep a wave at the top, instead of slamming every channel to a flat max.
+// Force Orgasm. `boost` is seconds since the ramp began (the same 1 BPM/s
+// the ceiling already climbs). The motors ease over ORGASM_RAMP_SECONDS from
+// what the toys were last sent to the top drawn here, which keeps a wave
+// instead of slamming every channel to a flat max. The engine does the
+// easing, on the output as it is dispatched; this draws the top and says how
+// far along the ramp is.
 export const ORGASM_RAMP_SECONDS = 28;
 
 export function orgasmFrame(seconds, boost = 0) {
-    const ramp = clamp((Number(boost) || 0) / ORGASM_RAMP_SECONDS, 0, 1);
     // Linear, so the first seconds are already hotter. A smoothstep sits
     // flat at the start and the button feels like it did nothing.
-    const ease = ramp;
+    const ease = clamp((Number(boost) || 0) / ORGASM_RAMP_SECONDS, 0, 1);
     const a = wobble(seconds, 4.7, 1.2);
     const b = wobble(seconds, 7.9, 3.4);
     const c = wobble(seconds, 11.3, 0.6);
@@ -94,7 +96,9 @@ export function orgasmFrame(seconds, boost = 0) {
         ease,
         primary: 78 + 22 * a,
         secondary: 70 + 30 * (0.6 * c + 0.4 * b),
-        depth: clamp(1 - ease * 0.34 * (1 - b), 0.66, 1)
+        // The stroke at the top: the whole window, which the wave shortens
+        // to no less than two thirds of it.
+        depth: clamp(1 - 0.34 * (1 - b), 0.66, 1)
     };
 }
 

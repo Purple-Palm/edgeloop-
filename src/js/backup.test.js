@@ -352,6 +352,27 @@ describe('an older file still imports', () => {
     });
 });
 
+describe("Force Orgasm's time limit rides in the backup", () => {
+    it('a chosen limit, Off included, goes out and comes back as it was', () => {
+        for (const forceOrgasmMaxSeconds of [60, 90, 120, 180, 0]) {
+            const file = buildBackup({ ...STORES, settings: { ...STORES.settings, forceOrgasmMaxSeconds } }, { now: NOW });
+            assert.equal(file.settings.forceOrgasmMaxSeconds, forceOrgasmMaxSeconds);
+            const read = readBackup(JSON.parse(JSON.stringify(file)));
+            assert.equal(read.ok, true);
+            assert.equal(read.settings.forceOrgasmMaxSeconds, forceOrgasmMaxSeconds);
+        }
+    });
+
+    it('a value no control writes comes back as the factory 90 s, never as Off', () => {
+        for (const junk of [45, 'off', '', null, false, true, -90, 3600, [0]]) {
+            const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: { forceOrgasmMaxSeconds: junk } });
+            assert.equal(read.ok, true);
+            assert.equal(read.settings.forceOrgasmMaxSeconds, 90, JSON.stringify(junk));
+            assert.deepEqual(read.requested, { forceOrgasmMaxSeconds: junk }, 'and the import can tell it was corrected');
+        }
+    });
+});
+
 describe('a hand-edited or hostile file cannot do harm', () => {
     it('refuses anything that is not an object', () => {
         for (const junk of [null, 42, 'settings', [1, 2, 3], true]) {

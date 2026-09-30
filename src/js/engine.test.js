@@ -24,8 +24,13 @@ import {
     GAME_MODES,
     cooldownShape
 } from './engine.js';
-import { MIN_MOVING_PERCENT, warmupShape, roundSpeed } from './patterns.js';
+import { MIN_MOVING_PERCENT, warmupShape, roundSpeed, ORGASM_RAMP_SECONDS } from './patterns.js';
 import { rememberEdgeReading } from './edge-confirm.js';
+
+// A plausible last dispatch for Force Orgasm's ramp to start from: speeds
+// and a stroke window on the physical travel, as app.js hands them to the
+// drivers.
+const SENT_MID = { primary: 40, secondary: 30, strokeMin: 10, strokeMax: 70 };
 
 // The readings a chest strap sent, one a second, oldest first, ending with
 // the current one: what app.js hands the engine as recentReadings.
@@ -713,6 +718,378 @@ describe('engine modes', () => {
         });
         assert.equal(done.primaryPercent, sameBeat.primaryPercent);
         assert.equal(done.strokeMaxPercent, sameBeat.strokeMaxPercent);
+    });
+});
+
+describe('Force Orgasm starts from what the toys were last sent', () => {
+    // 1.1.1 blended the ramp from the mode's own speeds worked out again with
+    // no ceiling rule, no warm-up and no cool-down, so its first tick was never
+    // what the toys were doing. Measured in the page on 1.1.2 with a mocked
+    // Handy: armed on the mark with Crawl, The Handy was sent PUT /hamp/stop,
+    // and /hamp/start a second later; armed 12 s into a five-minute warm-up at
+    // 95 BPM, it went from 13% to 75% in one tick. app.js now hands the engine
+    // what it last dispatched, and the ramp eases from exactly that.
+    const asSent = (out) => ({
+        primary: out.primaryPercent,
+        secondary: out.secondaryPercent,
+        strokeMin: out.strokeMinPercent,
+        strokeMax: out.strokeMaxPercent
+    });
+    const sentBy = (input) => asSent(calculateEngineOutputs(input));
+
+    // Where the defect was measured, and every mode's own way of holding the
+    // toys: each is what the wearer was being sent when Force Orgasm went on.
+    const SITUATIONS = [
+        ['on the mark with Crawl', { activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' }],
+        ['on the mark with Full Stop', { activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'stop' }],
+        ['in the warm-up', { activeMode: 'classic', hr: 95, edgeHr: 95, warmupMinutes: 5, sessionSeconds: 12 }],
+        ['in a cool-down', { activeMode: 'classic', hr: 110, edgeHr: 110, cooldownSeconds: 5, cooldownMinutes: 2 }],
+        ['Glans Protector on the mark', { activeMode: 'shortener', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' }],
+        ['Head Play on the mark', { activeMode: 'headplay', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' }],
+        ['Prostate Milker mid-band', { activeMode: 'milker', hr: 115, edgeHr: 115 }],
+        ['a Ruin & Leak ride', { activeMode: 'ruin', hr: 140, edgeHr: 140, isEdged: true }],
+        ['a Ruin & Leak lockout', { activeMode: 'ruin', hr: 140, edgeHr: 140, isEdged: true, ruinHoldSeconds: 8, ruinSpent: true }],
+        ['an Oracle hold', { activeMode: 'oracle', oracleState: 'HOLD', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' }],
+        ['Survival', { activeMode: 'survival', survivalSpeedFloor: 35, hr: 120, edgeHr: 120 }],
+        ['an Edge Training hold', { activeMode: 'edgetrain', trainingState: 'hold', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' }],
+        ['a stall pause', { activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl', stallGuardEngaged: true }],
+        ['a narrow travel envelope', { activeMode: 'headplay', hr: 128, edgeHr: 128, handyHwMin: 30, handyHwMax: 63 }]
+    ];
+    const INTENSITIES = [0, 50, 100];
+    const T0 = 40;
+
+    it('the first tick sends exactly what was sent, in every situation', () => {
+        for (const [where, patch] of SITUATIONS) {
+            for (const intensityValue of INTENSITIES) {
+                const before = { ...running, sessionSeconds: T0, ...patch, intensityValue };
+                const sent = sentBy(before);
+                const armed = calculateEngineOutputs({ ...before, orgasmMode: true, orgasmBoost: 0, orgasmFrom: sent });
+                assert.deepEqual(asSent(armed), sent, `${where}, intensity ${intensityValue}`);
+                // Told nothing, the engine starts from what it sends without
+                // Force Orgasm this second - for a caller that runs it every
+                // second, the same thing.
+                const untold = calculateEngineOutputs({ ...before, orgasmMode: true, orgasmBoost: 0 });
+                assert.deepEqual(asSent(untold), sent, `${where}, intensity ${intensityValue}, nothing said about what was sent`);
+            }
+        }
+        // The measured cases in numbers: the crawl stays the crawl, and the
+        // warm-up's slow short stroke stays slow and short.
+        const crawl = { ...running, activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' };
+        const crawlSent = sentBy(crawl);
+        assert.equal(crawlSent.primary, CRAWL_PERCENT);
+        assert.equal(calculateEngineOutputs({ ...crawl, orgasmMode: true, orgasmBoost: 0, orgasmFrom: crawlSent }).primaryPercent, CRAWL_PERCENT);
+        const warm = { ...running, activeMode: 'classic', hr: 95, edgeHr: 95, warmupMinutes: 5, sessionSeconds: 12 };
+        const warmSent = sentBy(warm);
+        assert.ok(warmSent.primary < 20 && warmSent.strokeMax < 30, `the warm-up fixture must be slow and short: ${JSON.stringify(warmSent)}`);
+        assert.deepEqual(asSent(calculateEngineOutputs({ ...warm, orgasmMode: true, orgasmBoost: 0, orgasmFrom: warmSent })), warmSent);
+    });
+
+    it('each second adds one ORGASM_RAMP_SECONDS-th of the way to the top, and a moving toy never gets 0%', () => {
+        for (const [where, patch] of SITUATIONS) {
+            for (const intensityValue of INTENSITIES) {
+                const before = { ...running, sessionSeconds: T0, ...patch, intensityValue };
+                const sent = sentBy(before);
+                let previous = asSent(calculateEngineOutputs({ ...before, orgasmMode: true, orgasmBoost: 0, orgasmFrom: sent }));
+                for (let boost = 1; boost <= ORGASM_RAMP_SECONDS + 4; boost += 1) {
+                    const at = { ...before, sessionSeconds: T0 + boost, orgasmMode: true, orgasmFrom: sent };
+                    const out = asSent(calculateEngineOutputs({ ...at, orgasmBoost: boost }));
+                    // The top of this very second: what the ramp is heading for.
+                    const top = asSent(calculateEngineOutputs({ ...at, orgasmBoost: ORGASM_RAMP_SECONDS }));
+                    const share = Math.min(1, boost / ORGASM_RAMP_SECONDS);
+                    const tag = `${where}, intensity ${intensityValue}, ${boost} s in`;
+                    for (const key of ['primary', 'secondary', 'strokeMin', 'strokeMax']) {
+                        const line = sent[key] + (top[key] - sent[key]) * share;
+                        assert.ok(Math.abs(out[key] - line) <= 1, `${tag}: ${key} ${out[key]} is off the straight line (${line.toFixed(2)})`);
+                    }
+                    if (sent.primary > 0) assert.ok(out.primary >= MIN_MOVING_PERCENT, `${tag}: a moving primary was handed ${out.primary}%`);
+                    if (sent.secondary > 0) assert.ok(out.secondary >= MIN_MOVING_PERCENT, `${tag}: a moving secondary was handed ${out.secondary}%`);
+                    if (boost === 1) {
+                        // The first second after the arming is one small step.
+                        for (const key of ['primary', 'secondary']) {
+                            const step = Math.abs(out[key] - previous[key]);
+                            const allowed = Math.ceil(Math.abs(top[key] - sent[key]) / ORGASM_RAMP_SECONDS) + 1;
+                            assert.ok(step <= allowed, `${tag}: ${key} jumped ${previous[key]} -> ${out[key]}`);
+                        }
+                    }
+                    previous = out;
+                }
+            }
+        }
+    });
+
+    it('the ramp is the same over every mode once it knows what was sent', () => {
+        // The overdrive is applied to what the toys were sent and not to a
+        // frame of the mode's worked out again, so neither the mode nor the
+        // pulse, the edge, the warm-up, the cool-down or the stall guard
+        // underneath can move it.
+        const sent = { primary: 12, secondary: 20, strokeMin: 0, strokeMax: 60 };
+        for (const boost of [0, 1, 7, 14, 21, 28, 40]) {
+            const seen = new Set();
+            for (const [, patch] of SITUATIONS.filter(([where]) => where !== 'a narrow travel envelope')) {
+                const out = calculateEngineOutputs({ ...running, ...patch, sessionSeconds: 90, orgasmMode: true, orgasmBoost: boost, orgasmFrom: sent });
+                seen.add(JSON.stringify(asSent(out)));
+            }
+            assert.equal(seen.size, 1, `${boost} s in: ${[...seen].join(' / ')}`);
+        }
+    });
+
+    it('a stopped toy starts from the stop: a pause, a stall halt, Full Stop', () => {
+        // What a pause sends every driver: both channels at 0 over the whole
+        // travel. RESUME starts the ramp again from it (app.js).
+        const stop = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
+        const first = calculateEngineOutputs({ ...running, orgasmMode: true, orgasmBoost: 0, orgasmFrom: stop });
+        assert.deepEqual(asSent(first), stop);
+        const second = calculateEngineOutputs({
+            ...running, sessionSeconds: running.sessionSeconds + 1, orgasmMode: true, orgasmBoost: 1, orgasmFrom: stop
+        });
+        assert.ok(second.primaryPercent >= MIN_MOVING_PERCENT && second.primaryPercent <= 5, `one second in: ${second.primaryPercent}%`);
+        assert.ok(second.secondaryPercent >= MIN_MOVING_PERCENT && second.secondaryPercent <= 5, `one second in: ${second.secondaryPercent}%`);
+        // The stop's window is held inside a narrower travel envelope.
+        const boxed = calculateEngineOutputs({ ...running, handyHwMin: 15, handyHwMax: 80, orgasmMode: true, orgasmBoost: 0, orgasmFrom: stop });
+        assert.deepEqual(asSent(boxed), { primary: 0, secondary: 0, strokeMin: 15, strokeMax: 80 });
+    });
+
+    it('at the top the output no longer depends on where the ramp started', () => {
+        const origins = [
+            SENT_MID,
+            { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 },
+            { primary: 100, secondary: 100, strokeMin: 50, strokeMax: 100 },
+            null
+        ];
+        for (const boost of [ORGASM_RAMP_SECONDS, 40, 60]) {
+            const tops = new Set();
+            for (const orgasmFrom of origins) {
+                const out = calculateEngineOutputs({ ...running, hr: 140, edgeHr: 140, isEdged: true, orgasmMode: true, orgasmBoost: boost, orgasmFrom });
+                tops.add(JSON.stringify(asSent(out)));
+            }
+            assert.equal(tops.size, 1, `${boost} s in: ${[...tops].join(' / ')}`);
+        }
+    });
+
+    it('an origin it cannot read is replaced part by part with what the engine sends without Force Orgasm', () => {
+        const base = { ...running, activeMode: 'classic', hr: 140, edgeHr: 140, isEdged: true, ceilingBehaviour: 'crawl' };
+        const own = sentBy(base);
+        const armed = (orgasmFrom, extra = {}) => asSent(calculateEngineOutputs({ ...base, ...extra, orgasmMode: true, orgasmBoost: 0, orgasmFrom }));
+        for (const junk of [null, undefined, 'crawl', 42, [], {}]) {
+            assert.deepEqual(armed(junk), own, `origin ${JSON.stringify(junk)}`);
+        }
+        // A speed that is not a number is no speed; the parts that are stand.
+        assert.deepEqual(armed({ primary: '40', secondary: 30, strokeMin: 10, strokeMax: 70 }), { ...own, secondary: 30, strokeMin: 10, strokeMax: 70 });
+        assert.deepEqual(armed({ primary: 40, secondary: NaN, strokeMin: 10, strokeMax: 70 }), { ...own, primary: 40, strokeMin: 10, strokeMax: 70 });
+        // Speeds off either end are held to 0-100, and a crawl of a fraction
+        // of a percent is still a motion.
+        assert.deepEqual(armed({ primary: 180, secondary: -20, strokeMin: 10, strokeMax: 70 }), { primary: 100, secondary: 0, strokeMin: 10, strokeMax: 70 });
+        assert.equal(armed({ primary: 0.3, secondary: 5, strokeMin: 10, strokeMax: 70 }).primary, MIN_MOVING_PERCENT);
+        // A window the wrong way round is put right; one off both ends is held
+        // to the travel; one too narrow to be an output, or left with no width
+        // inside a narrowed envelope, is not a window, and the speeds stand.
+        assert.deepEqual(armed({ primary: 40, secondary: 30, strokeMin: 70, strokeMax: 10 }), { primary: 40, secondary: 30, strokeMin: 10, strokeMax: 70 });
+        assert.deepEqual(armed({ primary: 40, secondary: 30, strokeMin: -50, strokeMax: 300 }), { primary: 40, secondary: 30, strokeMin: 0, strokeMax: 100 });
+        assert.deepEqual(armed({ primary: 40, secondary: 30, strokeMin: 40, strokeMax: 42 }), { ...own, primary: 40, secondary: 30 });
+        const narrowed = { handyHwMin: 50, handyHwMax: 100 };
+        const ownNarrowed = sentBy({ ...base, ...narrowed });
+        assert.deepEqual(armed({ primary: 40, secondary: 30, strokeMin: 10, strokeMax: 30 }, narrowed), { ...ownNarrowed, primary: 40, secondary: 30 });
+    });
+
+    it('stays inside the travel envelope, ordered and no narrower than the engine sends there', () => {
+        const origins = [
+            SENT_MID,
+            { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 },
+            { primary: 70, secondary: 5, strokeMin: 88, strokeMax: 99 },
+            null
+        ];
+        for (const [hwMin, hwMax] of [[0, 100], [15, 80], [30, 63], [45, 55], [90, 10]]) {
+            const env = { min: Math.min(hwMin, hwMax), max: Math.max(hwMin, hwMax) };
+            const narrowest = Math.max(1, Math.floor(((env.max - env.min) * MIN_ZONE_WIDTH) / 100));
+            for (const orgasmFrom of origins) {
+                for (let boost = 0; boost <= ORGASM_RAMP_SECONDS + 2; boost += 3) {
+                    for (const mode of ENGINE_MODES) {
+                        const out = calculateEngineOutputs({
+                            ...running, activeMode: mode, hr: 130, edgeHr: 130, handyHwMin: hwMin, handyHwMax: hwMax,
+                            sessionSeconds: 60 + boost, orgasmMode: true, orgasmBoost: boost, orgasmFrom
+                        });
+                        const tag = `${mode} envelope ${hwMin}-${hwMax} from ${JSON.stringify(orgasmFrom)} ${boost} s in`;
+                        assert.ok(out.strokeMinPercent >= env.min && out.strokeMaxPercent <= env.max, `${tag}: ${out.strokeMinPercent}-${out.strokeMaxPercent}`);
+                        assert.ok(out.strokeMaxPercent - out.strokeMinPercent >= narrowest, `${tag}: ${out.strokeMinPercent}-${out.strokeMaxPercent}`);
+                        assert.ok(out.primaryPercent >= 0 && out.primaryPercent <= 100, tag);
+                        assert.ok(out.secondaryPercent >= 0 && out.secondaryPercent <= 100, tag);
+                    }
+                }
+            }
+        }
+    });
+
+    it('only a running session is forced: a soft landing, a pause and a stopped session ignore the latch', () => {
+        for (const sessionStatus of ['RAMPDOWN', 'PAUSED', 'IDLE']) {
+            const base = { ...running, sessionStatus, rampdownSecondsLeft: 30, hr: 120, edgeHr: 120 };
+            assert.deepEqual(
+                calculateEngineOutputs({ ...base, orgasmMode: true, orgasmBoost: 20, orgasmFrom: SENT_MID }),
+                calculateEngineOutputs({ ...base, orgasmMode: false }),
+                sessionStatus
+            );
+        }
+    });
+});
+
+describe('a soft landing that takes over from Force Orgasm never speeds the toys up', () => {
+    // A RESUME starts Force Orgasm's ramp again from the stop the pause sent,
+    // while the run's time limit keeps counting from the arming, so a run
+    // paused in its last seconds runs out with its ramp still low. Measured
+    // in the page with a mocked Handy: after a heart-rate watchdog pause and
+    // auto-resume the limit's landing sent PUT /hamp/start and velocity 50
+    // (75 at Global Intensity 100) to a Handy at a standstill, and after the
+    // wearer's own PAUSE and RESUME the ramp had climbed back to 23% when the
+    // landing sent 50%, as the cue said "Easing you down". app.js now hands a
+    // landing that takes over from a run what the toys were last sent.
+    const STOP = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
+    const LEFT = Array.from({ length: 46 }, (_, i) => 45 - i);
+    const landing = (extra = {}) => calculateEngineOutputs({ ...running, hr: 150, edgeHr: 150, sessionStatus: 'RAMPDOWN', ...extra });
+    const speeds = (out) => ({ primary: out.primaryPercent, secondary: out.secondaryPercent });
+
+    it('a run resumed in its last seconds lands from where its ramp had got to, and eases down from there', () => {
+        // Second by second, as app.js drives it: RESUME starts the ramp from
+        // the stop, the ramp climbs for `climb` seconds, and the landing then
+        // takes over from what was last sent.
+        for (const intensityValue of [0, 50, 100]) {
+            for (const climb of [0, 1, 2, 5, 9, 14]) {
+                let sent = { primary: 0, secondary: 0 };
+                for (let boost = 0; boost < climb; boost += 1) {
+                    sent = speeds(calculateEngineOutputs({
+                        ...running, intensityValue, hr: 150, edgeHr: 150, sessionSeconds: 300 + boost,
+                        orgasmMode: true, orgasmBoost: boost, orgasmFrom: STOP
+                    }));
+                }
+                let previous = sent;
+                for (const rampdownSecondsLeft of LEFT) {
+                    const tag = `intensity ${intensityValue}, ${climb} s of climb, ${rampdownSecondsLeft} s of landing left`;
+                    const out = speeds(landing({ intensityValue, rampdownSecondsLeft, landingFrom: sent }));
+                    assert.ok(out.primary <= previous.primary, `${tag}: primary ${previous.primary} -> ${out.primary}`);
+                    assert.ok(out.secondary <= previous.secondary, `${tag}: secondary ${previous.secondary} -> ${out.secondary}`);
+                    // Eased, not cut: a channel that was moving keeps moving
+                    // until the landing's last second.
+                    if (rampdownSecondsLeft > 0 && sent.primary > 0) assert.ok(out.primary >= MIN_MOVING_PERCENT, `${tag}: primary stopped early`);
+                    if (rampdownSecondsLeft > 0 && sent.secondary > 0) assert.ok(out.secondary >= MIN_MOVING_PERCENT, `${tag}: secondary stopped early`);
+                    previous = out;
+                }
+                assert.deepEqual(previous, { primary: 0, secondary: 0 }, 'the landing ends in a stop');
+                // Told nothing, the landing is the one it always was, which
+                // is exactly what took the toys up.
+                const plain = speeds(landing({ intensityValue, rampdownSecondsLeft: 45 }));
+                assert.ok(plain.primary > sent.primary, `the fixture must be a run below the landing's start: ${JSON.stringify({ sent, plain })}`);
+            }
+        }
+        // The measured cases in numbers. A Handy at a standstill stays there
+        // for the whole landing, at Global Intensity 100 as at 50.
+        for (const intensityValue of [50, 100]) {
+            for (const rampdownSecondsLeft of LEFT) {
+                assert.deepEqual(speeds(landing({ intensityValue, rampdownSecondsLeft, landingFrom: { primary: 0, secondary: 0 } })), { primary: 0, secondary: 0 });
+            }
+        }
+        assert.deepEqual(speeds(landing({ intensityValue: 100, rampdownSecondsLeft: 45 })), { primary: 75, secondary: 75 });
+        // A ramp back at 23% (16% on the secondary) lands from 23% and 16%,
+        // not from 50%.
+        const from = { primary: 23, secondary: 16 };
+        assert.deepEqual(speeds(landing({ rampdownSecondsLeft: 45, landingFrom: from })), from);
+        assert.deepEqual(speeds(landing({ rampdownSecondsLeft: 44, landingFrom: from })), { primary: 23, secondary: 16 });
+        assert.deepEqual(speeds(landing({ rampdownSecondsLeft: 23, landingFrom: from })), { primary: 12, secondary: 8 });
+        assert.deepEqual(speeds(landing({ rampdownSecondsLeft: 1, landingFrom: from })), { primary: 1, secondary: 1 });
+        assert.deepEqual(speeds(landing({ rampdownSecondsLeft: 0, landingFrom: from })), { primary: 0, secondary: 0 });
+    });
+
+    it('each channel starts at the lower of what was sent and the landing\'s own start, and never goes above either', () => {
+        for (const intensityValue of [0, 13, 50, 77, 100]) {
+            for (const sent of [
+                { primary: 1, secondary: 90 }, { primary: 10, secondary: 10 }, { primary: 23, secondary: 16 },
+                { primary: 40, secondary: 0 }, { primary: 60, secondary: 74 }, { primary: 100, secondary: 3 }
+            ]) {
+                let previous = null;
+                for (const rampdownSecondsLeft of [...LEFT, 22.5, 0.4]) {
+                    const tag = `intensity ${intensityValue}, sent ${JSON.stringify(sent)}, ${rampdownSecondsLeft} s left`;
+                    const plain = landing({ intensityValue, rampdownSecondsLeft });
+                    const out = landing({ intensityValue, rampdownSecondsLeft, landingFrom: sent });
+                    assert.ok(out.primaryPercent <= plain.primaryPercent && out.primaryPercent <= sent.primary, `${tag}: primary ${out.primaryPercent}`);
+                    assert.ok(out.secondaryPercent <= plain.secondaryPercent && out.secondaryPercent <= sent.secondary, `${tag}: secondary ${out.secondaryPercent}`);
+                    if (rampdownSecondsLeft === 45) {
+                        assert.equal(out.primaryPercent, Math.min(plain.primaryPercent, sent.primary), tag);
+                        assert.equal(out.secondaryPercent, Math.min(plain.secondaryPercent, sent.secondary), tag);
+                    }
+                    if (previous && Number.isInteger(rampdownSecondsLeft)) {
+                        assert.ok(out.primaryPercent <= previous.primaryPercent && out.secondaryPercent <= previous.secondaryPercent, `${tag}: went up`);
+                    }
+                    // The speeds only: the stroke is the landing's own.
+                    assert.equal(out.strokeMinPercent, plain.strokeMinPercent, tag);
+                    assert.equal(out.strokeMaxPercent, plain.strokeMaxPercent, tag);
+                    assert.equal(out.isEdged, plain.isEdged, tag);
+                    assert.equal(out.newEdgeTriggered, plain.newEdgeTriggered, tag);
+                    if (Number.isInteger(rampdownSecondsLeft)) previous = out;
+                }
+            }
+        }
+    });
+
+    it('a run at its top lands exactly as a landing always has', () => {
+        // What a run sends at its top is above the landing's start on both
+        // channels, whatever the mode, the pulse and Global Intensity, so the
+        // landing after it is today's to the last percent - checked from the
+        // run's own output, and over every speed at or above the start.
+        for (const intensityValue of [0, 25, 50, 75, 100]) {
+            for (const mode of ENGINE_MODES) {
+                for (const sessionSeconds of [100, 137, 181, 222, 263]) {
+                    const top = calculateEngineOutputs({
+                        ...running, activeMode: mode, intensityValue, hr: 150, edgeHr: 150, sessionSeconds,
+                        orgasmMode: true, orgasmBoost: ORGASM_RAMP_SECONDS + (sessionSeconds % 7), orgasmFrom: SENT_MID
+                    });
+                    for (const rampdownSecondsLeft of LEFT) {
+                        const base = { activeMode: mode, intensityValue, rampdownSecondsLeft };
+                        assert.deepEqual(
+                            landing({ ...base, landingFrom: speeds(top) }),
+                            landing(base),
+                            `${mode}, intensity ${intensityValue}, top ${JSON.stringify(speeds(top))}, ${rampdownSecondsLeft} s left`
+                        );
+                    }
+                }
+            }
+        }
+        // The landing's start is half speed scaled by Global Intensity,
+        // 50 x (0.5 + intensity / 100), before any rounding: every whole speed
+        // from there up.
+        for (let intensityValue = 0; intensityValue <= 100; intensityValue += 1) {
+            const start = Math.ceil(25 + intensityValue / 2);
+            for (let sent = start; sent <= 100; sent += 1) {
+                for (const rampdownSecondsLeft of LEFT) {
+                    assert.deepEqual(
+                        speeds(landing({ intensityValue, rampdownSecondsLeft, landingFrom: { primary: sent, secondary: sent } })),
+                        speeds(landing({ intensityValue, rampdownSecondsLeft })),
+                        `intensity ${intensityValue}, sent ${sent}, ${rampdownSecondsLeft} s left`
+                    );
+                }
+            }
+        }
+    });
+
+    it('what it cannot read caps nothing, and only a landing reads it', () => {
+        const at = { rampdownSecondsLeft: 30, intensityValue: 70 };
+        const plain = landing(at);
+        for (const junk of [null, undefined, 'stop', 42, [], {}, { primary: '10', secondary: '10' }, { primary: NaN, secondary: Infinity }]) {
+            assert.deepEqual(landing({ ...at, landingFrom: junk }), plain, `landingFrom ${JSON.stringify(junk)}`);
+        }
+        // Channel by channel: the one it can read is capped, the other lands
+        // as any landing does. Speeds off either end are held to 0-100.
+        const capped = speeds(landing({ ...at, landingFrom: { primary: 12, secondary: 'x' } }));
+        assert.deepEqual(capped, { primary: 8, secondary: plain.secondaryPercent });
+        assert.deepEqual(speeds(landing({ ...at, landingFrom: { primary: 180, secondary: -20 } })), { primary: plain.primaryPercent, secondary: 0 });
+        // A running session, forced or not, a pause and a stopped one never
+        // read it: RESUME into RUNNING and a new session start from nothing.
+        for (const sessionStatus of ['RUNNING', 'PAUSED', 'IDLE']) {
+            for (const orgasmMode of [false, true]) {
+                const base = { ...running, sessionStatus, hr: 120, edgeHr: 120, orgasmMode, orgasmBoost: 9, orgasmFrom: SENT_MID };
+                assert.deepEqual(
+                    calculateEngineOutputs({ ...base, landingFrom: { primary: 2, secondary: 2 } }),
+                    calculateEngineOutputs(base),
+                    `${sessionStatus}${orgasmMode ? ' forced' : ''}`
+                );
+            }
+        }
     });
 });
 
@@ -2100,7 +2477,23 @@ describe('cool-down after edges', () => {
             // Seconds since Force Orgasm was armed: its ramp reads them. Drawn
             // LAST, so every draw above keeps its place in the stream. Without
             // it the sweep only ever saw the ramp at its first second.
-            orgasmBoost: pick(rnd, [0, 0, 1, 3, 14, 27, 28, 40, 60, NaN])
+            orgasmBoost: pick(rnd, [0, 0, 1, 3, 14, 27, 28, 40, 60, NaN]),
+            // What the toys were last sent, which the ramp starts from: none
+            // at all, real dispatches (a crawl, the stop a pause sends, a
+            // stroke in the middle of the travel), and junk the engine must
+            // refuse - text, NaN, an inverted window, one too narrow to be
+            // an output, values off both ends. Drawn after everything else.
+            orgasmFrom: pick(rnd, [
+                undefined, undefined, null,
+                { primary: 10, secondary: 10, strokeMin: 0, strokeMax: 100 },
+                { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 },
+                SENT_MID,
+                { primary: '40', secondary: 30, strokeMin: 10, strokeMax: 70 },
+                { primary: NaN, secondary: 30, strokeMin: 10, strokeMax: 70 },
+                { primary: 55, secondary: 70, strokeMin: 90, strokeMax: 20 },
+                { primary: 55, secondary: 70, strokeMin: 40, strokeMax: 42 },
+                { primary: 180, secondary: -20, strokeMin: -50, strokeMax: 300 }
+            ])
         };
     }
 
@@ -2325,7 +2718,16 @@ describe('cool-down after edges', () => {
         unchanged({ activeMode: 'ruin' }, 'ruin');
         unchanged({ activeMode: 'ruin', ruinHoldSeconds: 8 }, 'ruin lockout');
         for (const mode of COOLDOWN_MODES) {
-            unchanged({ activeMode: mode, orgasmMode: true }, `${mode} Force Orgasm`);
+            // A cool-down never slows the overdrive. Force Orgasm's ramp starts
+            // from what the toys were last sent, so once the caller says what
+            // that was - and once the ramp has reached the top - a cool-down
+            // cannot change a thing. (Told nothing, the ramp starts from the
+            // output the engine sends without Force Orgasm, which in a
+            // cool-down is the cooled one: see 'Force Orgasm starts from what
+            // the toys were last sent'.)
+            unchanged({ activeMode: mode, orgasmMode: true, orgasmFrom: SENT_MID }, `${mode} Force Orgasm from what was sent`);
+            unchanged({ activeMode: mode, orgasmMode: true, orgasmFrom: SENT_MID, orgasmBoost: 14 }, `${mode} Force Orgasm half way up`);
+            unchanged({ activeMode: mode, orgasmMode: true, orgasmBoost: 28 }, `${mode} Force Orgasm at the top`);
             unchanged({ activeMode: mode, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 30 }, `${mode} RAMPDOWN`);
             unchanged({ activeMode: mode, sessionStatus: 'PAUSED' }, `${mode} PAUSED`);
             unchanged({ activeMode: mode, sessionStatus: 'IDLE' }, `${mode} IDLE`);
@@ -2363,11 +2765,11 @@ describe('cool-down after edges', () => {
         let counted = 0;
         for (let i = 0; i < 100000; i += 1) {
             // The count's own inputs are derived from the draw, never drawn,
-            // so the stream is the one this sweep always ran: two readings of
-            // the measured pulse, which hold it wherever it is, and a count
-            // still owed on the edged inputs whose index is a multiple of
-            // three. Without them no edge is ever counted here, and the count
-            // would be compared for nothing.
+            // so they take nothing from the stream seededInput draws: two
+            // readings of the measured pulse, which hold it wherever it is,
+            // and a count still owed on the edged inputs whose index is a
+            // multiple of three. Without them no edge is ever counted here,
+            // and the count would be compared for nothing.
             const drawn = seededInput(rnd);
             const pulse = Number.isFinite(drawn.edgeHr) ? drawn.edgeHr : drawn.hr;
             const input = {
@@ -2433,15 +2835,27 @@ describe('cool-down after edges', () => {
         // ramps from the stop - which gives b2ebc162 and 553ece13: the engine
         // just before the cool-down arrived, and the cool-down with nothing
         // running left them there. And an edge is counted only once the pulse
-        // has held at the mark, which gives the digests below: this sweep
+        // has held at the mark, which gives 3038b1b4 and 3b656b53: this sweep
         // hands the engine no readings, so a reading on the mark still raises
         // the flag and pulls back, but no edge is counted (the count has its
         // own suite above). The engine just before the cool-down, with that
         // change made to it, gives the same two digests. An engine that
         // ignored either drawn field gives different digests, so both are
         // pinned here too. Release 1.1.0 gave ebd8f3f8 and 853ecdc8 over the
-        // sweep as it stood then, before it drew either field.
-        const GOLDEN = [[20260927, '3038b1b4'], [424242, '3b656b53']];
+        // sweep as it stood then, before it drew either field. The sweep now
+        // also draws orgasmFrom, what the toys were last sent, last of all,
+        // which moves every input after the first: over it the engine before
+        // the next change gives 114b5bfe and 95edb64e, and Force Orgasm easing
+        // from what was sent - or, told nothing, from what the engine sends
+        // without it that second - gives the digests below. Made on the
+        // engine as it was before an edge waited for the pulse to hold at the
+        // mark, the same change took 13bc6d6e and c49dd7e8 to c3e3a7d1 and
+        // b123e1e8. An engine that ignored orgasmFrom gives different digests
+        // too. The sweep does not draw landingFrom, what a soft landing that
+        // took over from Force Orgasm was last sent: told nothing, a landing
+        // is the one these digests pin, and 'a soft landing that takes over
+        // from Force Orgasm never speeds the toys up' covers it.
+        const GOLDEN = [[20260927, '86dced1d'], [424242, '726a2ad2']];
         for (const [seed, digest] of GOLDEN) {
             assert.equal(digestSweep(seed, 20000), digest, `seed ${seed}: the engine with no cool-down fields`);
             assert.equal(

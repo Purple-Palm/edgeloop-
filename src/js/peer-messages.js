@@ -10,7 +10,9 @@ import {
     MIN_TRAIN_HOLD_SECONDS,
     MAX_TRAIN_HOLD_SECONDS,
     MIN_TRAIN_EDGES,
-    MAX_TRAIN_EDGES
+    MAX_TRAIN_EDGES,
+    MAX_FORCE_ORGASM_SECONDS,
+    FORCE_ORGASM_REFUSALS
 } from './session-rules.js';
 
 export const PEER_ROLES = ['controller', 'viewer'];
@@ -104,6 +106,12 @@ export function sanitizeTelemetry(raw) {
     out.trainEdges = clampNumber(raw.trainEdges, MIN_TRAIN_EDGES, MAX_TRAIN_EDGES, true);
     out.edgeHoldPercent = clampNumber(raw.edgeHoldPercent, MIN_EDGE_HOLD_PERCENT, MAX_EDGE_HOLD_PERCENT, true);
     out.orgasmMode = typeof raw.orgasmMode === 'boolean' ? raw.orgasmMode : undefined;
+    // The countdown on the host's Force Orgasm button (0 = none), never
+    // longer than the longest limit the host offers, and why the host would
+    // refuse to switch it on, so a partner's button reads what the wearer's
+    // does and a partner's tap in a landing is answered on their own screen.
+    out.orgasmSecondsLeft = clampNumber(raw.orgasmSecondsLeft, 0, MAX_FORCE_ORGASM_SECONDS, true);
+    out.orgasmRefusal = oneOf(raw.orgasmRefusal, FORCE_ORGASM_REFUSALS);
     out.ready = typeof raw.ready === 'boolean' ? raw.ready : undefined;
 
     if (Array.isArray(raw.history)) {

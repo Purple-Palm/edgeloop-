@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
-import { sanitizeSessionLimits, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
+import { sanitizeSessionLimits, DURATION_MODES, ENDGAME_TYPES, FORCE_ORGASM_MAX_OPTIONS, DEFAULT_FORCE_ORGASM_MAX_SECONDS } from './session-rules.js';
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import {
     SETTING_SANITIZERS,
@@ -132,6 +132,37 @@ describe('the bounds are the ones the controls carry', () => {
             assert.equal(sanitizeSetting(name, max), max);
             assert.equal(sanitizeSetting(name, max + 1000), max);
         }
+    });
+});
+
+describe('Force Orgasm\'s time limit', () => {
+    // The Guards select writes one of five options. A guard that a typo, a
+    // damaged file or a value from some other build could switch off would
+    // not be a guard, so anything else comes back as the factory limit.
+    it('keeps every option the Guards select offers, Off included, and ships at 90 s', () => {
+        assert.equal(SETTING_DEFAULTS.forceOrgasmMaxSeconds, DEFAULT_FORCE_ORGASM_MAX_SECONDS);
+        assert.equal(SETTING_DEFAULTS.forceOrgasmMaxSeconds, 90);
+        for (const seconds of FORCE_ORGASM_MAX_OPTIONS) {
+            assert.equal(sanitizeSetting('forceOrgasmMaxSeconds', seconds), seconds);
+            assert.equal(sanitizeSetting('forceOrgasmMaxSeconds', String(seconds)), seconds, 'the select writes its value as text');
+        }
+        const store = { forceOrgasmMaxSeconds: 0 };
+        assert.deepEqual(applySettingSchema(store), [], 'an explicit Off is not a correction');
+        assert.equal(store.forceOrgasmMaxSeconds, 0);
+    });
+
+    it('turns a value no control writes into the factory 90 s, never into Off', () => {
+        for (const junk of [...JUNK, 45, 100, 3600, -90, '45', 'off', [0]]) {
+            assert.equal(sanitizeSetting('forceOrgasmMaxSeconds', junk), 90, `${JSON.stringify(junk)} must not be taken as a limit`);
+        }
+    });
+
+    it('offers exactly the options the sanitizer keeps', () => {
+        const at = INDEX.indexOf('id="forceOrgasmMaxSelect"');
+        assert.ok(at >= 0, 'the Guards tab has no Force Orgasm limit');
+        const select = INDEX.slice(at, INDEX.indexOf('</select>', at));
+        const offered = [...select.matchAll(/<option value="(\d+)"/g)].map((m) => Number(m[1]));
+        assert.deepEqual([...offered].sort((a, b) => a - b), [...FORCE_ORGASM_MAX_OPTIONS].sort((a, b) => a - b));
     });
 });
 

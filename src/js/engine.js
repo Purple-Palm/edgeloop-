@@ -220,6 +220,12 @@ export function calculateEngineOutputs({
     activeMode,
     sessionStatus,
     rampdownSecondsLeft,
+    // What the toys were last sent when the soft landing under way began,
+    // exactly as it was dispatched ({ primary, secondary }), if that landing
+    // took over from a Force Orgasm run; null for any other landing (app.js
+    // beginSoftLanding). The landing then never sends more than that, eased
+    // down on its own clock (landingCap).
+    landingFrom = null,
     isEdged,
     // The edge flag is up, and the pullback with it, but the edge has not
     // been counted yet: the pulse has not held at the mark (edge-confirm.js).
@@ -233,9 +239,15 @@ export function calculateEngineOutputs({
     recentReadings = [],
     readingGapMs,
     orgasmMode,
-    // Seconds since Force Orgasm was armed. The ceiling already climbs 1 BPM
-    // per second from this; the motors ramp on the same clock.
+    // Seconds since Force Orgasm's ramp began: at the arming, and again at
+    // a RESUME, which starts it over from the stop (app.js). The ceiling
+    // already climbs 1 BPM per second from this; the motors ramp on the
+    // same clock.
     orgasmBoost = 0,
+    // What the toys were last sent when that ramp began, exactly as it was
+    // dispatched: { primary, secondary, strokeMin, strokeMax }, the stroke in
+    // percent of the physical travel. The ramp starts from it (rampOrigin).
+    orgasmFrom = null,
     gamma = 2.0,
     intensityValue = 50,
     edgeStrokeDepth = 100,
@@ -394,11 +406,15 @@ export function calculateEngineOutputs({
     // passing it through here would have given that game Ruin's ending too.
     //
     // A spent edge holds its stop for as long as the edge flag says the
-    // wearer is still on it, and the flag is what gates it, not `atPeak`:
-    // Force Orgasm clears `atPeak` (the ramp blends from the mode's output),
-    // so gating on it handed the ramp a fresh ride on its first tick - 0% to
-    // about 43% - where over the lockout it climbs from the stop. Without
-    // Force Orgasm the two are the same thing.
+    // wearer is still on it, and the flag is what gates it. Force Orgasm
+    // used to clear `atPeak`, and gating on that handed its ramp a fresh ride
+    // on the first tick - 0% to about 43% - where over the lockout it climbs
+    // from the stop.
+    //
+    // Everything down to the travel envelope is the output WITHOUT Force
+    // Orgasm, ceiling rule, stall guard, warm-up and cool-down included: what
+    // the toys are being sent while it is off. The overdrive is applied last,
+    // on that output, and never reshapes the mode underneath it.
     const ruinActive = mode === 'ruin';
     const teaseArgs = {
         mode: teaseMode,
@@ -406,7 +422,7 @@ export function calculateEngineOutputs({
         shapedProgress: progress,
         sensorRaw: sensorRawProgress,
         climbProgress,
-        atPeak: nextIsEdged && !orgasmMode,
+        atPeak: nextIsEdged,
         crawlPercent,
         stallGuardEngaged,
         seconds,
@@ -445,24 +461,7 @@ export function calculateEngineOutputs({
     strokeMinPercent = stroke.strokeMin;
     strokeMaxPercent = stroke.strokeMax;
 
-    // Force Orgasm eases both channels up from whatever the mode was doing
-    // and keeps a wave at the top. It never drops a toy that was already
-    // hotter, and the stroke opens toward the full travel window. The
-    // working ceiling climbs on the same clock (app.js), so the pulse is
-    // allowed past the typed max until the wearer finishes.
-    if (orgasmMode && sessionStatus === 'RUNNING') {
-        const frame = orgasmFrame(seconds, orgasmBoost);
-        const ease = frame.ease;
-        primaryPercent = Math.round(primaryPercent * (1 - ease) + frame.primary * ease);
-        secondaryPercent = Math.round(secondaryPercent * (1 - ease) + frame.secondary * ease);
-        const openMin = strokeMinPercent * (1 - ease);
-        const openMax = strokeMaxPercent + (100 - strokeMaxPercent) * ease;
-        const opened = placeStroke(openMin, openMax, frame.depth, 'low');
-        strokeMinPercent = opened.min;
-        strokeMaxPercent = opened.max;
-    }
-
-    if (stallGuardEngaged && !orgasmMode && sessionStatus === 'RUNNING') {
+    if (stallGuardEngaged && sessionStatus === 'RUNNING') {
         primaryPercent = 0;
     }
 
@@ -484,7 +483,7 @@ export function calculateEngineOutputs({
     // running the factors are the warm-up's own. The edge flag was decided
     // above and is not read here, so the cool-down can never move it.
     let warmZone = null;
-    if (!orgasmMode && sessionStatus === 'RUNNING') {
+    if (sessionStatus === 'RUNNING') {
         const warm = warmupShape(seconds, warmupMinutes);
         const cool = cooldownShape(mode, cooldownSeconds, cooldownMinutes);
         const wake = combineWake(warm, cool);
@@ -518,6 +517,27 @@ export function calculateEngineOutputs({
     primaryPercent = roundSpeed(primaryPercent * intensityScale);
     secondaryPercent = roundSpeed(secondaryPercent * intensityScale);
 
+    // A soft landing that takes over from a Force Orgasm run eases down from
+    // what the toys were last sent whenever that is slower than the landing's
+    // own start, half speed scaled by Global Intensity. A RESUME starts the
+    // run's ramp again from the stop the pause sent (app.js) while its time
+    // limit keeps counting from the arming, so a run paused in its last
+    // seconds - a strap slipping at the moment of orgasm is enough for the
+    // watchdog - runs out with the ramp still low. The landing then took a
+    // toy that had only just started moving again, or had not moved at all,
+    // to 50% in one tick (75% at full intensity) while the cue said it was
+    // easing the wearer down, and the Soft Landing ending or an Oracle roll
+    // arriving in those seconds did the same. Each channel now starts at the
+    // lower of the two and eases down on the landing's own factor: the first
+    // second sends no more than was sent, and no second after it sends more
+    // than the one before (Global Intensity aside). A run at its top is sent
+    // more than the landing's start on both channels (78-100% and 70-100% of
+    // full speed, scaled the same way), and lands exactly as it always has.
+    if (sessionStatus === 'RAMPDOWN' && landingFrom && typeof landingFrom === 'object') {
+        primaryPercent = Math.min(primaryPercent, landingCap(landingFrom.primary, rampLeft));
+        secondaryPercent = Math.min(secondaryPercent, landingCap(landingFrom.secondary, rampLeft));
+    }
+
     const settled = settleZone(strokeMinPercent, strokeMaxPercent, contraction);
     strokeMinPercent = settled.min;
     strokeMaxPercent = settled.max;
@@ -548,9 +568,41 @@ export function calculateEngineOutputs({
     // The wearer's travel limits are the last word. A mode, a pattern, a
     // game, warm-up, or Force Orgasm can use less of that range. None of
     // them can stroke past it.
-    let physicalMin = clamp(Math.round(env.min + (strokeMinPercent / 100) * envSpan), env.min, env.max);
-    let physicalMax = clamp(Math.round(env.min + (strokeMaxPercent / 100) * envSpan), env.min, env.max);
+    const toTravel = (percent) => clamp(Math.round(env.min + (percent / 100) * envSpan), env.min, env.max);
+    let physicalMin = toTravel(strokeMinPercent);
+    let physicalMax = toTravel(strokeMaxPercent);
     if (physicalMax < physicalMin) [physicalMin, physicalMax] = [physicalMax, physicalMin];
+
+    // Force Orgasm eases both channels and the stroke from what the toys
+    // were last sent to a high varied top over ORGASM_RAMP_SECONDS, and keeps
+    // a wave there. The working ceiling climbs on the same clock (app.js), so
+    // the pulse is allowed past the typed max until the wearer finishes.
+    //
+    // The ramp starts from the output as it was DISPATCHED, and the easing is
+    // done on that output. 1.1.1 blended from the mode's own speeds worked
+    // out again with no ceiling rule, no warm-up and no cool-down, so the
+    // first tick was never what the toys were doing: armed on the mark with
+    // Crawl it handed The Handy 0% (PUT /hamp/stop, and /hamp/start a second
+    // or so later), and armed 12 s into a five-minute warm-up at 95 BPM it
+    // jumped from 13% to 75% in one tick. Easing from the output itself, the
+    // first tick sends exactly what was sent, and each second after it adds
+    // one ORGASM_RAMP_SECONDS-th of the way from there to the top. The top
+    // never drops below a third of full speed on either channel, whatever
+    // Global Intensity says, so a toy that was moving is never handed 0% on
+    // the way, and one that was stopped starts from the stop.
+    if (orgasmMode && sessionStatus === 'RUNNING') {
+        const frame = orgasmFrame(seconds, orgasmBoost);
+        const full = placeStroke(0, 100, frame.depth, 'low');
+        const top = settleZone(full.min, full.max, contraction);
+        const from = rampOrigin(orgasmFrom, env, {
+            primary: primaryPercent, secondary: secondaryPercent, min: physicalMin, max: physicalMax
+        });
+        const toward = (sent, peak) => sent + (peak - sent) * frame.ease;
+        primaryPercent = roundSpeed(toward(from.primary, roundSpeed(frame.primary * intensityScale)));
+        secondaryPercent = roundSpeed(toward(from.secondary, roundSpeed(frame.secondary * intensityScale)));
+        physicalMin = clamp(Math.round(toward(from.min, toTravel(top.min))), env.min, env.max);
+        physicalMax = clamp(Math.round(toward(from.max, toTravel(top.max))), env.min, env.max);
+    }
 
     return {
         primaryPercent: clamp(finiteOr(primaryPercent, 0), 0, 100),
@@ -583,6 +635,51 @@ function settleZone(min, max, contraction) {
         if (hi - lo < MIN_ZONE_WIDTH) hi = Math.min(100, lo + MIN_ZONE_WIDTH);
     }
     return { min: lo, max: hi };
+}
+
+// Where Force Orgasm's ramp starts: what the toys were last sent, as the
+// caller dispatched it. Only the caller knows that - a pause, a stop or a
+// stall halt sent the toys something this second's inputs no longer show.
+// `unforced` is the output this engine sends without Force Orgasm this
+// second, which for a caller that runs it every second is what was sent;
+// each part of the origin the caller cannot vouch for is taken from it
+// instead. A speed that is not a number is no speed. The window is held
+// inside the travel envelope as it is now (a stop is dispatched over the
+// whole travel, and the wearer may narrow the envelope in the middle of a
+// ramp), and one left narrower there than the narrowest zone this engine
+// ever sends is no window: the speeds that were sent still stand.
+function rampOrigin(from, env, unforced) {
+    const sent = from && typeof from === 'object' ? from : {};
+    const speed = (value, fallback) => (Number.isFinite(value) ? clamp(roundSpeed(value), 0, 100) : fallback);
+    const origin = {
+        primary: speed(sent.primary, unforced.primary),
+        secondary: speed(sent.secondary, unforced.secondary),
+        min: unforced.min,
+        max: unforced.max
+    };
+    if (Number.isFinite(sent.strokeMin) && Number.isFinite(sent.strokeMax)) {
+        const lo = clamp(Math.round(Math.min(sent.strokeMin, sent.strokeMax)), env.min, env.max);
+        const hi = clamp(Math.round(Math.max(sent.strokeMin, sent.strokeMax)), env.min, env.max);
+        const narrowest = Math.max(1, Math.floor(((env.max - env.min) * MIN_ZONE_WIDTH) / 100));
+        if (hi - lo >= narrowest) {
+            origin.min = lo;
+            origin.max = hi;
+        }
+    }
+    return origin;
+}
+
+// The most one channel of a landing that took over from Force Orgasm may
+// send this second: what that channel was last sent when the landing began,
+// eased down by the landing's own factor. The factor is counted in the same
+// fiftieths as the landing's half speed (the RAMPDOWN branch above), so a
+// channel that was sent at least the landing's start caps nothing, down to
+// the last rounding. A value that is not a speed caps nothing either, and
+// that channel lands as any landing does.
+function landingCap(sent, rampLeft) {
+    if (!Number.isFinite(sent)) return Infinity;
+    const steps = Math.round(50 * Math.max(0, rampLeft / 45));
+    return roundSpeed((steps * roundSpeed(sent)) / 50);
 }
 
 function applyOracle(oracleState, progress, nextIsEdged, orgasmMode, sessionSeconds, crawlPercent = CRAWL_PERCENT) {

@@ -28,6 +28,13 @@ import {
     startRuinEdge,
     ruinRideSecondsLeft,
     endgameKeepsOrgasmLatch,
+    resolveForceOrgasmMaxSeconds,
+    tickForceOrgasm,
+    forceOrgasmSecondsLeft,
+    forceOrgasmRefusal,
+    describeForceOrgasmRefusal,
+    describeForceOrgasmButton,
+    inSoftLanding,
     describeGameNotice,
     describeCutoffNotice,
     describeStallPauseNotice,
@@ -292,6 +299,14 @@ const orgasmBtnText = document.getElementById('orgasmBtnText');
 // (handlePageAway) cancel the wait.
 const startGate = createStartGate();
 
+// What the toys were last sent, exactly as dispatchHardware() handed it to
+// the drivers: Force Orgasm's ramp starts from it. Nothing has been sent
+// before the first dispatch, and the toys are at rest then.
+let lastDispatched = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
+// The reason the last refused Force Orgasm tap was refused ('landing' or
+// 'idle'), shown under the button for as long as that reason holds.
+let orgasmRefusalShown = '';
+
 // Age Verification Handlers
 const ageOverlay = document.getElementById('ageOverlay');
 if (safeGet('edgeloop_age_verified') === 'true' && ageOverlay) {
@@ -442,6 +457,7 @@ function pauseSession(voiceText = 'Paused.') {
     dispatchHardware(0, 0, 0, 100, true);
     syncScreenWakeLock();
     if (voiceText) cueVoice('paused');
+    renderForceOrgasmButton();
     return true;
 }
 
@@ -965,6 +981,7 @@ function updateEngine() {
         activeMode: resolveEngineMode(state.activeMode),
         sessionStatus: state.sessionStatus,
         rampdownSecondsLeft: state.rampdownSecondsLeft,
+        landingFrom: state.landingFrom,
         isEdged: state.isEdged,
         edgePending: state.edgePending,
         // Two readings further apart than the signal-loss timeout are not
@@ -973,6 +990,7 @@ function updateEngine() {
         readingGapMs: hrWatchdog.settings.staleMs,
         orgasmMode: state.orgasmMode,
         orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0,
+        orgasmFrom: state.orgasmMode ? state.orgasmFrom : null,
         gamma: advancedSettings.gammaCurve,
         intensityValue: state.intensityValue,
         edgeStrokeDepth: advancedSettings.edgeStrokeDepth,
@@ -1085,6 +1103,7 @@ function updateEngine() {
 
     updateWarmupBadge();
     updateGameNotice();
+    renderForceOrgasmButton();
 
     dispatchHardware(result.primaryPercent, result.secondaryPercent, result.strokeMinPercent, result.strokeMaxPercent);
 }
@@ -1098,6 +1117,7 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
 
 function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false) {
     if (isRemotePage) return;
+    lastDispatched = { primary: primarySpeed, secondary: secondarySpeed, strokeMin, strokeMax };
 
     // The role picks the channel and the speed cap scales it. A low cap
     // slows a crawl down to the slowest velocity the Handy has; it never
@@ -1316,8 +1336,11 @@ function resetSessionCounters() {
     // ride on its own (tickRuin).
     applyRuinClock({ rideSeconds: 0, lockSeconds: 0, spent: false });
     state.orgasmBoost = 0;
+    state.orgasmSeconds = 0;
     clearMicBoost(state);
     state.rampdownSecondsLeft = 45;
+    state.landingAfterForceOrgasm = false;
+    state.landingFrom = null;
     state.resumeStatus = null;
     state.durationFallback = false;
     state.endgameFired = false;
@@ -1837,6 +1860,10 @@ setInterval(() => {
     if (state.sessionStatus === 'RUNNING') {
         state.sessionSeconds += 1;
         updateTimerDisplay();
+        // Force Orgasm's time limit is asked before the engine runs, so on
+        // the second it runs out the toys are sent the soft landing rather
+        // than one more second of overdrive.
+        tickForcedOrgasm();
         // Refresh the engine first so the guards and games below judge THIS
         // second's HR, ceiling and edge flag, not the previous tick's.
         updateEngine();
@@ -1875,7 +1902,9 @@ setInterval(() => {
         state.rampdownSecondsLeft -= 1;
         const timerEl = document.getElementById('sessionTimer');
         if (timerEl) timerEl.textContent = `00:${String(state.rampdownSecondsLeft).padStart(2, '0')}`;
-        if (state.rampdownSecondsLeft <= 0) stopSession("Soft Landing (Edged Out)");
+        // A landing Force Orgasm's time limit started follows a forced
+        // climax, not an edge the wearer rode out, and the history says so.
+        if (state.rampdownSecondsLeft <= 0) stopSession(state.landingAfterForceOrgasm ? 'Force Orgasm (Soft Landing)' : "Soft Landing (Edged Out)");
     }
 
     // The watchdog guards every state in which motors may move, and keeps
@@ -1910,22 +1939,42 @@ function handleTargetTimeReached() {
     // timer then chose the tease-down - would keep driving the toys instead
     // of the gentle ending. Denied stops the session, which clears it
     // anyway; the Orgasm endgame IS the latch and keeps it.
+    // Read before the latch is cleared: a landing that takes over from a run
+    // starts no higher than the run was sending (beginSoftLanding).
+    const forcedRun = state.orgasmMode;
     if (!endgameKeepsOrgasmLatch(state.endgameType)) setOrgasmMode(false);
     if (state.endgameType === 'orgasm') {
         if (!state.orgasmMode && orgasmBtn) orgasmBtn.click();
     } else if (state.endgameType === 'rampdown') {
-        state.sessionStatus = 'RAMPDOWN';
-        state.rampdownSecondsLeft = 45;
-        // RAMPDOWN computes both channels from the ramp factor alone and
-        // never looks at the heart rate, so no boost reaches the toys. The
-        // session tick that refreshes (and clears) the boost is RUNNING-only,
-        // so without this the badge would show a MIC +N frozen at whatever
-        // the room was when the target time arrived, for the whole 45 s.
-        clearMicBoost(state);
-        document.getElementById('rampdownNotice')?.classList.remove('hidden');
+        beginSoftLanding({ afterForcedRun: forcedRun });
     } else {
         stopSession("Denied");
     }
+}
+
+// The soft landing: both channels from half speed down to a stop over 45 s,
+// and then the session ends. The Soft Landing ending and Force Orgasm's
+// time limit both finish a session through it. `afterForcedRun`: the landing
+// takes over from a Force Orgasm run - its time limit ran out, or the Soft
+// Landing ending (the timer's or an Oracle roll's) arrived with it latched -
+// and then starts from what the toys were last sent wherever that is slower
+// than half speed (engine.js landingCap). A RESUME starts the run's ramp
+// again from a standstill, so the toys may be far below half speed when it
+// ends, and a landing must never speed them up.
+function beginSoftLanding({ afterForcedRun = false } = {}) {
+    state.sessionStatus = 'RAMPDOWN';
+    state.rampdownSecondsLeft = 45;
+    state.landingFrom = afterForcedRun
+        ? { primary: lastDispatched.primary, secondary: lastDispatched.secondary }
+        : null;
+    // RAMPDOWN computes both channels from the ramp factor alone and
+    // never looks at the heart rate, so no boost reaches the toys. The
+    // session tick that refreshes (and clears) the boost is RUNNING-only,
+    // so without this the badge would show a MIC +N frozen at whatever
+    // the room was when the landing began, for the whole 45 s.
+    clearMicBoost(state);
+    document.getElementById('rampdownNotice')?.classList.remove('hidden');
+    renderForceOrgasmButton();
 }
 
 function updateTimerDisplay() {
@@ -1999,6 +2048,13 @@ function startOrResumeSession() {
     }
     state.sessionStatus = resumingRampdown ? 'RAMPDOWN' : 'RUNNING';
     state.resumeStatus = null;
+    // A Force Orgasm run that a pause interrupted ramps up again from the
+    // stop the pause sent, never from where it was: resumed at its old
+    // level, a heart-rate watchdog pause, a supervision gap or a frozen tab
+    // put the toys straight back on the 78-100% wave on the first tick, from
+    // a standstill. Only the ramp starts again; the run's time limit still
+    // counts from the arming. (START switched Force Orgasm off above.)
+    if (state.orgasmMode && state.sessionStatus === 'RUNNING') startOrgasmRamp();
     // Supervision starts now. The clock may not have ticked for a while (a
     // pulse returning to a watchdog pause in a background tab), and that
     // quiet stretch belongs to the pause, not to this session.
@@ -2007,6 +2063,7 @@ function startOrResumeSession() {
     document.getElementById('rampdownNotice')?.classList.toggle('hidden', !resumingRampdown);
     renderTransport(state.sessionStatus);
     syncScreenWakeLock();
+    renderForceOrgasmButton();
     return true;
 }
 
@@ -2233,7 +2290,11 @@ cameEarlyBtn?.addEventListener('click', () => {
     // The learning profile and the typed max belong to the host.
     if (isRemotePage || isRemoteViewer) return;
     if (state.activeMode === 'survival') {
-        if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'PAUSED') {
+        // A run is live until it has ended, its soft landing included: Force
+        // Orgasm's time limit hands a run that has just finished the wearer
+        // to that landing, and Finished me must still save the heart rate
+        // there rather than tell them to start the run they are in.
+        if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'PAUSED' && state.sessionStatus !== 'RAMPDOWN') {
             confirm(advancedSettings.survivalCalibrating
                 ? 'Start Survival first. Once it is running, Finished me saves the heart rate the climb pushed you to.'
                 : 'Start Survival first. Check Calibration on the card if Finished me should save your heart rate.');
@@ -2289,18 +2350,20 @@ document.getElementById('wipeLearningBtn')?.addEventListener('click', () => {
 // Force Orgasm Overdrive. The state and button look live in one place so the
 // toggle, stop, reset and remote telemetry all agree. The ceiling boost
 // counter restarts from zero on every change and the typed Climax HR input
-// is never modified.
+// is never modified. A run's time limit counts from the moment it is
+// switched on, so switching it on or off by any path - the button, STOP,
+// Reset, an ending, the limit itself - clears that clock.
 function setOrgasmMode(on, { voice = false } = {}) {
     const next = Boolean(on);
     const changed = next !== Boolean(state.orgasmMode);
     state.orgasmMode = next;
-    state.orgasmBoost = 0;
-    if (orgasmBtnText) orgasmBtnText.textContent = state.orgasmMode ? 'Forcing...' : 'Force Orgasm';
-    if (orgasmBtn) {
-        orgasmBtn.className = state.orgasmMode
-            ? 'bg-rose-700 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center animate-pulse cursor-pointer shadow-lg shadow-rose-950/40'
-            : 'bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-amber-950/30';
+    if (next) startOrgasmRamp();
+    else {
+        state.orgasmBoost = 0;
+        state.orgasmFrom = null;
     }
+    if (changed || !next) state.orgasmSeconds = 0;
+    renderForceOrgasmButton();
     if (!changed || !voice) return;
     if (next) {
         cueVoice('forceOrgasm');
@@ -2311,10 +2374,133 @@ function setOrgasmMode(on, { voice = false } = {}) {
     cueVoice('forceOrgasmOff');
 }
 
+// Force Orgasm's ramp starts from what the toys were last sent, as it was
+// dispatched: at the arming, and again at a RESUME, where that is the stop
+// the pause sent. The engine eases from there to the top (engine.js).
+function startOrgasmRamp() {
+    state.orgasmBoost = 0;
+    state.orgasmFrom = { ...lastDispatched };
+}
+
+// One second of Force Orgasm's clock (session-rules.js tickForceOrgasm). The
+// master clock asks it on every RUNNING tick, so every way of switching Force
+// Orgasm on - the button, the Climax ending, an Oracle climax, the end of
+// Edge Training, a run during Survival, a partner's ORGASM_TOGGLE (which
+// clicks the same button) - runs against the same limit.
+function tickForcedOrgasm() {
+    const step = tickForceOrgasm(
+        { seconds: state.orgasmSeconds },
+        {
+            orgasmMode: state.orgasmMode,
+            sessionStatus: state.sessionStatus,
+            maxSeconds: advancedSettings.forceOrgasmMaxSeconds
+        }
+    );
+    state.orgasmSeconds = step.seconds;
+    if (step.expired) landForcedOrgasm();
+    renderForceOrgasmButton();
+}
+
+// The run has lasted as long as the Guards tab allows. It is never simply
+// cut: the session goes into the same soft landing the Soft Landing ending
+// uses, never above what the run was sending (beginSoftLanding), with its
+// own cue on the dashboard (and in the voice), and the landing ends the
+// session. That landing is this session's ending, so the endgame is spent
+// with it: a target time falling inside the 45 s must neither arm Force
+// Orgasm again nor stop the toys dead with Denied.
+function landForcedOrgasm() {
+    setOrgasmMode(false);
+    state.endgameFired = true;
+    state.landingAfterForceOrgasm = true;
+    beginSoftLanding({ afterForcedRun: true });
+    cueVoice('forceOrgasmLimit');
+    // The landing's first value goes to the toys now, and past The Handy's
+    // 400 ms throttle: the driver drops a command that follows the last one
+    // it sent by less than that, so a strap reading just before this tick
+    // would have left the overdrive on The Handy for most of another second.
+    // For a speed that is not a stop, force only skips that throttle (and
+    // sends the stroke range again with it); Intiface and T-Code take it as
+    // they take any other dispatch. A run that runs out on the first tick
+    // after a RESUME has not moved yet, and its landing is a stop, sent the
+    // way every stop is.
+    updateEngine();
+    dispatchHardware(state.strokerSpeed, state.prostateSpeed, state.strokeMin, state.strokeMax, true);
+}
+
+// The seconds the Force Orgasm button counts down, 0 for none. A remote page
+// runs no session of its own, so it shows the number the host sends.
+function forceOrgasmSecondsLeftNow() {
+    if (isRemotePage) return state.orgasmMode ? state.remoteOrgasmSecondsLeft : 0;
+    return forceOrgasmSecondsLeft({
+        orgasmMode: state.orgasmMode,
+        seconds: state.orgasmSeconds,
+        maxSeconds: advancedSettings.forceOrgasmMaxSeconds
+    });
+}
+
+// Why switching Force Orgasm on would be refused right now ('' when it would
+// not). The host decides from its own session; a remote page from what the
+// host last said, since only the host knows what a pause resumes into.
+function forceOrgasmRefusalNow() {
+    if (isRemotePage) return state.remoteOrgasmRefusal || '';
+    return forceOrgasmRefusal({ sessionStatus: state.sessionStatus, resumeStatus: state.resumeStatus });
+}
+
+const ORGASM_BUTTON_LOOKS = {
+    ready: 'bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-amber-950/30',
+    forcing: 'bg-rose-700 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center animate-pulse cursor-pointer shadow-lg shadow-rose-950/40',
+    armed: 'bg-rose-900 text-rose-100 font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-rose-950/40',
+    barred: 'bg-slate-800 text-slate-400 font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-not-allowed border border-slate-700'
+};
+
+// The button says what the session is really doing (describeForceOrgasmButton)
+// and counts a timed run down, and the line under the action bar says why the
+// last refused tap was refused, for as long as that is still the reason.
+function renderForceOrgasmButton() {
+    const refusal = forceOrgasmRefusalNow();
+    const face = describeForceOrgasmButton({
+        orgasmMode: state.orgasmMode,
+        sessionStatus: state.sessionStatus,
+        landing: isRemotePage ? refusal === 'landing' : inSoftLanding(state),
+        secondsLeft: forceOrgasmSecondsLeftNow()
+    });
+    // Painted on every engine tick, so only what changed is written: the
+    // pulsing look must not be restarted, and a remote page's lock (added to
+    // the button's classes after each telemetry frame) must not be undone
+    // between frames for nothing.
+    const paint = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
+    paint(orgasmBtnText, face.label);
+    paint(document.getElementById('orgasmBtnKicker'), face.kicker);
+    const countdown = document.getElementById('orgasmBtnCountdown');
+    paint(countdown, face.countdown);
+    countdown?.classList.toggle('hidden', !face.countdown);
+    const look = ORGASM_BUTTON_LOOKS[face.look] || ORGASM_BUTTON_LOOKS.ready;
+    if (orgasmBtn && orgasmBtn.dataset.look !== face.look) {
+        orgasmBtn.className = look;
+        orgasmBtn.dataset.look = face.look;
+    }
+    if (orgasmRefusalShown && orgasmRefusalShown !== refusal) orgasmRefusalShown = '';
+    const notice = document.getElementById('orgasmNotice');
+    paint(notice, describeForceOrgasmRefusal(orgasmRefusalShown));
+    notice?.classList.toggle('hidden', !orgasmRefusalShown);
+}
+
 orgasmBtn?.addEventListener('click', () => {
     if (isRemoteViewer) return;
+    // Switching Force Orgasm OFF is never refused, here or on a partner's
+    // page. Switching it ON is refused in a soft landing and with no session
+    // running (session-rules.js forceOrgasmRefusal says why), and the line
+    // under the button says so instead of the button reading Forcing...
+    // while nothing is forced.
+    const refusal = state.orgasmMode ? '' : forceOrgasmRefusalNow();
+    if (refusal) {
+        orgasmRefusalShown = refusal;
+        renderForceOrgasmButton();
+        return;
+    }
     if (isRemoteController) {
-        // The host toggles and reports back through telemetry.
+        // The host toggles and reports back through telemetry. It refuses a
+        // switch-on it cannot honour itself, whatever this page last heard.
         sendPeerCommand({ type: 'ORGASM_TOGGLE' });
         return;
     }
@@ -2781,6 +2967,8 @@ function syncParamsUI() {
     if (stallSec) stallSec.value = clampStallGuardSeconds(advancedSettings.stallGuardSeconds);
     const stallPause = document.getElementById('stallPauseSecondsInput');
     if (stallPause) stallPause.value = clampStallPauseSeconds(advancedSettings.stallPauseSeconds);
+    const orgasmMax = document.getElementById('forceOrgasmMaxSelect');
+    if (orgasmMax) orgasmMax.value = String(resolveForceOrgasmMaxSeconds(advancedSettings.forceOrgasmMaxSeconds));
     const ceilingSelect = document.getElementById('ceilingBehaviourSelect');
     if (ceilingSelect) ceilingSelect.value = advancedSettings.ceilingBehaviour === 'stop' ? 'stop' : 'crawl';
     const holdInput = document.getElementById('edgeHoldPercentInput');
@@ -3377,6 +3565,9 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     advancedSettings.stallGuard = document.getElementById('stallGuardToggle')?.checked ?? true;
     advancedSettings.stallGuardSeconds = clampStallGuardSeconds(document.getElementById('stallGuardSecondsInput')?.value);
     advancedSettings.stallPauseSeconds = clampStallPauseSeconds(document.getElementById('stallPauseSecondsInput')?.value);
+    // Takes hold of a run already under way: one that has gone past a limit
+    // lowered here lands on the next tick.
+    advancedSettings.forceOrgasmMaxSeconds = resolveForceOrgasmMaxSeconds(document.getElementById('forceOrgasmMaxSelect')?.value);
     advancedSettings.ceilingBehaviour = document.getElementById('ceilingBehaviourSelect')?.value === 'stop' ? 'stop' : 'crawl';
     advancedSettings.edgeHoldPercent = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
     advancedSettings.dualDampening = document.getElementById('dualDampeningToggle')?.checked ?? true;
@@ -4744,7 +4935,11 @@ function applyRemoteTelemetry(data) {
         highlightModeCard();
         renderModeDetail();
     }
+    // Taken before setOrgasmMode, which repaints the button from them.
+    if (data.orgasmSecondsLeft !== undefined) state.remoteOrgasmSecondsLeft = data.orgasmSecondsLeft;
+    if (data.orgasmRefusal !== undefined) state.remoteOrgasmRefusal = data.orgasmRefusal;
     if (data.orgasmMode !== undefined && data.orgasmMode !== state.orgasmMode) setOrgasmMode(data.orgasmMode);
+    renderForceOrgasmButton();
     if (data.ready !== undefined) state.remoteHostReady = data.ready;
     // Watchdog state is rendered, never evaluated, on a remote page.
     if (data.hrSignal) {
@@ -4820,6 +5015,11 @@ function syncTelemetry() {
         trainEdges: clampTrainEdges(advancedSettings.trainEdges),
         edgeHoldPercent: clampEdgeHoldPercent(advancedSettings.edgeHoldPercent),
         orgasmMode: state.orgasmMode,
+        // The countdown on the wearer's Force Orgasm button (0 = none) and
+        // why the host would refuse to switch it on, so a partner's button
+        // reads what the wearer's does.
+        orgasmSecondsLeft: forceOrgasmSecondsLeftNow(),
+        orgasmRefusal: forceOrgasmRefusalNow(),
         ready: readiness.hrReady && readiness.toyReady,
         hrSignal: {
             status: state.hrSignalState,

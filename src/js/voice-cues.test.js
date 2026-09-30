@@ -35,6 +35,11 @@ describe('voice cue templates', () => {
         assert.ok(DEFAULT_VOICE_CUES.forceOrgasm.length >= 8);
         assert.ok(DEFAULT_VOICE_CUES.cameEarly.length >= 6);
         assert.ok(DEFAULT_VOICE_CUES.forceOrgasmOff.length >= 2);
+        // Spoken, and painted on the dashboard, as Force Orgasm's time limit
+        // hands the session to the soft landing.
+        assert.ok(DEFAULT_VOICE_CUES.forceOrgasmLimit.length >= 2);
+        assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'forceOrgasmLimit')?.group, 'Climax');
+        assert.deepEqual(parseVoiceCuesText('# forceOrgasmLimit\nEase down.\n').cues.forceOrgasmLimit, ['Ease down.']);
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'encourage')?.group, 'Build-up');
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'edge')?.group, 'Edge');
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'forceOrgasm')?.group, 'Climax');

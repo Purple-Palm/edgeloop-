@@ -1,7 +1,8 @@
 // Pure session rules shared by the cockpit: the effective heart-rate ceiling
 // (typed limit minus every safety offset), HR-limit sanitising, duration
-// parsing, the Survival climb, the stall guard and Ruin & Leak's one-ride
-// clock. No DOM and no storage, so all of it runs under node:test.
+// parsing, the Survival climb, the stall guard, Ruin & Leak's one-ride clock
+// and Force Orgasm's time limit. No DOM and no storage, so all of it runs
+// under node:test.
 
 // What this file reads from the engine: the crawl level, so the cockpit
 // banner can tell a crawling motor from a running one with the same number
@@ -713,6 +714,157 @@ export function tickEdgeTraining(
 // stops the session (which clears the latch anyway).
 export function endgameKeepsOrgasmLatch(endgameType) {
     return endgameType === 'orgasm';
+}
+
+// ---- Force Orgasm: how long one run may last ------------------------------
+
+// Nothing used to end Force Orgasm but the wearer. The button, the Climax
+// ending, an Oracle climax, the end of Edge Training and a partner's remote
+// all switched on an overdrive that ran until somebody tapped it off or
+// found STOP, and a wearer who came on it said it "wasn't gonna let me rest":
+// he had to find STOP in the middle of his orgasm. So a run now lasts at most
+// the time the Guards tab says, counted from the moment it was switched on -
+// its ramp is part of the run - and then the session goes into the soft
+// landing, both channels eased down to a stop over 45 s from half speed, or
+// from what the run was sending if that is slower: a run resumed in its last
+// seconds has only just begun to climb again from the stop (engine.js
+// landingCap). It is never a cut to 0, and never a step up.
+//
+// Why 90 s by default. The orgasm itself is short and regular: measured by
+// anal pressure probe it is a series of 10 to 15 pelvic contractions that
+// starts at about 0.6 s apart, each gap about 0.1 s longer than the one
+// before (Bohlen, Held & Sanderson, "The male orgasm: pelvic contractions
+// measured by anal probe", Archives of Sexual Behavior 9(6):503-521, 1980),
+// which is about 9 to 18 seconds from the first contraction to the last. In
+// the same study the second most common pattern carried on after that
+// series with irregular contractions, and it was the longest of the three.
+// A run spends its first ORGASM_RAMP_SECONDS (28 s) easing up from what the
+// toys were doing, so 90 s leaves a full minute at the top: the regular
+// series more than three times over, with room for the climb to it from
+// wherever the run found the wearer and for that irregular tail. The
+// landing after it still strokes for 45 s, from half speed down, so an
+// orgasm that comes late is eased out rather than cut off. The longer limits
+// are for a wearer who takes longer to get there; Off is the old behaviour,
+// for a wearer who wants it back.
+export const FORCE_ORGASM_MAX_OPTIONS = [60, 90, 120, 180, 0];
+export const DEFAULT_FORCE_ORGASM_MAX_SECONDS = 90;
+export const MAX_FORCE_ORGASM_SECONDS = Math.max(...FORCE_ORGASM_MAX_OPTIONS);
+
+// A stored or chosen limit: one of the options, as a number, 0 being Off.
+// The options are a list, not a range, so nothing is rounded to the nearest
+// one. Anything else - a number no control writes, junk from a hand-edited
+// file, a missing value - is the factory limit and never Off: a guard that a
+// typo could switch off would not be a guard. The Guards select writes its
+// option as a string of digits, so such a string is read as its number;
+// true, null, '' and [] are not a 0 anybody chose, whatever Number() says.
+export function resolveForceOrgasmMaxSeconds(value) {
+    const n = typeof value === 'number' ? value
+        : typeof value === 'string' && /^\s*\d+\s*$/.test(value) ? Number(value)
+            : NaN;
+    const option = FORCE_ORGASM_MAX_OPTIONS.find((seconds) => seconds === n);
+    return option === undefined ? DEFAULT_FORCE_ORGASM_MAX_SECONDS : option;
+}
+
+// One 1 s tick of a Force Orgasm run's clock. app.js asks it on every tick
+// BEFORE the engine runs, so on the second the limit runs out the toys are
+// sent the landing and not one more second of overdrive. `seconds` is how
+// many running seconds the run has had; it starts again from 0 whenever
+// Force Orgasm is switched on or off. Only a RUNNING session counts: a pause
+// stops the clock. The clock counts whole ticks, so the part of a second
+// before a pause goes uncounted, but RESUME starts the ramp again from the
+// stop the pause sent (app.js) and the climb back is counted, so a pause can
+// only ever shorten the time a run spends at the top, never stretch it.
+// `expired`: the limit is up, and the run ends in the soft landing.
+export function tickForceOrgasm(
+    { seconds = 0 } = {},
+    { orgasmMode = false, sessionStatus, maxSeconds } = {}
+) {
+    if (!orgasmMode) return { seconds: 0, expired: false };
+    const ran = wholeSeconds(seconds);
+    if (sessionStatus !== 'RUNNING') return { seconds: ran, expired: false };
+    const limit = resolveForceOrgasmMaxSeconds(maxSeconds);
+    const next = ran + 1;
+    return { seconds: next, expired: limit > 0 && next >= limit };
+}
+
+// The seconds the Force Orgasm button counts down, or 0 for no countdown:
+// Force Orgasm is off, or the limit is Off (then nothing ends the run but
+// the wearer, exactly as before the limit existed). A run shows at least one
+// second for as long as it lasts: a limit lowered below the time already
+// run ends it on the next tick.
+export function forceOrgasmSecondsLeft({ orgasmMode = false, seconds = 0, maxSeconds } = {}) {
+    const limit = resolveForceOrgasmMaxSeconds(maxSeconds);
+    if (!orgasmMode || limit === 0) return 0;
+    return Math.max(1, limit - wholeSeconds(seconds));
+}
+
+// The countdown as the button shows it (m:ss), or '' when there is none.
+export function describeForceOrgasmCountdown(secondsLeft) {
+    const s = wholeSeconds(secondsLeft);
+    if (s <= 0) return '';
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// A soft landing is under way: RAMPDOWN, or a pause that resumes into one.
+export function inSoftLanding({ sessionStatus, resumeStatus = null } = {}) {
+    return sessionStatus === 'RAMPDOWN' || (sessionStatus === 'PAUSED' && resumeStatus === 'RAMPDOWN');
+}
+
+// Why switching Force Orgasm ON must be refused right now: 'landing',
+// 'idle', or '' when it may go on. Switching it OFF is never refused. A tap,
+// a partner's ORGASM_TOGGLE and the Climax ending all reach app.js as a
+// click on the button and are asked here; an Oracle climax and the end of
+// Edge Training switch it on from inside a running tick, where nothing is
+// refused.
+//
+// A landing - the Soft Landing ending, the landing the time limit starts, any
+// RAMPDOWN - is how the session ends, and nothing starts the overdrive inside
+// it. The engine only forces a RUNNING session, so a tap there used to latch
+// Force Orgasm while nothing was forced: the button read Forcing... for the
+// rest of the landing and the dashboard said "Take it. Come." over toys that
+// were winding down. And the limit switches Force Orgasm off by itself while
+// the button is a toggle: a wearer reaching for it to stop the overdrive as
+// the countdown runs out - the moment the limit exists for - would switch it
+// back ON if the tap landed just after the limit did, and a partner's tap
+// lands later still (their page learns of the landing from the next frame of
+// telemetry, and their command then crosses the network). Refused, such a
+// tap can never re-arm the overdrive.
+//
+// With no session running the engine forces nothing either, and START
+// switches a latched Force Orgasm off before the first tick, so a tap there
+// only ever made the button read Forcing... over toys that were not moving.
+export const FORCE_ORGASM_REFUSALS = ['', 'landing', 'idle'];
+
+export function forceOrgasmRefusal({ sessionStatus, resumeStatus = null } = {}) {
+    if (inSoftLanding({ sessionStatus, resumeStatus })) return 'landing';
+    if (sessionStatus !== 'RUNNING' && sessionStatus !== 'PAUSED') return 'idle';
+    return '';
+}
+
+// The line the cockpit shows under the button when a switch-on is refused.
+export function describeForceOrgasmRefusal(reason) {
+    if (reason === 'landing') return 'SOFT LANDING: FORCE ORGASM STAYS OFF UNTIL THE SESSION ENDS';
+    if (reason === 'idle') return 'FORCE ORGASM NEEDS A RUNNING SESSION: PRESS START FIRST';
+    return '';
+}
+
+// What the Force Orgasm button says, from the state the session is really in.
+// It reads Forcing... only while a running session is being forced. A pause
+// holds a latched run as it is: Armed, with its countdown standing still, and
+// RESUME ramps it up again from the stop. In a landing it reads as off, and a
+// tap there is refused. `landing` is inSoftLanding() on the wearer's page; a
+// partner's page is told it by the host, which alone knows what a pause will
+// resume into. `look` picks the button's colours.
+export function describeForceOrgasmButton({ orgasmMode = false, sessionStatus, landing = false, secondsLeft = 0 } = {}) {
+    const countdown = describeForceOrgasmCountdown(secondsLeft);
+    if (orgasmMode && sessionStatus === 'RUNNING') {
+        return { kicker: 'Overdrive', label: 'Forcing...', countdown, look: 'forcing' };
+    }
+    if (landing) return { kicker: 'Soft landing', label: 'Force Orgasm', countdown: '', look: 'barred' };
+    if (orgasmMode && sessionStatus === 'PAUSED') {
+        return { kicker: 'Overdrive', label: 'Armed', countdown, look: 'armed' };
+    }
+    return { kicker: 'Overdrive', label: 'Force Orgasm', countdown: '', look: 'ready' };
 }
 
 // The highest reading a crawl can give: Global Intensity scales every motor

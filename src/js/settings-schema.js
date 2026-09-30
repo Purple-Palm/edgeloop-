@@ -20,7 +20,7 @@
 // after this pass; this file is per-field only.
 
 import { SETTING_DEFAULTS } from './state.js';
-import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, MAX_SESSION_MINUTES, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
+import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, resolveForceOrgasmMaxSeconds, MAX_SESSION_MINUTES, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
 import { clampEdgeHoldPercent } from './engine.js';
 import { clampStaleSeconds } from './hr-watchdog.js';
 import { clampEndMargin } from './hardware/handy-protocol.js';
@@ -163,6 +163,10 @@ export const SETTING_SANITIZERS = {
     stallGuard: boolean('stallGuard'),
     stallGuardSeconds: (value) => clampStallGuardSeconds(value),
     stallPauseSeconds: (value) => clampStallPauseSeconds(value),
+    // One of the options the Guards select offers. A value it never offers
+    // is the factory limit, not Off: only an explicit 0 switches the limit
+    // off, so a hand-edited or damaged file cannot take the guard away.
+    forceOrgasmMaxSeconds: (value) => resolveForceOrgasmMaxSeconds(value),
     ceilingBehaviour: oneOf('ceilingBehaviour', ['stop', 'crawl']),
     edgeHoldPercent: (value) => clampEdgeHoldPercent(value),
     trainHoldSeconds: (value) => clampTrainHoldSeconds(value),

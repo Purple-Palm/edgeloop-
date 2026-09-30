@@ -28,6 +28,18 @@ import {
     SURVIVAL_OVERDRIVE_CAP,
     SURVIVAL_EDGE_BPM,
     endgameKeepsOrgasmLatch,
+    FORCE_ORGASM_MAX_OPTIONS,
+    DEFAULT_FORCE_ORGASM_MAX_SECONDS,
+    MAX_FORCE_ORGASM_SECONDS,
+    FORCE_ORGASM_REFUSALS,
+    resolveForceOrgasmMaxSeconds,
+    tickForceOrgasm,
+    forceOrgasmSecondsLeft,
+    describeForceOrgasmCountdown,
+    inSoftLanding,
+    forceOrgasmRefusal,
+    describeForceOrgasmRefusal,
+    describeForceOrgasmButton,
     describeGameNotice,
     describeCutoffNotice,
     MIN_STALL_GUARD_SECONDS,
@@ -858,6 +870,193 @@ describe('the endgame and a latched Force Orgasm', () => {
         const clear = fn[0].indexOf('setOrgasmMode(false)');
         const ramp = fn[0].indexOf("'rampdown'");
         assert.ok(clear >= 0 && ramp >= 0 && clear < ramp, 'the latch must be cleared before the rampdown starts');
+    });
+});
+
+describe('Force Orgasm runs for at most the time the Guards tab says', () => {
+    // Nothing used to end Force Orgasm but the wearer: a wearer who came on it
+    // had to find STOP in the middle of his orgasm. These drive the rules the
+    // cockpit runs once a second, a second at a time, the way app.js does.
+
+    // One running session, second by second: `arm` switches Force Orgasm on
+    // (the clock restarts at 0, as setOrgasmMode does), `pause` / `resume`
+    // move the transport, and each tick asks tickForceOrgasm before anything
+    // else. Returns the tick on which the limit expired, or null.
+    function drive(maxSeconds, script, ticks = 400) {
+        let session = { sessionStatus: 'RUNNING', resumeStatus: null, orgasmMode: false, seconds: 0 };
+        const trace = [];
+        for (let t = 1; t <= ticks; t += 1) {
+            const action = script[t];
+            if (action === 'arm') session = { ...session, orgasmMode: true, seconds: 0 };
+            if (action === 'off') session = { ...session, orgasmMode: false, seconds: 0 };
+            if (action === 'pause') session = { ...session, resumeStatus: session.sessionStatus, sessionStatus: 'PAUSED' };
+            if (action === 'resume') session = { ...session, sessionStatus: session.resumeStatus, resumeStatus: null };
+            const step = tickForceOrgasm({ seconds: session.seconds }, { orgasmMode: session.orgasmMode, sessionStatus: session.sessionStatus, maxSeconds });
+            session = { ...session, seconds: step.seconds };
+            trace.push({ t, ...session, left: forceOrgasmSecondsLeft({ orgasmMode: session.orgasmMode, seconds: session.seconds, maxSeconds }) });
+            if (step.expired) return { expiredAt: t, trace };
+        }
+        return { expiredAt: null, trace };
+    }
+
+    it('offers 60, 90, 120 and 180 seconds and Off, and 90 s is the factory limit', () => {
+        assert.deepEqual(FORCE_ORGASM_MAX_OPTIONS, [60, 90, 120, 180, 0]);
+        assert.equal(DEFAULT_FORCE_ORGASM_MAX_SECONDS, 90);
+        assert.equal(MAX_FORCE_ORGASM_SECONDS, 180);
+    });
+
+    it('takes an option as it is written and anything else as the factory limit, never as Off', () => {
+        for (const seconds of FORCE_ORGASM_MAX_OPTIONS) {
+            assert.equal(resolveForceOrgasmMaxSeconds(seconds), seconds);
+            assert.equal(resolveForceOrgasmMaxSeconds(String(seconds)), seconds, 'the select writes its option as text');
+        }
+        assert.equal(resolveForceOrgasmMaxSeconds(' 120 '), 120);
+        // Only an explicit 0 is Off. Number() reads all of these as 0.
+        for (const junk of [undefined, null, '', ' ', false, true, [], [0], {}, 'off', 'Off', '0x0', '0.0e1', NaN, Infinity]) {
+            assert.equal(resolveForceOrgasmMaxSeconds(junk), DEFAULT_FORCE_ORGASM_MAX_SECONDS, `${JSON.stringify(junk)} is not a limit anybody chose`);
+        }
+        // A number no control writes is not rounded to the nearest option.
+        for (const stray of [1, 30, 59, 61, 89.5, 90.4, 100, 179, 181, 3600, -60, -90, '45', '90s', '1:30']) {
+            assert.equal(resolveForceOrgasmMaxSeconds(stray), DEFAULT_FORCE_ORGASM_MAX_SECONDS, `${JSON.stringify(stray)}`);
+        }
+        assert.ok(Object.is(resolveForceOrgasmMaxSeconds(-0), 0), 'an explicit zero is Off, and the plain number 0');
+    });
+
+    it('lands 90 running seconds after the arming by default, the ramp included', () => {
+        const run = drive(undefined, { 5: 'arm' });
+        assert.equal(run.expiredAt, 5 + 89, 'the arming tick counts as the first second of the run');
+        // The button counted it down the whole way, never below 0:01.
+        const armed = run.trace.filter((r) => r.orgasmMode);
+        assert.equal(armed[0].left, 89);
+        assert.equal(Math.min(...armed.map((r) => r.left)), 1);
+        assert.deepEqual(armed.map((r) => r.left), [...armed.map((r) => r.left)].sort((a, b) => b - a), 'the countdown only goes down');
+        for (const limit of [60, 120, 180]) {
+            assert.equal(drive(limit, { 1: 'arm' }).expiredAt, limit, `${limit} s`);
+        }
+    });
+
+    it('Off is the old behaviour: no countdown, and nothing ends the run', () => {
+        const run = drive(0, { 2: 'arm' }, 1000);
+        assert.equal(run.expiredAt, null);
+        assert.ok(run.trace.every((r) => r.left === 0), 'no countdown while it runs');
+    });
+
+    it('a pause stops the clock, and the run lands after its running seconds', () => {
+        // Armed at 1, paused from 31 to 60, resumed: the 30 paused ticks do not
+        // count, and it lands after 90 running seconds.
+        const run = drive(90, { 1: 'arm', 31: 'pause', 61: 'resume' });
+        assert.equal(run.expiredAt, 90 + 30);
+        const paused = run.trace.filter((r) => r.sessionStatus === 'PAUSED');
+        assert.equal(new Set(paused.map((r) => r.left)).size, 1, 'the countdown stands still in a pause');
+    });
+
+    it('switching it off and on again starts a fresh run', () => {
+        const run = drive(60, { 1: 'arm', 40: 'off', 50: 'arm' });
+        assert.equal(run.expiredAt, 50 + 59);
+    });
+
+    it('a lowered limit ends a run already past it on the next tick', () => {
+        let seconds = 0;
+        for (let t = 0; t < 100; t += 1) {
+            seconds = tickForceOrgasm({ seconds }, { orgasmMode: true, sessionStatus: 'RUNNING', maxSeconds: 180 }).seconds;
+        }
+        assert.equal(forceOrgasmSecondsLeft({ orgasmMode: true, seconds, maxSeconds: 60 }), 1, 'never 0:00 while it still runs');
+        assert.equal(tickForceOrgasm({ seconds }, { orgasmMode: true, sessionStatus: 'RUNNING', maxSeconds: 60 }).expired, true);
+    });
+
+    it('only counts a running session, and only while Force Orgasm is on', () => {
+        for (const sessionStatus of ['PAUSED', 'RAMPDOWN', 'IDLE']) {
+            assert.deepEqual(tickForceOrgasm({ seconds: 89 }, { orgasmMode: true, sessionStatus, maxSeconds: 90 }), { seconds: 89, expired: false }, sessionStatus);
+        }
+        assert.deepEqual(tickForceOrgasm({ seconds: 89 }, { orgasmMode: false, sessionStatus: 'RUNNING', maxSeconds: 90 }), { seconds: 0, expired: false });
+        // A clock that is not a number starts again rather than stopping forever.
+        assert.deepEqual(tickForceOrgasm({ seconds: NaN }, { orgasmMode: true, sessionStatus: 'RUNNING', maxSeconds: 90 }), { seconds: 1, expired: false });
+    });
+
+    it('counts down as m:ss, and says nothing when there is nothing to count', () => {
+        assert.equal(describeForceOrgasmCountdown(90), '1:30');
+        assert.equal(describeForceOrgasmCountdown(180), '3:00');
+        assert.equal(describeForceOrgasmCountdown(61), '1:01');
+        assert.equal(describeForceOrgasmCountdown(9), '0:09');
+        assert.equal(describeForceOrgasmCountdown(1), '0:01');
+        for (const none of [0, -3, NaN, undefined, null]) assert.equal(describeForceOrgasmCountdown(none), '', `${none}`);
+        assert.equal(forceOrgasmSecondsLeft({ orgasmMode: false, seconds: 0, maxSeconds: 90 }), 0);
+        assert.equal(forceOrgasmSecondsLeft({ orgasmMode: true, seconds: 0, maxSeconds: 90 }), 90);
+        assert.equal(forceOrgasmSecondsLeft({ orgasmMode: true, seconds: 30, maxSeconds: 'junk' }), 60, 'a junk limit is the factory 90 s');
+    });
+});
+
+describe('Force Orgasm cannot be switched on in a soft landing', () => {
+    const STATES = [
+        { sessionStatus: 'IDLE', resumeStatus: null },
+        { sessionStatus: 'RUNNING', resumeStatus: null },
+        { sessionStatus: 'PAUSED', resumeStatus: 'RUNNING' },
+        { sessionStatus: 'RAMPDOWN', resumeStatus: null },
+        { sessionStatus: 'PAUSED', resumeStatus: 'RAMPDOWN' }
+    ];
+
+    it('refuses it in every landing, and with no session running', () => {
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'RAMPDOWN' }), 'landing');
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'PAUSED', resumeStatus: 'RAMPDOWN' }), 'landing', 'a paused landing is still a landing');
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'IDLE' }), 'idle');
+        assert.equal(forceOrgasmRefusal({}), 'idle');
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'RUNNING' }), '');
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'PAUSED', resumeStatus: 'RUNNING' }), '', 'armed in a pause, it ramps up from the stop on RESUME');
+        for (const reason of ['landing', 'idle']) {
+            assert.ok(FORCE_ORGASM_REFUSALS.includes(reason));
+            assert.ok(describeForceOrgasmRefusal(reason).length > 0, reason);
+        }
+        assert.equal(describeForceOrgasmRefusal(''), '');
+        assert.match(describeForceOrgasmRefusal('landing'), /SOFT LANDING/);
+        assert.match(describeForceOrgasmRefusal('idle'), /START/);
+    });
+
+    it('a tap just after the limit ran out lands in the landing, and is refused there', () => {
+        // The race the limit creates: the limit switches Force Orgasm off by
+        // itself, and a tap meant to switch it off arrives a moment later.
+        // By then the session is in its landing, and the tap would switch it
+        // back ON - so it is refused, whether it is the wearer's or a
+        // partner's, however late it comes.
+        let seconds = 0;
+        let expired = false;
+        for (let t = 0; t < 90 && !expired; t += 1) {
+            ({ seconds, expired } = tickForceOrgasm({ seconds }, { orgasmMode: true, sessionStatus: 'RUNNING', maxSeconds: 90 }));
+        }
+        assert.equal(expired, true);
+        // app.js answers `expired` with Force Orgasm off and the soft landing.
+        const landing = { sessionStatus: 'RAMPDOWN', resumeStatus: null };
+        assert.equal(forceOrgasmRefusal(landing), 'landing');
+        assert.equal(forceOrgasmRefusal({ sessionStatus: 'PAUSED', resumeStatus: 'RAMPDOWN' }), 'landing');
+    });
+
+    it('the button reads Forcing... only while a running session is being forced', () => {
+        for (const orgasmMode of [false, true]) {
+            for (const state of STATES) {
+                for (const secondsLeft of [0, 45]) {
+                    const landing = inSoftLanding(state);
+                    const face = describeForceOrgasmButton({ orgasmMode, sessionStatus: state.sessionStatus, landing, secondsLeft });
+                    const where = `${JSON.stringify(state)} orgasm=${orgasmMode} left=${secondsLeft}`;
+                    const forcing = orgasmMode && state.sessionStatus === 'RUNNING';
+                    assert.equal(face.label === 'Forcing...', forcing, `${where}: ${face.label}`);
+                    assert.equal(face.look === 'forcing', forcing, where);
+                    if (landing) {
+                        assert.equal(face.look, 'barred', where);
+                        assert.equal(face.countdown, '', `${where}: nothing is counting down in a landing`);
+                    }
+                    if (!orgasmMode) assert.equal(face.countdown, '', `${where}: no countdown while it is off`);
+                    if (forcing) assert.equal(face.countdown, secondsLeft ? '0:45' : '', where);
+                }
+            }
+        }
+        // A latched run in a pause says so, and its countdown stands still.
+        assert.deepEqual(
+            describeForceOrgasmButton({ orgasmMode: true, sessionStatus: 'PAUSED', landing: false, secondsLeft: 61 }),
+            { kicker: 'Overdrive', label: 'Armed', countdown: '1:01', look: 'armed' }
+        );
+        assert.deepEqual(
+            describeForceOrgasmButton({ orgasmMode: false, sessionStatus: 'RAMPDOWN', landing: true, secondsLeft: 0 }),
+            { kicker: 'Soft landing', label: 'Force Orgasm', countdown: '', look: 'barred' }
+        );
     });
 });
 

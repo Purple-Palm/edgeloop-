@@ -95,6 +95,19 @@ export const VOICE_CUE_CATALOG = [
             'Not this time. Stay edged.'
         ]
     },
+    {
+        // Spoken as the soft landing starts, when Force Orgasm has run for as
+        // long as the Guards tab allows.
+        id: 'forceOrgasmLimit',
+        group: 'Climax',
+        label: 'Force orgasm time is up, soft landing',
+        lines: [
+            'Time is up. Easing you down.',
+            'That\'s enough. Coming down slowly now.',
+            'Rest now. Winding down.',
+            'Let it fade. Soft landing.'
+        ]
+    },
     { id: 'oracleWatching', group: 'Climax', label: 'Oracle approach', lines: ['The Oracle is watching. Climb.'] },
     { id: 'oracleHold', group: 'Climax', label: 'Oracle hold', lines: ['Hold. Fifteen seconds.'] },
     {

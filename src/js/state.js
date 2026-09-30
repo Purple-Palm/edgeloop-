@@ -3,6 +3,7 @@
 // read goes through storage.js.
 import { safeGet } from './storage.js';
 import { HANDY_DEFAULT_END_MARGIN } from './hardware/handy-protocol.js';
+import { DEFAULT_FORCE_ORGASM_MAX_SECONDS } from './session-rules.js';
 
 export const state = {
     sessionStatus: 'IDLE',
@@ -17,6 +18,13 @@ export const state = {
     durationMode: 'range',
     endgameType: 'orgasm',
     rampdownSecondsLeft: 45,
+    // The soft landing under way was started by Force Orgasm's time limit,
+    // so the session it ends is recorded as a forced climax, not an edge.
+    landingAfterForceOrgasm: false,
+    // What the toys were last sent when the soft landing under way took over
+    // from a Force Orgasm run ({ primary, secondary }, as dispatched), which
+    // that landing never goes above; null for any other landing.
+    landingFrom: null,
     hrCurrent: 70,
     edges: 0,
     pauses: 0,
@@ -28,8 +36,17 @@ export const state = {
     edgePending: false,
     orgasmMode: false,
     // Force Orgasm raises the WORKING ceiling by 1 BPM/s (capped) instead of
-    // rewriting the typed Climax HR input; cleared by stop/reset.
+    // rewriting the typed Climax HR input; cleared by stop/reset. It is also
+    // the clock the motors ramp on, so a RESUME starts it again from 0.
     orgasmBoost: 0,
+    // What the toys were last sent when that ramp began, as it was
+    // dispatched ({ primary, secondary, strokeMin, strokeMax }): the ramp
+    // starts from it. Null while Force Orgasm is off.
+    orgasmFrom: null,
+    // Running seconds of the current Force Orgasm run, against its time
+    // limit (session-rules.js tickForceOrgasm). Zeroed whenever Force Orgasm
+    // goes on or off; a pause stops it.
+    orgasmSeconds: 0,
     // Ceiling and HR the engine actually used on the last tick, after every
     // offset; guards and games compare against these, never the raw input.
     effectiveMinHr: 70,
@@ -70,6 +87,11 @@ export const state = {
     // Remote controller page only: the host reports whether it has a pulse
     // source and a toy, so the partner's START button can mirror it.
     remoteHostReady: false,
+    // Remote page only: the host's Force Orgasm countdown (0 = none) and why
+    // the host would refuse to switch it on ('landing', 'idle' or ''). A
+    // remote page runs no session of its own, so its button shows these.
+    remoteOrgasmSecondsLeft: 0,
+    remoteOrgasmRefusal: '',
     strokerSpeed: 0,
     prostateSpeed: 0,
     strokeMin: 0,
@@ -179,6 +201,11 @@ export const advancedSettings = {
     stallGuard: true,
     stallGuardSeconds: 20,
     stallPauseSeconds: 8,
+    // The longest one Force Orgasm run may last, from the moment it is
+    // switched on, before the session goes into the soft landing; 0 is Off.
+    // The options and the reason for this default live in session-rules.js
+    // (FORCE_ORGASM_MAX_OPTIONS).
+    forceOrgasmMaxSeconds: DEFAULT_FORCE_ORGASM_MAX_SECONDS,
     // What the primary does while parked at the pullback trigger: 'stop'
     // (0%) or 'crawl' (CRAWL_PERCENT). The stall guard only matters in crawl.
     ceilingBehaviour: 'crawl',
