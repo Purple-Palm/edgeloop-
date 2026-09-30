@@ -60,10 +60,30 @@ describe('parseHeartRateMeasurement', () => {
         assert.deepEqual(out.rrIntervalsMs, [1000, 750]);
     });
 
+    it('keeps the 1/1024 s resolution of an RR interval instead of rounding it', () => {
+        // 1000 units are 976.5625 ms exactly. A whole-millisecond 977 would be
+        // a value the strap never measured, and the beat-to-beat tracker sums
+        // squared differences of a few tens of ms where that error shows.
+        const out = parseHeartRateMeasurement(view([0b10000, 72, 0xE8, 0x03]));
+        assert.deepEqual(out.rrIntervalsMs, [976.5625]);
+        // The exact conversions still come out exact.
+        const exact = parseHeartRateMeasurement(view([0b10000, 72, 0x00, 0x04, 0x00, 0x03]));
+        assert.deepEqual(exact.rrIntervalsMs, [1000, 750]);
+        // 1 unit is the smallest step the sensor can report; the top of the
+        // field converts without rounding too.
+        const edges = parseHeartRateMeasurement(view([0b10000, 72, 0x01, 0x00, 0xFF, 0xFF]));
+        assert.deepEqual(edges.rrIntervalsMs, [1000 / 1024, 65535 * 1000 / 1024]);
+    });
+
     it('tolerates a truncated RR tail', () => {
         const out = parseHeartRateMeasurement(view([0b10000, 88, 0x00]));
         assert.equal(out.bpm, 88);
         assert.deepEqual(out.rrIntervalsMs, []);
+        // One complete interval followed by a dangling byte: the complete one
+        // is kept at full resolution and the half interval is ignored.
+        const partial = parseHeartRateMeasurement(view([0b10000, 88, 0xE8, 0x03, 0x12]));
+        assert.equal(partial.bpm, 88);
+        assert.deepEqual(partial.rrIntervalsMs, [976.5625]);
     });
 
     it('ignores values too short to carry a BPM', () => {

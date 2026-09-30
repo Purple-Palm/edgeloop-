@@ -22,6 +22,12 @@ export function reconnectDelayMs(attempt, delays = BLE_RECONNECT_DELAYS_MS) {
 //   flags bit 4    : RR intervals (uint16 each, 1/1024 s) present
 // Returns null when the value is too short to hold a BPM at all; a truncated
 // tail (RR intervals cut off by an MTU limit) is tolerated.
+// RR intervals come back in milliseconds WITHOUT rounding, so the 1/1024 s
+// resolution the strap measured survives into the beat-to-beat tracker.
+// Rounding to whole milliseconds was a presentation choice hiding in a
+// decoder: RMSSD is the root mean square of differences of a few tens of ms,
+// and an error of up to half a millisecond added to every beat is noise the
+// strap never produced.
 export function parseHeartRateMeasurement(view) {
     if (!view || typeof view.getUint8 !== 'function' || !Number.isFinite(view.byteLength)) return null;
     if (view.byteLength < 2) return null;
@@ -44,7 +50,7 @@ export function parseHeartRateMeasurement(view) {
     const rrIntervalsMs = [];
     if (flags & 0x10) {
         while (view.byteLength >= offset + 2) {
-            rrIntervalsMs.push(Math.round(view.getUint16(offset, true) * 1000 / 1024));
+            rrIntervalsMs.push(view.getUint16(offset, true) * 1000 / 1024);
             offset += 2;
         }
     }

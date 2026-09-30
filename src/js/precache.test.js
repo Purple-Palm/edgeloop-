@@ -23,8 +23,12 @@ const PAGE_URL = new URL('index.html', SITE).href;
 const SW_URL = new URL('sw.js', SITE).href;
 
 // Modules under src/js that the page does not load, each with its reason.
-// Empty: every module there belongs to the cockpit today.
-const NOT_LOADED_BY_THE_PAGE = [];
+// They are not precached either: sw.js holds what the page loads, and once
+// the page imports one of them, the walk reaches it and the precache check
+// below fails until sw.js names it.
+const NOT_LOADED_BY_THE_PAGE = [
+    './src/js/hrv.js' // the HRV display (H3) will import it
+];
 
 const readRepo = (relative) => readFileSync(new URL(relative, ROOT), 'utf8');
 const sameOrigin = (url) => new URL(url).origin === SITE.origin;
