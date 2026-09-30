@@ -18,7 +18,7 @@ import {
     isHandyOfflineStopPending,
     handyConnected
 } from './handy.js';
-import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed } from './handy-protocol.js';
+import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed, applyEndMargin, normalizeSlideRange } from './handy-protocol.js';
 import { calculateEngineOutputs } from '../engine.js';
 
 const KEY = 'test-key-123';
@@ -789,16 +789,164 @@ describe('handy driver', () => {
 
     it('never leaves the envelope or the minimum stroke with a margin applied', async () => {
         await connectOk();
-        // A tip-only zone at the top of a full envelope, at the widest margin.
+        // A tip-only zone at the top of a full envelope, at the widest
+        // margin: a whole minimum stroke, clear of the top end stop.
         dispatchHandy(50, 95, 100, true, 0, 100, 10);
         await tick(5);
-        const body = sent('/slide')[0].body;
-        assert.ok(body.min >= 0 && body.max <= 100);
-        assert.ok(body.max - body.min >= 10, `stroke was ${body.min}-${body.max}`);
+        assert.deepEqual(sent('/slide')[0].body, { min: 80, max: 90 });
         // A narrow envelope: the margin yields rather than shrink the stroke.
         dispatchHandy(50, 0, 100, true, 0, 10, 10);
         await tick(5);
         assert.deepEqual(sent('/slide')[1].body, { min: 0, max: 10 });
+    });
+
+    // On the wire before this change, with the default 0-100 envelope and 5%
+    // margin: Glans Protector's warm-up at 139 BPM sent {0,10}, and Head Play
+    // {86,96}. The margin gave way on any zone too short to be cut, so the
+    // carriage was run onto the very end stop it exists to keep it off, or
+    // into the margin beside it.
+    it('moves a minimum-width stroke off the end stop inside a wide envelope', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 10, true, 0, 100);
+        dispatchHandy(50, 86, 96, true, 0, 100);
+        dispatchHandy(50, 90, 100, true, 0, 100);
+        dispatchHandy(50, 0, 10, true, 0, 100, 10);
+        await tick(5);
+        assert.deepEqual(sent('/slide').map((c) => c.body), [
+            { min: 5, max: 15 }, { min: 85, max: 95 }, { min: 85, max: 95 }, { min: 10, max: 20 }
+        ]);
+    });
+
+    it('moves the stroke only inside the envelope the wearer set', async () => {
+        await connectOk();
+        // Room for the stroke to move but not for the whole margin: it
+        // keeps what it can and stays inside the typed bounds.
+        dispatchHandy(50, 0, 10, true, 0, 12);
+        dispatchHandy(50, 88, 100, true, 88, 100);
+        // A narrowed envelope that clears the ends is sent as it was.
+        dispatchHandy(50, 15, 25, true, 15, 85);
+        // Margin 0 still sends the engine's zone untouched.
+        dispatchHandy(50, 0, 10, true, 0, 100, 0);
+        await tick(5);
+        assert.deepEqual(sent('/slide').map((c) => c.body), [
+            { min: 2, max: 12 }, { min: 88, max: 98 }, { min: 15, max: 25 }, { min: 0, max: 10 }
+        ]);
+    });
+
+    it('sends every zone through the margin rule the protocol tests cover', async () => {
+        // The exhaustive grid lives in handy-protocol.test.js. This holds
+        // the driver to it: whatever dispatchHandy puts on the wire must be
+        // that function's answer, and must keep the margin by itself.
+        await connectOk();
+        const envelopes = [[0, 100], [0, 50], [50, 100], [0, 20], [80, 100], [0, 12], [88, 100], [0, 10], [90, 100], [15, 85], [30, 45]];
+        const expected = [];
+        let n = 0;
+        for (const [envMin, envMax] of envelopes) {
+            for (const margin of [0, 1, 5, 10]) {
+                for (let lo = 0; lo <= 100; lo += 5) {
+                    for (let hi = lo; hi <= 100; hi += 5) {
+                        dispatchHandy(50, lo, hi, true, envMin, envMax, margin);
+                        expected.push({ envMin, envMax, margin, lo, hi });
+                        n += 1;
+                        // Let the mocked replies land now and then.
+                        if (n % 500 === 0) await tick(0);
+                    }
+                }
+            }
+        }
+        await tick(5);
+        const bodies = sent('/slide').map((c) => c.body);
+        assert.equal(bodies.length, expected.length);
+        expected.forEach(({ envMin, envMax, margin, lo, hi }, i) => {
+            const at = `zone ${lo}-${hi} envelope ${envMin}-${envMax} margin ${margin}`;
+            const want = applyEndMargin(normalizeSlideRange(lo, hi, envMin, envMax), margin, { min: envMin, max: envMax });
+            assert.deepEqual(bodies[i], want, at);
+            const body = bodies[i];
+            assert.ok(body.min >= envMin && body.max <= envMax, `left the envelope at ${at}`);
+            assert.ok(body.max - body.min >= 10, `shorter than the minimum stroke at ${at}`);
+            const roomy = Math.min(envMax, 100 - margin) - Math.max(envMin, margin) >= 10;
+            if (roomy) assert.ok(body.min >= margin && body.max <= 100 - margin, `inside the margin at ${at}`);
+        });
+    });
+
+    // A pulse held at 139 BPM on this 70-140 band, factory settings, as it
+    // was recorded in the page before this change: Glans Protector's warm-up
+    // put all 26 of its strokes inside the margin, 21 of them {0,10}, on the
+    // end stop; Head Play 16 of 35, {86,96} 14 times; the warm-ups of
+    // Classic, Ultimate and Milker 18 of 43, 16 of 36 and 16 of 36.
+    it('keeps every stroke of a session off the end stops, the shortest ones too', async () => {
+        await connectOk();
+        await runSession([
+            { ticks: 60, activeMode: 'shortener', hr: 139, warmupMinutes: 5, sessionSeconds: 0 },
+            { ticks: 60, activeMode: 'headplay', hr: 139, warmupMinutes: 5, sessionSeconds: 0 },
+            { ticks: 60, activeMode: 'headplay', hr: 139, sessionSeconds: 600 },
+            { ticks: 60, activeMode: 'classic', hr: 139, warmupMinutes: 5, sessionSeconds: 0 },
+            { ticks: 60, activeMode: 'ultimate', hr: 139, warmupMinutes: 5, sessionSeconds: 0 },
+            { ticks: 60, activeMode: 'milker', hr: 139, warmupMinutes: 5, sessionSeconds: 0 }
+        ]);
+        const bodies = sent('/slide').map((c) => c.body);
+        assert.ok(bodies.length > 150, `only ${bodies.length} strokes were sent`);
+        assert.deepEqual(bodies.filter((b) => b.min < 5 || b.max > 95), [], 'a stroke went out inside the margin');
+        assert.deepEqual(bodies.filter((b) => b.max - b.min < 10), [], 'a stroke went out shorter than the minimum');
+        // The engine really did ask for minimum strokes on both ends: they
+        // left moved off the end, whole.
+        assert.ok(bodies.some((b) => b.min === 5 && b.max === 15), 'no minimum stroke at the base was moved up');
+        assert.ok(bodies.some((b) => b.min === 85 && b.max === 95), 'no minimum stroke at the tip was moved down');
+    });
+
+    // What the far end pays, through the real engine: the stroke Glans
+    // Protector and Head Play hold at the ceiling, as The Handy is sent it at
+    // each margin. README.md quotes these numbers.
+    it('sends a stroke held against one end at most one margin further toward the other than no margin does', async () => {
+        await connectOk();
+        const atCeiling = (activeMode, envMin, envMax, margin) => {
+            const out = calculateEngineOutputs({
+                hr: 150, edgeHr: 150, minHr: 70, maxHr: 140, activeMode,
+                sessionStatus: 'RUNNING', isEdged: true, orgasmMode: false,
+                warmupMinutes: 0, ceilingBehaviour: 'crawl', sessionSeconds: 600,
+                handyHwMin: envMin, handyHwMax: envMax
+            });
+            dispatchHandy(out.primaryPercent, out.strokeMinPercent, out.strokeMaxPercent, true, envMin, envMax, margin);
+            return `${out.strokeMinPercent}-${out.strokeMaxPercent}`;
+        };
+        assert.deepEqual([
+            atCeiling('shortener', 0, 100, 0),
+            atCeiling('shortener', 0, 100, 5),
+            atCeiling('shortener', 0, 100, 10),
+            atCeiling('shortener', 0, 60, 10),
+            atCeiling('headplay', 0, 100, 5)
+        ], ['0-35', '0-35', '0-35', '0-21', '75-100'], 'the engine\'s own zones');
+        await tick(5);
+        assert.deepEqual(sent('/slide').map((c) => `${c.body.min}-${c.body.max}`), ['0-35', '5-40', '10-45', '10-31', '70-95']);
+    });
+
+    // A narrowed envelope, through the real engine. In 0-40 Glans
+    // Protector's warm-up at 139 BPM asks for 0-4 - a tenth of the envelope,
+    // less than the 10% of travel The Handy is always sent - and the
+    // cockpit's Zone badge shows 0-4%. The driver lengthens it to a whole
+    // minimum stroke first, margin or not, and only then moves that off the
+    // end stop. At the default margin its far end lands 11 past the zone the
+    // engine asked for and 5 past what no margin sends, which is why the
+    // Handy panel and README.md measure what the margin costs from no
+    // margin, and say that a shorter stroke is lengthened to 10% first.
+    it('lengthens a short stroke in a narrowed envelope before moving it off the end stop', async () => {
+        await connectOk();
+        const out = calculateEngineOutputs({
+            hr: 139, edgeHr: 139, minHr: 70, maxHr: 140, activeMode: 'shortener',
+            sessionStatus: 'RUNNING', isEdged: false, orgasmMode: false,
+            warmupMinutes: 5, ceilingBehaviour: 'crawl', sessionSeconds: 10,
+            handyHwMin: 0, handyHwMax: 40
+        });
+        assert.deepEqual([out.strokeMinPercent, out.strokeMaxPercent], [0, 4], 'the engine\'s own zone');
+        assert.ok(out.primaryPercent > 0, 'the warm-up is moving');
+        for (const margin of [0, 5, 10]) {
+            dispatchHandy(out.primaryPercent, out.strokeMinPercent, out.strokeMaxPercent, true, 0, 40, margin);
+        }
+        // Head Play's warm-up at the tip of a 50-100 envelope asks for 94-99.
+        dispatchHandy(50, 94, 99, true, 50, 100, 0);
+        dispatchHandy(50, 94, 99, true, 50, 100, 5);
+        await tick(5);
+        assert.deepEqual(sent('/slide').map((c) => `${c.body.min}-${c.body.max}`), ['0-10', '5-15', '10-20', '90-100', '85-95']);
     });
 
     it('passes on a range the device rounded to its own limits, once', async () => {

@@ -234,11 +234,11 @@ export function clampEndMargin(value, fallback = HANDY_DEFAULT_END_MARGIN) {
 // wires its field ('input', 'change', 'blur'). Returns the margin to put in
 // effect, or null when the event changes nothing.
 //
-// A larger margin can only ever send a narrower range (applyEndMargin), so a
-// keystroke that finishes a larger number takes effect at once. A smaller
-// one moves the carriage back toward its end stops and waits for the commit:
-// typing 10 over a margin of 5 used to pass through 1 and send strokes out
-// to 1% and 99% of travel on the way.
+// A larger margin never lengthens a stroke or shrinks its distance from the
+// end stops (applyEndMargin), so a keystroke that finishes a larger number
+// takes effect at once. A smaller one moves the carriage back toward its end
+// stops and waits for the commit: typing 10 over a margin of 5 used to pass
+// through 1 and send strokes out to 1% and 99% of travel on the way.
 export function endMarginFieldEvent(current, raw, event) {
     const now = clampEndMargin(current);
     if (event === 'input') {
@@ -252,29 +252,72 @@ export function endMarginFieldEvent(current, raw, event) {
     return clampEndMargin(typed === null ? now : typed);
 }
 
-// Inset an already-normalised slide range away from 0 and 100 by `margin`.
+// The part of the wearer's travel envelope a stroke may use once the
+// end-stop margin is kept: the envelope with everything closer than
+// `margin` to the mechanical ends at 0 and 100 taken off.
 //
-// The result is ALWAYS a subset of the range it was handed, which is what
-// makes it safe: the input is already inside the user's hardware envelope, so
-// the envelope can never be exceeded, the zone can never invert, and the
-// stroke can never come back wider than it went in. The margin also yields
-// rather than shrink a stroke below `minGap` (or below the width it already
-// had, when that is narrower) - a margin must never take the wearer's stroke
-// away, only move it off the ends.
-export function applyEndMargin(range, margin = HANDY_DEFAULT_END_MARGIN, minGap = HANDY_MIN_SLIDE_GAP) {
-    let lo0 = clampPercent(range ? range.min : 0, 0);
-    let hi0 = clampPercent(range ? range.max : 100, 100);
-    if (lo0 > hi0) [lo0, hi0] = [hi0, lo0];
+// The envelope is normalised exactly as normalizeSlideRange normalises it,
+// so the window always lies inside the envelope a zone was placed in. Each
+// end gives up the margin only when the envelope is too narrow to lose it
+// and still hold a `minGap` stroke - an envelope the wearer set barely
+// wider than the minimum stroke, against an end - and then only as much of
+// it as it has to. That is the one case where the margin yields, and the
+// Handy panel's full-length readout shows by how much. How narrow the ZONE
+// inside the envelope is never enters into it: a short stroke in a wide
+// envelope has room to move off the end, so it is moved, not left on the
+// end stop.
+export function endMarginWindow(envMin = 0, envMax = 100, margin = HANDY_DEFAULT_END_MARGIN, minGap = HANDY_MIN_SLIDE_GAP) {
+    const gap = Math.max(0, toInt(minGap, HANDY_MIN_SLIDE_GAP));
+    const env = normalizeEnvelope(envMin, envMax, 'max', gap);
+    const keep = Math.min(gap, env.max - env.min);
     const m = clampEndMargin(margin);
-    if (m === 0) return { min: lo0, max: hi0 };
-
-    const keep = Math.min(Math.max(0, toInt(minGap, HANDY_MIN_SLIDE_GAP)), hi0 - lo0);
-    let lo = Math.min(hi0, Math.max(lo0, m));
-    let hi = Math.max(lo0, Math.min(hi0, 100 - m));
-    if (hi < lo) return { min: lo0, max: hi0 };
-    if (hi - lo < keep) lo = Math.max(lo0, hi - keep);
-    if (hi - lo < keep) hi = Math.min(hi0, lo + keep);
+    let lo = Math.max(env.min, m);
+    let hi = Math.min(env.max, 100 - m);
+    if (hi - lo < keep) lo = Math.max(env.min, hi - keep);
+    if (hi - lo < keep) hi = Math.min(env.max, lo + keep);
     return { min: lo, max: hi };
+}
+
+// Move a slide range off the mechanical ends at 0 and 100 by `margin`,
+// inside the wearer's travel `envelope` ({ min, max }).
+//
+// The patterns pin short strokes to an end of the envelope. Near the
+// pullback mark Glans Protector closes its stroke on the base and Head Play
+// climbs to the tip, and the warm-up shortens a stroke from the bottom of
+// the mode's window, down to the minimum stroke. A margin that could only
+// cut a zone had to give way on every one of them rather than shrink it
+// below the minimum, so a full 0-100 envelope sent {0,10} and {86,96}:
+// strokes on the mechanical end stop the Handy 2 firmware locks itself out
+// over, or inside the margin that is there to keep the carriage off it. The
+// zone now keeps its length and slides inward into endMarginWindow()
+// instead, and only a zone longer than that window is cut down to it.
+//
+// The result is ALWAYS inside the window, and the window inside the
+// envelope, so the envelope still bounds everything that reaches the
+// device. It never inverts, it is never longer than the range it was handed,
+// and it is shorter only when the window itself is. Keeping the length is
+// paid for at the far end: a zone inside its envelope that slides off one
+// end reaches up to `margin` further toward the other, and never further.
+// Without an envelope the range is its own, so the result is a subset of
+// it: that is a full-length stroke, which is what the Handy panel shows.
+// Margin 0 returns the range exactly as it came in.
+export function applyEndMargin(range, margin = HANDY_DEFAULT_END_MARGIN, envelope = null, minGap = HANDY_MIN_SLIDE_GAP) {
+    let lo = clampPercent(range ? range.min : 0, 0);
+    let hi = clampPercent(range ? range.max : 100, 100);
+    if (lo > hi) [lo, hi] = [hi, lo];
+    const m = clampEndMargin(margin);
+    if (m === 0) return { min: lo, max: hi };
+
+    // Anything that does not name both bounds is no envelope at all. Read
+    // as one, its missing bounds would default to full travel and could
+    // slide a stroke out of the bounds the wearer set; the range itself
+    // can only ever fail to move it.
+    const named = envelope && typeof envelope === 'object' && envelope.min !== undefined && envelope.max !== undefined;
+    const env = named ? envelope : { min: lo, max: hi };
+    const win = endMarginWindow(env.min, env.max, m, minGap);
+    const width = Math.min(hi - lo, win.max - win.min);
+    const min = Math.min(Math.max(lo, win.min), win.max - width);
+    return { min, max: min + width };
 }
 
 // PUT /slide answers with a SlideResult: ACCEPTED(0), ACCEPTED_ROUNDED_DOWN(1)

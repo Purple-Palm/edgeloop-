@@ -598,8 +598,12 @@
               <p class="text-[9px] text-slate-400 leading-snug">
                 Keeps the carriage off the mechanical ends of the slider. The Handy's firmware stops the
                 slider when it reads as blocked, and a carriage driven hard into its end stop can read
-                exactly like that. Only strokes that reach within this margin of 0% or 100% are moved;
-                a narrower Travel Envelope is sent untouched, and <strong>0 sends the full range</strong>.
+                exactly like that. The Handy is never sent a stroke shorter than 10% of travel: a shorter
+                one is lengthened to 10% first, margin or not. Only strokes that then reach within this
+                margin of 0% or 100% are moved: a stroke keeps its length and slides inward, so its far end
+                can go up to the margin further than with no margin, and only a stroke longer than the room
+                left is cut. Nothing leaves your Travel Envelope, the margin leaves one that already clears
+                it untouched, and <strong>0 sends the full range</strong>.
                 While you type, only a larger margin is sent; a smaller one waits until you press Enter or leave the field.
               </p>
               <span id="handySlideDisplay" class="font-mono text-[10px] font-bold text-teal-400 block">A full-length stroke reaches the device as 5% - 95%</span>

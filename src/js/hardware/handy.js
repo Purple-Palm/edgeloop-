@@ -18,9 +18,9 @@
 //      that "may still be moving", so that warning still means something
 //      on the day it is true.
 //   2. Never exceed the user's hardware envelope; the stroke range sent to
-//      PUT /slide is always normalised through handy-protocol.js, then inset
-//      from the mechanical ends by the end-stop margin (a subset of the
-//      normalised range, so the envelope still bounds it), and the range is
+//      PUT /slide is always normalised through handy-protocol.js, then moved
+//      off the mechanical ends by the end-stop margin (inside that same
+//      envelope, so the envelope still bounds it), and the range is
 //      confirmed by the API before the motor is started.
 //   3. Stay under the API rate limit: velocity is throttled to one call per
 //      400 ms (a zero that sends nothing takes no turn, see dispatchHandy),
@@ -888,8 +888,10 @@ function sendSlide(range) {
 // the mapping); the envelope arguments are used only to widen a too-narrow
 // range in the right direction without leaving the user's bounds.
 // `endMargin` is the wearer's end-stop margin in percent of travel (0 = off):
-// it can only inset the normalised range, never widen it, so the envelope
-// still bounds everything that reaches the device.
+// the normalised range is moved inside the envelope less that margin,
+// keeping its length wherever that leaves room for it, so the envelope
+// still bounds everything that reaches the device and a short stroke pinned
+// to an end is moved off it too.
 export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false, envMin = 0, envMax = 100, endMargin = HANDY_DEFAULT_END_MARGIN) {
     if (!handyConnected || !handyKey) return;
     const now = Date.now();
@@ -920,7 +922,10 @@ export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false,
     // A reconnect is stopping this device before replacing it: no motion.
     if (handySwitching) return;
 
-    const range = applyEndMargin(normalizeSlideRange(strokeMin, strokeMax, envMin, envMax), endMargin);
+    // The margin is handed the same envelope the range was normalised into:
+    // without it the margin could only cut the zone, and a minimum-width
+    // zone on an end has nothing to cut, so it stayed on the end stop.
+    const range = applyEndMargin(normalizeSlideRange(strokeMin, strokeMax, envMin, envMax), endMargin, { min: envMin, max: envMax });
     const rangeChanged = range.min !== handyLastStrokeSent.min || range.max !== handyLastStrokeSent.max;
     let rangeConfirmed = Promise.resolve(true);
     if (force || rangeChanged || (now - handyLastStrokeSend > STROKE_THROTTLE_MS)) {
