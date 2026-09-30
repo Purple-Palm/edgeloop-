@@ -11,6 +11,7 @@ import {
     setAxisInvert,
     setDeviceRotation,
     reverseIntifaceRotation,
+    testSingleAxis,
     saveIntifaceConfig,
     stopAllIntiface,
     isIntifaceConnected,
@@ -24,7 +25,7 @@ import {
     INTIFACE_STORAGE_KEY,
     HANDSHAKE_TIMEOUT_TEXT
 } from './intiface.js';
-import { REST_MOVE_MS } from './stroke-planner.js';
+import { REST_MOVE_MS, legDurationMs } from './stroke-planner.js';
 
 const sockets = [];
 
@@ -335,6 +336,250 @@ describe('dispatch', () => {
         dispatchIntiface(0, 0, 0, 100, 0, 100, true);
     });
 
+    it('a cut the engine decides rests a stroker at once, not after the leg in flight', async () => {
+        const ws = connectWith([OSR2, EDGE]);
+        // The crawl on the mark: a slow leg, over two seconds long.
+        dispatchIntiface(5, 40, 0, 100);
+        const legs = ws.messages('LinearCmd');
+        assert.equal(legs.length, 1);
+        assert.ok(legs[0].Vectors[0].Duration > 2000);
+        // A slowdown that is not a stop waits for the leg.
+        dispatchIntiface(2, 40, 0, 100);
+        assert.equal(ws.messages('LinearCmd').length, 1);
+        // The stall guard cuts the primary on an ordinary dispatch: the rest
+        // move goes out with it, and the secondary keeps its vibration.
+        const scalarsBefore = ws.messages('ScalarCmd').length;
+        dispatchIntiface(0, 40, 0, 100);
+        const after = ws.messages('LinearCmd');
+        assert.equal(after.length, 2, 'the rest move goes out with the cut');
+        assert.equal(after[1].Vectors[0].Duration, REST_MOVE_MS);
+        assert.equal(after[1].Vectors[0].Position, 0);
+        assert.equal(ws.messages('StopAllDevices').length, 0, 'an engine cut is not STOP');
+        assert.equal(ws.messages('ScalarCmd').length, scalarsBefore, 'the secondary did not change');
+        // Once, whatever the ticks after it say.
+        dispatchIntiface(0, 40, 0, 100);
+        await sleep(REST_MOVE_MS + 40);
+        dispatchIntiface(0, 40, 0, 100);
+        assert.equal(ws.messages('LinearCmd').length, 2);
+    });
+
+    it('an urgent dispatch re-times a stroker\'s leg in flight; an ordinary one waits for the next leg', async () => {
+        // A stroker set to the secondary channel when the Ruin lockout
+        // begins: the ride's 46% drops to 18% and the zone opens up.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        // Nothing moves yet: the axis rests first.
+        await sleep(REST_MOVE_MS + 40);
+        const rested = ws.messages('LinearCmd').length;
+        const t0 = Date.now();
+        dispatchIntiface(46, 46, 5, 69);
+        const ride = ws.messages('LinearCmd').slice(rested);
+        assert.equal(ride.length, 1);
+        assert.deepEqual(ride[0].Vectors[0], { Index: 0, Duration: legDurationMs(46, 0.64), Position: 0.69 });
+        await sleep(100);
+        // The packet before the lockout, an ordinary change: the next leg's.
+        dispatchIntiface(0, 18, 0, 100);
+        assert.equal(ws.messages('LinearCmd').length, rested + 1);
+        // The lockout's own dispatch, urgent: the rest of the upstroke, to
+        // the same end, at 18%.
+        dispatchIntiface(0, 18, 0, 100, 0, 100, false, { urgent: true });
+        const retimed = ws.messages('LinearCmd').slice(rested);
+        assert.equal(retimed.length, 2);
+        const { Position, Duration } = retimed[1].Vectors[0];
+        assert.equal(Position, 0.69, 'no position the leg was not already on its way to');
+        const left = t0 + ride[0].Vectors[0].Duration - Date.now();
+        assert.ok(Duration > left && Duration < legDurationMs(18, 0.64), `${Duration} ms for what was left of ${left} ms`);
+        // Once: the same decision again has nothing left to re-time.
+        dispatchIntiface(0, 18, 0, 100, 0, 100, false, { urgent: true });
+        assert.equal(ws.messages('LinearCmd').length, rested + 2);
+        // The next leg comes when the re-timed one ends, not the original.
+        await sleep(left + 60);
+        assert.equal(ws.messages('LinearCmd').length, rested + 2);
+        await sleep(Duration - left);
+        const legs = ws.messages('LinearCmd').slice(rested);
+        assert.equal(legs.length, 3);
+        assert.deepEqual(legs[2].Vectors[0], { Index: 0, Duration: legDurationMs(18, 1), Position: 0 });
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a re-timed leg goes where its leg was sent, not through an envelope changed since', async () => {
+        // An inverted stroker on the secondary channel, a travel envelope of
+        // 0-80: the zone's bottom is the envelope's top, 80%. During that leg
+        // the wearer raises the envelope's minimum to 20, then an urgent
+        // decision re-times the leg. Mirrored through 20-80, the leg's end
+        // would have become 100%, 20 points past the wearer's maximum.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        setAxisInvert(1, 0, true);
+        await sleep(REST_MOVE_MS + 40);
+        const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        const leg = legDurationMs(60, 0.8);
+        dispatchIntiface(0, 60, 0, 80, 0, 80);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 0 }, 'the zone top, mirrored to the envelope bottom');
+        await sleep(leg + 10);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 0.8 }, 'the zone bottom, mirrored to the envelope top');
+        const edited = legs().length;
+        dispatchIntiface(0, 60, 20, 80, 20, 80);
+        dispatchIntiface(0, 18, 20, 80, 20, 80, false, { urgent: true });
+        const sent = legs().slice(edited);
+        assert.equal(sent.length, 1, 'the leg is re-timed, once');
+        assert.equal(sent[0].Position, 0.8, 'to 80%, where it was going');
+        assert.ok(sent[0].Duration > leg - 20, `${sent[0].Duration} ms: the rest of the leg at 18%`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a re-timed leg goes where its leg was sent when the invert switch flips during it', async () => {
+        // The wearer turns the sleeve over mid-stroke. Re-timed, the leg in
+        // flight goes on up to the top at the new speed; mirrored through the
+        // new setting, it was turned back down to the bottom.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        await sleep(REST_MOVE_MS + 40);
+        const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        const leg = legDurationMs(60, 1);
+        dispatchIntiface(0, 60, 0, 100);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 1 });
+        await sleep(100);
+        setAxisInvert(1, 0, true);
+        dispatchIntiface(0, 95, 0, 100, 0, 100, false, { urgent: true });
+        const retimed = legs().pop();
+        assert.equal(retimed.Position, 1, 'on up to the top, not back down');
+        assert.ok(retimed.Duration < leg - 100, `${retimed.Duration} ms: faster, as 95% asks`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('re-times a leg to the envelope\'s own bound, which an inverted axis reaches through float noise', async () => {
+        // 0.2 + 0.8 - 0.8 is 0.19999999999999996: the leg to the bottom of a
+        // 20-80 envelope is on its bound, and an urgent decision re-times it
+        // like any other.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        setAxisInvert(1, 0, true);
+        await sleep(REST_MOVE_MS + 40);
+        const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        const leg = legDurationMs(60, 0.6);
+        dispatchIntiface(0, 60, 20, 80, 20, 80);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 0.2 });
+        await sleep(60);
+        const before = legs().length;
+        dispatchIntiface(0, 18, 20, 80, 20, 80, false, { urgent: true });
+        assert.equal(legs().length, before + 1);
+        const retimed = legs().pop();
+        assert.equal(retimed.Position, 0.2);
+        assert.ok(retimed.Duration > leg, `${retimed.Duration} ms: re-timed at 18%`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a leg the wearer has put outside the envelope runs out instead of being re-timed', async () => {
+        // During an upstroke to the top the wearer lowers the envelope's
+        // maximum to 60, then the Ruin lockout drops the secondary to 18%.
+        // Sent again, the leg would be a new command to 100%, outside the
+        // envelope: it runs out as it was sent, as a leg in flight always did
+        // when the envelope changed, and the next leg, inside the envelope,
+        // carries the 18%.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        await sleep(REST_MOVE_MS + 40);
+        const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        const leg = legDurationMs(70, 1);
+        const t0 = Date.now();
+        dispatchIntiface(0, 70, 0, 100);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 1 });
+        await sleep(60);
+        const edited = legs().length;
+        dispatchIntiface(0, 70, 0, 60, 0, 60);
+        dispatchIntiface(0, 18, 0, 60, 0, 60, false, { urgent: true });
+        assert.equal(legs().length, edited, 'no new command to 100%');
+        await sleep(t0 + leg - Date.now() + 40);
+        assert.deepEqual(legs().slice(edited), [{ Index: 0, Duration: legDurationMs(18, 1), Position: 0 }], 'the next leg, at 18%');
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('times what is left of a leg over what it covers on the device', async () => {
+        // A narrow zone at the bottom of the envelope. The wearer turns the
+        // sleeve over during a leg to 0.2: the next leg, the zone's bottom
+        // mirrored to the top, takes the sleeve 0.8 of the travel in a leg
+        // timed for the zone's 0.2. An urgent raise to 80% early in it times
+        // what is left over the 0.8, at the planner's pace for 80%; over the
+        // 0.2 it was the 120 ms floor, faster than any leg the planner makes.
+        const ws = connectWith([OSR2]);
+        setAxisRole(1, 0, 'secondary');
+        await sleep(REST_MOVE_MS + 40);
+        const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        const leg = legDurationMs(10, 0.2);
+        const t0 = Date.now();
+        dispatchIntiface(0, 10, 0, 20, 0, 100);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 0.2 });
+        setAxisInvert(1, 0, true);
+        await sleep(t0 + leg - Date.now() + 5);
+        assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 1 }, 'from 0.2 to the top on a leg timed for 0.2');
+        const before = legs().length;
+        dispatchIntiface(0, 80, 0, 20, 0, 100, false, { urgent: true });
+        // The leg began no earlier than t0 + leg: at least this share of it
+        // is left.
+        const share = (leg - (Date.now() - t0 - leg)) / leg;
+        assert.equal(legs().length, before + 1, 'the leg is re-timed');
+        const retimed = legs().pop();
+        assert.equal(retimed.Position, 1);
+        assert.ok(retimed.Duration >= Math.round(share * legDurationMs(80, 0.8)) - 1, `${retimed.Duration} ms: at least ${share.toFixed(2)} of a leg over 0.8 at 80%`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('times what is left of a first leg as if it covered the whole travel', async () => {
+        // Intiface does not rest a stroker on connect: the first leg starts
+        // wherever the sleeve was left, which can be the far end. What is left
+        // of it is timed over the whole travel, never over less.
+        const ws = connectWith([OSR2]);
+        const leg = legDurationMs(10, 0.2);
+        const t0 = Date.now();
+        dispatchIntiface(10, 0, 0, 20);
+        assert.deepEqual(ws.messages('LinearCmd').map((m) => m.Vectors[0]), [{ Index: 0, Duration: leg, Position: 0.2 }]);
+        await sleep(50);
+        dispatchIntiface(80, 0, 0, 20, 0, 100, false, { urgent: true });
+        const share = (leg - (Date.now() - t0)) / leg;
+        const legs = ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+        assert.equal(legs.length, 2);
+        assert.equal(legs[1].Position, 0.2);
+        assert.ok(legs[1].Duration >= Math.round(share * legDurationMs(80, 1)) - 1, `${legs[1].Duration} ms: at least ${share.toFixed(2)} of a leg over the whole travel at 80%`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('times a leg after the Test button from where the test left the sleeve', async () => {
+        // The stroker rests at 0.9, then the Test button takes it to the top
+        // and back to the bottom. The next leg goes from the bottom to the
+        // top of a zone at 0.8-1.0: the whole travel on a leg timed for the
+        // zone's 0.2, and an urgent raise times what is left of it over the
+        // whole travel - not from the rest, nor from the top of the test.
+        const testMoveMs = INTIFACE_TIMINGS.testMoveMs;
+        INTIFACE_TIMINGS.testMoveMs = 20;
+        try {
+            const ws = connectWith([OSR2]);
+            const legs = () => ws.messages('LinearCmd').map((m) => m.Vectors[0]);
+            dispatchIntiface(0, 0, 90, 100);
+            assert.deepEqual(legs(), [{ Index: 0, Duration: REST_MOVE_MS, Position: 0.9 }]);
+            await sleep(REST_MOVE_MS + 40);
+            dispatchIntiface(0, 0, 0, 100);
+            assert.equal(testSingleAxis(1, 0), true);
+            await sleep(3 * INTIFACE_TIMINGS.testMoveMs + 100);
+            assert.deepEqual(legs().slice(1).map((v) => v.Position), [1, 0]);
+            const leg = legDurationMs(10, 0.2);
+            const t0 = Date.now();
+            dispatchIntiface(10, 0, 80, 100);
+            assert.deepEqual(legs().pop(), { Index: 0, Duration: leg, Position: 1 });
+            await sleep(40);
+            const before = legs().length;
+            dispatchIntiface(80, 0, 80, 100, 0, 100, false, { urgent: true });
+            const share = (leg - (Date.now() - t0)) / leg;
+            assert.equal(legs().length, before + 1, 'the leg is re-timed');
+            const retimed = legs().pop();
+            assert.equal(retimed.Position, 1);
+            assert.ok(retimed.Duration >= Math.round(share * legDurationMs(80, 1)) - 1, `${retimed.Duration} ms: at least ${share.toFixed(2)} of a leg over the whole travel at 80%`);
+            dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        } finally {
+            INTIFACE_TIMINGS.testMoveMs = testMoveMs;
+        }
+    });
+
     it('stop sends StopAllDevices then a single 400 ms rest move and goes quiet', async () => {
         const ws = connectWith([OSR2]);
         dispatchIntiface(0, 0, 0, 100, 10, 90, true);
@@ -452,6 +697,28 @@ describe('rotation', () => {
         assert.equal(reverseIntifaceRotation('edge', t0 + 1500), 0);
         setDeviceRotation(2, { reverseOnEdge: false });
         assert.equal(reverseIntifaceRotation('edge', t0 + 5000), 0);
+    });
+
+    it('a reversal left to the next dispatch sends the new direction with the new speed, once', () => {
+        const ws = connectWith([VORZE]);
+        dispatchIntiface(45, 0, 0, 100);
+        const t0 = intifaceDevices.get(2).lastDirectionChangeAt;
+        // Full Stop on the edge: the engine reverses and cuts in one pass.
+        assert.equal(reverseIntifaceRotation('edge', t0 + 1000, { apply: false }), 1);
+        assert.equal(ws.messages('RotateCmd').length, 1, 'the reversal sent nothing by itself');
+        dispatchIntiface(0, 0, 0, 100);
+        let rot = ws.messages('RotateCmd');
+        assert.equal(rot.length, 2, 'the stop, and no 45% the other way before it');
+        assert.equal(rot[1].Rotations[0].Speed, 0);
+        // Crawl on the next edge: the crawl goes out already reversed.
+        dispatchIntiface(45, 0, 0, 100);
+        rot = ws.messages('RotateCmd');
+        assert.deepEqual(rot[2].Rotations[0], { Index: 0, Speed: 0.45, Clockwise: false });
+        assert.equal(reverseIntifaceRotation('edge', t0 + 2000, { apply: false }), 1);
+        dispatchIntiface(10, 0, 0, 100);
+        rot = ws.messages('RotateCmd');
+        assert.equal(rot.length, 4);
+        assert.deepEqual(rot[3].Rotations[0], { Index: 0, Speed: 0.1, Clockwise: true });
     });
 
     it('alternates direction every N seconds while spinning', () => {

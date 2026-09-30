@@ -26,7 +26,10 @@
 //      400 ms (a zero that sends nothing takes no turn, see dispatchHandy),
 //      the slide range to one call per second unless it changed, and the
 //      GET /connected poll to one call per 10 s in a session and one per
-//      30 s outside one (see startOfflinePolling).
+//      30 s outside one (see startOfflinePolling). A stop is not throttled,
+//      and neither is an urgent dispatch (a cut, a guard's decision, the
+//      landing Force Orgasm's time limit starts): each goes out on the
+//      dispatch that carries it.
 //   4. Never show a link that is not there: the poll runs for as long as a
 //      Handy is connected, in a session or not, and START / RESUME ask the
 //      API again before anything moves (pollHandyConnected, used by app.js).
@@ -892,11 +895,12 @@ function sendSlide(range) {
 // keeping its length wherever that leaves room for it, so the envelope
 // still bounds everything that reaches the device and a short stroke pinned
 // to an end is moved off it too.
-export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false, envMin = 0, envMax = 100, endMargin = HANDY_DEFAULT_END_MARGIN) {
+// `urgent` (tick-dispatch.js): this dispatch carries a cut, a guard's
+// decision or the landing Force Orgasm's time limit starts, and is not
+// throttled.
+export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false, envMin = 0, envMax = 100, endMargin = HANDY_DEFAULT_END_MARGIN, { urgent = false } = {}) {
     if (!handyConnected || !handyKey) return;
     const now = Date.now();
-    if (!force && (now - handyLastSend < VELOCITY_THROTTLE_MS)) return;
-
     const velocity = clampVelocity(primarySpeed);
     // A zero for a motor this driver knows to be at rest sends nothing, so
     // it is no dispatch at all: it takes no turn from the throttle, which is
@@ -910,6 +914,30 @@ export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false,
     // the device was sent anything.
     const stopNeeded = force || handyStartInFlight || motorMayBeMoving();
     if (velocity === 0 && !stopNeeded) return;
+    // Two dispatches are never throttled. The throttle keeps velocity
+    // changes under the API's rate limit, and it drops a dispatch rather
+    // than delaying it: what it dropped waited for the next dispatch, a
+    // heart-rate packet or a tick up to a second later.
+    //   - A stop of this device. A zero it dropped left a device the engine
+    //     had cut - a stall guard, the Ruin lockout, Full Stop on the mark -
+    //     stroking until the next dispatch. Measured in the page with a
+    //     mocked API: a Full Stop decided on a packet that came 150 ms after
+    //     the tick reached the device 0.85 s later. Only a device that may
+    //     be moving is sent one (above), and a dispatch that finds a stop in
+    //     flight joins it.
+    //   - An urgent dispatch: one that cuts a moving primary to 0, or that a
+    //     guard made in the tick, or the first of the landing Force Orgasm's
+    //     time limit starts. It carries what that decision leaves THIS
+    //     device, whichever channel it follows: a Handy set to follow the
+    //     secondary channel was sent the Ruin lockout's 18% 0.8 s late, on
+    //     the next packet, because a packet 200 ms before the tick had
+    //     opened the window that dropped it.
+    // Neither can raise the request rate: a stop goes out once per stop of
+    // the device, an urgent dispatch once per cut, guard engaging or Force
+    // Orgasm landing, the throttle's clock restarts from either, and every
+    // other start or velocity change still waits out the throttle.
+    const stopping = velocity === 0;
+    if (!force && !urgent && !stopping && (now - handyLastSend < VELOCITY_THROTTLE_MS)) return;
     handyLastSend = now;
     dispatchSequence += 1;
 

@@ -297,6 +297,239 @@ describe('dispatch', () => {
         assert.equal(port.written.length, before + 2);
         assert.equal(lastLine(), `L02000I${legDurationMs(90, 0.6)}`);
     });
+    it('a cut the engine decides rests L0 at once, not after the leg in flight', async () => {
+        await connect();
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        // The crawl on the mark: a slow leg, over two seconds long.
+        dispatchTCode(5, 40, 0, 100, 0, 100);
+        await flush();
+        const legs = stroke();
+        assert.match(legs[legs.length - 1], /^L09999I\d+$/);
+        assert.ok(Number(legs[legs.length - 1].split('I')[1]) > 2000);
+        const before = port.written.length;
+        // A slowdown that is not a stop waits for the leg.
+        dispatchTCode(2, 40, 0, 100, 0, 100);
+        await flush();
+        assert.equal(port.written.length, before);
+        // The stall guard cuts the primary on an ordinary dispatch: L0 rests
+        // now, and the secondary vibration is left as it was.
+        dispatchTCode(0, 40, 0, 100, 0, 100);
+        await flush();
+        assert.equal(port.written.length, before + 1);
+        assert.equal(lastLine(), `L00000I${TCODE_TIMINGS.restMs}`);
+        // Once, whatever the ticks after it say.
+        dispatchTCode(0, 40, 0, 100, 0, 100);
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        dispatchTCode(0, 40, 0, 100, 0, 100);
+        await flush();
+        assert.equal(port.written.length, before + 1);
+    });
+    it('an urgent dispatch re-times a planner axis\'s leg in flight; an ordinary one waits for the next leg', async () => {
+        // L0 and the twist set to the secondary channel when the Ruin lockout
+        // begins: the ride's 46% drops to 18% and the zone opens up.
+        await connect();
+        setAxisRole(0, 'secondary');
+        setAxisRole(1, 'secondary');
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const axisLines = (id) => lines().filter((l) => l.startsWith(id));
+        const interval = (line) => Number(line.split('I')[1]);
+        const t0 = Date.now();
+        dispatchTCode(46, 46, 5, 69, 0, 100);
+        await flush();
+        // From the rest at the bottom: 0.69 of travel.
+        assert.equal(axisLines('L0').pop(), `L06900I${legDurationMs(46, 0.69)}`);
+        assert.equal(axisLines('R0').pop(), `R07300I${legDurationMs(46, 1)}`);
+        await sleep(60);
+        const before = port.written.length;
+        // The packet before the lockout, an ordinary change: the next leg's.
+        dispatchTCode(0, 18, 0, 100, 0, 100);
+        await flush();
+        assert.deepEqual(port.written.slice(before).map((w) => w.trim()), ['V01800'], 'only the vibration takes it now');
+        // The lockout's own dispatch, urgent: the rest of each leg, to the
+        // same end, at 18%.
+        dispatchTCode(0, 18, 0, 100, 0, 100, false, { urgent: true });
+        await flush();
+        const l0 = axisLines('L0').pop();
+        const r0 = axisLines('R0').pop();
+        assert.match(l0, /^L06900I\d+$/, 'no position the leg was not already on its way to');
+        assert.match(r0, /^R07300I\d+$/);
+        const leftL0 = t0 + legDurationMs(46, 0.69) - Date.now();
+        assert.ok(interval(l0) > leftL0 && interval(l0) < legDurationMs(18, 0.69), `${l0} for what was left of ${leftL0} ms`);
+        assert.ok(interval(r0) > t0 + legDurationMs(46, 1) - Date.now() && interval(r0) < legDurationMs(18, 1), r0);
+        assert.equal(port.written.length, before + 3, 'the vibration once, each planner axis once');
+        // Once: the same decision again has nothing left to re-time.
+        dispatchTCode(0, 18, 0, 100, 0, 100, false, { urgent: true });
+        await flush();
+        assert.equal(port.written.length, before + 3);
+        // L0's next leg comes when its re-timed leg ends, not the original.
+        await sleep(leftL0 + 40);
+        assert.equal(axisLines('L0').pop(), l0);
+        await sleep(interval(l0) - leftL0);
+        assert.equal(axisLines('L0').pop(), `L00000I${legDurationMs(18, 1)}`);
+    });
+    it('a re-timed leg goes where its leg was sent, not through an envelope changed since', async () => {
+        // L0 inverted on the secondary channel, a travel envelope of 0-80:
+        // the zone's bottom is the envelope's top, 80%. During that leg the
+        // wearer raises the envelope's minimum to 20, then an urgent decision
+        // re-times the leg. Mirrored through 20-80, the leg's end would have
+        // become 100%, 20 points past the wearer's maximum.
+        await connect();
+        setAxisRole(0, 'secondary');
+        setAxisInvert(0, true);
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        const leg = legDurationMs(60, 0.8);
+        dispatchTCode(0, 60, 0, 80, 0, 80);
+        await flush();
+        assert.equal(stroke().pop(), `L00000I${leg}`, 'the zone top, mirrored to the envelope bottom');
+        await sleep(leg + 10);
+        assert.equal(stroke().pop(), `L08000I${leg}`, 'the zone bottom, mirrored to the envelope top');
+        const edited = port.written.length;
+        dispatchTCode(0, 60, 20, 80, 20, 80);
+        dispatchTCode(0, 18, 20, 80, 20, 80, false, { urgent: true });
+        await flush();
+        const sent = port.written.slice(edited).map((w) => w.trim()).filter((l) => l.startsWith('L0'));
+        assert.equal(sent.length, 1, 'the leg is re-timed, once');
+        assert.match(sent[0], /^L08000I\d+$/, 'to 80%, where it was going');
+        assert.ok(Number(sent[0].split('I')[1]) > leg - 20, `${sent[0]}: the rest of the leg at 18%`);
+    });
+    it('a re-timed leg goes where its leg was sent when the invert switch flips during it', async () => {
+        // The wearer turns the sleeve over mid-stroke. Re-timed, the leg in
+        // flight goes on up to the top at the new speed. Mirrored through the
+        // new setting it was turned back down to the bottom: late in a leg,
+        // three quarters of the travel in 120 ms, faster than any leg the
+        // planner makes.
+        await connect();
+        setAxisRole(0, 'secondary');
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        const leg = legDurationMs(60, 1);
+        dispatchTCode(0, 60, 0, 100, 0, 100);
+        await flush();
+        assert.equal(stroke().pop(), `L09999I${leg}`);
+        await sleep(100);
+        setAxisInvert(0, true);
+        dispatchTCode(0, 95, 0, 100, 0, 100, false, { urgent: true });
+        await flush();
+        const retimed = stroke().pop();
+        assert.match(retimed, /^L09999I\d+$/, 'on up to the top, not back down');
+        assert.ok(Number(retimed.split('I')[1]) < leg - 100, `${retimed}: faster, as 95% asks`);
+    });
+    it('re-times a leg to the envelope\'s own bound, which an inverted axis reaches through float noise', async () => {
+        // 0.2 + 0.8 - 0.8 is 0.19999999999999996: the leg to the bottom of a
+        // 20-80 envelope is on its bound, and an urgent decision re-times it
+        // like any other.
+        await connect();
+        setAxisRole(0, 'secondary');
+        setAxisInvert(0, true);
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        // From the rest at 0: 0.8 of travel.
+        const leg = legDurationMs(60, 0.8);
+        dispatchTCode(0, 60, 20, 80, 20, 80);
+        await flush();
+        assert.equal(stroke().pop(), `L02000I${leg}`);
+        await sleep(60);
+        dispatchTCode(0, 18, 20, 80, 20, 80, false, { urgent: true });
+        await flush();
+        const retimed = stroke().pop();
+        assert.match(retimed, /^L02000I\d+$/);
+        assert.ok(Number(retimed.split('I')[1]) > leg, `${retimed}: re-timed at 18%`);
+    });
+    it('a leg the wearer has put outside the envelope runs out instead of being re-timed', async () => {
+        // L0 and the twist on the secondary channel. During an upstroke to the
+        // top the wearer lowers the envelope's maximum to 60, then the Ruin
+        // lockout drops the secondary to 18%. Sent again, the leg would be a
+        // new command to 100%, outside the envelope: it runs out as it was
+        // sent, as a leg in flight always did when the envelope changed, and
+        // the next leg, inside the envelope, carries the 18%. The twist
+        // swings around the middle, which the envelope does not bound: it is
+        // re-timed as ever.
+        await connect();
+        setAxisRole(0, 'secondary');
+        setAxisRole(1, 'secondary');
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const axisLines = (id) => lines().filter((l) => l.startsWith(id));
+        const leg = legDurationMs(70, 1);
+        const t0 = Date.now();
+        dispatchTCode(0, 70, 0, 100, 0, 100);
+        await flush();
+        assert.equal(axisLines('L0').pop(), `L09999I${leg}`);
+        assert.equal(axisLines('R0').pop(), `R08500I${leg}`);
+        await sleep(60);
+        const edited = port.written.length;
+        dispatchTCode(0, 70, 0, 60, 0, 60);
+        dispatchTCode(0, 18, 0, 60, 0, 60, false, { urgent: true });
+        await flush();
+        const sent = port.written.slice(edited).map((w) => w.trim());
+        assert.deepEqual(sent.filter((l) => l.startsWith('L0')), [], 'no new command to 100%');
+        assert.match(sent.filter((l) => l.startsWith('R0')).join(' '), /^R08500I\d+$/, 'the twist is re-timed');
+        await sleep(t0 + leg - Date.now() + 30);
+        assert.equal(axisLines('L0').pop(), `L00000I${legDurationMs(18, 1)}`, 'the next leg, at 18%');
+    });
+    it('times what is left of a leg over what it covers on the device', async () => {
+        // A narrow zone at the bottom of the envelope. The wearer turns the
+        // sleeve over during a leg to 0.2: the next leg, the zone's bottom
+        // mirrored to the top, takes the sleeve 0.8 of the travel in a leg
+        // timed for the zone's 0.2. An urgent raise to 80% early in it times
+        // what is left over the 0.8, at the planner's pace for 80%; over the
+        // 0.2 it was the 120 ms floor, faster than any leg the planner makes.
+        await connect();
+        setAxisRole(0, 'secondary');
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        const leg = legDurationMs(10, 0.2);
+        const t0 = Date.now();
+        dispatchTCode(0, 10, 0, 20, 0, 100);
+        await flush();
+        assert.equal(stroke().pop(), `L02000I${leg}`);
+        setAxisInvert(0, true);
+        await sleep(t0 + leg - Date.now() + 5);
+        assert.equal(stroke().pop(), `L09999I${leg}`, 'from 0.2 to the top on a leg timed for 0.2');
+        const before = stroke().length;
+        dispatchTCode(0, 80, 0, 20, 0, 100, false, { urgent: true });
+        // The leg began no earlier than t0 + leg: at least this share of it
+        // is left.
+        const share = (leg - (Date.now() - t0 - leg)) / leg;
+        await flush();
+        assert.equal(stroke().length, before + 1, 'the leg is re-timed');
+        const retimed = stroke().pop();
+        assert.match(retimed, /^L09999I\d+$/);
+        const interval = Number(retimed.split('I')[1]);
+        assert.ok(interval >= Math.round(share * legDurationMs(80, 0.8)) - 1, `${retimed}: at least ${share.toFixed(2)} of a leg over 0.8 at 80%`);
+    });
+    it('times a leg after the Test button from where the test left the sleeve', async () => {
+        // L0 rests at 0.9, then the Test button takes it to the top and back
+        // to the bottom. The next leg goes from the bottom to the top of a
+        // zone at 0.8-1.0: the whole travel on a leg timed for the zone's
+        // 0.2, and an urgent raise times what is left of it over the whole
+        // travel - not from the rest, nor from the top of the test.
+        await connect();
+        const stroke = () => lines().filter((l) => l.startsWith('L0'));
+        dispatchTCode(0, 0, 0, 100, 90, 100, true);
+        await flush();
+        assert.match(stroke().pop(), new RegExp(`^L09000I${TCODE_TIMINGS.restMs}`));
+        await sleep(TCODE_TIMINGS.restMs + 10);
+        dispatchTCode(0, 0, 0, 100, 0, 100);
+        assert.equal(testAxis(0), true);
+        await sleep(3 * TCODE_TIMINGS.testMoveMs + 100);
+        assert.deepEqual(stroke().slice(-2), [`L09999I${TCODE_TIMINGS.testMoveMs}`, `L00000I${TCODE_TIMINGS.testMoveMs}`]);
+        const leg = legDurationMs(10, 0.2);
+        const t0 = Date.now();
+        dispatchTCode(10, 0, 80, 100, 0, 100);
+        await flush();
+        assert.equal(stroke().pop(), `L09999I${leg}`);
+        await sleep(40);
+        const before = stroke().length;
+        dispatchTCode(80, 0, 80, 100, 0, 100, false, { urgent: true });
+        const share = (leg - (Date.now() - t0)) / leg;
+        await flush();
+        assert.equal(stroke().length, before + 1, 'the leg is re-timed');
+        const retimed = stroke().pop();
+        assert.match(retimed, /^L09999I\d+$/);
+        const interval = Number(retimed.split('I')[1]);
+        assert.ok(interval >= Math.round(share * legDurationMs(80, 1)) - 1, `${retimed}: at least ${share.toFixed(2)} of a leg over the whole travel at 80%`);
+    });
     it('feeds the secondary channel to V0 and deduplicates', async () => {
         await connect();
         dispatchTCode(0, 50, 0, 100, 0, 100);

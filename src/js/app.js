@@ -60,6 +60,7 @@ import {
     describePageAway
 } from './supervision.js';
 import { createScreenWakeLock } from './screen-wake-lock.js';
+import { createTickDispatch, guardEngagedBy } from './tick-dispatch.js';
 import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
@@ -300,8 +301,9 @@ const orgasmBtnText = document.getElementById('orgasmBtnText');
 const startGate = createStartGate();
 
 // What the toys were last sent, exactly as dispatchHardware() handed it to
-// the drivers: Force Orgasm's ramp starts from it. Nothing has been sent
-// before the first dispatch, and the toys are at rest then.
+// the drivers: Force Orgasm's ramp starts from it. A decision the master
+// clock's tick held and never sent does not count (tickDispatch). Nothing
+// has been sent before the first dispatch, and the toys are at rest then.
 let lastDispatched = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
 // The reason the last refused Force Orgasm tap was refused ('landing' or
 // 'idle'), shown under the button for as long as that reason holds.
@@ -1025,7 +1027,9 @@ function updateEngine() {
         state.edges += 1;
         const edgeEl = document.getElementById('edgeCount');
         if (edgeEl) edgeEl.textContent = state.edges;
-        reverseIntifaceRotation('edge');
+        // The new direction goes out with this edge's own speed, below; the
+        // speed from before the edge is never sent reversed first.
+        reverseIntifaceRotation('edge', Date.now(), { apply: false });
         cueVoice('edge');
     }
     // Survival steps its climb on the edges counted while it is on. The edge
@@ -1115,8 +1119,31 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
     return { min: strokeMin, max: strokeMax, env };
 }
 
-function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false) {
+// The master clock's dispatch (tick-dispatch.js): what the engine computes
+// while a tick runs is sent once, when the tick is over, so the toys get the
+// decision the guards and games leave standing - a cut in the same tick it
+// was decided, and never first the speed it overrules.
+const tickDispatch = createTickDispatch();
+
+// `urgent`: the decision of a tick a guard engaged in, or in which Force
+// Orgasm's time limit handed the run to its landing (the master clock
+// passes it with the tick's decision).
+function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false, urgent = false) {
     if (isRemotePage) return;
+
+    // Inside a tick an ordinary dispatch waits for the end of the tick. A
+    // forced one (STOP, a pause, the watchdog) goes out now and nothing the
+    // tick decided before it may follow it; a tick sends a stop once, and
+    // nothing after it. What goes out is urgent when it is forced, cuts a
+    // moving primary to 0, or a guard or Force Orgasm's time limit made it:
+    // every toy takes it now - The Handy past its velocity throttle, a
+    // stroker on the leg in flight - whichever channel it follows.
+    const release = tickDispatch.admit([primarySpeed, secondarySpeed, strokeMin, strokeMax], { force, urgent });
+    if (!release) return;
+    // Only what goes out is what the toys were sent. A decision a tick held
+    // and replaced never reached them, and Force Orgasm's ramp and its
+    // landing start from what did: a landing must never begin above the
+    // speed the toys were really running.
     lastDispatched = { primary: primarySpeed, secondary: secondarySpeed, strokeMin, strokeMax };
 
     // The role picks the channel and the speed cap scales it. A low cap
@@ -1131,13 +1158,14 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // driver and the funscript export still records what the engine asked
     // for. A T-Code or Intiface linear axis takes a wider zone as a longer,
     // slower stroke rather than a faster one, so they keep the envelope as is.
-    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin);
+    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
     // Intiface linear axes run on their own per-leg timers; this call only
-    // updates the planner inputs (and, with force, issues StopAllDevices).
-    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force);
+    // updates the planner inputs (and, with force, issues StopAllDevices;
+    // urgent re-times the leg in flight).
+    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
     // Same for the direct T-Code serial device: a forced zero dispatch is an
     // immediate stop (every axis to rest on one line).
-    dispatchTCode(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force);
+    dispatchTCode(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
 }
 
 // Queue a spoken cue (voice.js keeps a short queue, so back-to-back cues are
@@ -1431,9 +1459,10 @@ function tickSessionGuardsAndGames() {
     // pulse still parked at the ceiling - except a pause that began during a
     // Ruin ride, which runs its course. Both clocks tick in one call because
     // the order is part of the rule (see tickRuinAndStallGuard).
+    const ruinBefore = readRuinClock();
     const step = tickRuinAndStallGuard(
         {
-            ruin: readRuinClock(),
+            ruin: ruinBefore,
             guard: { holdSeconds: state.edgeStallSeconds, pauseSeconds: state.stallPauseElapsed, engaged: state.stallGuardEngaged }
         },
         {
@@ -1450,6 +1479,13 @@ function tickSessionGuardsAndGames() {
     state.edgeStallSeconds = step.guard.holdSeconds;
     state.stallPauseElapsed = step.guard.pauseSeconds;
     state.stallGuardEngaged = step.guard.engaged;
+    // A guard that engages this second makes the tick's decision urgent, so
+    // every toy takes it in this tick: a Handy that follows the secondary
+    // channel was sent the Ruin lockout's 18% only with the next packet,
+    // the throttle having dropped it (tick-dispatch.js). The lockout can
+    // begin with the primary already at 0 - a stall pause from the ride
+    // still running - so a cut alone would not say so.
+    if (guardEngagedBy(step, ruinBefore)) tickDispatch.markUrgent();
     step.cues.forEach((cue) => cueVoice(cue));
 
     const warmupSeconds = Math.max(0, advancedSettings.warmupMinutes || 0) * 60;
@@ -1834,8 +1870,12 @@ function haltIfUnsupervised(now = Date.now()) {
     return true;
 }
 
-// 1-Second Master Clock
-setInterval(() => {
+// 1-Second Master Clock. Whatever the engine computes during a tick reaches
+// the toys once, when the tick is over (tickDispatch above), urgent when a
+// guard engaged in it or Force Orgasm's time limit ran out in it.
+setInterval(() => tickDispatch.run(masterClockTick, (decision, { urgent }) => dispatchHardware(...decision, false, urgent)), 1000);
+
+function masterClockTick() {
     if (isRemotePage) {
         renderRemoteClock();
         return;
@@ -1862,10 +1902,13 @@ setInterval(() => {
         updateTimerDisplay();
         // Force Orgasm's time limit is asked before the engine runs, so on
         // the second it runs out the toys are sent the soft landing rather
-        // than one more second of overdrive.
+        // than one more second of overdrive, urgent, in this tick.
         tickForcedOrgasm();
         // Refresh the engine first so the guards and games below judge THIS
-        // second's HR, ceiling and edge flag, not the previous tick's.
+        // second's HR, ceiling and edge flag, not the previous tick's. What
+        // it computes is held, not sent: the toys get the decision the tick
+        // ends on, once, and never first the speed a stall guard or a Ruin
+        // lockout below is about to cut.
         updateEngine();
         tickSessionGuardsAndGames();
 
@@ -1923,13 +1966,14 @@ setInterval(() => {
 
     pruneStalePeers(Date.now());
     syncTelemetry();
+    // The decision this second ends on: the one the toys are sent.
     updateEngine();
     redrawChart();
     // Every transport change syncs the screen lock itself; this catches any
     // path that did not, so the lock never outlives the session by more than
     // a second or fails to follow it into a new one.
     syncScreenWakeLock();
-}, 1000);
+}
 
 function handleTargetTimeReached() {
     // A latched Force Orgasm does not survive an ending that is not an
@@ -2414,17 +2458,19 @@ function landForcedOrgasm() {
     state.landingAfterForceOrgasm = true;
     beginSoftLanding({ afterForcedRun: true });
     cueVoice('forceOrgasmLimit');
-    // The landing's first value goes to the toys now, and past The Handy's
-    // 400 ms throttle: the driver drops a command that follows the last one
-    // it sent by less than that, so a strap reading just before this tick
-    // would have left the overdrive on The Handy for most of another second.
-    // For a speed that is not a stop, force only skips that throttle (and
-    // sends the stroke range again with it); Intiface and T-Code take it as
-    // they take any other dispatch. A run that runs out on the first tick
-    // after a RESUME has not moved yet, and its landing is a stop, sent the
-    // way every stop is.
-    updateEngine();
-    dispatchHardware(state.strokerSpeed, state.prostateSpeed, state.strokeMin, state.strokeMax, true);
+    // The landing's first value goes to the toys in this tick, and past The
+    // Handy's 400 ms throttle: the driver drops a command that follows the
+    // last one it sent by less than that, so a strap reading just before
+    // this tick would have left the overdrive on The Handy for most of
+    // another second. The master clock asks the limit before the engine
+    // runs, and its tick sends the decision it ends on - this landing's first
+    // value - once, when the tick is over (tickDispatch). Marked urgent, like
+    // a guard's decision, it passes The Handy's throttle, and a stroker on
+    // Intiface or T-Code takes it on the leg in flight instead of the next
+    // one. A run that runs out on the first tick after a RESUME has not moved
+    // yet, and its landing is a zero, sent like any other: a stop to a Handy
+    // that may be moving, nothing to one at rest.
+    tickDispatch.markUrgent();
 }
 
 // The seconds the Force Orgasm button counts down, 0 for none. A remote page

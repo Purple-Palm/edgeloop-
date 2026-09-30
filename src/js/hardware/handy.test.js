@@ -20,6 +20,9 @@ import {
 } from './handy.js';
 import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed, applyEndMargin, normalizeSlideRange } from './handy-protocol.js';
 import { calculateEngineOutputs } from '../engine.js';
+import { tickRuinAndStallGuard, startRuinEdge } from '../session-rules.js';
+import { createTickDispatch, guardEngagedBy } from '../tick-dispatch.js';
+import { RUIN_LOCK_SECONDARY } from '../patterns.js';
 
 const KEY = 'test-key-123';
 // The shipped poll cadence, read before any test shortens it.
@@ -279,6 +282,98 @@ describe('handy driver', () => {
         dispatchHandy(50, 0, 100, false, 0, 100);
         await tick(5);
         assert.equal(sent('/hamp/start').length, 1);
+    });
+
+    it('never throttles a stop: a cut right after a dispatch goes out on its own dispatch', async () => {
+        await connectOk();
+        dispatchHandy(40, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        // A few ms later, well inside the 400 ms window, the engine cuts.
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(isHandyMoving(), false);
+        // The start that follows still waits out the throttle.
+        dispatchHandy(40, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+    });
+
+    it('keeps the throttle for a slowdown that is not a stop', async () => {
+        await connectOk();
+        dispatchHandy(60, 0, 100, false, 0, 100);
+        await tick(5);
+        dispatchHandy(1, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.deepEqual(sent('/hamp/velocity').map((c) => c.body.velocity), [60]);
+        assert.equal(sent('/hamp/stop').length, 0);
+    });
+
+    it('never throttles an urgent dispatch, whatever speed it carries', async () => {
+        // A Handy that follows the secondary channel, on the second the Ruin
+        // lockout begins: the ride's 51% went out on a packet 200 ms before,
+        // and the lockout drops the channel to 18%.
+        await connectOk();
+        dispatchHandy(51, 0, 60, false, 0, 100);
+        await tick(5);
+        dispatchHandy(18, 0, 100, false, 0, 100, 5, { urgent: true });
+        await tick(5);
+        assert.deepEqual(sent('/hamp/velocity').map((c) => c.body.velocity), [51, 18]);
+        // The end-stop margin moves 0-60 off the end stop, keeping its length.
+        assert.deepEqual(sent('/slide').map((c) => [c.body.min, c.body.max]), [[5, 65], [5, 95]]);
+        assert.equal(sent('/hamp/stop').length, 0, 'a slowdown, not a stop');
+        // The throttle's clock restarts from it: an ordinary change right
+        // after it still waits.
+        dispatchHandy(30, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.deepEqual(sent('/hamp/velocity').map((c) => c.body.velocity), [51, 18]);
+    });
+
+    it('an urgent dispatch that changes nothing on this device sends nothing', async () => {
+        // A stall guard cut leaves the secondary channel where it was, so a
+        // Handy that follows it has nothing new to be sent.
+        await connectOk();
+        dispatchHandy(40, 0, 100, false, 0, 100);
+        await tick(5);
+        const before = calls.length;
+        dispatchHandy(40, 0, 100, false, 0, 100, 5, { urgent: true });
+        await tick(5);
+        assert.equal(calls.length, before);
+    });
+
+    it('an urgent zero stops only a device that may be moving', async () => {
+        await connectOk();
+        dispatchHandy(0, 0, 100, false, 0, 100, 5, { urgent: true });
+        await tick(5);
+        assert.equal(calls.length, 0);
+    });
+
+    it('a zero sends nothing when nothing may be moving', async () => {
+        await connectOk();
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(calls.length, 0);
+    });
+
+    it('sends one stop while one is in flight, however many zero dispatches arrive', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, false, 0, 100);
+        await tick(5);
+        let release;
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => { release = () => resolve(jsonResponse({ result: 0 })); });
+        for (let i = 0; i < 5; i++) {
+            dispatchHandy(0, 0, 100, false, 0, 100);
+            await tick(1);
+        }
+        assert.equal(sent('/hamp/stop').length, 1);
+        release();
+        await tick(5);
+        assert.equal(isHandyMoving(), false);
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
     });
 
     it('stops on zero speed and marks the device stopped only after confirmation', async () => {
@@ -1932,5 +2027,292 @@ describe('handy driver', () => {
         await pollHandyConnected();
         assert.equal(isHandyOfflineStopPending(), false);
         assert.equal(calls.filter((c) => c.path === '/hamp/stop' && c.key === 'second-key').length, 1, 'only its verification stop');
+    });
+
+    // The master clock and a strap, wired to the driver the way app.js wires
+    // them: each second a heart-rate packet runs the engine `packetLeadMs`
+    // before the tick, and the tick runs the engine, the guards and the
+    // engine again, its dispatch held until the tick is over and marked
+    // urgent when a guard engaged in it (tick-dispatch.js). Every dispatch
+    // asks the gate, which also makes a cut urgent. The Handy follows
+    // `handyRole`. Date.now is stepped so the throttle sees the real spacing
+    // of the two. Returns, per second, what the packet and the tick each put
+    // on the wire. `markGuards: false` leaves out the guard's mark, and
+    // `urgency: false` every urgent dispatch: the defects each one fixes.
+    async function runClock({ seconds, pulse, mode, ceilingBehaviour = 'crawl', stallGuard = false, pauseTimeoutSeconds = 8, packetLeadMs = 200, handyRole = 'primary', markGuards = true, urgency = true }) {
+        const realNow = Date.now;
+        let clock = realNow.call(Date);
+        Date.now = () => clock;
+        const gate = createTickDispatch();
+        const s = {
+            second: 0,
+            isEdged: false,
+            primary: null,
+            secondary: null,
+            ruin: { rideSeconds: 0, lockSeconds: 0, spent: false },
+            guard: { holdSeconds: 0, pauseSeconds: 0, engaged: false }
+        };
+        // app.js dispatchHardware, for The Handy alone.
+        const dispatch = (d, urgent = false) => {
+            const release = gate.admit(d, { urgent });
+            if (!release) return;
+            dispatchHandy(handyTargetSpeed(handyRole, d[0], d[1], 100), d[2], d[3], false, 0, 100, 5, { urgent: urgency && release.urgent });
+        };
+        const updateEngine = (hr) => {
+            const out = calculateEngineOutputs({
+                hr,
+                edgeHr: hr,
+                minHr: 70,
+                maxHr: 140,
+                activeMode: mode,
+                sessionStatus: 'RUNNING',
+                isEdged: s.isEdged,
+                orgasmMode: false,
+                warmupMinutes: 0,
+                ceilingBehaviour,
+                stallGuardEngaged: s.guard.engaged,
+                ruinHoldSeconds: s.ruin.lockSeconds,
+                ruinSpent: s.ruin.spent,
+                sessionSeconds: s.second
+            });
+            // As app.js does: a new edge's Ruin ride starts with the pullback,
+            // on the first reading at the mark.
+            if (out.pullbackStarted) s.ruin = startRuinEdge(s.ruin);
+            s.isEdged = out.isEdged;
+            s.primary = out.primaryPercent;
+            s.secondary = out.secondaryPercent;
+            dispatch([out.primaryPercent, out.secondaryPercent, out.strokeMinPercent, out.strokeMaxPercent]);
+        };
+        const velocityOf = () => handyTargetSpeed(handyRole, s.primary, s.secondary, 100);
+        const wireSince = (at) => calls.slice(at).map((c) => (c.path === '/hamp/velocity' ? `${c.path} ${c.body.velocity}` : c.path));
+        const log = [];
+        try {
+            for (let second = 1; second <= seconds; second++) {
+                const hr = pulse(second);
+                clock += 1000 - packetLeadMs;
+                const atPacket = calls.length;
+                updateEngine(hr);
+                const packet = { primary: s.primary, velocity: velocityOf(), sent: wireSince(atPacket) };
+                await tick(0);
+                packet.sent = wireSince(atPacket);
+                clock += packetLeadMs;
+                s.second = second;
+                const atTick = calls.length;
+                gate.run(() => {
+                    updateEngine(hr);
+                    const ruinBefore = s.ruin;
+                    const step = tickRuinAndStallGuard({ ruin: s.ruin, guard: s.guard }, {
+                        activeMode: mode,
+                        isEdged: s.isEdged,
+                        orgasmMode: false,
+                        stallGuard,
+                        ceilingBehaviour,
+                        holdTimeoutSeconds: 3,
+                        pauseTimeoutSeconds
+                    });
+                    s.ruin = step.ruin;
+                    s.guard = step.guard;
+                    if (markGuards && guardEngagedBy(step, ruinBefore)) gate.markUrgent();
+                    updateEngine(hr);
+                }, (d, { urgent }) => dispatch(d, urgent));
+                // What the tick itself issued, before any reply came back.
+                const tickSent = wireSince(atTick);
+                await tick(0);
+                log.push({ second, packet, tick: { primary: s.primary, velocity: velocityOf(), sent: tickSent, engaged: s.guard.engaged, lock: s.ruin.lockSeconds } });
+            }
+        } finally {
+            Date.now = realNow;
+        }
+        return log;
+    }
+
+    // Stops, and the one urgent dispatch a guard or a cut earns ('tick 16',
+    // 'packet 6'), aside, no two motion requests from different dispatches
+    // closer than 400 ms: the throttle still holds every ordinary change.
+    function assertThrottled(log, packetLeadMs, urgent = []) {
+        const at = [];
+        for (const row of log) {
+            if (row.packet.sent.some((p) => p !== '/hamp/stop')) at.push({ t: row.second * 1000 - packetLeadMs, task: `packet ${row.second}` });
+            if (row.tick.sent.some((p) => p !== '/hamp/stop')) at.push({ t: row.second * 1000, task: `tick ${row.second}` });
+        }
+        for (let i = 1; i < at.length; i++) {
+            if (urgent.includes(at[i].task)) continue;
+            assert.ok(at[i].t - at[i - 1].t >= 400, `${at[i].task}: motion ${at[i].t - at[i - 1].t} ms after the last`);
+        }
+    }
+
+    // A packet 200 ms before the tick leaves the tick inside the throttle
+    // window; one 850 ms before it (150 ms after the last tick) leaves the
+    // tick's own dispatch free to go out, the speed a guard overrules with it.
+    for (const packetLeadMs of [200, 850]) {
+        it(`a stall guard cut reaches the device on the tick that decides it (packet ${packetLeadMs} ms before)`, async () => {
+            await connectOk();
+            const log = await runClock({
+                seconds: 14,
+                mode: 'classic',
+                stallGuard: true,
+                packetLeadMs,
+                pulse: (second) => (second <= 6 ? 100 : 145)
+            });
+            const engaged = log.find((row) => row.tick.engaged);
+            assert.ok(engaged, 'the guard engaged');
+            assert.equal(engaged.packet.primary, 10, 'the packet before it still crawled');
+            assert.equal(engaged.tick.primary, 0);
+            assert.deepEqual(engaged.tick.sent, ['/hamp/stop'], 'the stop, and nothing the guard overruled');
+            assert.equal(sent('/hamp/stop').length, 1, 'one stop for one cut');
+            assert.equal(isHandyMoving(), false);
+        });
+
+        it(`the Ruin lockout reaches the device on its tick, with nothing for the ride it cut (packet ${packetLeadMs} ms before)`, async () => {
+            await connectOk();
+            const log = await runClock({
+                seconds: 24,
+                mode: 'ruin',
+                packetLeadMs,
+                pulse: (second) => (second <= 5 ? 100 : 145)
+            });
+            const locked = log.find((row) => row.tick.lock > 0);
+            assert.ok(locked, 'the lockout began');
+            assert.ok(locked.packet.primary > 0, 'the packet before it still rode');
+            assert.deepEqual(locked.tick.sent, ['/hamp/stop']);
+            assert.equal(sent('/hamp/stop').length, 1);
+            assertThrottled(log, packetLeadMs);
+        });
+
+        it(`the Ruin lockout reaches a Handy on the secondary channel on its tick (packet ${packetLeadMs} ms before)`, async () => {
+            await connectOk();
+            const log = await runClock({
+                seconds: 24,
+                mode: 'ruin',
+                handyRole: 'secondary',
+                packetLeadMs,
+                pulse: (second) => (second <= 5 ? 100 : 145)
+            });
+            const locked = log.find((row) => row.tick.lock > 0);
+            assert.ok(locked, 'the lockout began');
+            assert.ok(locked.packet.velocity > RUIN_LOCK_SECONDARY, 'the packet before it still carried the ride');
+            assert.equal(locked.tick.velocity, RUIN_LOCK_SECONDARY);
+            // Its own dispatch, in its own tick: the lockout's stroke range and
+            // its 18%, and nothing else.
+            assert.deepEqual(locked.tick.sent, ['/slide', `/hamp/velocity ${RUIN_LOCK_SECONDARY}`]);
+            assert.equal(sent('/hamp/stop').length, 0, 'the secondary channel slows, it does not stop');
+            assertThrottled(log, packetLeadMs, [`tick ${locked.second}`]);
+        });
+    }
+
+    it('without urgency the lockout\'s 18% waited for the next packet, the defect this fixes', async () => {
+        // The clock as it was: the tick held, but nothing urgent. A packet
+        // 200 ms before the tick opened the throttle's window, and the
+        // lockout's own dispatch fell inside it.
+        await connectOk();
+        const log = await runClock({
+            seconds: 24,
+            mode: 'ruin',
+            handyRole: 'secondary',
+            packetLeadMs: 200,
+            urgency: false,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const at = log.findIndex((row) => row.tick.lock > 0);
+        assert.ok(at > 0 && at + 1 < log.length, 'the lockout began');
+        assert.deepEqual(log[at].tick.sent, [], 'the throttle dropped the lockout in its own tick');
+        assert.ok(log[at + 1].packet.sent.includes(`/hamp/velocity ${RUIN_LOCK_SECONDARY}`), 'the next packet carried it, 0.8 s later');
+    });
+
+    it('a lockout that cuts a riding primary is urgent by the cut alone', async () => {
+        // Without the guard's mark the gate still sees the ride's primary
+        // go to 0; the mark is for the lockout the cut cannot see (below).
+        await connectOk();
+        const log = await runClock({
+            seconds: 24,
+            mode: 'ruin',
+            handyRole: 'secondary',
+            packetLeadMs: 200,
+            markGuards: false,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const locked = log.find((row) => row.tick.lock > 0);
+        assert.ok(locked.packet.primary > 0);
+        assert.deepEqual(locked.tick.sent, ['/slide', `/hamp/velocity ${RUIN_LOCK_SECONDARY}`]);
+    });
+
+    it('a Ruin lockout that begins under a stall pause reaches a Handy on the secondary channel on its tick', async () => {
+        // The stall guard cuts the ride 3 s in and its pause outlasts the
+        // ride, so the primary is already 0 when the lockout begins: no cut,
+        // only the guard, says the tick must go out now.
+        await connectOk();
+        const log = await runClock({
+            seconds: 24,
+            mode: 'ruin',
+            handyRole: 'secondary',
+            stallGuard: true,
+            pauseTimeoutSeconds: 30,
+            packetLeadMs: 200,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const locked = log.find((row) => row.tick.lock > 0);
+        assert.ok(locked, 'the lockout began');
+        assert.equal(locked.packet.primary, 0, 'the stall pause already held the primary');
+        assert.ok(locked.packet.velocity > RUIN_LOCK_SECONDARY);
+        assert.deepEqual(locked.tick.sent, ['/slide', `/hamp/velocity ${RUIN_LOCK_SECONDARY}`]);
+        const engagedAt = log.find((row) => row.tick.engaged).second;
+        assertThrottled(log, 200, [`tick ${engagedAt}`, `tick ${locked.second}`]);
+    });
+
+    it('the same lockout under a stall pause, with no guard marked, waited for the next packet', async () => {
+        await connectOk();
+        const log = await runClock({
+            seconds: 24,
+            mode: 'ruin',
+            handyRole: 'secondary',
+            stallGuard: true,
+            pauseTimeoutSeconds: 30,
+            packetLeadMs: 200,
+            markGuards: false,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const at = log.findIndex((row) => row.tick.lock > 0);
+        assert.ok(at > 0 && at + 1 < log.length);
+        assert.deepEqual(log[at].tick.sent, [], 'the throttle dropped the lockout in its own tick');
+        assert.ok(log[at + 1].packet.sent.includes(`/hamp/velocity ${RUIN_LOCK_SECONDARY}`), 'the next packet carried it, 0.8 s later');
+    });
+
+    it('Full Stop decided on a packet 150 ms after the tick reaches the device on that packet', async () => {
+        await connectOk();
+        const log = await runClock({
+            seconds: 8,
+            mode: 'classic',
+            ceilingBehaviour: 'stop',
+            packetLeadMs: 850,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const edge = log.find((row) => row.packet.primary === 0);
+        assert.ok(edge, 'the pulse crossed the mark on a packet');
+        assert.deepEqual(edge.packet.sent, ['/hamp/stop']);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(isHandyMoving(), false);
+    });
+
+    it('Full Stop on a packet 150 ms after the tick carries its secondary to a Handy that follows it', async () => {
+        // At the mark Milker drops the primary to 0 and raises the secondary.
+        // The tick 150 ms before restarted the throttle's clock, so the raise
+        // was dropped and the next tick sent the lower value after it: the
+        // peak never reached a Handy that follows the secondary channel. The
+        // cut is urgent, so it goes out on the packet that decides it.
+        await connectOk();
+        const log = await runClock({
+            seconds: 8,
+            mode: 'milker',
+            ceilingBehaviour: 'stop',
+            handyRole: 'secondary',
+            packetLeadMs: 850,
+            pulse: (second) => (second <= 5 ? 100 : 145)
+        });
+        const at = log.findIndex((row) => row.packet.primary === 0);
+        assert.ok(at > 0, 'the pulse crossed the mark on a packet');
+        const edge = log[at];
+        assert.notEqual(edge.packet.velocity, log[at - 1].tick.velocity, 'the cut moved the secondary');
+        assert.ok(edge.packet.sent.includes(`/hamp/velocity ${edge.packet.velocity}`), JSON.stringify(edge.packet));
+        assertThrottled(log, 850, [`packet ${edge.second}`]);
     });
 });

@@ -85,23 +85,164 @@ describe('stroke planner', () => {
         assert.equal(c.durationMs, legDurationMs(10, 0.2));
     });
 
-    it('issues a single rest move on speed 0 and then stays silent', () => {
+    it('a stop interrupts the leg in flight with a single rest move and then stays silent', () => {
         const p = createStrokePlanner();
-        p.setInput({ speed: 100, zoneMin: 0.2, zoneMax: 0.8 });
+        p.setInput({ speed: 10, zoneMin: 0.2, zoneMax: 0.8 });
         const a = p.next(0);
+        assert.ok(a.durationMs > 1000, 'a crawl leg is long');
+        // A stall guard, Full Stop or the Ruin lockout cuts the speed to 0
+        // early in it: the sleeve rests now, not after the leg.
         p.setInput({ speed: 0 });
-        // Still in flight: the running stroke is not snapped.
-        assert.equal(p.next(a.durationMs - 1), null);
-        const rest = p.next(a.durationMs);
+        const rest = p.next(100);
         assert.deepEqual(rest, { position: 0.2, durationMs: REST_MOVE_MS, kind: 'rest' });
         assert.equal(p.isResting(), true);
-        assert.equal(p.next(a.durationMs + REST_MOVE_MS), null);
-        assert.equal(p.next(a.durationMs + REST_MOVE_MS + 5000), null);
+        assert.equal(p.next(100 + REST_MOVE_MS), null);
+        assert.equal(p.next(a.durationMs), null, 'the interrupted leg is gone');
+        assert.equal(p.next(a.durationMs + 5000), null);
         // Speed returns: the first stroke goes up from the rest position.
         p.setInput({ speed: 50 });
-        const up = p.next(a.durationMs + REST_MOVE_MS + 6000);
+        const up = p.next(a.durationMs + 6000);
         assert.equal(up.position, 0.8);
         assert.equal(p.isResting(), false);
+    });
+
+    it('a cap of 0 is a stop and interrupts the leg too', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 40, cap: 100, zoneMin: 0, zoneMax: 1 });
+        p.next(0);
+        p.setInput({ cap: 0 });
+        assert.equal(p.next(50).kind, 'rest');
+    });
+
+    it('a slowdown that is not a stop waits for the leg in flight', () => {
+        // Speed changes apply to the next leg: the Ruin lockout lowering the
+        // secondary, or a pattern easing off, never cuts a stroke short.
+        const p = createStrokePlanner();
+        p.setInput({ speed: 60, zoneMin: 0, zoneMax: 1 });
+        const a = p.next(0);
+        p.setInput({ speed: 1 });
+        assert.equal(p.next(a.durationMs - 1), null);
+        const b = p.next(a.durationMs);
+        assert.equal(b.kind, 'stroke');
+        assert.equal(b.durationMs, legDurationMs(1, 1));
+    });
+
+    it('an urgent decision re-times the rest of the leg in flight, to the same end', () => {
+        // A stroker on the secondary channel when the Ruin lockout begins:
+        // the ride's 46% drops to 18%, a quarter of the way into an upstroke.
+        const p = createStrokePlanner();
+        p.setInput({ speed: 46, zoneMin: 0.05, zoneMax: 0.69 });
+        const a = p.next(0);
+        assert.deepEqual(a, { position: 0.69, durationMs: legDurationMs(46, 0.64), kind: 'stroke' });
+        const at = Math.round(a.durationMs / 4);
+        p.setInput({ speed: 18, zoneMin: 0, zoneMax: 1 });
+        const left = (a.durationMs - at) / a.durationMs;
+        const r = p.retime(at);
+        assert.deepEqual(r, { position: 0.69, durationMs: Math.round(left * legDurationMs(18, 0.64)), kind: 'stroke' });
+        assert.ok(r.durationMs > a.durationMs - at, 'the rest of the stroke is slower, not cut short');
+        assert.equal(p.legEndsAt(), at + r.durationMs);
+        assert.equal(p.next(at + r.durationMs - 1), null, 'nothing more until it ends');
+        // Then the strokes carry on at the new speed, in the new zone.
+        const b = p.next(at + r.durationMs);
+        assert.deepEqual(b, { position: 0, durationMs: legDurationMs(18, 1), kind: 'stroke' });
+        assert.equal(p.next(at + r.durationMs + b.durationMs).position, 1);
+    });
+
+    it('a second urgent decision re-times what is left of a re-timed leg', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 60, zoneMin: 0, zoneMax: 1 });
+        const a = p.next(0);
+        const half = Math.round(a.durationMs / 2);
+        p.setInput({ speed: 20 });
+        const r1 = p.retime(half);
+        const share1 = (a.durationMs - half) / a.durationMs;
+        assert.equal(r1.durationMs, Math.round(share1 * legDurationMs(20, 1)));
+        const at = half + Math.round(r1.durationMs / 2);
+        p.setInput({ speed: 80 });
+        const share2 = share1 * ((half + r1.durationMs - at) / r1.durationMs);
+        assert.deepEqual(p.retime(at), { position: 1, durationMs: Math.round(share2 * legDurationMs(80, 1)), kind: 'stroke' });
+    });
+
+    it('re-times a leg by the travel it was sized for', () => {
+        // The first leg after a rest crosses more than the zone: what is left
+        // of it is timed over that longer way at the new speed, not over the
+        // zone's width.
+        const p = createStrokePlanner();
+        p.setInput({ speed: 0, zoneMin: 0, zoneMax: 1 });
+        p.next(0);
+        p.setInput({ speed: 50, zoneMin: 0.6, zoneMax: 0.8 });
+        const leg = p.next(REST_MOVE_MS);
+        assert.equal(leg.durationMs, legDurationMs(50, 0.8));
+        p.setInput({ speed: 25 });
+        const r = p.retime(REST_MOVE_MS);
+        assert.deepEqual(r, { position: 0.8, durationMs: legDurationMs(25, 0.8), kind: 'stroke' });
+    });
+
+    it('re-times a leg over the travel the driver says it covers, when that is more', () => {
+        // The invert switch flipped at a leg's end: the next leg, sized for a
+        // 0.2 zone, takes the sleeve 0.8 of the travel on the device. What is
+        // left of it is timed over that 0.8 at the new speed; over the 0.2 it
+        // would be the 120 ms floor, three times the planner's pace.
+        const p = createStrokePlanner();
+        p.setInput({ speed: 10, zoneMin: 0, zoneMax: 0.2 });
+        const a = p.next(0);
+        assert.equal(a.durationMs, legDurationMs(10, 0.2));
+        p.setInput({ speed: 80 });
+        const at = Math.round(a.durationMs / 4);
+        const share1 = (a.durationMs - at) / a.durationMs;
+        const r1 = p.retime(at, { travel: 0.8 });
+        assert.deepEqual(r1, { position: 0.2, durationMs: Math.round(share1 * legDurationMs(80, 0.8)), kind: 'stroke' });
+        assert.ok(r1.durationMs > 2 * MIN_LEG_MS);
+        // A second decision in the same leg keeps timing it over the 0.8.
+        p.setInput({ speed: 40 });
+        const at2 = at + Math.round(r1.durationMs / 2);
+        const share2 = share1 * ((at + r1.durationMs - at2) / r1.durationMs);
+        assert.equal(p.retime(at2).durationMs, Math.round(share2 * legDurationMs(40, 0.8)));
+    });
+
+    it('never re-times a leg over less travel than it was sized for', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 10, zoneMin: 0, zoneMax: 1 });
+        const a = p.next(0);
+        p.setInput({ speed: 80 });
+        const at = Math.round(a.durationMs / 2);
+        const share = (a.durationMs - at) / a.durationMs;
+        assert.equal(p.retime(at, { travel: 0.1 }).durationMs, Math.round(share * legDurationMs(80, 1)));
+    });
+
+    it('has nothing to re-time unless a stroke at another speed is in flight', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 40, zoneMin: 0, zoneMax: 1 });
+        assert.equal(p.retime(0), null, 'nothing sent yet');
+        const a = p.next(0);
+        assert.equal(p.retime(100), null, 'the leg already has this speed');
+        p.setInput({ speed: 40, zoneMin: 0.2, zoneMax: 0.6 });
+        assert.equal(p.retime(150), null, 'a zone change still waits for the next leg');
+        p.setInput({ speed: 10 });
+        assert.equal(p.retime(a.durationMs - MIN_LEG_MS + 1), null, 'a leg about to end is left to end');
+        assert.equal(p.retime(a.durationMs), null, 'the leg has ended');
+        // A stop is not re-timed: it interrupts the leg, and next() rests.
+        p.next(a.durationMs);
+        p.setInput({ speed: 0 });
+        assert.equal(p.retime(a.durationMs + 50), null);
+        assert.equal(p.next(a.durationMs + 50).kind, 'rest');
+        // Nor is the rest move.
+        p.setInput({ speed: 30 });
+        assert.equal(p.retime(a.durationMs + 100), null);
+        // After a reset there is no leg to re-time.
+        p.next(a.durationMs + 50 + REST_MOVE_MS);
+        p.reset();
+        p.setInput({ speed: 70 });
+        assert.equal(p.retime(a.durationMs + 50 + REST_MOVE_MS + 10), null);
+    });
+
+    it('a stop while already resting sends nothing more', () => {
+        const p = createStrokePlanner();
+        p.setInput({ speed: 0, zoneMin: 0.1, zoneMax: 0.9 });
+        assert.equal(p.next(0).kind, 'rest');
+        p.setInput({ speed: 0, enabled: false });
+        assert.equal(p.next(10), null, 'the rest move in flight is not re-sent');
+        assert.equal(p.next(REST_MOVE_MS + 10), null);
     });
 
     it('treats role OFF (enabled: false) like speed 0', () => {
@@ -166,12 +307,12 @@ describe('stroke planner', () => {
         const rest = p.next(100);
         assert.deepEqual(rest, { position: 0, durationMs: REST_MOVE_MS, kind: 'rest' });
         assert.equal(p.next(200), null);
-        // Speed 0 (STOP / pause) still lets the running stroke finish.
+        // Speed 0 (a guard, STOP, a pause) is a stop the same way.
         p.setInput({ speed: 5, enabled: true });
         const again = p.next(100 + REST_MOVE_MS);
         assert.equal(again.kind, 'stroke');
         p.setInput({ speed: 0 });
-        assert.equal(p.next(100 + REST_MOVE_MS + 50), null);
+        assert.deepEqual(p.next(100 + REST_MOVE_MS + 50), { position: 0, durationMs: REST_MOVE_MS, kind: 'rest' });
     });
 
     it('legTravel times the leg by speed alone so a small swing is a slow swing', () => {

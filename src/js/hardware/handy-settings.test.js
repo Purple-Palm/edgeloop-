@@ -77,7 +77,7 @@ describe('the end-stop margin is settled like every other setting', () => {
     });
 
     it('reaches the driver, and reaches nothing else', () => {
-        assert.match(APP, /dispatchHandy\([^)]*advancedSettings\.handyEndMargin\)/,
+        assert.match(APP, /dispatchHandy\([^)]*advancedSettings\.handyEndMargin\b/,
             'the margin must be handed to The Handy driver');
         const dispatch = bodyOf('dispatchHardware');
         assert.ok(!/dispatchIntiface\([^)]*handyEndMargin/.test(dispatch),

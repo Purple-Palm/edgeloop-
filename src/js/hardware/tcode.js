@@ -13,7 +13,10 @@
 //   3. Smooth motion: linear and rotation axes are driven by the shared
 //      stroke planner (stroke-planner.js): ONE command per leg carrying the
 //      full leg duration, timed by a per-axis setTimeout at leg end. Engine
-//      ticks only update the planner inputs, nothing is re-sent mid-leg.
+//      ticks only update the planner inputs, nothing is re-sent mid-leg but
+//      the leg an urgent dispatch (a guard engaging, a cut, Force Orgasm's
+//      landing) re-times - to the position it was sent to, and on L0 only
+//      inside the envelope - and only a stop cuts a leg short.
 //
 // Formatting and parsing live in tcode-protocol.js (pure, unit-tested).
 // Roles, caps and the linear invert flag are persisted per device name
@@ -366,6 +369,11 @@ function makeAxis(parsedAxis, saved, defaults) {
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
         invert: kind === 'linear' && Boolean(savedAxis && savedAxis.invert),
         planner: usesPlanner ? createStrokePlanner({ restMs: TCODE_TIMINGS.restMs }) : null,
+        // The physical positions the leg in flight was sent from and to (the
+        // end of the move before it, and its own), for a re-time
+        // (pumpPlanner); null while unknown.
+        legFrom: null,
+        legTarget: null,
         timer: null,
         testTimer: null,
         lastSent: null
@@ -547,13 +555,61 @@ function physicalPosition(axis, position) {
     return lastEnvelope.min + lastEnvelope.max - position;
 }
 
+// How far past a bound of the envelope a position may lie and still be on
+// it. A mirrored position carries float noise: 0.2 + 0.8 - 0.8 is
+// 0.19999999999999996, and the leg that carries it goes to the bottom of a
+// 20-80 envelope. The finest step a device is sent, 1/10000 of its travel,
+// is a hundred thousand times this.
+const ENVELOPE_BOUND_SLACK = 1e-9;
+
+// Whether the leg in flight may be re-timed: it was sent somewhere, and on
+// the stroke axis that is still inside the travel envelope (pumpPlanner says
+// why). The centred axes swing around the middle, which the envelope does
+// not bound.
+function mayRetime(axis) {
+    const to = axis.legTarget;
+    if (to === null) return false;
+    if (axis.centred) return true;
+    return to >= lastEnvelope.min - ENVELOPE_BOUND_SLACK && to <= lastEnvelope.max + ENVELOPE_BOUND_SLACK;
+}
+
+// How much of the travel the leg in flight covers on the device, for a
+// re-time: from where the move before it was sent to where it was sent.
+// Before that is known, the whole of it, so what is left of a leg is never
+// timed as shorter than it may be.
+function travelCovered(axis) {
+    return axis.legFrom === null ? 1 : Math.abs(axis.legTarget - axis.legFrom);
+}
+
 // Ask the planner for the next leg and, when it yields one, send it and arm
-// a timer for its end. Never sends while a leg is in flight.
-function pumpPlanner(axis, now = Date.now()) {
+// a timer for its end. Never sends while a leg is in flight, except the leg
+// in flight re-timed for an urgent decision (`retime`, stroke-planner.js).
+//
+// A re-timed leg goes to the physical position its leg was sent to
+// (axis.legTarget), never to the planner's position mapped again. The
+// planner's is a logical position, and what maps it onto the device - the
+// mirror of an inverted axis, through the travel envelope on L0 - can change
+// while the leg is in flight. Mapped again after the wearer had raised the
+// envelope's minimum from 0 to 20 during a leg to 80%, the re-timed leg of a
+// cut sent an inverted L0 to 100%, past the wearer's maximum; after the
+// invert switch was flipped during an upstroke, back down three quarters of
+// the travel in 120 ms. Nor is an L0 leg re-timed whose end the wearer has
+// since put outside the envelope: sent again, it would be a new command past
+// the wearer's bounds. It runs out as it was sent, as a leg in flight always
+// did when the envelope changed, and the next leg, inside the envelope,
+// carries the new speed. And what is left of a leg is timed over what the
+// leg covers on the device (travelCovered), which is more than the planner
+// sized it for when the mapping changed just before it was planned.
+function pumpPlanner(axis, now = Date.now(), { retime = false } = {}) {
     if (!axis.planner || !isTCodeConnected() || !device.axes.includes(axis)) return;
-    const leg = axis.planner.next(now);
+    const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
+    const leg = retimed || axis.planner.next(now);
     if (!leg) return;
-    writeCommands([formatAxisCommand(axis.id, physicalPosition(axis, leg.position), { intervalMs: leg.durationMs })]);
+    if (!retimed) {
+        axis.legFrom = axis.legTarget;
+        axis.legTarget = physicalPosition(axis, leg.position);
+    }
+    writeCommands([formatAxisCommand(axis.id, axis.legTarget, { intervalMs: leg.durationMs })]);
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
         axis.timer = null;
@@ -574,12 +630,12 @@ function speedForRole(role, primary, secondary) {
     return 0;
 }
 
-function applyAxis(axis, primary, secondary, zone, now) {
+function applyAxis(axis, primary, secondary, zone, now, urgent = false) {
     const speed = speedForRole(axis.role, primary, secondary);
     const enabled = axis.role !== 'off';
     if (axis.kind === 'linear' && !axis.centred) {
         axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled });
-        pumpPlanner(axis, now);
+        pumpPlanner(axis, now, { retime: urgent });
     } else if (axis.planner) {
         // Rotation and surge / sway: swing around the centre; amplitude 0
         // (speed 0 or OFF) rests at 0.5. The leg time follows the speed
@@ -587,15 +643,15 @@ function applyAxis(axis, primary, secondary, zone, now) {
         // fast twitch.
         const amp = enabled ? rotationAmplitude(speed, axis.maxCap) : 0;
         axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: 0.5 - amp, zoneMax: 0.5 + amp, enabled: enabled && amp > 0, legTravel: 1 });
-        pumpPlanner(axis, now);
+        pumpPlanner(axis, now, { retime: urgent });
     } else {
         sendScalar(axis, enabled ? scalarLevel(speed, axis.maxCap) : 0);
     }
 }
 
-function applyLastSpeeds(now = Date.now()) {
+function applyLastSpeeds(now = Date.now(), { urgent = false } = {}) {
     if (!isTCodeConnected()) return;
-    device.axes.forEach((axis) => applyAxis(axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, now));
+    device.axes.forEach((axis) => applyAxis(axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, now, urgent));
 }
 
 function zoneFromPercent(strokeMin, strokeMax, envMin, envMax) {
@@ -614,8 +670,11 @@ function zoneFromPercent(strokeMin, strokeMax, envMin, envMax) {
 // stop / pause (force = true with both speeds 0). strokeMin/strokeMax are
 // physical percents already mapped into the hardware envelope by engine.js;
 // the envelope is used only to clamp so no position can leave the user's
-// bounds. Never throws.
-export function dispatchTCode(primarySpeed, secondarySpeed, strokeMin = 0, strokeMax = 100, envMin = 0, envMax = 100, force = false) {
+// bounds. `urgent` (tick-dispatch.js): this dispatch carries a guard's
+// decision, a cut or the landing Force Orgasm's time limit starts, and a
+// planner axis takes its new speed on the leg in flight instead of the next
+// one. Never throws.
+export function dispatchTCode(primarySpeed, secondarySpeed, strokeMin = 0, strokeMax = 100, envMin = 0, envMax = 100, force = false, { urgent = false } = {}) {
     try {
         const mapped = zoneFromPercent(strokeMin, strokeMax, envMin, envMax);
         lastZone = mapped.zone;
@@ -629,7 +688,7 @@ export function dispatchTCode(primarySpeed, secondarySpeed, strokeMin = 0, strok
             stopTCode();
             return;
         }
-        applyLastSpeeds(Date.now());
+        applyLastSpeeds(Date.now(), { urgent });
     } catch (e) {
         // A driver bug must never take the engine tick down with it.
     }
@@ -652,8 +711,9 @@ export function stopTCode() {
             const rest = axis.centred ? 0.5 : lastEnvelope.min;
             axis.planner.setInput({ speed: 0, zoneMin: rest, zoneMax: axis.centred ? 0.5 : lastEnvelope.max, enabled: false });
             const leg = axis.planner.next(now);
-            const position = leg ? leg.position : rest;
-            commands.push(formatAxisCommand(axis.id, physicalPosition(axis, position), { intervalMs: leg ? leg.durationMs : TCODE_TIMINGS.restMs }));
+            // Where the next leg starts from (travelCovered).
+            axis.legTarget = physicalPosition(axis, leg ? leg.position : rest);
+            commands.push(formatAxisCommand(axis.id, axis.legTarget, { intervalMs: leg ? leg.durationMs : TCODE_TIMINGS.restMs }));
         } else {
             axis.lastSent = 0;
             commands.push(formatAxisCommand(axis.id, restPositionFor(axis.id)));
@@ -730,10 +790,13 @@ export function testAxis(axisIdx) {
             down = physicalPosition(axis, lastZone.min);
         }
         writeCommands([formatAxisCommand(axis.id, up, { intervalMs: moveMs })]);
+        // Where the next leg starts from (travelCovered).
+        axis.legTarget = up;
         axis.testTimer = setTimeout(() => {
             axis.testTimer = null;
             if (session !== s || !isTCodeConnected()) return;
             writeCommands([formatAxisCommand(axis.id, down, { intervalMs: moveMs })]);
+            axis.legTarget = down;
             axis.planner.reset();
         }, moveMs + 50);
         return true;

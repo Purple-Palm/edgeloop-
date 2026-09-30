@@ -10,8 +10,12 @@
 //   3. Smooth motion: each linear axis is driven by a stroke planner
 //      (stroke-planner.js) issuing ONE LinearCmd per leg with the full leg
 //      duration, timed by a per-axis setTimeout at leg end. Engine ticks only
-//      update the planner inputs. Vibrators and rotators get immediate
-//      updates, deduplicated so identical values are not re-sent.
+//      update the planner inputs: only a stop cuts a leg short, and only an
+//      urgent dispatch (a guard engaging, a cut, Force Orgasm's landing)
+//      re-times the leg in flight, to the position it was sent to and only
+//      inside the envelope.
+//      Vibrators and rotators get immediate updates, deduplicated so
+//      identical values are not re-sent.
 //
 // Message construction and parsing live in buttplug-protocol.js (pure,
 // unit-tested). Roles, caps, linear invert and the rotation settings are
@@ -463,6 +467,11 @@ function makeAxis(kind, attr, position, parsed, saved) {
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
         invert: Boolean(savedAxis && savedAxis.invert),
         planner: kind === 'linear' ? createStrokePlanner() : null,
+        // The physical positions the leg in flight was sent from and to (the
+        // end of the leg before it, and its own), for a re-time (pumpLinear);
+        // null while unknown.
+        legFrom: null,
+        legTarget: null,
         timer: null,
         testTimer: null,
         lastSent: null,
@@ -595,13 +604,57 @@ function physicalPosition(axis, position) {
     return lastEnvelope.min + lastEnvelope.max - position;
 }
 
+// How far past a bound of the envelope a position may lie and still be on
+// it. A mirrored position carries float noise: 0.2 + 0.8 - 0.8 is
+// 0.19999999999999996, and the leg that carries it goes to the bottom of a
+// 20-80 envelope. The finest step a device is sent, 1/1000 of its travel, is
+// a million times this.
+const ENVELOPE_BOUND_SLACK = 1e-9;
+
+// Whether the leg in flight may be re-timed: it was sent somewhere, and that
+// is still inside the travel envelope (pumpLinear says why).
+function mayRetime(axis) {
+    const to = axis.legTarget;
+    return to !== null && to >= lastEnvelope.min - ENVELOPE_BOUND_SLACK && to <= lastEnvelope.max + ENVELOPE_BOUND_SLACK;
+}
+
+// How much of the travel the leg in flight covers on the device, for a
+// re-time: from where the leg before it was sent to where it was sent. Before
+// that is known, the whole of it, so what is left of a leg is never timed as
+// shorter than it may be.
+function travelCovered(axis) {
+    return axis.legFrom === null ? 1 : Math.abs(axis.legTarget - axis.legFrom);
+}
+
 // Ask the planner for the next leg and, when it yields one, send it and
-// arm a timer for its end. Never sends while a leg is in flight.
-function pumpLinear(dev, axis, now = Date.now()) {
+// arm a timer for its end. Never sends while a leg is in flight, except the
+// leg in flight re-timed for an urgent decision (`retime`, stroke-planner.js).
+//
+// A re-timed leg goes to the physical position its leg was sent to
+// (axis.legTarget), never to the planner's position mapped again. The
+// planner's is a logical position, and what maps it onto the device - the
+// mirror of an inverted axis through the travel envelope - can change while
+// the leg is in flight. Mapped again after the wearer had raised the
+// envelope's minimum from 0 to 20 during a leg to 80%, the re-timed leg of a
+// cut sent an inverted stroker to 100%, past the wearer's maximum; after the
+// invert switch was flipped during a downstroke, back up to the top. Nor is
+// a leg re-timed whose end the wearer has since put outside the envelope:
+// sent again, it would be a new command past the wearer's bounds. It runs
+// out as it was sent, as a leg in flight always did when the envelope
+// changed, and the next leg, inside the envelope, carries the new speed. And
+// what is left of a leg is timed over what the leg covers on the device
+// (travelCovered), which is more than the planner sized it for when the
+// mapping changed just before it was planned.
+function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
     if (!axis.planner || !isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
-    const leg = axis.planner.next(now);
+    const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
+    const leg = retimed || axis.planner.next(now);
     if (!leg) return;
-    const position = physicalPosition(axis, leg.position);
+    if (!retimed) {
+        axis.legFrom = axis.legTarget;
+        axis.legTarget = physicalPosition(axis, leg.position);
+    }
+    const position = axis.legTarget;
     sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position, durationMs: leg.durationMs }]));
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
@@ -619,14 +672,21 @@ function flipDirection(dev, now) {
 
 // Reverse every rotator that opted in (reason 'edge' honours the per-device
 // "reverse on edge" switch). Rate-limited to one change per second.
-export function reverseIntifaceRotation(reason = 'edge', now = Date.now()) {
+//
+// `apply: false` only turns the direction; the caller's own dispatch, which
+// follows at once, sends it. The engine reverses on the edge it has just
+// counted, in the same pass that decides the edge's speed, and re-sending
+// the last speeds reversed put the speed from before the edge on the wire
+// first: at Full Stop a rotator was sent 45% the other way and then 0,
+// within two milliseconds.
+export function reverseIntifaceRotation(reason = 'edge', now = Date.now(), { apply = true } = {}) {
     let flipped = 0;
     intifaceDevices.forEach((dev) => {
         if (!dev.axes.some((a) => a.kind === 'rotate')) return;
         if (reason === 'edge' && dev.reverseOnEdge === false) return;
         if (flipDirection(dev, now)) flipped += 1;
     });
-    if (flipped > 0) applyLastSpeeds();
+    if (flipped > 0 && apply) applyLastSpeeds();
     return flipped;
 }
 
@@ -635,11 +695,11 @@ function maybeAlternate(dev, now, active) {
     if (now - (dev.lastDirectionChangeAt || 0) >= dev.alternateSeconds * 1000) flipDirection(dev, now);
 }
 
-function applyAxis(dev, axis, primary, secondary, zone, now) {
+function applyAxis(dev, axis, primary, secondary, zone, now, urgent = false) {
     const speed = axis.role === 'primary' ? primary : (axis.role === 'secondary' ? secondary : 0);
     if (axis.kind === 'linear') {
         axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled: axis.role !== 'off' });
-        pumpLinear(dev, axis, now);
+        pumpLinear(dev, axis, now, { retime: urgent });
     } else if (axis.kind === 'rotate') {
         const value = scalarFor(axis, speed);
         maybeAlternate(dev, now, value > 0);
@@ -649,10 +709,10 @@ function applyAxis(dev, axis, primary, secondary, zone, now) {
     }
 }
 
-function applyLastSpeeds(now = Date.now()) {
+function applyLastSpeeds(now = Date.now(), { urgent = false } = {}) {
     if (!isIntifaceConnected()) return;
     intifaceDevices.forEach((dev) => {
-        dev.axes.forEach((axis) => applyAxis(dev, axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, now));
+        dev.axes.forEach((axis) => applyAxis(dev, axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, now, urgent));
     });
 }
 
@@ -672,8 +732,11 @@ function zoneFromPercent(strokeMin, strokeMax, envMin, envMax) {
 // stop / pause (force = true). strokeMin/strokeMax are physical percents
 // already mapped into the hardware envelope by engine.js; the envelope is
 // used only to clamp (and to mirror inverted axes) so no position can ever
-// leave the user's bounds.
-export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, strokeMax = 100, envMin = 0, envMax = 100, force = false) {
+// leave the user's bounds. `urgent` (tick-dispatch.js): this dispatch
+// carries a guard's decision, a cut or the landing Force Orgasm's time limit
+// starts, and a linear axis takes its new speed on the leg in flight instead
+// of the next one.
+export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, strokeMax = 100, envMin = 0, envMax = 100, force = false, { urgent = false } = {}) {
     const mapped = zoneFromPercent(strokeMin, strokeMax, envMin, envMax);
     lastZone = mapped.zone;
     lastEnvelope = mapped.envelope;
@@ -684,11 +747,11 @@ export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, st
     if (!isIntifaceConnected() || intifaceDevices.size === 0) return;
     if (force && lastSpeeds.primary === 0 && lastSpeeds.secondary === 0) {
         // STOP / pause: the server-side stop first, then the per-axis rest
-        // moves and zeros (the planner finishes the leg in flight instead of
-        // snapping the sleeve).
+        // moves and zeros (a stop interrupts a linear axis's leg in flight,
+        // so its rest move goes out now: stroke-planner.js).
         send(buildStopAllDevices(nextId()));
     }
-    applyLastSpeeds(Date.now());
+    applyLastSpeeds(Date.now(), { urgent });
 }
 
 // ---- user settings ----------------------------------------------------------------
@@ -772,10 +835,13 @@ export function testSingleAxis(devIdx, axisIdx) {
         const down = physicalPosition(axis, lastZone.min);
         const moveMs = INTIFACE_TIMINGS.testMoveMs;
         sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position: up, durationMs: moveMs }]));
+        // Where the next leg starts from (travelCovered).
+        axis.legTarget = up;
         axis.testTimer = setTimeout(() => {
             axis.testTimer = null;
             if (!isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
             sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position: down, durationMs: moveMs }]));
+            axis.legTarget = down;
             axis.planner.reset();
         }, moveMs + 50);
         return true;
