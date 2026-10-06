@@ -161,6 +161,7 @@ import {
     INTIFACE_STORAGE_KEY
 } from './hardware/intiface.js';
 import { PULSE_PERIODS_MS } from './hardware/vibe-pulse.js';
+import { capChoices, capSteps, capStepPercent } from './hardware/buttplug-protocol.js';
 import {
     connectTCode,
     disconnectTCode,
@@ -5586,9 +5587,28 @@ document.getElementById('modalIntifaceSaveBtn')?.addEventListener('click', () =>
     if (saved) setTimeout(closeModal, 600);
 });
 
+// The travel envelope goes with a role change: the Oscillate mode of an
+// OSSM-type machine is refused while it is narrower than 0-100%.
 window.setDeviceRole = (devIdx, axisIdx, role) => {
-    setAxisRole(devIdx, axisIdx, role);
+    setAxisRole(devIdx, axisIdx, role, { envelope: normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax) });
     renderIntifaceDevices();
+    syncTelemetry();
+};
+
+function formatCapPercent(percent) {
+    return `${Math.round(Number(percent) * 10) / 10}%`;
+}
+
+// A stepped toy's cap moves a step at a time and shows the real percentage.
+window.setDeviceCapStep = (devIdx, axisIdx, steps, rerender = false) => {
+    const axis = intifaceDevices.get(devIdx)?.axes[axisIdx];
+    if (!axis || !axis.stepCount) return;
+    const percent = capStepPercent(parseInt(steps, 10), axis.stepCount);
+    setAxisMaxCap(devIdx, axisIdx, percent);
+    if (rerender) renderIntifaceDevices();
+    const el = document.getElementById(`capVal_${devIdx}_${axisIdx}`);
+    if (el) el.textContent = formatCapPercent(percent);
+    document.getElementById(`capOff_${devIdx}_${axisIdx}`)?.remove();
     syncTelemetry();
 };
 
@@ -5655,10 +5675,13 @@ function renderIntifaceDevices() {
             // axis, driven through that one only (buttplug-protocol.js,
             // drivesAsLevel). No role, no cap, no Test.
             if (axis.inert) {
+                const why = axis.inertReason === 'rotate'
+                    ? 'The same rotator as the Rotate axis below, listed twice by Intiface: EdgeLoop drives it there, with its direction, and sends this one nothing.'
+                    : 'A position without a duration: EdgeLoop strokes this motor through its Linear axis and sends this one nothing.';
                 axisRows += `
             <div class="bg-slate-900 p-2 rounded-lg border border-slate-800 space-y-1 text-[10px]">
             <div class="font-bold text-slate-500 truncate">Axis ${axis.index} (${label}) - not used</div>
-            <p class="text-[9px] text-slate-500 leading-snug">A position without a duration: EdgeLoop strokes this motor through its Linear axis and sends this one nothing.</p>
+            <p class="text-[9px] text-slate-500 leading-snug">${why}</p>
             </div>`;
                 return;
             }
@@ -5674,15 +5697,52 @@ function renderIntifaceDevices() {
             // only one in use, and the Test of the other refused while it is.
             const twinBusy = Boolean(axis.twin && axis.twin.role !== 'off');
             const twinLabel = axis.twin ? `Axis ${axis.twin.index} (${escapeHtml(axis.twin.type)})` : '';
+            // The Oscillate mode of an OSSM-type machine strokes the whole
+            // rail at full depth: refused while the envelope is narrower.
+            const fullRail = Boolean(axis.twin) && axis.kind === 'scalar' && axis.type === 'Oscillate';
+            const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+            const railBlocked = fullRail && (env.min > 0 || env.max < 100);
             let twinNote = '';
             if (axis.twin && axis.kind === 'linear') {
-                twinNote = `<p class="text-[9px] text-slate-500 leading-snug">Same motor as ${twinLabel}: only one of the two can be on. This one strokes inside your Travel Envelope.</p>`;
-            } else if (axis.twin) {
-                twinNote = `<p class="text-[9px] text-amber-300/80 leading-snug">Same motor as ${twinLabel}: only one of the two can be on, and switching makes the machine stop and change mode. Oscillate runs the machine's own stroke over its whole rail - Intiface sets full depth and stroke - at the engine's speed; your Travel Envelope cannot reach it. Use ${twinLabel} to keep the stroke inside your envelope.</p>`;
+                twinNote = `<p class="text-[9px] text-slate-500 leading-snug">Same motor as ${twinLabel}: only one of the two can be on. This one strokes inside your Travel Envelope, and on STOP it holds where it is.</p>`;
+            } else if (railBlocked) {
+                twinNote = `<p class="text-[9px] text-amber-300/80 leading-snug">Not available while your Travel Envelope is ${env.min}-${env.max}%: Oscillate runs the machine's own stroke over its whole rail at full depth - Intiface sets depth and stroke to 100% - and cannot keep to the envelope.${axis.role !== 'off' ? ' It stays at 0 until then.' : ''} Set the envelope to 0-100% to use it, or use ${twinLabel}.</p>`;
+            } else if (fullRail) {
+                twinNote = `<p class="text-[9px] text-amber-300/80 leading-snug">Same motor as ${twinLabel}: only one of the two can be on, and switching makes the machine stop and change mode. Oscillate runs the machine's own stroke over its whole rail at full depth and ignores your Travel Envelope; EdgeLoop sends only the speed.</p>`;
             }
-            const testButton = twinBusy
-                ? `<button disabled title="${twinLabel} is in use; set it OFF to test this one" class="bg-slate-800 px-1.5 py-0.5 rounded text-[9px] opacity-40 cursor-not-allowed">Test</button>`
+            const testRefusal = twinBusy ? `${twinLabel} is in use; set it OFF to test this one` : (railBlocked ? 'Not available while your Travel Envelope is narrower than 0-100%' : '');
+            const testButton = testRefusal
+                ? `<button disabled title="${testRefusal}" class="bg-slate-800 px-1.5 py-0.5 rounded text-[9px] opacity-40 cursor-not-allowed">Test</button>`
                 : `<button onclick="testAxis(${devIdx}, ${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer">Test</button>`;
+            const onButton = (role, label, onClass) => railBlocked
+                ? `<button disabled title="Not available while your Travel Envelope is narrower than 0-100%" class="flex-1 py-1 rounded ${axis.role === role ? onClass : 'bg-slate-800 text-slate-400'} opacity-40 cursor-not-allowed">${label}</button>`
+                : `<button onclick="setDeviceRole(${devIdx}, ${aIdx}, '${role}')" class="flex-1 py-1 rounded ${axis.role === role ? onClass : 'bg-slate-800 text-slate-400'} transition cursor-pointer">${label}</button>`;
+            // A stepped toy's cap is one of its steps, shown as its real
+            // percentage (capChoices); others keep the 10-100% slider.
+            const steps = axis.kind !== 'linear' && axis.stepCount ? Math.round(axis.stepCount) : 0;
+            let capRow;
+            if (steps) {
+                const choices = capChoices(steps);
+                const now = capSteps(axis.maxCap ?? 100, steps);
+                const lowest = choices[0].steps;
+                const off = now === 0
+                    ? `<p id="capOff_${devIdx}_${aIdx}" class="text-[9px] text-amber-300/80 leading-snug">Your saved cap (${formatCapPercent(axis.maxCap)}) is under this toy's first step (${formatCapPercent(capStepPercent(1, steps))}), so this axis stays off. <button onclick="setDeviceCapStep(${devIdx}, ${aIdx}, ${lowest}, true)" class="underline cursor-pointer">Use ${formatCapPercent(capStepPercent(lowest, steps))}</button></p>`
+                    : '';
+                capRow = `
+            <div class="flex justify-between text-[9px] text-slate-400">
+            <span>Max Power Cap${steps < 20 ? ` (${steps} step${steps === 1 ? '' : 's'})` : ''}:</span>
+            <span id="capVal_${devIdx}_${aIdx}" class="font-bold font-mono text-amber-400">${now === 0 ? 'off' : formatCapPercent(capStepPercent(now, steps))}</span>
+            </div>
+            <input type="range" min="${lowest}" max="${steps}" step="1" value="${Math.max(now, lowest)}" ${lowest === steps ? 'disabled' : ''} oninput="setDeviceCapStep(${devIdx}, ${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">
+            ${off}`;
+            } else {
+                capRow = `
+            <div class="flex justify-between text-[9px] text-slate-400">
+            <span>Max Power Cap:</span>
+            <span id="capVal_${devIdx}_${aIdx}" class="font-bold font-mono text-amber-400">${axis.maxCap ?? 100}%</span>
+            </div>
+            <input type="range" min="10" max="100" step="5" value="${axis.maxCap ?? 100}" oninput="setDeviceCap(${devIdx}, ${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">`;
+            }
             let vibeRow = '';
             if (axis.kind === 'scalar' && axis.type === 'Vibrate') {
                 const pulsed = axis.vibeMode === 'pulsed';
@@ -5707,16 +5767,12 @@ function renderIntifaceDevices() {
             </div>
             ${twinNote}
             <div class="flex gap-1">
-            <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'primary')" class="flex-1 py-1 rounded ${axis.role === 'primary' ? 'bg-rose-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Primary</button>
-            <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'secondary')" class="flex-1 py-1 rounded ${axis.role === 'secondary' ? 'bg-purple-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Secondary</button>
+            ${onButton('primary', 'Primary', 'bg-rose-600 text-white font-bold')}
+            ${onButton('secondary', 'Secondary', 'bg-purple-600 text-white font-bold')}
             <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'off')" class="flex-1 py-1 rounded ${axis.role === 'off' ? 'bg-slate-700 text-amber-300 font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">OFF</button>
             </div>
             <div class="space-y-0.5 pt-1 border-t border-slate-800/60">
-            <div class="flex justify-between text-[9px] text-slate-400">
-            <span>Max Power Cap:</span>
-            <span id="capVal_${devIdx}_${aIdx}" class="font-bold font-mono text-amber-400">${axis.maxCap ?? 100}%</span>
-            </div>
-            <input type="range" min="10" max="100" step="5" value="${axis.maxCap ?? 100}" oninput="setDeviceCap(${devIdx}, ${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">
+            ${capRow}
             </div>
             ${vibeRow}
             ${invertRow}

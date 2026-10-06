@@ -21,7 +21,14 @@
 //   4. One motor, one mode: an Oscillate actuator and the linear axis of the
 //      same motor (an OSSM, oscillateTwins) are never both in use, and the
 //      one not in use is sent nothing (silenced). A ScalarCmd Position is a
-//      position, never a level, and is sent nothing (drivesAsLevel).
+//      position, never a level, and a ScalarCmd Rotate that RotateCmd lists
+//      as well is the same rotator: both are sent nothing (axis.inert).
+//   5. The linear axis of such a motor holds where it is on a stop: Intiface
+//      cannot stop an OSSM in position mode and its firmware will not turn a
+//      move round, so each leg goes out in short segments and a stop is the
+//      end of the segments (pumpHeld). Its Oscillate twin runs the machine's
+//      own full-rail stroke, so it runs only while the travel envelope is
+//      the whole travel (fullRail).
 //
 // Message construction and parsing live in buttplug-protocol.js (pure,
 // unit-tested). Roles, caps, linear invert and the rotation settings are
@@ -51,7 +58,10 @@ import {
     defaultRoleFor,
     drivesAsLevel,
     oscillateTwins,
-    scalarLevel
+    rotateDuplicates,
+    scalarLevel,
+    linearStep,
+    capSteps
 } from './buttplug-protocol.js';
 import { createStrokePlanner } from './stroke-planner.js';
 import { readVibeMode, readPulsePeriod, pulsePhase, pulseLevel, DEFAULT_VIBE_MODE, DEFAULT_PULSE_PERIOD_MS } from './vibe-pulse.js';
@@ -69,12 +79,17 @@ export const INTIFACE_TIMINGS = {
     testMoveMs: 450
 };
 
-// The Test button's level. An Oscillate actuator is a reciprocating
-// machine's speed - on an OSSM its own stroke over the whole rail, which
-// Intiface sets to full depth and full stroke on entering that mode - so the
+// The Test button's level. The Oscillate mode of an OSSM-type machine
+// (fullRail) runs the machine's own stroke over the whole rail, which
+// Intiface sets to full depth and full stroke on entering that mode, so the
 // press that only has to show which motor it is runs it slowly.
 export const TEST_LEVEL = 0.6;
 export const OSCILLATE_TEST_LEVEL = 0.2;
+
+// The longest one segment of a held axis's leg lasts (pumpHeld): a stop
+// leaves the machine at most this much movement, at five to ten commands a
+// second.
+export const HELD_SEGMENT_MS = 200;
 
 export const INVALID_URL_TEXT = 'Invalid WebSocket URL: it must start with ws:// (or wss:// for a remote server with TLS), e.g. ws://localhost:12345.';
 export const HANDSHAKE_TIMEOUT_TEXT = 'Handshake timed out. Make sure Intiface Central is running and its server is started; for localhost the URL must be ws://, not wss://.';
@@ -214,6 +229,7 @@ function clearAxisTimers(dev) {
     dev.axes.forEach((axis) => {
         if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
         if (axis.testTimer) { clearTimeout(axis.testTimer); axis.testTimer = null; }
+        cancelSegments(axis);
         cutPulse(axis);
     });
 }
@@ -341,8 +357,11 @@ export function disconnectIntiface() {
 // server-side stop without touching the planners). A pulse train is cut
 // with it: its next pulse would start the vibrator again after the stop, on
 // a page that has gone away or been frozen with the session still running.
+// A held axis (pumpHeld) stops here as well: StopAllDevices does nothing to
+// an OSSM in position mode, and only the end of its segments stops it.
 export function stopAllIntiface() {
     intifaceDevices.forEach((dev) => dev.axes.forEach((axis) => {
+        if (axis.holds) holdNow(axis);
         if (!axis.pulse) return;
         cutPulse(axis);
         axis.lastSent = null;
@@ -493,7 +512,10 @@ function makeAxis(kind, attr, position, parsed, saved) {
         descriptor: attr.descriptor || '',
         stepCount: attr.stepCount || null,
         role: inert ? 'off' : role,
+        // Never driven: 'position' (drivesAsLevel) or 'rotate'
+        // (rotateDuplicates, set by addDiscoveredDevice); null when driven.
         inert,
+        inertReason: inert ? 'position' : null,
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
         invert: Boolean(savedAxis && savedAxis.invert),
         // Vibrate axes only: Constant (the engine's level as it is) or
@@ -507,6 +529,13 @@ function makeAxis(kind, attr, position, parsed, saved) {
         // mode; null on every other axis.
         twin: null,
         pair: null,
+        // A linear axis that holds where it is on a stop (pumpHeld), with
+        // its segment timer and the last position it was sent, as a
+        // position and as the device step it lands on (null: unknown).
+        holds: false,
+        segTimer: null,
+        sentPos: null,
+        sentStep: null,
         planner: kind === 'linear' ? createStrokePlanner() : null,
         // The physical positions the leg in flight was sent from and to (the
         // end of the leg before it, and its own), for a re-time (pumpLinear);
@@ -550,6 +579,16 @@ function addDiscoveredDevice(raw) {
         osc.twin = lin; lin.twin = osc;
         osc.pair = pair; lin.pair = pair;
         if (osc.role !== 'off' && lin.role !== 'off') osc.role = 'off';
+        lin.holds = true;
+        lin.planner = createStrokePlanner({ hold: true });
+    });
+    // A rotator listed twice is driven through RotateCmd only.
+    rotateDuplicates(parsed).forEach((pos) => {
+        const axis = axes[pos];
+        if (!axis) return;
+        axis.inert = true;
+        axis.inertReason = 'rotate';
+        axis.role = 'off';
     });
 
     const altSaved = saved ? Number(saved.alternateSeconds) : 0;
@@ -623,14 +662,34 @@ export function saveIntifaceConfig() {
 
 // ---- per-axis output ----------------------------------------------------------------
 
+// The Max Power Cap as a fraction of full power: on a stepped actuator the
+// step it allows (capSteps), which is what the modal shows.
+function capFraction(axis) {
+    const steps = capSteps(axis.maxCap ?? 100, axis.stepCount);
+    return steps === null ? (axis.maxCap ?? 100) / 100 : steps / Math.round(axis.stepCount);
+}
+
 // The axis's level for an engine speed (percent): the speed under the
 // axis's Max Power Cap, on the axis's step grid and never above the cap
 // (scalarLevel).
 function scalarFor(axis, speedPercent) {
     if (axis.role === 'off' || axis.inert) return 0;
-    const cap = (axis.maxCap ?? 100) / 100;
+    const cap = capFraction(axis);
     const speed = Math.max(0, Math.min(100, Number(speedPercent) || 0)) / 100;
     return scalarLevel(speed * cap, axis.stepCount, cap);
+}
+
+// The Oscillate mode of an OSSM-type machine (an Oscillate twin): Intiface
+// sets the OSSM's depth and stroke to 100% on entering it
+// (protocol_impl/ossm.rs), so it strokes the whole rail at full depth, and
+// nothing EdgeLoop sends can keep it inside a travel envelope. It is driven
+// only while the envelope is the whole travel.
+function fullRail(axis) {
+    return axis.kind === 'scalar' && axis.type === 'Oscillate' && Boolean(axis.twin);
+}
+
+function envelopeIsWhole(env) {
+    return Boolean(env) && env.min <= 0 && env.max >= 1;
 }
 
 function speedForRole(role) {
@@ -648,13 +707,15 @@ function noteDrove(axis, acting) {
     if (axis.pair && acting) axis.pair.owner = axis.kind;
 }
 
-// Whether an axis must be sent nothing at all. A scalar that takes a
-// position (axis.inert) never is. Nor is an OFF twin whose twin holds the
-// motor: a rest move, a zero or a Test to it is a command for the other
-// mode, and Buttplug answers that by sending the OSSM to its menu, which its
-// firmware runs as an emergency stop, and then into the other mode - the
-// slam and the stop forum user X333 saw. The twin in use stops the motor
-// (STOP sends StopAllDevices, which reaches whichever mode it is in).
+// Whether an axis must be sent nothing at all. An inert scalar (a position,
+// or a rotator RotateCmd drives) never is. Nor is an OFF twin whose twin
+// holds the motor: a rest move, a zero or a Test to it is a command for the
+// other mode, and Buttplug answers that by sending the OSSM to its menu,
+// which its firmware runs as an emergency stop, and then into the other
+// mode - the slam and the stop forum user X333 saw. The twin in use stops
+// the motor: in oscillate mode StopAllDevices reaches it (Oscillate 0); in
+// position mode nothing from Intiface does, and the held linear axis stops
+// by sending no further segment (pumpHeld).
 function silenced(axis) {
     if (axis.inert) return true;
     return Boolean(axis.pair) && axis.role === 'off' && axis.pair.owner !== axis.kind;
@@ -704,7 +765,7 @@ function armPulse(dev, axis, now) {
 // - at the peak at once - and is cut by the first 0: a stop, a pause, the
 // watchdog, OFF, a cap of 0.
 function applyScalar(dev, axis, speed, now) {
-    const level = scalarFor(axis, speed);
+    const level = fullRail(axis) && !envelopeIsWhole(lastEnvelope) ? 0 : scalarFor(axis, speed);
     if (!isPulsed(axis) || level <= 0) {
         cutPulse(axis);
         sendScalar(dev, axis, level);
@@ -783,6 +844,11 @@ function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
     if (!axis.planner || !isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
     if (silenced(axis)) {
         if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
+        cancelSegments(axis);
+        return;
+    }
+    if (axis.holds) {
+        pumpHeld(dev, axis, now);
         return;
     }
     const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
@@ -801,11 +867,105 @@ function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
 }
 
 // One LinearCmd, on the axis's step grid and inside the travel envelope
-// (linearWirePosition).
+// (linearWirePosition). A held axis is never sent the step it was last
+// sent: the OSSM firmware takes a move's direction as
+// distance / abs(distance) (src/ossm/streaming/streaming.cpp), an integer
+// 0 / 0 when the position repeats - on its ESP32 a divide-by-zero fault and
+// a reboot, whose homing then drives the rail to both of its ends.
 function sendLinear(dev, axis, position, durationMs) {
+    const step = linearStep(position, axis.stepCount, lastEnvelope);
+    if (axis.holds && step === axis.sentStep) return false;
     const sent = sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position, durationMs, stepCount: axis.stepCount, bounds: lastEnvelope }]));
+    if (sent) {
+        axis.sentPos = position;
+        axis.sentStep = step;
+    }
     noteDrove(axis, sent);
     return sent;
+}
+
+// ---- held linear axes (an OSSM in Intiface's position mode) ---------------
+//
+// Intiface cannot stop an OSSM that is streaming positions: StopDeviceCmd
+// and StopAllDevices become an Oscillate 0, which Buttplug drops outside
+// oscillate mode (protocol_impl/ossm.rs). The firmware runs a move to its
+// end and will not take one the other way before it has
+// (streaming.cpp). So a leg in one long LinearCmd ran on for up to its
+// whole length after a STOP, and the rest move that followed went to the
+// bottom of the travel envelope - toward an end of the rail that depends on
+// the OSSM's firmware version. Here a leg goes out as segments of about
+// HELD_SEGMENT_MS, all in the leg's direction, which the firmware takes one
+// after another without stopping; a stop sends nothing more, so the
+// machine halts within one segment, where it is, and holds there. No rest
+// move, on STOP, pause, the watchdog, page-away or OFF. Nor a re-time: it
+// would send the leg's end again. The first leg from a position nobody
+// knows (after connecting, or after Oscillate) has no start to cut into
+// segments and goes as one move, sized for the farthest end of the travel.
+
+function cancelSegments(axis) {
+    if (axis.segTimer) { clearTimeout(axis.segTimer); axis.segTimer = null; }
+}
+
+// Stop a held axis where it is: nothing more goes out, and the planner is
+// told the position the last segment sent will leave it at.
+function holdAxis(axis) {
+    cancelSegments(axis);
+    if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
+    axis.planner.place(axis.sentPos === null ? null : physicalPosition(axis, axis.sentPos));
+}
+
+// The same from outside a dispatch (page-away): the planner stops as well.
+function holdNow(axis) {
+    axis.planner.setInput({ enabled: false });
+    axis.planner.next(Date.now());
+    holdAxis(axis);
+}
+
+function pumpHeld(dev, axis, now) {
+    const leg = axis.planner.next(now);
+    if (!leg) return;
+    if (leg.kind === 'hold') {
+        holdAxis(axis);
+        return;
+    }
+    const to = physicalPosition(axis, leg.position);
+    axis.legFrom = axis.sentPos;
+    axis.legTarget = to;
+    streamLeg(dev, axis, axis.sentPos, to, leg.durationMs);
+    if (axis.timer) clearTimeout(axis.timer);
+    axis.timer = setTimeout(() => {
+        axis.timer = null;
+        pumpLinear(dev, axis, Math.max(Date.now(), axis.planner.legEndsAt()));
+    }, leg.durationMs);
+}
+
+// One leg as segments from `from` to `to` over `durationMs`; a segment that
+// lands on the step the one before it did is folded into the next one.
+function streamLeg(dev, axis, from, to, durationMs) {
+    cancelSegments(axis);
+    const n = from === null ? 1 : Math.max(1, Math.ceil(durationMs / HELD_SEGMENT_MS));
+    const each = durationMs / n;
+    const segments = [];
+    let prev = axis.sentStep;
+    let carry = 0;
+    for (let i = 1; i <= n; i++) {
+        const pos = from === null ? to : from + (to - from) * (i / n);
+        const step = linearStep(pos, axis.stepCount, lastEnvelope);
+        if (step === prev) { carry += each; continue; }
+        segments.push({ pos, ms: Math.round(each + carry), at: (i - 1) * each - carry });
+        prev = step;
+        carry = 0;
+    }
+    const start = Date.now();
+    const next = () => {
+        axis.segTimer = null;
+        if (!isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
+        const seg = segments.shift();
+        if (!seg) return;
+        sendLinear(dev, axis, seg.pos, seg.ms);
+        if (segments.length) axis.segTimer = setTimeout(next, Math.max(1, start + segments[0].at - Date.now()));
+    };
+    next();
 }
 
 function flipDirection(dev, now) {
@@ -901,12 +1061,13 @@ export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, st
 
 // ---- user settings ----------------------------------------------------------------
 
-// An axis set OFF stops where it is: a linear axis with one rest move to
-// the bottom of the zone it was last given, inside the travel envelope; a
-// scalar (its pulse train cut) or a rotator with a 0. A linear axis nothing
-// has moved yet is sent nothing: its planner had never been given a zone,
-// and its rest move went to 0 whatever the travel envelope - setting an
-// OSSM's Position axis OFF before a session sent it to full extension.
+// An axis set OFF stops: a linear axis with one rest move to the bottom of
+// the zone it was last given, inside the travel envelope - a held one
+// (pumpHeld) where it is, with no move at all; a scalar (its pulse train
+// cut) or a rotator with a 0. A linear axis nothing has moved yet is sent
+// nothing: its planner had never been given a zone, and its rest move went
+// to 0 whatever the travel envelope - setting an OSSM's Position axis OFF
+// before a session sent it to the end of its rail.
 function restAxisNow(dev, axis) {
     if (axis.kind === 'linear') {
         axis.planner.setInput({ enabled: false, zoneMin: lastZone.min, zoneMax: lastZone.max });
@@ -928,22 +1089,30 @@ function yieldTwin(axis) {
     axis.role = 'off';
     if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
     if (axis.testTimer) { clearTimeout(axis.testTimer); axis.testTimer = null; }
+    cancelSegments(axis);
     cutPulse(axis);
     if (axis.planner) {
         axis.planner.reset();
         axis.planner.setInput({ enabled: false });
         axis.legFrom = null;
         axis.legTarget = null;
+        axis.sentPos = null;
+        axis.sentStep = null;
     }
     axis.lastSent = null;
 }
 
-export function setAxisRole(devIdx, axisIdx, role) {
+// `envelope`: the travel envelope in percent, { min, max }, as the page has
+// it now. The Oscillate mode of an OSSM-type machine cannot keep to it
+// (fullRail): it is refused while the envelope is narrower than 0-100%.
+export function setAxisRole(devIdx, axisIdx, role, { envelope = null } = {}) {
     const dev = intifaceDevices.get(devIdx);
     const axis = dev && dev.axes[axisIdx];
     if (!axis || !['primary', 'secondary', 'off'].includes(role)) return false;
-    // A scalar that takes a position is never driven (drivesAsLevel).
+    // An inert scalar is never driven (drivesAsLevel, rotateDuplicates).
     if (axis.inert && role !== 'off') return false;
+    useEnvelope(envelope);
+    if (role !== 'off' && fullRail(axis) && !envelopeIsWhole(lastEnvelope)) return false;
     axis.role = role;
     // One motor, one mode: putting one twin in use takes the other out.
     if (role !== 'off' && axis.twin && axis.twin.role !== 'off') yieldTwin(axis.twin);
@@ -958,12 +1127,14 @@ export function setAxisRole(devIdx, axisIdx, role) {
     return true;
 }
 
+// A stepped actuator's cap is one of its steps (capChoices), stored to
+// 1/10000 % so that capSteps() reads the same step back.
 export function setAxisMaxCap(devIdx, axisIdx, maxCap) {
     const dev = intifaceDevices.get(devIdx);
     const axis = dev && dev.axes[axisIdx];
     if (!axis) return false;
     const n = Number(maxCap);
-    axis.maxCap = Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : 100;
+    axis.maxCap = Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n * 10000) / 10000)) : 100;
     saveIntifaceConfig();
     if (isIntifaceConnected() && axis.role !== 'off') {
         applyAxis(dev, axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, Date.now());
@@ -1016,8 +1187,9 @@ export function testSingleAxis(devIdx, axisIdx, envelope = null) {
     if (!axis || !isIntifaceConnected() || axis.inert) return false;
     if (axis.twin && axis.twin.role !== 'off') return false;
     useEnvelope(envelope);
-    const cap = (axis.maxCap ?? 100) / 100;
-    const level = scalarLevel((axis.type === 'Oscillate' ? OSCILLATE_TEST_LEVEL : TEST_LEVEL) * cap, axis.stepCount, cap);
+    if (fullRail(axis) && !envelopeIsWhole(lastEnvelope)) return false;
+    const cap = capFraction(axis);
+    const level = scalarLevel((fullRail(axis) ? OSCILLATE_TEST_LEVEL : TEST_LEVEL) * cap, axis.stepCount, cap);
     const holdMs = 1000;
 
     if (axis.kind === 'linear') {
@@ -1034,6 +1206,8 @@ export function testSingleAxis(devIdx, axisIdx, envelope = null) {
             sendLinear(dev, axis, down, moveMs);
             axis.legTarget = down;
             axis.planner.reset();
+            // A held axis stays where the Test left it, and starts from there.
+            if (axis.holds) axis.planner.place(axis.sentPos === null ? null : physicalPosition(axis, axis.sentPos));
         }, moveMs + 50);
         return true;
     }

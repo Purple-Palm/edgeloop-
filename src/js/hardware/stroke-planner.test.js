@@ -394,3 +394,46 @@ describe('what a running session hands the planner', () => {
         }
     });
 });
+
+describe('a holding planner (an OSSM in position mode)', () => {
+    it('answers a stop with one hold and silence, never a rest move', () => {
+        const p = createStrokePlanner({ hold: true });
+        p.setInput({ speed: 50, zoneMin: 0.3, zoneMax: 0.7 });
+        const leg = p.next(0);
+        assert.equal(leg.kind, 'stroke');
+        p.setInput({ speed: 0 });
+        assert.deepEqual(p.next(10), { position: null, durationMs: 0, kind: 'hold' });
+        assert.equal(p.isInFlight(10), false);
+        assert.equal(p.next(20), null);
+        assert.equal(p.next(5000), null);
+        p.setInput({ enabled: false });
+        assert.equal(p.next(6000), null);
+    });
+
+    it('starts again from where it was placed, toward the farther end, sized by that distance', () => {
+        const p = createStrokePlanner({ hold: true });
+        p.setInput({ speed: 50, zoneMin: 0.3, zoneMax: 0.7 });
+        p.next(0);
+        p.setInput({ speed: 0 });
+        p.next(10);
+        p.place(0.62);
+        p.setInput({ speed: 50 });
+        const first = p.next(20);
+        assert.equal(first.position, 0.3, '0.3 is farther from 0.62 than 0.7');
+        assert.equal(first.durationMs, legDurationMs(50, 0.4));
+        p.place(0.35);
+        p.setInput({ speed: 0 });
+        p.next(first.durationMs + 20);
+        p.setInput({ speed: 50 });
+        assert.equal(p.next(first.durationMs + 30).position, 0.7);
+    });
+
+    it('sizes a first leg from nowhere it knows for the farthest end of the travel', () => {
+        const p = createStrokePlanner({ hold: true });
+        p.setInput({ speed: 50, zoneMin: 0.3, zoneMax: 0.7 });
+        assert.equal(p.next(0).durationMs, legDurationMs(50, 0.7));
+        const plain = createStrokePlanner();
+        plain.setInput({ speed: 50, zoneMin: 0.3, zoneMax: 0.7 });
+        assert.equal(plain.next(0).durationMs, legDurationMs(50, 0.4), 'the resting planner keeps its zone-width first leg');
+    });
+});

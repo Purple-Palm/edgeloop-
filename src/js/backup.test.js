@@ -236,6 +236,17 @@ describe('a vibrator\'s Pulsed setting rides in the backup like the other per-ax
         assert.deepEqual(map.d.axes['scalar:2'], { invert: false, role: 'primary' });
     });
 
+    it('keeps an Intiface cap that is a step of the toy, not the nearest 5%', () => {
+        // A 3-step toy's 67% is 66.6667%: on the 5% grid it became 65%, one step down.
+        const map = sanitizeDeviceMap({ shark: { axes: { 'scalar:0': { maxCap: 66.6667 }, 'scalar:1': { maxCap: 33.33333 }, 'scalar:2': { maxCap: 3 }, 'scalar:3': { maxCap: '250' } } } }, { extras: true });
+        assert.equal(map.shark.axes['scalar:0'].maxCap, 66.6667);
+        assert.equal(map.shark.axes['scalar:1'].maxCap, 33.3333);
+        assert.equal(map.shark.axes['scalar:2'].maxCap, MIN_CAP_PERCENT);
+        assert.equal(map.shark.axes['scalar:3'].maxCap, 100);
+        const tcode = sanitizeDeviceMap({ osr: { axes: { L0: { maxCap: 66.6667 } } } });
+        assert.equal(tcode.osr.axes.L0.maxCap, 65, 'a T-Code cap stays on the 5% grid');
+    });
+
     it('is an Intiface setting only: a T-Code axis map never carries it', () => {
         const map = sanitizeDeviceMap({ osr: { axes: { V0: { role: 'secondary', vibeMode: 'pulsed', pulsePeriodMs: 800 } } } });
         assert.deepEqual(map.osr.axes.V0, { invert: false, role: 'secondary' });

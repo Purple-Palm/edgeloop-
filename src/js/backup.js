@@ -198,6 +198,16 @@ export function sanitizeMaxCap(value) {
     return Math.floor(bounded / CAP_STEP_PERCENT) * CAP_STEP_PERCENT;
 }
 
+// An Intiface axis cap is one of the toy's own steps (buttplug-protocol.js
+// capChoices): a third of a 3-step toy is 33.3333%, which the 5% grid above
+// would turn into 30% and the driver into nothing above the first step.
+// Bounded like any cap, kept to 1/10000 %, never invented.
+export function sanitizeStepCap(value) {
+    const n = typeof value === 'number' ? value : Number.parseFloat(String(value ?? ''));
+    if (!Number.isFinite(n)) return null;
+    return Math.round(Math.max(MIN_CAP_PERCENT, Math.min(100, n)) * 10000) / 10000;
+}
+
 // An axis entry keeps only what the drivers read back. An unreadable role or
 // cap is OMITTED rather than defaulted, so the driver's own default for that
 // device applies instead of a value this file never really carried. An
@@ -208,7 +218,7 @@ function sanitizeAxis(raw, { extras = false } = {}) {
     if (!isPlainObject(raw)) return null;
     const axis = { invert: raw.invert === true };
     if (AXIS_ROLES.includes(raw.role)) axis.role = raw.role;
-    const cap = sanitizeMaxCap(raw.maxCap);
+    const cap = extras ? sanitizeStepCap(raw.maxCap) : sanitizeMaxCap(raw.maxCap);
     if (cap !== null) axis.maxCap = cap;
     if (extras) {
         const mode = readVibeMode(raw.vibeMode);

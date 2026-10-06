@@ -48,6 +48,14 @@
 //     width gets proportionally longer, never a snap. `legTravel` overrides
 //     the zone width as the base (rotation axes: 1, so the swing period
 //     depends on the speed alone, not on the amplitude).
+//   - A planner made with `hold: true` never sends a rest move: a stop is a
+//     single { kind: 'hold' } and then silence, and the axis stays where the
+//     driver stopped it - the driver says where with place(), and the next
+//     stroke is sized from there and goes first to the zone end farther from
+//     it. Its first leg from a position nobody knows is sized for the
+//     farthest the axis could have to go. For a machine that will not stop or
+//     turn a move round on command (an OSSM in Intiface's position mode,
+//     intiface.js), a rest move would only be one more move EdgeLoop chose.
 
 export const FAST_LEG_MS = 180;
 export const SLOW_LEG_MS = 2200;
@@ -93,12 +101,13 @@ function isMoving(input) {
     return input.enabled && input.effectiveSpeed > 0;
 }
 
-export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
+export function createStrokePlanner({ restMs = REST_MOVE_MS, hold = false } = {}) {
     let input = normalizePlannerInput({});
     let legEndsAt = 0;
     let lastPosition = null;      // null: position unknown (fresh axis)
     let atRest = false;           // a rest move has been issued and nothing since
     let goingUp = true;           // direction of the next stroke leg
+    let aimFromPlace = false;     // place() was called: aim the next leg from there
     // The stroke leg in flight as it was last timed, for retime(): when that
     // timing began, the speed it was for, the travel the whole leg was timed
     // over, and the share of that travel still ahead when it began. Null for
@@ -139,19 +148,30 @@ export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
                 if (atRest) return null;
                 atRest = true;
                 goingUp = true;
+                stroke = null;
+                if (hold) {
+                    legEndsAt = now;
+                    return { position: null, durationMs: 0, kind: 'hold' };
+                }
                 lastPosition = input.zoneMin;
                 legEndsAt = now + restMs;
-                stroke = null;
                 return { position: input.zoneMin, durationMs: restMs, kind: 'rest' };
             }
             atRest = false;
+            if (aimFromPlace && lastPosition !== null) {
+                goingUp = (input.zoneMax - lastPosition) >= (lastPosition - input.zoneMin);
+            }
+            aimFromPlace = false;
             const travel = input.zoneMax - input.zoneMin;
             const position = goingUp ? input.zoneMax : input.zoneMin;
             // Size the leg by what it really has to cover: the zone width
             // (or legTravel) at least, the distance from the last position
             // when that is longer (first leg after a rest or a zone shift).
+            // A holding planner that does not know where the axis is sizes
+            // it for the farthest end of the travel.
             const base = input.legTravel !== null ? input.legTravel : travel;
-            const distance = lastPosition === null ? 0 : Math.abs(position - lastPosition);
+            let distance = lastPosition === null ? 0 : Math.abs(position - lastPosition);
+            if (hold && lastPosition === null) distance = Math.max(position, 1 - position);
             const durationMs = legDurationMs(input.effectiveSpeed, Math.max(base, distance));
             goingUp = !goingUp;
             lastPosition = position;
@@ -190,6 +210,15 @@ export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
             legEndsAt = now + durationMs;
             return { position: lastPosition, durationMs, kind: 'stroke' };
         },
+        // Where the axis really is (a logical position), or null when
+        // nobody knows: a holding planner is told this after a stop, since
+        // the axis stops wherever its driver stopped sending. The next leg
+        // is sized from it and aimed at the zone end farther from it.
+        place(position) {
+            const n = Number(position);
+            lastPosition = position === null || position === undefined || !Number.isFinite(n) ? null : clamp01(n);
+            aimFromPlace = lastPosition !== null;
+        },
         // Forget the in-flight leg (device removed, socket closed). The next
         // call to next() with speed 0 issues a fresh rest move.
         reset() {
@@ -197,6 +226,7 @@ export function createStrokePlanner({ restMs = REST_MOVE_MS } = {}) {
             lastPosition = null;
             atRest = false;
             goingUp = true;
+            aimFromPlace = false;
             stroke = null;
         }
     };

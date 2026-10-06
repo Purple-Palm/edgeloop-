@@ -47,24 +47,23 @@ function stepsOf(stepCount) {
     return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-// The next double up or down from x (x > 0), for the two encoders below.
-function nudge(x, up) {
-    const f = new Float64Array([x]);
-    const bits = new BigInt64Array(f.buffer);
-    bits[0] += up ? 1n : -1n;
-    return f[0];
-}
+// How Buttplug turns a client's float back into a step
+// (server_device_feature.rs): a ScalarCmd / RotateCmd level is multiplied by
+// StepCount and rounded UP, a LinearCmd position (hw_position_with_duration)
+// multiplied by StepCount and TRUNCATED. A float that is exactly a step is
+// one rounding or parse error away from the next or the previous one - 0.07
+// x 100 is 7.000000000000001, ceil 8; 0.29 x 100 is 28.999999999999996,
+// trunc 28 - so both encoders send the middle of the step instead, where an
+// error in the last bits of the float cannot move it: half a step under it
+// for a level (ceil lands on the step; a rounding or truncating server at
+// most one step under it), half a step over it for a position (trunc lands
+// on it; the top of the travel goes as 1, which JSON carries exactly).
 
 // The ScalarCmd / RotateCmd level for `value` (0..1) on an actuator with
 // `stepCount` steps, never above `cap` (0..1): the nearest step at or under
-// the cap, as a float the server turns back into that very step. Buttplug
-// multiplies by StepCount and rounds UP (server_device_feature.rs,
-// calculate_scaled_float), so a float a hair above a step is the next step:
-// 0.07 x 100 is 7.000000000000001 and went out as 8, and the 3-decimal
-// rounding used before did it for every step count 1000 is not a multiple
-// of - 2/3 sent as 0.667 is ceil(2.001) = 3, full power on a 3-step toy
-// under a 65% cap. Without a step count the level is rounded to 1/1000,
-// still never above the cap.
+// the cap. The 3-decimal level sent before went over: 2/3 left as 0.667,
+// ceil(2.001) = 3, full power on a 3-step toy under a 65% cap. Without a
+// step count the level is rounded to 1/1000, still never above the cap.
 export function scalarLevel(value, stepCount, cap = 1) {
     const v = clamp01(value);
     const top = clamp01(cap);
@@ -72,32 +71,71 @@ export function scalarLevel(value, stepCount, cap = 1) {
     if (!n) return Math.min(Math.round(v * 1000), Math.floor(top * 1000 + 1e-9)) / 1000;
     const step = Math.min(Math.round(v * n), Math.floor(top * n + 1e-9));
     if (step <= 0) return 0;
-    if (step >= n) return 1;
-    let level = step / n;
-    for (let i = 0; i < 8 && Math.ceil(level * n) > step; i++) level = nudge(level, false);
-    return level;
+    return Math.min(1, (Math.min(step, n) - 0.5) / n);
 }
 
-// The LinearCmd Position for `position` (0..1) on an axis with `stepCount`
-// steps: the nearest step inside `bounds` (the travel envelope, 0..1), as a
-// float the server turns back into that very step. Buttplug multiplies by
-// StepCount and TRUNCATES for hw_position_with_duration
-// (server_device_feature.rs): 0.29 x 100 is 28.999999999999996, so a 29%
-// lower guard went out as 28% - on an OSSM, whose 0 is full extension, 1%
-// deeper than the wearer allowed. Without a step count: 1/1000, as before.
-export function linearWirePosition(position, stepCount, bounds = { min: 0, max: 1 }) {
-    const p = clamp01(position);
-    const n = stepsOf(stepCount);
-    if (!n) return Math.round(p * 1000) / 1000;
+// The step a LinearCmd for `position` (0..1) lands on, on an axis with
+// `stepCount` steps (1000 when it lists none): the nearest one inside
+// `bounds` (the travel envelope, 0..1).
+export function linearStep(position, stepCount, bounds = { min: 0, max: 1 }) {
+    const n = stepsOf(stepCount) || 1000;
     const lo = Math.ceil(clamp01(bounds && bounds.min) * n - 1e-9);
     const hi = Math.floor(clamp01(bounds && bounds.max !== undefined ? bounds.max : 1) * n + 1e-9);
-    let step = Math.round(p * n);
+    let step = Math.round(clamp01(position) * n);
     if (lo <= hi) step = Math.max(lo, Math.min(hi, step));
-    if (step <= 0) return 0;
-    if (step >= n) return 1;
-    let wire = step / n;
-    for (let i = 0; i < 8 && wire * n < step; i++) wire = nudge(wire, true);
-    return wire;
+    return step;
+}
+
+// The LinearCmd Position that lands on linearStep(): the middle of that
+// step. A 29% lower guard went out as 28% before. Without a step count:
+// 1/1000, as before.
+export function linearWirePosition(position, stepCount, bounds = { min: 0, max: 1 }) {
+    const n = stepsOf(stepCount);
+    if (!n) return Math.round(clamp01(position) * 1000) / 1000;
+    const step = linearStep(position, n, bounds);
+    return step >= n ? 1 : (step + 0.5) / n;
+}
+
+// ---- the Max Power Cap on a stepped actuator --------------------------------
+
+// The lowest cap the modal offers: the app's floor (backup.js keeps the
+// same), or the actuator's first step when that is above it.
+export const MIN_AXIS_CAP_PERCENT = 10;
+
+// How many of an actuator's steps a Max Power Cap (percent) lets it reach.
+// A cap between two steps is the step under it - except under the first
+// step, where a cap at least half of it is that first step: the old level,
+// rounded to the nearest step, ran the toy there, and a cap must not turn a
+// toy that ran into one that never does. Below half of it, 0: the axis stays
+// off and the modal says so. Null without a step count.
+export function capSteps(capPercent, stepCount) {
+    const n = stepsOf(stepCount);
+    if (!n) return null;
+    const c = Number(capPercent);
+    const exact = (Number.isFinite(c) ? Math.max(0, Math.min(100, c)) : 100) * n / 100;
+    const k = Math.min(n, Math.floor(exact + 1e-3));
+    return k === 0 && exact >= 0.5 ? 1 : k;
+}
+
+// The percent a cap of k steps stores: exact to 1/10000 %, so capSteps()
+// reads back k.
+export function capStepPercent(k, stepCount) {
+    const n = stepsOf(stepCount);
+    if (!n) return 100;
+    const steps = Math.max(0, Math.min(n, Math.round(Number(k) || 0)));
+    return Math.round((steps / n) * 1000000) / 10000;
+}
+
+// The caps an actuator with `stepCount` steps can really do, lowest first:
+// every step from the first at or above MIN_AXIS_CAP_PERCENT (or the first
+// step, when that one is above it) to full power, as { steps, percent }.
+export function capChoices(stepCount) {
+    const n = stepsOf(stepCount);
+    if (!n) return [];
+    const first = Math.max(1, Math.ceil((MIN_AXIS_CAP_PERCENT / 100) * n - 1e-9));
+    const out = [];
+    for (let k = first; k <= n; k++) out.push({ steps: k, percent: capStepPercent(k, n) });
+    return out;
 }
 
 // ---- builders -------------------------------------------------------------
@@ -307,14 +345,15 @@ export function deviceSignature(parsed) {
 // Default role for each actuator on a freshly discovered device: the first
 // stroke-capable axis is primary, the rest secondary; an internal toy
 // (prostate massager / Lovense Edge) defaults to secondary everywhere. A
-// scalar EdgeLoop does not drive (drivesAsLevel) is OFF, and so is the
-// Oscillate twin of a linear axis (oscillateTwins): the linear axis is the
-// one that keeps the stroke inside the travel envelope.
+// scalar EdgeLoop does not drive (drivesAsLevel, rotateDuplicates) is OFF,
+// and so is the Oscillate twin of a linear axis (oscillateTwins): the linear
+// axis is the one that keeps the stroke inside the travel envelope.
 export function defaultRoleFor(parsed, kind, position) {
     if (kind === 'scalar' && parsed && Array.isArray(parsed.scalars)) {
         const attr = parsed.scalars[position];
         if (attr && !drivesAsLevel(attr.actuatorType)) return 'off';
         if (oscillateTwins(parsed).some((t) => t.scalar === position)) return 'off';
+        if (rotateDuplicates(parsed).includes(position)) return 'off';
     }
     const lower = (parsed && parsed.name ? parsed.name : '').toLowerCase();
     const looksInternal = lower.includes('prostate') || lower.includes('edge') || lower.includes('hush');
@@ -342,19 +381,38 @@ export function defaultRoleFor(parsed, kind, position) {
 // positions in parsed.scalars / parsed.linears.
 export function oscillateTwins(parsed) {
     if (!parsed || !Array.isArray(parsed.scalars) || !Array.isArray(parsed.linears)) return [];
-    const osc = parsed.scalars.map((a, pos) => ({ a, pos })).filter(({ a }) => a.actuatorType === 'Oscillate');
-    const lin = parsed.linears.map((a, pos) => ({ a, pos }));
-    if (osc.length === 0 || lin.length === 0) return [];
-    if (osc.length === lin.length && osc.every((o, i) => o.a.descriptor === lin[i].a.descriptor)) {
-        return osc.map((o, i) => ({ scalar: o.pos, linear: lin[i].pos }));
+    return pairByFeature(parsed.scalars, 'Oscillate', parsed.linears).map(({ scalar, other }) => ({ scalar, linear: other }));
+}
+
+// The ScalarCmd Rotate entries that are a RotateCmd motor listed again.
+// Buttplug lists a rotate output in ScalarCmd always and, when it turns both
+// ways, in RotateCmd as well (server_device_message_attributes.rs): a
+// Lovense Nora's rotator reached a v3 client twice, and both were driven -
+// one way at the speed of one channel, both ways at the speed of the other.
+// The RotateCmd one, which has the direction, is the one EdgeLoop drives.
+// Returns positions in parsed.scalars.
+export function rotateDuplicates(parsed) {
+    if (!parsed || !Array.isArray(parsed.scalars) || !Array.isArray(parsed.rotations)) return [];
+    return pairByFeature(parsed.scalars, 'Rotate', parsed.rotations).map(({ scalar }) => scalar);
+}
+
+// Pair the ScalarCmd entries of `type` with entries of another list that
+// came from the same features: by order when the two lists are as long and
+// their descriptors agree, else by a non-empty descriptor only the two share.
+function pairByFeature(scalars, type, others) {
+    const mine = scalars.map((a, pos) => ({ a, pos })).filter(({ a }) => a.actuatorType === type);
+    const theirs = others.map((a, pos) => ({ a, pos }));
+    if (mine.length === 0 || theirs.length === 0) return [];
+    if (mine.length === theirs.length && mine.every((o, i) => o.a.descriptor === theirs[i].a.descriptor)) {
+        return mine.map((o, i) => ({ scalar: o.pos, other: theirs[i].pos }));
     }
     const pairs = [];
-    osc.forEach((o) => {
+    mine.forEach((o) => {
         const d = o.a.descriptor;
         if (!d) return;
-        const sameLin = lin.filter((l) => l.a.descriptor === d);
-        const sameOsc = osc.filter((x) => x.a.descriptor === d);
-        if (sameLin.length === 1 && sameOsc.length === 1) pairs.push({ scalar: o.pos, linear: sameLin[0].pos });
+        const sameTheirs = theirs.filter((l) => l.a.descriptor === d);
+        const sameMine = mine.filter((x) => x.a.descriptor === d);
+        if (sameTheirs.length === 1 && sameMine.length === 1) pairs.push({ scalar: o.pos, other: sameTheirs[0].pos });
     });
     return pairs;
 }

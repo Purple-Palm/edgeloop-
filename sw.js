@@ -6,7 +6,7 @@
 // offline once it has been visited. Bump CACHE_VERSION when the precache list
 // changes; old caches are removed on activate.
 
-const CACHE_VERSION = 'edgeloop-v6';
+const CACHE_VERSION = 'edgeloop-v7';
 
 // Every module the page imports, directly or through another module, belongs
 // here. One import that fails fails the whole module graph, so a module

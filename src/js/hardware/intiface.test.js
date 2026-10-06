@@ -27,9 +27,21 @@ import {
     HANDSHAKE_TIMEOUT_TEXT
 } from './intiface.js';
 import { REST_MOVE_MS, legDurationMs } from './stroke-planner.js';
-import { OSCILLATE_TEST_LEVEL } from './intiface.js';
+import { OSCILLATE_TEST_LEVEL, TEST_LEVEL, HELD_SEGMENT_MS } from './intiface.js';
+import { capStepPercent } from './buttplug-protocol.js';
 
 const sockets = [];
+
+// The driver sends the middle of a step (buttplug-protocol.js); what a
+// test reads in `sent` is the step the server lands on, as a fraction -
+// ceil for a level, trunc for a position, with the StepCount the device was
+// announced with. `raw` keeps the wire values.
+function landed(steps, kind, value) {
+    const n = Number(steps);
+    if (!(n > 0)) return value;
+    if (kind === 'linear') return Math.trunc(n * value) / n;
+    return value < 0.000001 ? 0 : Math.ceil(n * value) / n;
+}
 
 class FakeSocket {
     constructor(url) {
@@ -37,6 +49,9 @@ class FakeSocket {
         this.url = url;
         this.readyState = 0;
         this.sent = [];
+        this.raw = [];
+        this.at = [];
+        this.steps = new Map();
         this.closed = false;
         this.onopen = null;
         this.onmessage = null;
@@ -46,7 +61,15 @@ class FakeSocket {
     }
     send(data) {
         if (this.readyState !== 1) throw new Error('not open');
-        this.sent.push(JSON.parse(data));
+        this.raw.push(JSON.parse(data));
+        this.at.push(Date.now());
+        this.sent.push(JSON.parse(data).map((m) => {
+            const steps = (list, i) => ((this.steps.get(Object.values(m)[0].DeviceIndex) || {})[list] || [])[i];
+            if (m.ScalarCmd) m.ScalarCmd.Scalars.forEach((x) => { x.Scalar = landed(steps('ScalarCmd', x.Index), 'scalar', x.Scalar); });
+            if (m.RotateCmd) m.RotateCmd.Rotations.forEach((x) => { x.Speed = landed(steps('RotateCmd', x.Index), 'scalar', x.Speed); });
+            if (m.LinearCmd) m.LinearCmd.Vectors.forEach((x) => { x.Position = landed(steps('LinearCmd', x.Index), 'linear', x.Position); });
+            return m;
+        }));
     }
     close() {
         this.closed = true;
@@ -54,7 +77,20 @@ class FakeSocket {
     }
     // test helpers
     open() { this.readyState = 1; if (this.onopen) this.onopen(); }
-    receive(msgs) { if (this.onmessage) this.onmessage({ data: JSON.stringify(Array.isArray(msgs) ? msgs : [msgs]) }); }
+    receive(msgs) {
+        for (const m of Array.isArray(msgs) ? msgs : [msgs]) {
+            const devices = m.DeviceList ? m.DeviceList.Devices : (m.DeviceAdded ? [m.DeviceAdded] : []);
+            for (const d of devices) {
+                const lists = {};
+                for (const list of ['ScalarCmd', 'LinearCmd', 'RotateCmd']) {
+                    const attrs = d.DeviceMessages && d.DeviceMessages[list];
+                    if (Array.isArray(attrs)) lists[list] = attrs.map((a) => a.StepCount);
+                }
+                this.steps.set(d.DeviceIndex, lists);
+            }
+        }
+        if (this.onmessage) this.onmessage({ data: JSON.stringify(Array.isArray(msgs) ? msgs : [msgs]) });
+    }
     dropped() { this.readyState = 3; if (this.onclose) this.onclose({}); }
     messages(type) { return this.sent.flat().filter((m) => m[type]).map((m) => m[type]); }
 }
@@ -876,8 +912,9 @@ describe('an OSSM through Intiface: one motor, one mode', () => {
         assert.deepEqual(dev.axes.map((a) => a.role), ['primary', 'off']);
         assert.equal(ossmMessages(ws, 'LinearCmd').length, 0, 'no rest move for the axis going out: it would flip the machine');
         setAxisMaxCap(4, 0, 50);
+        // Oscillate runs only while the travel envelope is the whole travel.
         for (const speed of [20, 40, 60]) {
-            dispatchIntiface(speed, 90, 30, 70, 20, 80);
+            dispatchIntiface(speed, 90, 30, 70, 0, 100);
             await sleep(20);
         }
         const levels = ossmMessages(ws, 'ScalarCmd').map((m) => m.Scalars[0]);
@@ -885,9 +922,9 @@ describe('an OSSM through Intiface: one motor, one mode', () => {
         // The primary speed under the cap - a speed, never a position, and
         // the secondary's 90 nowhere. (The 0 the role change sent at rest
         // Buttplug drops outside oscillate mode: no mode change.)
-        assert.deepEqual(levels.filter((x) => x.Scalar > 0).map((x) => Math.ceil(100 * x.Scalar)), [10, 20, 30]);
+        assert.deepEqual(levels.filter((x) => x.Scalar > 0).map((x) => Math.round(100 * x.Scalar)), [10, 20, 30]);
         // STOP: the server-side stop, a zero, and still no LinearCmd.
-        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
         const stopAt = ws.sent.findIndex((f) => f.some((m) => m.StopAllDevices));
         assert.ok(stopAt >= 0);
         assert.equal(ossmMessages(ws, 'ScalarCmd').at(-1).Scalars[0].Scalar, 0);
@@ -908,7 +945,7 @@ describe('an OSSM through Intiface: one motor, one mode', () => {
         disconnectIntiface();
     });
 
-    it('setting Position OFF before anything moved it sends nothing, not a move to full extension', () => {
+    it('setting Position OFF before anything moved it sends nothing, not a move to the end of the rail', () => {
         const ws = connectWith([OSSM, OSR2]);
         setAxisRole(4, 1, 'off');
         setAxisRole(1, 0, 'off');
@@ -932,13 +969,13 @@ describe('an OSSM through Intiface: one motor, one mode', () => {
         dispatchIntiface(100, 0, 29, 71, 29, 71);
         await sleep(400);
         dispatchIntiface(0, 0, 0, 100, 29, 71, true);
-        const steps = ossmMessages(ws, 'LinearCmd').map((m) => Math.trunc(100 * m.Vectors[0].Position));
+        const steps = ossmMessages(ws, 'LinearCmd').map((m) => Math.round(100 * m.Vectors[0].Position));
         assert.ok(steps.length >= 2);
         assert.ok(steps.every((s) => s >= 29 && s <= 71), `steps ${steps}`);
         assert.ok(steps.includes(29));
     });
 
-    it('stops at once from either mode: STOP, page-away and disconnect', () => {
+    it('STOP, page-away and disconnect send StopAllDevices, which stops the Oscillate mode', () => {
         const ws = connectWith([OSSM]);
         setAxisRole(4, 0, 'primary');
         dispatchIntiface(60, 0, 30, 70);
@@ -1016,10 +1053,11 @@ describe('pulsed vibration', () => {
         setAxisMaxCap(6, 0, 38);
         const from = levels(ws).length;
         dispatchIntiface(100, 0, 0, 100);
-        // 38% is not a step of a 20-step toy: the peak is the step under it.
+        // 38% is not a step of a 20-step toy: the cap is the step under it,
+        // 35%, and the peak is the engine's level under that.
         assert.deepEqual(levels(ws).slice(from), [0.35]);
         dispatchIntiface(60, 0, 0, 100);
-        assert.deepEqual(levels(ws).slice(from), [0.35, 0.25]);
+        assert.deepEqual(levels(ws).slice(from), [0.35, 0.2]);
         assert.ok(levels(ws).every((x) => Math.ceil(20 * x) / 20 <= 0.38));
         dispatchIntiface(0, 0, 0, 100, 0, 100, true);
     });
@@ -1065,8 +1103,9 @@ describe('pulsed vibration', () => {
         setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 800 });
         dispatchIntiface(60, 0, 0, 100);
         stopAllIntiface();
+        const before = levels(ws).length;
         dispatchIntiface(60, 0, 0, 100);
-        assert.equal(levels(ws).at(-1), 0.6, 'the level the server stopped is not taken as still running');
+        assert.deepEqual(levels(ws).slice(before), [0.6], 'the level the server stopped is not taken as still running');
         dispatchIntiface(0, 0, 0, 100, 0, 100, true);
     });
 
@@ -1080,5 +1119,229 @@ describe('pulsed vibration', () => {
         const axis = intifaceDevices.get(9).axes[0];
         assert.equal(axis.vibeMode, 'pulsed');
         assert.equal(axis.pulsePeriodMs, 2400);
+    });
+});
+
+// The OSSM's linear axis as the server sees it: each LinearCmd with the step
+// it lands on (100 steps) and when it was sent.
+function ossmLegs(ws) {
+    const out = [];
+    ws.sent.forEach((frame, i) => frame.forEach((m) => {
+        if (m.LinearCmd && m.LinearCmd.DeviceIndex === OSSM.DeviceIndex) {
+            out.push({ step: Math.round(100 * m.LinearCmd.Vectors[0].Position), ms: m.LinearCmd.Vectors[0].Duration, at: ws.at[i] });
+        }
+    }));
+    return out;
+}
+
+describe('an OSSM\'s Position axis holds where it is on a stop', () => {
+    it('STOP, pause and the watchdog send it nothing more - no rest move', async () => {
+        const ws = connectWith([OSSM]);
+        dispatchIntiface(30, 0, 30, 70, 20, 80);
+        await sleep(1700);
+        const moving = ossmLegs(ws).length;
+        assert.ok(moving >= 3);
+        // What app.js sends for STOP, a pause and the watchdog alike.
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        assert.equal(ws.messages('StopAllDevices').length, 1);
+        await sleep(1200);
+        assert.equal(ossmLegs(ws).length, moving, 'not a segment and not a rest move after the stop');
+    });
+
+    it('page-away and OFF hold it the same way', async () => {
+        for (const cut of [() => stopAllIntiface(), () => setAxisRole(4, 1, 'off')]) {
+            resetIntifaceForTests();
+            memory.clear();
+            const ws = connectWith([OSSM]);
+            dispatchIntiface(10, 0, 30, 70, 0, 100);
+            await sleep(1500);
+            const moving = ossmLegs(ws).length;
+            cut();
+            await sleep(1200);
+            assert.equal(ossmLegs(ws).length, moving);
+        }
+    });
+
+    it('sends every leg after the first as one-way segments of at most 200 ms, re-timed never', async () => {
+        const ws = connectWith([OSSM]);
+        dispatchIntiface(5, 0, 30, 70, 0, 100);
+        await sleep(2500);
+        // A guard's new speed mid-leg: re-timed, the leg's end would go out
+        // ahead of the segments still due, and they would run back from it.
+        dispatchIntiface(8, 0, 30, 70, 0, 100, false, { urgent: true });
+        await sleep(2000);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        const legs = ossmLegs(ws);
+        const later = legs.slice(1);
+        assert.ok(later.length >= 8, `${later.length} segments`);
+        assert.ok(later.every((l) => l.ms <= HELD_SEGMENT_MS), `durations ${later.map((l) => l.ms)}`);
+        // One way between the zone's ends, and only there does it turn.
+        for (let i = 1; i < later.length - 1; i++) {
+            const turn = Math.sign(later[i].step - later[i - 1].step) !== Math.sign(later[i + 1].step - later[i].step);
+            if (turn) assert.ok([30, 70].includes(later[i].step), `turned at ${later[i].step}`);
+        }
+        const span = (legs.at(-1).at - legs[0].at) / 1000;
+        assert.ok(legs.length / span <= 10, `${(legs.length / span).toFixed(1)} commands a second`);
+    });
+
+    it('never sends the position it last sent: no re-time, no repeat at a turn, a stop or a restart', async () => {
+        const ws = connectWith([OSSM]);
+        dispatchIntiface(20, 0, 30, 70, 20, 80);
+        await sleep(300);
+        // A guard engaging mid-leg: an OSR2 re-times the leg in flight; an OSSM would get its end again.
+        dispatchIntiface(70, 0, 30, 70, 20, 80, false, { urgent: true });
+        await sleep(900);
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        await sleep(300);
+        dispatchIntiface(40, 0, 45, 65, 20, 80);
+        await sleep(900);
+        dispatchIntiface(40, 0, 45, 65, 20, 80, false, { urgent: true });
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        setAxisRole(4, 1, 'off');
+        setAxisRole(4, 1, 'primary');
+        await sleep(200);
+        dispatchIntiface(60, 0, 30, 70, 20, 80);
+        await sleep(600);
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        const steps = ossmLegs(ws).map((l) => l.step);
+        assert.ok(steps.length >= 6);
+        steps.forEach((step, i) => { if (i) assert.notEqual(step, steps[i - 1], `repeat at ${i}: ${steps.join(' ')}`); });
+        assert.ok(steps.every((x) => x >= 20 && x <= 80));
+    });
+
+    it('starts again from where it held, in segments, toward the farther end of the zone', async () => {
+        const ws = connectWith([OSSM]);
+        dispatchIntiface(5, 0, 30, 70, 0, 100);
+        await sleep(2700);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        const held = ossmLegs(ws).at(-1).step;
+        await sleep(200);
+        const before = ossmLegs(ws).length;
+        dispatchIntiface(5, 0, 30, 70, 0, 100);
+        const first = ossmLegs(ws)[before];
+        assert.ok(first, 'it moves again');
+        assert.notEqual(first.step, held);
+        assert.ok(first.ms <= HELD_SEGMENT_MS, 'the start is known: segments from the first command');
+        const farther = (70 - held) >= (held - 30) ? 70 : 30;
+        assert.equal(Math.sign(first.step - held), Math.sign(farther - held));
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+});
+
+describe('the Oscillate mode of an OSSM only with the whole travel', () => {
+    it('is refused while the travel envelope is narrower than 0-100%, Test included', () => {
+        const ws = connectWith([OSSM]);
+        assert.equal(setAxisRole(4, 0, 'primary', { envelope: { min: 20, max: 80 } }), false);
+        assert.deepEqual(intifaceDevices.get(4).axes.map((a) => a.role), ['off', 'primary']);
+        setAxisRole(4, 1, 'off');
+        assert.equal(testSingleAxis(4, 0, { min: 0, max: 90 }), false);
+        assert.equal(ossmMessages(ws, 'ScalarCmd').length, 0);
+        assert.equal(setAxisRole(4, 0, 'primary', { envelope: { min: 0, max: 100 } }), true);
+    });
+
+    it('stays at 0 if the envelope is narrowed while it is on', () => {
+        const ws = connectWith([OSSM]);
+        setAxisRole(4, 0, 'primary', { envelope: { min: 0, max: 100 } });
+        dispatchIntiface(50, 0, 0, 100, 0, 100);
+        assert.ok(ossmMessages(ws, 'ScalarCmd').at(-1).Scalars[0].Scalar > 0);
+        dispatchIntiface(50, 0, 30, 70, 30, 70);
+        assert.equal(ossmMessages(ws, 'ScalarCmd').at(-1).Scalars[0].Scalar, 0);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('keeps the slow Test for the OSSM\'s Oscillate only', () => {
+        const HISMITH = {
+            DeviceIndex: 7,
+            DeviceName: 'Hismith Thrusting Cup',
+            DeviceMessages: { ScalarCmd: [{ FeatureDescriptor: 'Stroker Oscillation Speed', StepCount: 100, ActuatorType: 'Oscillate' }], StopDeviceCmd: {} }
+        };
+        const ws = connectWith([HISMITH]);
+        assert.equal(testSingleAxis(7, 0, { min: 20, max: 80 }), true, 'not an OSSM twin: the envelope rule is the OSSM\'s');
+        assert.equal(ws.messages('ScalarCmd')[0].Scalars[0].Scalar, TEST_LEVEL);
+        disconnectIntiface();
+    });
+});
+
+describe('a rotator Intiface lists twice is driven once', () => {
+    const NORA2 = {
+        DeviceIndex: 8,
+        DeviceName: 'Lovense Nora',
+        DeviceMessages: {
+            ScalarCmd: [{ FeatureDescriptor: '', StepCount: 20, ActuatorType: 'Vibrate' }, { FeatureDescriptor: '', StepCount: 20, ActuatorType: 'Rotate' }],
+            RotateCmd: [{ FeatureDescriptor: '', StepCount: 20 }],
+            StopDeviceCmd: {}
+        }
+    };
+
+    it('drives the RotateCmd axis and sends the ScalarCmd Rotate nothing', () => {
+        const ws = connectWith([NORA2]);
+        const dev = intifaceDevices.get(8);
+        assert.deepEqual(dev.axes.map((a) => [a.key, a.role, a.inert]), [['scalar:0', 'secondary', false], ['scalar:1', 'off', true], ['rotate:0', 'primary', false]]);
+        assert.equal(setAxisRole(8, 1, 'primary'), false);
+        dispatchIntiface(60, 60, 0, 100);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        assert.ok(ws.messages('ScalarCmd').every((m) => m.Scalars.every((x) => x.Index === 0)));
+        assert.ok(ws.messages('RotateCmd').some((m) => m.Rotations[0].Speed > 0));
+    });
+});
+
+describe('a cap on a stepped toy never keeps a toy that ran from running', () => {
+    const SHARK = {
+        DeviceIndex: 9,
+        DeviceName: 'Libo Shark',
+        DeviceMessages: { ScalarCmd: [{ StepCount: 3, ActuatorType: 'Vibrate' }, { StepCount: 3, ActuatorType: 'Vibrate' }], StopDeviceCmd: {} }
+    };
+    const levels = (ws) => ws.messages('ScalarCmd').filter((m) => m.DeviceIndex === 9).map((m) => [m.Scalars[0].Index, m.Scalars[0].Scalar]);
+
+    it('runs a 3-step toy at its first step under a saved 30% cap, and keeps one under half of it off', () => {
+        memory.set(INTIFACE_STORAGE_KEY, JSON.stringify({
+            'Libo Shark|S:Vibrate,Vibrate|L:|R:': { axes: { 'scalar:0': { role: 'primary', maxCap: 30 }, 'scalar:1': { role: 'primary', maxCap: 10 } } }
+        }));
+        const ws = connectWith([SHARK]);
+        dispatchIntiface(100, 0, 0, 100);
+        const last = Object.fromEntries(levels(ws));
+        assert.equal(last[0], 1 / 3, 'the strict cap sent this toy 0 for ever');
+        assert.equal(last[1], 0, 'under half its first step it never ran: it stays off');
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('takes a cap chosen as a step and gives the toy exactly that step', () => {
+        const ws = connectWith([SHARK]);
+        setAxisMaxCap(9, 0, capStepPercent(2, 3));
+        dispatchIntiface(100, 0, 0, 100);
+        assert.equal(Object.fromEntries(levels(ws))[0], 2 / 3);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+});
+
+describe('a held axis is never sent the same step twice and never left idle mid-leg', () => {
+    it('refuses a Test that would repeat where a stop left it', () => {
+        const ws = connectWith([OSSM]);
+        // A fast leg is one segment: the stop lands with 70 the last step sent.
+        dispatchIntiface(100, 0, 30, 70, 30, 70);
+        dispatchIntiface(0, 0, 0, 100, 30, 70, true);
+        assert.deepEqual(ossmLegs(ws).map((l) => l.step), [70]);
+        testSingleAxis(4, 1, { min: 30, max: 70 });
+        assert.deepEqual(ossmLegs(ws).map((l) => l.step), [70], 'the Test\'s first move would be 70 again');
+        disconnectIntiface();
+    });
+
+    it('folds segments that land on one step, so the motion does not stop between them', async () => {
+        // Intiface lets a user limit a device's range; this OSSM is left 10 steps.
+        const COARSE = { ...OSSM, DeviceMessages: { ...OSSM.DeviceMessages, LinearCmd: [{ FeatureDescriptor: '', StepCount: 10, ActuatorType: 'Position' }] } };
+        const ws = connectWith([COARSE]);
+        dispatchIntiface(5, 0, 30, 70, 0, 100);
+        await sleep(3500);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        const legs = ws.sent.flatMap((frame, i) => frame.filter((m) => m.LinearCmd).map((m) => ({ step: Math.round(10 * m.LinearCmd.Vectors[0].Position), ms: m.LinearCmd.Vectors[0].Duration, at: ws.at[i] })));
+        legs.forEach((l, i) => { if (i) assert.notEqual(l.step, legs[i - 1].step); });
+        let checked = 0;
+        for (let i = 1; i < legs.length - 1; i++) {
+            const sameWay = Math.sign(legs[i].step - legs[i - 1].step) === Math.sign(legs[i + 1].step - legs[i].step);
+            if (!sameWay) continue;
+            assert.ok(Math.abs(legs[i + 1].at - (legs[i].at + legs[i].ms)) < 60, `segment ${i} ran ${legs[i].ms} ms, the next came ${legs[i + 1].at - legs[i].at} ms later`);
+            checked += 1;
+        }
+        assert.ok(checked >= 2, `${checked} segment joints checked`);
     });
 });

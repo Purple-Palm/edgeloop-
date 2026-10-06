@@ -23,7 +23,13 @@ import {
     drivesAsLevel,
     oscillateTwins,
     scalarLevel,
-    linearWirePosition
+    linearWirePosition,
+    linearStep,
+    rotateDuplicates,
+    capSteps,
+    capStepPercent,
+    capChoices,
+    MIN_AXIS_CAP_PERCENT
 } from './buttplug-protocol.js';
 
 // How current Buttplug (buttplugio/buttplug, device-config v5) lists these
@@ -286,7 +292,19 @@ describe('scalarLevel: the step the server lands on, never above the cap', () =>
         assert.equal(scalarLevel(0.4567, null), 0.457);
         assert.equal(scalarLevel(0.9, null, 0.35), 0.35);
         assert.equal(scalarLevel(-1, 20), 0);
-        assert.equal(scalarLevel(2, 20), 1);
+        assert.equal(serverStep(scalarLevel(2, 20), 20), 20);
+    });
+
+    it('sends the middle of the step, so an error in the float\'s last bits cannot change it', () => {
+        for (const n of [3, 7, 20, 100, 255]) {
+            for (let k = 1; k <= n; k++) {
+                const level = scalarLevel(k / n, n);
+                assert.equal(level, (k - 0.5) / n);
+                for (const off of [-1e-12, 1e-12]) assert.equal(serverStep(level + off, n), k, `${k}/${n} off by ${off}`);
+                assert.ok([k - 1, k].includes(Math.round(n * level)), 'a rounding server lands on it or one under it');
+                assert.ok(Math.trunc(n * level) <= k, 'a truncating one lands under it, never over');
+            }
+        }
     });
 });
 
@@ -310,17 +328,91 @@ describe('linearWirePosition: the step the server lands on, inside the envelope'
         }
     });
 
-    it('is the step the position is nearest to, and exact where the float already was', () => {
-        assert.equal(linearWirePosition(0.8, 1000), 0.8);
-        assert.equal(linearWirePosition(0.2 + 0.8 - 0.8, 1000), 0.2);
+    it('is the step the position is nearest to, sent as the middle of it', () => {
+        assert.equal(serverPosition(linearWirePosition(0.8, 1000), 1000), 800);
+        assert.equal(serverPosition(linearWirePosition(0.2 + 0.8 - 0.8, 1000), 1000), 200);
         assert.equal(serverPosition(linearWirePosition(0.574, 100), 100), 57);
+        assert.equal(linearWirePosition(0.57, 100), 0.575);
         assert.equal(linearWirePosition(1, 100), 1);
-        assert.equal(linearWirePosition(0, 100), 0);
+        assert.equal(serverPosition(linearWirePosition(0, 100), 100), 0);
         assert.equal(linearWirePosition(0.1234, null), 0.123, 'without a step count: 3 decimals, as before');
+        for (let k = 0; k < 100; k++) {
+            const wire = linearWirePosition(k / 100, 100);
+            for (const off of [-1e-12, 1e-12]) assert.equal(serverPosition(wire + off, 100), k, `step ${k} off by ${off}`);
+            assert.equal(linearStep(k / 100, 100), k);
+        }
+        assert.equal(linearWirePosition(1, 100), 1, 'the top step is 1, which JSON carries exactly');
     });
 
     it('is what buildLinearCmd sends when the axis\'s step count and bounds come with it', () => {
         const cmd = buildLinearCmd(9, 0, [{ index: 0, position: 0.29, durationMs: 400, stepCount: 100, bounds: { min: 0.29, max: 1 } }]);
         assert.equal(serverPosition(cmd.LinearCmd.Vectors[0].Position, 100), 29);
+    });
+});
+
+describe('a rotator listed twice is driven once', () => {
+    // protocols/lovense.yml, "Lovense Nora": vibrate 0..20 and rotate -20..20.
+    // A rotate output turning both ways reaches a v3 client in ScalarCmd AND RotateCmd.
+    const NORA_RAW = {
+        DeviceName: 'Lovense Nora',
+        DeviceIndex: 3,
+        DeviceMessages: {
+            ScalarCmd: [{ FeatureDescriptor: '', StepCount: 20, ActuatorType: 'Vibrate' }, { FeatureDescriptor: '', StepCount: 20, ActuatorType: 'Rotate' }],
+            RotateCmd: [{ FeatureDescriptor: '', StepCount: 20 }],
+            StopDeviceCmd: {}
+        }
+    };
+
+    it('finds the ScalarCmd Rotate that RotateCmd lists again, and defaults it OFF', () => {
+        const nora = parseDevice(NORA_RAW);
+        assert.deepEqual(rotateDuplicates(nora), [1]);
+        assert.equal(defaultRoleFor(nora, 'scalar', 1), 'off');
+        assert.equal(defaultRoleFor(nora, 'rotate', 0), 'primary');
+    });
+
+    it('leaves a one-way rotator that only ScalarCmd lists alone', () => {
+        const oneWay = parseDevice({ DeviceName: 'Spinner', DeviceIndex: 1, DeviceMessages: { ScalarCmd: [{ StepCount: 10, ActuatorType: 'Rotate' }] } });
+        assert.deepEqual(rotateDuplicates(oneWay), []);
+    });
+});
+
+describe('a Max Power Cap on a stepped toy is one of its steps', () => {
+    it('offers every step from 10% (or the first step, when that is above it) to full power', () => {
+        assert.equal(MIN_AXIS_CAP_PERCENT, 10);
+        assert.deepEqual(capChoices(3).map((c) => c.steps), [1, 2, 3]);
+        assert.deepEqual(capChoices(1), [{ steps: 1, percent: 100 }]);
+        assert.deepEqual(capChoices(20).map((c) => c.percent), [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]);
+        assert.equal(capChoices(12)[0].steps, 2, '1/12 is under 10%: the first choice is 2/12');
+        assert.equal(capChoices(100).length, 91);
+        assert.deepEqual(capChoices(null), []);
+    });
+
+    it('reads every choice back as its own step', () => {
+        for (const n of [1, 2, 3, 7, 12, 20, 50, 100, 255, 1000]) {
+            for (const { steps, percent } of capChoices(n)) assert.equal(capSteps(percent, n), steps, `${steps}/${n} stored as ${percent}`);
+            assert.equal(capStepPercent(n, n), 100);
+        }
+    });
+
+    it('never stops a toy that ran: a saved cap under the first step but at least half of it is that step', () => {
+        // The Libo Shark (3 steps) at the default-looking 30%, Hismith's 1-step vibrator at 90%:
+        // under the strict cap both were sent 0 for ever.
+        assert.equal(capSteps(30, 3), 1);
+        assert.equal(capSteps(90, 1), 1);
+        assert.equal(capSteps(50, 1), 1);
+        // Under half the first step the toy did not run before either: it stays off.
+        assert.equal(capSteps(10, 3), 0);
+        assert.equal(capSteps(40, 1), 0);
+        // Between two steps: the step under it.
+        assert.equal(capSteps(38, 20), 7);
+        assert.equal(capSteps(65, 3), 1);
+        assert.equal(capSteps(100, 3), 3);
+        assert.equal(capSteps(55, null), null);
+    });
+
+    it('lets no choice on any step count leave a toy that cannot run at full speed', () => {
+        for (let n = 1; n <= 30; n++) {
+            for (const { percent } of capChoices(n)) assert.ok(capSteps(percent, n) >= 1, `n=${n} cap ${percent}`);
+        }
     });
 });
