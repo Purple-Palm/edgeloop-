@@ -30,6 +30,8 @@
 // cluster it was reached through, and the recovery sends each of them the
 // whole stop - the motor stop and both valve closes - through
 // stopVacuglideAfterCrash, and reports what came of it on the same banner.
+// A whole stop that is not confirmed in its window is owed to the next page
+// to open, and sent again there, exactly as a Handy's stop is.
 //
 // Rules:
 //   * Nothing is started, connected or changed: the one command ever sent is
@@ -198,10 +200,13 @@ export const DRIVING_LOCK_PREFIX = 'edgeloop-drives-handy:';
 export const VACUGLIDE_LINK_LOCK_PREFIX = 'edgeloop-vacuglide-link:';
 
 // The Handy keys of sessions that did not end cleanly whose stop is still
-// owed, oldest first: { handy: [{ key, promised }], version }. `promised` is
-// the token of the last page whose stop gave up and promised the next page
-// to open another try; '' while none has. `version` grows with every change,
-// so that of two copies the newer can be told (reconcilePendingCrashStops).
+// owed, oldest first: { handy: [{ key, promised }], version }, and the
+// VacuGlides whose whole stop is, the same way, beside them: vacuglide:
+// [{ token, cluster, promised }] - left out while there are none, so a
+// record of Handys alone reads as it always has. `promised` is the token of
+// the last page whose stop gave up and promised the next page to open
+// another try; '' while none has. `version` grows with every change, so
+// that of two copies the newer can be told (reconcilePendingCrashStops).
 export const PENDING_CRASH_STOPS_KEY = 'edgeloop_pending_crash_stops';
 
 // How long the record that a session ended is kept, in both stores, after
@@ -1036,13 +1041,23 @@ export async function isOwnerAlive(owner, locks, timeoutMs = OWNER_QUERY_TIMEOUT
     return (await aliveOwners([owner], locks, timeoutMs)).has(owner);
 }
 
-// The stops still owed, as stored: [{ key, promised }], oldest first. Only
+// The stops still owed, as stored: { handy: [{ key, promised }], vacuglide:
+// [{ token, cluster, promised }], version }, each list oldest first. Only
 // this module writes the record, and always as JSON, so one that cannot be
 // read was not written here and names nothing to stop.
-function readPendingEntries(storage) {
-    const record = parsePending(safeGet(PENDING_CRASH_STOPS_KEY, null, storage));
-    return record ? record.entries : [];
+function readPending(storage) {
+    return parsePending(safeGet(PENDING_CRASH_STOPS_KEY, null, storage)) || { handy: [], vacuglide: [], version: 0 };
 }
+
+function readPendingEntries(storage) {
+    return readPending(storage).handy;
+}
+
+// How each list of the record names a device.
+const PENDING_LISTS = {
+    handy: { id: (entry) => entry.key, clean: (value) => sanitizeConnectionKey(value) },
+    vacuglide: { id: (entry) => entry.token, clean: (value) => sanitizeDeviceToken(value) }
+};
 
 // Brings the stops still owed in localStorage into line with the durable
 // snapshot `durable`, when this page first reads the durable store and
@@ -1077,12 +1092,16 @@ export function reconcilePendingCrashStops(storage, durable) {
     }
     if (!mine && here.version > onDisk.version) return;
     const [newer, older] = here.version >= onDisk.version ? [here, onDisk] : [onDisk, here];
-    const merged = older.entries.filter((entry) => !newer.entries.some((item) => item.key === entry.key)).concat(newer.entries);
-    writePendingEntries(merged.slice(-MAX_PENDING_CRASH_STOPS), storage, Math.max(here.version, onDisk.version));
+    const merge = (list) => {
+        const id = PENDING_LISTS[list].id;
+        return older[list].filter((entry) => !newer[list].some((item) => id(item) === id(entry))).concat(newer[list]).slice(-MAX_PENDING_CRASH_STOPS);
+    };
+    writePending({ handy: merge('handy'), vacuglide: merge('vacuglide') }, storage, Math.max(here.version, onDisk.version));
 }
 
-// { entries, version } as stored, or null for no record, or one this module
-// did not write. A record without a version is older than any with one.
+// { handy, vacuglide, version } as stored, or null for no record, or one
+// this module did not write. A record without a version is older than any
+// with one.
 function parsePending(raw) {
     if (typeof raw !== 'string' || raw === '') return null;
     let parsed = null;
@@ -1092,15 +1111,24 @@ function parsePending(raw) {
         return null;
     }
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.handy)) return null;
-    const entries = [];
+    const handy = [];
     for (const item of parsed.handy) {
         const key = sanitizeConnectionKey(item && typeof item === 'object' ? item.key : null);
-        if (!key || entries.some((entry) => entry.key === key)) continue;
-        entries.push({ key, promised: cleanPromise(item.promised) });
-        if (entries.length >= MAX_PENDING_CRASH_STOPS) break;
+        if (!key || handy.some((entry) => entry.key === key)) continue;
+        handy.push({ key, promised: cleanPromise(item.promised) });
+        if (handy.length >= MAX_PENDING_CRASH_STOPS) break;
+    }
+    // A token the Connect field would refuse is none, and a cluster it would
+    // not send a token to is '' (the stop then asks Autoblow's router).
+    const vacuglide = [];
+    for (const item of Array.isArray(parsed.vacuglide) ? parsed.vacuglide : []) {
+        const token = sanitizeDeviceToken(item && typeof item === 'object' ? item.token : null);
+        if (!token || vacuglide.some((entry) => entry.token === token)) continue;
+        vacuglide.push({ token, cluster: normalizeCluster(item.cluster) || '', promised: cleanPromise(item.promised) });
+        if (vacuglide.length >= MAX_PENDING_CRASH_STOPS) break;
     }
     const version = cleanGeneration(parsed.version);
-    return { entries, version: version === null ? 0 : version };
+    return { handy, vacuglide, version: version === null ? 0 : version };
 }
 
 // A promise as stored: the token of the page that made it (a newPageId), or
@@ -1113,10 +1141,50 @@ function cleanPromise(value) {
 // than `after`. An empty list is written too, never removed: a durable store
 // that has no record would leave the next page unable to tell stops settled
 // from stops whose durable copy was never written.
-function writePendingEntries(entries, storage, after = 0) {
+function writePending({ handy = [], vacuglide = [] }, storage, after = 0) {
     const current = parsePending(safeGet(PENDING_CRASH_STOPS_KEY, null, storage));
     const version = Math.max(after, current ? current.version : 0) + 1;
-    return safeSet(PENDING_CRASH_STOPS_KEY, JSON.stringify({ handy: entries, version }), storage);
+    const record = { handy, version };
+    if (vacuglide.length > 0) record.vacuglide = vacuglide;
+    return safeSet(PENDING_CRASH_STOPS_KEY, JSON.stringify(record), storage);
+}
+
+// The Handys' list replaced by `entries`, the VacuGlides' kept as stored.
+function writePendingEntries(entries, storage, after = 0) {
+    return writePending({ ...readPending(storage), handy: entries }, storage, after);
+}
+
+// The device `id` leaves `list` of the stops still owed (clearPendingCrashStop).
+function clearPending(list, id, storage) {
+    const { id: idOf, clean: cleanId } = PENDING_LISTS[list];
+    const clean = cleanId(id);
+    const record = readPending(storage);
+    if (!clean || !record[list].some((entry) => idOf(entry) === clean)) return true;
+    return writePending({ ...record, [list]: record[list].filter((entry) => idOf(entry) !== clean) }, storage);
+}
+
+// The stop owed to the device `id` in `list` gave up (notePendingCrashStopGaveUp).
+function notePendingGaveUp(list, id, { seen = '', token = newPageId() } = {}, storage) {
+    const { id: idOf, clean: cleanId } = PENDING_LISTS[list];
+    const clean = cleanId(id);
+    const record = readPending(storage);
+    const entry = clean ? record[list].find((item) => idOf(item) === clean) : null;
+    if (!entry) return false;
+    if (entry.promised !== '' && entry.promised === cleanPromise(seen)) {
+        return !writePending({ ...record, [list]: record[list].filter((item) => item !== entry) }, storage);
+    }
+    const first = entry.promised === '';
+    // Never the token being replaced: a page that found that one would take
+    // this promise for the one it already keeps.
+    let mine = cleanPromise(token);
+    if (mine === '' || mine === entry.promised) mine = newPageId();
+    entry.promised = mine;
+    // If the browser refuses the write, a first promise still holds: with
+    // none noted, no page can count as the try, so the device stays owed,
+    // and the next page to open sends it and promises in its turn. A refused
+    // renewal leaves the older promise in place, which a page that found it
+    // could count as its try and so end: then promise nothing.
+    return writePending(record, storage) || first;
 }
 
 // The keys still owed a stop, oldest first; [] when there are none.
@@ -1151,10 +1219,7 @@ export function addPendingCrashStops(keys, storage) {
 // not in HAMP mode, or Connect has confirmed a stop of its own. Returns
 // false only when the key was owed and the browser refused to drop it.
 export function clearPendingCrashStop(key, storage) {
-    const clean = sanitizeConnectionKey(key);
-    const current = readPendingEntries(storage);
-    if (!clean || !current.some((entry) => entry.key === clean)) return true;
-    return writePendingEntries(current.filter((entry) => entry.key !== clean), storage);
+    return clearPending('handy', key, storage);
 }
 
 // This page's stop to an owed `key` gave up at the end of its window with
@@ -1173,25 +1238,47 @@ export function clearPendingCrashStop(key, storage) {
 // is the one thing the banner may then promise: a key the browser refused to
 // drop is still owed, and the next page to open does send it.
 export function notePendingCrashStopGaveUp(key, { seen = '', token = newPageId() } = {}, storage) {
-    const clean = sanitizeConnectionKey(key);
-    const current = readPendingEntries(storage);
-    const entry = clean ? current.find((item) => item.key === clean) : null;
-    if (!entry) return false;
-    if (entry.promised !== '' && entry.promised === cleanPromise(seen)) {
-        return !writePendingEntries(current.filter((item) => item !== entry), storage);
-    }
-    const first = entry.promised === '';
-    // Never the token being replaced: a page that found that one would take
-    // this promise for the one it already keeps.
-    let mine = cleanPromise(token);
-    if (mine === '' || mine === entry.promised) mine = newPageId();
-    entry.promised = mine;
-    // If the browser refuses the write, a first promise still holds: with
-    // none noted, no page can count as the try, so the key stays owed, and
-    // the next page to open sends it and promises in its turn. A refused
-    // renewal leaves the older promise in place, which a page that found it
-    // could count as its try and so end: then promise nothing.
-    return writePendingEntries(current, storage) || first;
+    return notePendingGaveUp('handy', key, { seen, token }, storage);
+}
+
+// The VacuGlides still owed their whole stop, as for The Handy above:
+// [{ token, cluster }], oldest first, with the cluster each was last reached
+// through ('' when none is known: the stop asks Autoblow's router). A
+// VacuGlide crash stop that is not confirmed in its window is sent again the
+// next time EdgeLoop opens, the one try the banner promises, exactly as a
+// Handy's is - it has no watchdog either, and runs on at its last speed.
+export function readPendingVacuglideStops(storage) {
+    return readPending(storage).vacuglide.map(({ token, cluster }) => ({ token, cluster }));
+}
+
+export function readPendingVacuglideStopPromises(storage) {
+    return new Map(readPending(storage).vacuglide.map((entry) => [entry.token, entry.promised]));
+}
+
+// Hands the VacuGlides a crashed session drove ([{ token, cluster }]) over
+// to the stops still owed. One already owed starts over, with the cluster
+// named now. Returns the tokens owed afterwards, as stored.
+export function addPendingVacuglideStops(devices, storage) {
+    const adding = cleanVacuglides(devices);
+    const record = readPending(storage);
+    if (adding.length === 0) return record.vacuglide.map((entry) => entry.token);
+    const next = record.vacuglide
+        .filter((entry) => !adding.some((item) => item.token === entry.token))
+        .concat(adding.map(({ token, cluster }) => ({ token, cluster, promised: '' })))
+        .slice(-MAX_PENDING_CRASH_STOPS);
+    return (writePending({ ...record, vacuglide: next }, storage) ? next : record.vacuglide).map((entry) => entry.token);
+}
+
+// The whole stop owed to `token` is settled: confirmed, or the device has
+// been connected - here or in another tab - and its connect confirmed a
+// whole stop of its own.
+export function clearPendingVacuglideStop(token, storage) {
+    return clearPending('vacuglide', token, storage);
+}
+
+// As notePendingCrashStopGaveUp, for a VacuGlide's whole stop.
+export function notePendingVacuglideStopGaveUp(token, { seen = '', token: promise = newPageId() } = {}, storage) {
+    return notePendingGaveUp('vacuglide', token, { seen, token: promise }, storage);
 }
 
 // What to do about the markers whose pages are gone (`markers`, the last
@@ -1217,11 +1304,14 @@ export function notePendingCrashStopGaveUp(key, { seen = '', token = newPageId()
 // open has connected (`vacuglideInUse`): that page answers for it, and the
 // banner says so (`vacuglideLeftInUse`). A marker that says nothing usable
 // sends the token saved here (`savedVacuglideToken`) the whole stop too,
-// through Autoblow's router, since nothing says where it was reached. There
-// is no record of VacuGlide stops still owed: the stop is chased for five
-// minutes with the alarm up, as the driver chases any device it lost, and a
-// page that goes away meanwhile leaves the chase to the next one
-// (vacuglide.js). Returns null when there is nothing to do.
+// through Autoblow's router, since nothing says where it was reached. The
+// stop is chased for five minutes with the alarm up, as the driver chases
+// any device it lost, and a page that goes away meanwhile leaves the chase
+// to the next one (vacuglide.js). A VacuGlide a session drove whose whole
+// stop is still owed (`pendingVacuglide`, [{ token, cluster }]) is sent it
+// again with the stops earlier sessions owe (`earlierVacuglide`), as a
+// Handy key is - unless the last session drove it too, or another page
+// still open has it connected. Returns null when there is nothing to do.
 export function planCrashRecovery({
     marker = null,
     markers = marker ? [marker] : [],
@@ -1231,9 +1321,11 @@ export function planCrashRecovery({
     earlier: withEarlier = true,
     otherPage = false,
     savedVacuglideToken = '',
-    vacuglideInUse = []
+    vacuglideInUse = [],
+    pendingVacuglide = []
 } = {}) {
     const busy = new Set(cleanHandyKeys(inUse, 64));
+    const linkedElsewhere = new Set((Array.isArray(vacuglideInUse) ? vacuglideInUse : []).map((token) => sanitizeDeviceToken(token)).filter(Boolean));
     const saved = sanitizeConnectionKey(savedHandyKey);
     const owed = cleanHandyKeys(pending, MAX_PENDING_CRASH_STOPS).filter((key) => !busy.has(key));
     const found = (Array.isArray(markers) ? markers : []).filter(Boolean);
@@ -1249,7 +1341,6 @@ export function planCrashRecovery({
     const vacuglideLeftInUse = [];
     if (found.length > 0) {
         const driven = [];
-        const linkedElsewhere = new Set((Array.isArray(vacuglideInUse) ? vacuglideInUse : []).map((token) => sanitizeDeviceToken(token)).filter(Boolean));
         const addVacuglide = (token, cluster, wasDriven) => {
             if (linkedElsewhere.has(token)) {
                 if (!vacuglideLeftInUse.includes(token)) vacuglideLeftInUse.push(token);
@@ -1296,8 +1387,15 @@ export function planCrashRecovery({
     const earlier = withEarlier
         ? owed.filter((key) => !inLastSession.includes(key)).map((key) => ({ key, saved: key === saved, driven: true }))
         : [];
-    if (found.length === 0 && earlier.length === 0) return null;
-    return { lastSession: found.length > 0, otherPage: otherPage === true, handy, leftInUse, intiface, tcode, known, earlier, vacuglide, vacuglideLeftInUse };
+    const earlierVacuglide = [];
+    for (const item of withEarlier && Array.isArray(pendingVacuglide) ? pendingVacuglide : []) {
+        const token = sanitizeDeviceToken(item && typeof item === 'object' ? item.token : null);
+        if (!token || linkedElsewhere.has(token) || vacuglide.some((entry) => entry.token === token)) continue;
+        if (vacuglideLeftInUse.includes(token) || earlierVacuglide.some((entry) => entry.token === token)) continue;
+        earlierVacuglide.push({ token, cluster: normalizeCluster(item.cluster) || '', driven: true });
+    }
+    if (found.length === 0 && earlier.length === 0 && earlierVacuglide.length === 0) return null;
+    return { lastSession: found.length > 0, otherPage: otherPage === true, handy, leftInUse, intiface, tcode, known, earlier, vacuglide, vacuglideLeftInUse, earlierVacuglide };
 }
 
 function retryWindow(minutes) {
@@ -1360,8 +1458,9 @@ export function describeHandyLeftInUse(key) {
 // stop and both valve closes - which the driver chases until Autoblow's
 // server confirms it (vacuglide.js, stopVacuglideAfterCrash). `update` is
 // null while nothing has come back yet. `driven: false` is the token saved
-// here, sent the stop because the marker could not be read.
-export function describeVacuglideCrashStop(update, { label = '', driven = true, retryMinutes = 5 } = {}) {
+// here, sent the stop because the marker could not be read. `kept`: the
+// whole stop is still owed, and the next page to open sends it again.
+export function describeVacuglideCrashStop(update, { label = '', driven = true, kept = false, retryMinutes = 5 } = {}) {
     const who = label ? `The VacuGlide (token ending ${label})` : 'The VacuGlide';
     const how = driven ? '' : ' (the token saved here: EdgeLoop could not read whether that session drove it)';
     const sent = `EdgeLoop sent ${who}${how} its whole stop - the motor stop and both valve closes`;
@@ -1381,7 +1480,7 @@ export function describeVacuglideCrashStop(update, { label = '', driven = true, 
                 ? `, but Autoblow's server answered that the device is not online${detail}, so the stop could not reach it`
                 : `, but the stop was not confirmed${detail}`;
             const next = update.final
-                ? `EdgeLoop stopped sending it after ${retryWindow(retryMinutes)}.`
+                ? `EdgeLoop stopped sending it after ${retryWindow(retryMinutes)}${kept ? ' and sends it again the next time it opens' : ''}.`
                 : `EdgeLoop keeps sending it for ${retryWindow(retryMinutes)}.`;
             return `${sent}${why}. If ${who} is running or a valve is open, switch it off with its power button. ${next}`;
         }
@@ -1396,7 +1495,8 @@ export function describeVacuglideLeftInUse(token) {
 
 // The whole banner. `updates` maps each Handy key to its latest update, and
 // `owed` lists the keys still owed a stop right now (null: every key a
-// session drove). The last session comes first, with its advice - under a
+// session drove); `vacuglideUpdates` and `owedVacuglide` are the same for
+// the VacuGlides, by token. The last session comes first, with its advice - under a
 // headline that names another tab or window when a page found it at the
 // start of a session of its own; then the keys earlier sessions still owe,
 // under a headline of their own, so "that session" in each line names the
@@ -1405,7 +1505,7 @@ export function describeVacuglideLeftInUse(token) {
 // another Handy while this report is still changing, and next to that
 // link's own warnings a bare "The Handy has stopped" would read as news
 // about the device connected now.
-export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes = 5, owed = null, vacuglideUpdates = new Map(), vacuglideRetryMinutes = 5 } = {}) {
+export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes = 5, owed = null, vacuglideUpdates = new Map(), vacuglideRetryMinutes = 5, owedVacuglide = null } = {}) {
     if (!plan) return '';
     const line = ({ key, saved, driven }) => describeHandyCrashStop(
         updates && typeof updates.get === 'function' ? updates.get(key) || null : null,
@@ -1417,24 +1517,32 @@ export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes 
             retryMinutes
         }
     );
+    const vacuglideLine = (entry) => describeVacuglideCrashStop(
+        vacuglideUpdates && typeof vacuglideUpdates.get === 'function' ? vacuglideUpdates.get(entry.token) || null : null,
+        {
+            label: entry.token.slice(-4),
+            driven: entry.driven !== false,
+            kept: entry.driven !== false && (!Array.isArray(owedVacuglide) || owedVacuglide.includes(entry.token)),
+            retryMinutes: vacuglideRetryMinutes
+        }
+    );
     const parts = [];
     if (plan.lastSession) {
         parts.push(plan.otherPage ? OTHER_PAGE_CRASH_HEADLINE : CRASH_HEADLINE);
         if (!plan.known) parts.push(UNKNOWN_HARDWARE_NOTE);
         for (const entry of plan.handy) parts.push(line(entry));
         for (const key of Array.isArray(plan.leftInUse) ? plan.leftInUse : []) parts.push(describeHandyLeftInUse(key));
-        for (const entry of Array.isArray(plan.vacuglide) ? plan.vacuglide : []) {
-            const update = vacuglideUpdates && typeof vacuglideUpdates.get === 'function' ? vacuglideUpdates.get(entry.token) || null : null;
-            parts.push(describeVacuglideCrashStop(update, { label: entry.token.slice(-4), driven: entry.driven !== false, retryMinutes: vacuglideRetryMinutes }));
-        }
+        for (const entry of Array.isArray(plan.vacuglide) ? plan.vacuglide : []) parts.push(vacuglideLine(entry));
         for (const token of Array.isArray(plan.vacuglideLeftInUse) ? plan.vacuglideLeftInUse : []) parts.push(describeVacuglideLeftInUse(token));
         if (plan.intiface) parts.push(INTIFACE_CRASH_ADVICE);
         if (plan.tcode) parts.push(TCODE_CRASH_ADVICE);
     }
     const earlier = Array.isArray(plan.earlier) ? plan.earlier : [];
-    if (earlier.length > 0) {
+    const earlierVacuglide = Array.isArray(plan.earlierVacuglide) ? plan.earlierVacuglide : [];
+    if (earlier.length > 0 || earlierVacuglide.length > 0) {
         parts.push(EARLIER_CRASH_HEADLINE);
         for (const entry of earlier) parts.push(line(entry));
+        for (const entry of earlierVacuglide) parts.push(vacuglideLine(entry));
     }
     return parts.join(' ');
 }
@@ -1561,7 +1669,8 @@ export async function runCrashRecovery({
         if (expired.length > 0) tidying.push(sweepEnded(storage, expired));
     }
     const tidied = () => Promise.all(tidying).then(() => {});
-    if (found.length === 0 && stale.length === 0 && unwritten.length === 0 && (!earlier || readPendingCrashStops(storage).length === 0)) {
+    const nothingOwed = () => readPendingCrashStops(storage).length === 0 && readPendingVacuglideStops(storage).length === 0;
+    if (found.length === 0 && stale.length === 0 && unwritten.length === 0 && (!earlier || nothingOwed())) {
         await tidied();
         return { recovered: false, alive: 0 };
     }
@@ -1615,19 +1724,29 @@ export async function runCrashRecovery({
         earlier,
         otherPage,
         savedVacuglideToken: savedToken && savedToken !== liveToken ? savedToken : '',
-        vacuglideInUse
+        vacuglideInUse,
+        pendingVacuglide: readPendingVacuglideStops(storage)
     });
     // A stop still owed that another pass of this page is sending is left to
     // it: the boot pass and the one a late durable read brings both send them.
+    // A VacuGlide is noted under its token in the same set, marked as one.
+    const owedVacuglideId = (token) => `vacuglide:${token}`;
     if (plan && sentOwed) {
-        plan = { ...plan, earlier: plan.earlier.filter((entry) => !sentOwed.has(entry.key)) };
-        if (!plan.lastSession && plan.earlier.length === 0) plan = null;
+        plan = {
+            ...plan,
+            earlier: plan.earlier.filter((entry) => !sentOwed.has(entry.key)),
+            earlierVacuglide: plan.earlierVacuglide.filter((entry) => !sentOwed.has(owedVacuglideId(entry.token)))
+        };
+        if (!plan.lastSession && plan.earlier.length === 0 && plan.earlierVacuglide.length === 0) plan = null;
     }
     if (!plan) {
         await tidied();
         return { recovered: false, alive: open.length };
     }
-    if (sentOwed) for (const entry of plan.earlier) sentOwed.add(entry.key);
+    if (sentOwed) {
+        for (const entry of plan.earlier) sentOwed.add(entry.key);
+        for (const entry of plan.earlierVacuglide) sentOwed.add(owedVacuglideId(entry.token));
+    }
 
     // Before any stop goes out. From here on the stops still owed answer for
     // the keys the dead sessions drove, so neither a session run after this,
@@ -1642,7 +1761,10 @@ export async function runCrashRecovery({
     // they did before there was one.
     const drivenKeys = plan.handy.filter((entry) => entry.driven).map((entry) => entry.key);
     const owedNow = addPendingCrashStops(drivenKeys, storage);
-    const handedOver = drivenKeys.every((key) => owedNow.includes(key));
+    const drivenVacuglides = plan.vacuglide.filter((entry) => entry.driven);
+    const owedVacuglidesNow = addPendingVacuglideStops(drivenVacuglides, storage);
+    const handedOver = drivenKeys.every((key) => owedNow.includes(key))
+        && drivenVacuglides.every((entry) => owedVacuglidesNow.includes(entry.token));
     const removeMarkers = () => {
         const ends = new Map();
         for (const marker of dead) {
@@ -1661,6 +1783,7 @@ export async function runCrashRecovery({
     // stop this page sends comes after such a promise, so this page is the
     // try it promised. And the token under which this page promises.
     const seen = readPendingCrashStopPromises(storage);
+    const seenVacuglide = readPendingVacuglideStopPromises(storage);
     const token = newPageId();
 
     const updates = new Map();
@@ -1668,8 +1791,9 @@ export async function runCrashRecovery({
     // Per key whose stop gave up: whether the next page to open is sure to
     // send it again (notePendingCrashStopGaveUp).
     const promised = new Map();
+    const promisedVacuglide = new Map();
     const entries = plan.handy.concat(plan.earlier);
-    const vacuglides = Array.isArray(plan.vacuglide) ? plan.vacuglide : [];
+    const vacuglides = plan.vacuglide.concat(plan.earlierVacuglide);
     // The banner promises another try only for a key that is still owed,
     // read back from storage each time after the record has been brought up
     // to date, and that this page could promise. `fresh`: the report is news
@@ -1680,9 +1804,10 @@ export async function runCrashRecovery({
         if (typeof onReport !== 'function') return;
         try {
             const owed = readPendingCrashStops(storage).filter((key) => promised.get(key) !== false);
+            const owedVacuglide = readPendingVacuglideStops(storage).map((entry) => entry.token).filter((device) => promisedVacuglide.get(device) !== false);
             const open = entries.some(({ key }) => !isSettled(updates.get(key)))
                 || vacuglides.some(({ token }) => !isSettled(vacuglideUpdates.get(token)));
-            onReport(describeCrashRecovery(plan, updates, { retryMinutes, owed, vacuglideUpdates, vacuglideRetryMinutes }), { fresh, open });
+            onReport(describeCrashRecovery(plan, updates, { retryMinutes, owed, vacuglideUpdates, vacuglideRetryMinutes, owedVacuglide }), { fresh, open });
         } catch (e) {}
     };
     report(true);
@@ -1708,19 +1833,22 @@ export async function runCrashRecovery({
     });
 
     // Each VacuGlide's whole stop, reported the same way: news while nothing
-    // has settled it, a rewording once something has.
-    const vacuglideStops = vacuglides.map(({ token, cluster }) => {
+    // has settled it, a rewording once something has - and owed, and
+    // promised to the next page to open, the same way as well.
+    const vacuglideStops = vacuglides.map(({ token: device, cluster }) => {
         const onUpdate = (update) => {
-            vacuglideUpdates.set(token, update);
+            if (isSettled(update)) clearPendingVacuglideStop(device, storage);
+            else if (update && update.final) promisedVacuglide.set(device, notePendingVacuglideStopGaveUp(device, { seen: seenVacuglide.get(device) || '', token }, storage));
+            vacuglideUpdates.set(device, update);
             report(!isSettled(update));
         };
         return Promise.resolve()
             .then(() => (typeof stopVacuglide === 'function'
-                ? stopVacuglide(token, { cluster, onUpdate })
+                ? stopVacuglide(device, { cluster, onUpdate })
                 : { outcome: RECOVERY_STOP.FAILED, detail: 'no stop available', final: true }))
             .catch((e) => ({ outcome: RECOVERY_STOP.FAILED, detail: e && e.message ? e.message : 'unknown error', final: true }))
             .then((update) => {
-                if (vacuglideUpdates.get(token) !== update) onUpdate(update);
+                if (vacuglideUpdates.get(device) !== update) onUpdate(update);
                 return update;
             });
     });
@@ -1728,7 +1856,8 @@ export async function runCrashRecovery({
     if (!handedOver) {
         // A key the session never drove does not hold the markers, nor keep
         // them waiting while its own stop is still being retried.
-        const lastDriven = await Promise.all(stops.filter((_, i) => i < plan.handy.length && plan.handy[i].driven));
+        const lastDriven = await Promise.all(stops.filter((_, i) => i < plan.handy.length && plan.handy[i].driven)
+            .concat(vacuglideStops.filter((_, i) => i < plan.vacuglide.length && plan.vacuglide[i].driven)));
         if (lastDriven.every(isSettled)) removeMarkers();
     }
     const finals = await Promise.all(stops);

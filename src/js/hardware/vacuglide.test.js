@@ -33,7 +33,7 @@ import {
     vacuglideStopChaseMs
 } from './vacuglide.js';
 import { createLiveSessionTracker, runCrashRecovery } from '../crash-recovery.js';
-import { RATE_WINDOW_MS, RATE_CEILING, RATE_RESERVE, MAX_VALVE_OPENS_PER_WINDOW, rateLogStorageKey } from './vacuglide-protocol.js';
+import { RATE_WINDOW_MS, RATE_CEILING, RATE_RESERVE, RATE_WATCH_RESERVE, MAX_VALVE_OPENS_PER_WINDOW, rateLogStorageKey } from './vacuglide-protocol.js';
 
 // The timings the driver ships with, before any test shortens them.
 const SHIPPED_TIMINGS = { ...VACUGLIDE_TIMINGS };
@@ -315,6 +315,47 @@ function valveTimeline(valve) {
     return device.events.filter((e) => e.what === 'valve' && e.valve === valve).map((e) => (e.open ? 'open' : 'close'));
 }
 
+// The VacuGlide panel as app.js paints it, from app.js's own text: its
+// handlers for the driver, and the bookkeeping beside them, run against a
+// stand-in for the page - the badge, the status line and the banner's
+// reports by source. app.js itself cannot be loaded here (it needs the page),
+// so the stretch of it that holds them is run as it stands.
+function appVacuglidePanel({ badge = 'VacuGlide', status = 'Connected (fw 1.01)' } = {}) {
+    const src = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+    const from = src.indexOf('const vacuglideStopsOwed = new Map();');
+    const call = src.indexOf('setVacuglideHandlers({', from);
+    const to = src.indexOf('\n});', call) + 4;
+    assert.ok(from > 0 && call > from && to > call, 'the VacuGlide panel code in app.js');
+    const els = {
+        badgeVacuglideText: { textContent: badge },
+        modalVacuglideMsg: { textContent: `Status: ${status}` }
+    };
+    const banner = new Map();
+    let handlers = null;
+    const env = {
+        document: { getElementById: (id) => els[id] || null },
+        state: { sessionStatus: 'IDLE' },
+        vacuglideConnectedLabel: 'Connected (fw 1.01)',
+        isVacuglideConnected,
+        setVacuglideStatus: (text) => { els.modalVacuglideMsg.textContent = `Status: ${text}`; },
+        setBadgeState: (type, tone, label) => { els.badgeVacuglideText.textContent = label; },
+        paintVacuglideButtons: () => {},
+        renderVacuglideValves: () => {},
+        setVacuglideValveMessage: () => {},
+        triggerDisconnectAlert: (text, source) => { banner.set(source, text); },
+        reviseAlertBanner: (text, { source }) => { if (banner.has(source)) banner.set(source, text); },
+        hideAlertBanner: (source) => { banner.delete(source); },
+        setVacuglideHandlers: (h) => { handlers = h; }
+    };
+    new Function('env', `with (env) {\n${src.slice(from, to)}\n}`)(env);
+    return {
+        handlers,
+        badge: () => els.badgeVacuglideText.textContent,
+        status: () => els.modalVacuglideMsg.textContent,
+        banner
+    };
+}
+
 describe('vacuglide driver', () => {
     beforeEach(() => {
         tokenCounter += 1;
@@ -353,6 +394,7 @@ describe('vacuglide driver', () => {
         VACUGLIDE_LIMITS.windowMs = RATE_WINDOW_MS;
         VACUGLIDE_LIMITS.ceiling = RATE_CEILING;
         VACUGLIDE_LIMITS.reserve = RATE_RESERVE;
+        VACUGLIDE_LIMITS.watchReserve = RATE_WATCH_RESERVE;
         VACUGLIDE_LIMITS.maxOpens = MAX_VALVE_OPENS_PER_WINDOW;
         installFetch();
         setVacuglideHandlers({
@@ -652,6 +694,7 @@ describe('vacuglide driver', () => {
     it('an urgent speed is routine traffic: it never spends the reserve kept for a stop', async () => {
         VACUGLIDE_LIMITS.ceiling = 13;
         VACUGLIDE_LIMITS.reserve = 7;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         await connectOk();
         // connect spent 5, and this speed fills the routine budget.
         dispatchVacuglide(20);
@@ -1141,6 +1184,7 @@ describe('vacuglide driver', () => {
         // and says so: a read it cannot make is a device it cannot see.
         VACUGLIDE_LIMITS.ceiling = 18;
         VACUGLIDE_LIMITS.reserve = 12;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         await connectOk();
         VACUGLIDE_TIMINGS.requestTimeoutMs = 600;
         VACUGLIDE_TIMINGS.staleOpenGuardMs = 300;
@@ -1474,6 +1518,7 @@ describe('vacuglide driver', () => {
         // sends, so neither has to wait out a 66 s window.
         VACUGLIDE_LIMITS.ceiling = 13;
         VACUGLIDE_LIMITS.reserve = 7;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         await connectOk();
         // connect spent 5: discovery, info and the three rest commands
         dispatchVacuglide(20);
@@ -1496,6 +1541,7 @@ describe('vacuglide driver', () => {
     it('a speed held back by the budget goes out once the window allows', async () => {
         VACUGLIDE_LIMITS.ceiling = 10;
         VACUGLIDE_LIMITS.reserve = 4;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         // Long enough that no pause of a busy machine lets it lapse between
         // the send and the check that follows it.
         VACUGLIDE_LIMITS.windowMs = 1000;
@@ -1514,6 +1560,7 @@ describe('vacuglide driver', () => {
     it('a stop at the ceiling raises the alarm the moment it has to wait, and goes as soon as a slot frees', async () => {
         VACUGLIDE_LIMITS.ceiling = 9;
         VACUGLIDE_LIMITS.reserve = 3;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         VACUGLIDE_LIMITS.windowMs = 700;
         await connectOk();
         dispatchVacuglide(50);
@@ -1528,11 +1575,53 @@ describe('vacuglide driver', () => {
         await tick(100);
         assert.equal(calls.length, 0, 'nothing is sent into a refusal');
         assert.equal(unconfirmed.length, 1, 'the wearer hears of it now, not after the wait');
-        assert.match(unconfirmed[0], /^A stop is held back: this device token has used up Autoblow's request limit for the minute, and EdgeLoop sends it in 1 s$/);
+        // Nothing here came from Autoblow: it is EdgeLoop's own count that
+        // is full, and the alarm says so rather than blame Autoblow's limit.
+        assert.match(unconfirmed[0], /^A stop is held back: EdgeLoop's own count of requests for this device token is full for the minute - it counts every request it sent, answered or not, to stay under Autoblow's limit\. EdgeLoop sends it in 1 s$/);
         await waitFor(() => calls.length === 3, 3000, 'the stop, once the window lets it go');
         await tick(20);
         assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
         assert.equal(unconfirmed.length, 1, 'one alarm for one wait');
+    });
+
+    // The requests that filled the count failed on the way and never
+    // reached Autoblow; then they did reach it, and its server refused them
+    // for rate. Each held-back stop says which.
+    it("a stop held back says what filled the count: requests that never reached Autoblow, or Autoblow's server refusing them", async () => {
+        VACUGLIDE_LIMITS.ceiling = 9;
+        VACUGLIDE_LIMITS.reserve = 3;
+        VACUGLIDE_LIMITS.watchReserve = 0;
+        VACUGLIDE_LIMITS.windowMs = 700;
+        await connectOk();
+        dispatchVacuglide(50);
+        await waitFor(() => device.targetSpeed === 50, 1000, 'the speed');
+        await tick(20);
+        // Autoblow's cloud cannot be reached for a while: the stop's requests
+        // fail on the way, and fill EdgeLoop's count.
+        let mode = 'network';
+        routes['PUT /vacuglide/target-speed/stop'] = ({ next }) => {
+            if (mode === 'network') throw new TypeError('Failed to fetch');
+            if (mode === 'refused') return jsonResponse(null, 429);
+            return next();
+        };
+        dispatchVacuglide(0, true);
+        await waitFor(() => unconfirmed.length >= 1, 2000, 'a part of the stop to wait for a slot');
+        assert.match(unconfirmed[0], /^A (stop|valve close) is held back: EdgeLoop's own count of requests for this device token is full for the minute/);
+        assert.doesNotMatch(unconfirmed[0], /refused/);
+        mode = 'ok';
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PAUSED' && !isVacuglideMoving(), 5000, 'the stop, once slots free');
+        // Now Autoblow's server refuses the stop for rate.
+        await tick(750);
+        dispatchVacuglide(60);
+        await waitFor(() => device.targetSpeed === 60, 1000, 'the speed again');
+        await tick(20);
+        mode = 'refused';
+        const before = unconfirmed.length;
+        dispatchVacuglide(0, true);
+        await waitFor(() => unconfirmed.slice(before).some((m) => /held back/.test(m)), 2000, 'a part of the stop to wait for a slot');
+        assert.match(unconfirmed.slice(before).find((m) => /held back/.test(m)), /^A (stop|valve close) is held back: Autoblow's server has refused requests for this device token as over its limit, and EdgeLoop's own count of them for the minute is full\. EdgeLoop sends it in \d+ s$/);
+        mode = 'ok';
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PAUSED' && !isVacuglideMoving(), 5000, 'the stop, once slots free');
     });
 
     it('a reloaded page counts what the last one sent, so its STOP is never refused for rate', async () => {
@@ -1540,7 +1629,7 @@ describe('vacuglide driver', () => {
         // minute per token and host; EdgeLoop's ceiling is 34 over every
         // host, 16 of them kept for a stop, so routine traffic stops at 18.
         serverLimit = 36;
-        Object.assign(VACUGLIDE_LIMITS, { ceiling: 34, reserve: 16 });
+        Object.assign(VACUGLIDE_LIMITS, { ceiling: 34, reserve: 16, watchReserve: 0 });
         VACUGLIDE_TIMINGS.speedGapMs = 5;
         globalThis.localStorage = memoryStorage();
         const reloaded = await loadAnotherPage();
@@ -1597,6 +1686,7 @@ describe('vacuglide driver', () => {
     it('a connect with nothing left under the ceiling says so at once, and sends nothing', async () => {
         VACUGLIDE_LIMITS.ceiling = 8;
         VACUGLIDE_LIMITS.reserve = 3;
+        VACUGLIDE_LIMITS.watchReserve = 0;
         await connectOk();
         await disconnectVacuglide();
         calls = [];
@@ -1659,6 +1749,21 @@ describe('vacuglide driver', () => {
         const before = sent('/vacuglide/state').length;
         await tick(150);
         assert.equal(sent('/vacuglide/state').length, before, 'outside a session the gap is the idle one');
+    });
+
+    // Connect times the next check between sessions; a session started right
+    // after it had its first link check only that long in, about 30 s.
+    it('START brings the next link check in to the in-session interval at once', async () => {
+        VACUGLIDE_TIMINGS.pollIdleMs = 5000;
+        VACUGLIDE_TIMINGS.pollActiveMs = 150;
+        await connectOk();
+        await tick(20);
+        sessionActive = true;
+        const startedAt = Date.now();
+        dispatchVacuglide(40);
+        await waitFor(() => sent('/vacuglide/state').length >= 1, 1500, 'a link check in the session\'s pace');
+        assert.ok(sent('/vacuglide/state')[0].at - startedAt < 1000, 'not at the end of the gap Connect set');
+        await waitFor(() => sent('/vacuglide/state').length >= 2, 1500, 'and the next one in the same pace');
     });
 
     it('a device that came back through another cluster is a lost link, and its stop goes to the new cluster', async () => {
@@ -1746,6 +1851,41 @@ describe('vacuglide driver', () => {
         await waitFor(() => !isVacuglideOfflineStopPending(), 2000, 'the background stop');
         assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
         assert.equal(unconfirmed.length, 1);
+    });
+
+    // The panel as app.js paints it: the lost link's background stop could
+    // not be confirmed while the device was not online, and the badge, the
+    // status line and the banner said so. Once that stop is confirmed the
+    // device is at rest, and all three take it back - and nothing else.
+    it('once the background stop after a lost link is confirmed, the panel takes back "Stop unconfirmed", its status line and the banner (app.js)', async () => {
+        const app = appVacuglidePanel();
+        setVacuglideHandlers({ ...app.handlers, isSessionActive: () => sessionActive });
+        await connectOk();
+        sessionActive = true;
+        dispatchVacuglide(50);
+        await tick(5);
+        device.online = false;
+        await pollVacuglideConnected();
+        await waitFor(() => app.badge() === 'Stop unconfirmed', 1000, 'the alarm on the panel');
+        assert.equal(app.status(), 'Status: Stop not confirmed: The VacuGlide is not online');
+        assert.match(app.banner.get('vacuglideStop'), /may still be running/);
+        assert.match(app.banner.get('vacuglideLink'), /no longer online/);
+        device.online = true;
+        await waitFor(() => !isVacuglideOfflineStopPending(), 2000, 'the background stop');
+        assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
+        assert.equal(app.badge(), 'Offline', 'the badge the lost link left, not "Stop unconfirmed"');
+        assert.equal(app.status(), "Status: Autoblow's server confirmed the stop: the motor is stopped and both valves are closed.");
+        assert.equal(app.banner.has('vacuglideStop'), false, 'no "may still be running"');
+        assert.match(app.banner.get('vacuglideLink'), /no longer online/, 'the link is still gone, and the banner still says so');
+        // Another device's confirmed stop, or a line painted since, is not
+        // taken back for it.
+        app.handlers.onStopUnconfirmed('Stop not confirmed: no answer', TOKEN);
+        app.handlers.onStopConfirmed(`${TOKEN}b`);
+        assert.equal(app.badge(), 'Stop unconfirmed');
+        app.handlers.onTakeover('An EdgeLoop page went away while the VacuGlide may have been running.', true);
+        app.handlers.onStopConfirmed(TOKEN);
+        assert.equal(app.status(), 'Status: An EdgeLoop page went away while the VacuGlide may have been running.');
+        assert.equal(app.badge(), 'Watching');
     });
 
     it('a lost device that was at rest is not chased and raises no alarm', async () => {
@@ -2394,6 +2534,30 @@ describe('vacuglide driver', () => {
         assert.equal(isVacuglideOfflineStopPending(), false);
     });
 
+    // A part of a stop still unanswered a read beat after it went out, to a
+    // device that may be moving, may not have reached it: the device is read
+    // then, at once - not a beat after that, two beats after the stop.
+    it('a stop still unanswered a read beat after it went out has the device read at once, not a beat later', async () => {
+        await connectOk();
+        VACUGLIDE_TIMINGS.requestTimeoutMs = 20000;
+        VACUGLIDE_TIMINGS.lateCommandWatchBeatMs = 500;
+        VACUGLIDE_TIMINGS.lateCommandWatchMs = 200;
+        dispatchVacuglide(40);
+        await waitFor(() => isVacuglideMoving() && device.targetSpeed === 40, 1000, 'the session to run');
+        await tick(60);
+        let answer = null;
+        routes['PUT /vacuglide/target-speed/stop'] = ({ next }) => (answer ? next() : new Promise((resolve) => { answer = () => resolve(next()); }));
+        calls = [];
+        dispatchVacuglide(0, true);
+        await waitFor(() => answer !== null, 1000, 'STOP to go out');
+        const stopAt = sent('/vacuglide/target-speed/stop')[0].at;
+        await waitFor(() => sent('/vacuglide/state').length > 0, 2000, 'the first read');
+        const after = sent('/vacuglide/state')[0].at - stopAt;
+        assert.ok(after >= 490 && after < 900, `the first read went out ${after} ms after the stop, with a 500 ms beat`);
+        answer();
+        await waitFor(() => !isVacuglideMoving(), 2000, 'every stop to settle');
+    });
+
     // A stop answered within a read beat needs no read: its own answers say
     // the device is at rest.
     it('a stop answered within a read beat reads nothing', async () => {
@@ -2731,6 +2895,42 @@ describe('vacuglide driver', () => {
         await waitFor(() => !isVacuglideMoving(), 1000, 'the stops to settle');
     });
 
+    // A busy session has spent the routine share of the window when a speed
+    // fails without an answer, and the watch reads the device for it. Those
+    // reads were refused by EdgeLoop's own budget, and each stretch of them
+    // raised the alarm and paused the session. A watch read is a safety read:
+    // it has a share routine traffic cannot spend - and it never takes the
+    // reserve kept for a stop.
+    it('in a busy session the watch still reads the device, in a share of its own, and the reserve kept for a stop stays whole', async () => {
+        globalThis.localStorage = memoryStorage();
+        VACUGLIDE_LIMITS.windowMs = 3000;
+        VACUGLIDE_TIMINGS.lateCommandWatchBeatMs = 50;
+        VACUGLIDE_TIMINGS.lateCommandWatchMs = 300;
+        await connectOk();
+        dispatchVacuglide(40);
+        await tick(60);
+        const held = holdNextSpeed();
+        dispatchVacuglide(55);
+        await waitFor(() => held.sentAt !== null, 1000, 'the speed to go out');
+        // The rest of the routine share is spent: with connect's five
+        // requests and the two speeds, 96 of the 150.
+        const key = rateLogStorageKey(TOKEN);
+        const log = JSON.parse(globalThis.localStorage.getItem(key));
+        const at = Date.now();
+        for (let i = 0; i < RATE_CEILING - RATE_RESERVE - RATE_WATCH_RESERVE - 7; i += 1) log.e.push([at, 'another page', 0]);
+        globalThis.localStorage.setItem(key, JSON.stringify(log));
+        assert.equal((await pulseValve('plus', 300)).reason, 'rate', 'routine traffic has nothing left');
+        calls = [];
+        held.fail();
+        await waitFor(() => isVacuglideWatchPending(), 1000, 'the watch for the speed');
+        await waitFor(() => !isVacuglideWatchPending(), 2000, 'the watch to end');
+        assert.ok(sent('/vacuglide/state').length >= 3, `the watch read the device ${sent('/vacuglide/state').length} times`);
+        assert.deepEqual(unconfirmed, [], 'no alarm: every read was made');
+        // Six whole stops still go at once: the watch took nothing of theirs.
+        for (let i = 0; i < 6; i += 1) assert.equal(await stopVacuglide(), true, `whole stop ${i + 1}`);
+        assert.deepEqual(unconfirmed, []);
+    });
+
     it('the unload stop with a speed still out: a page that comes back watches for it', async () => {
         await connectOk();
         VACUGLIDE_TIMINGS.lateCommandWatchBeatMs = 50;
@@ -2953,6 +3153,114 @@ describe('vacuglide driver', () => {
         assert.equal(isVacuglideOfflineStopPending(), false);
         assert.notEqual(result.reason, 'close-unconfirmed');
         assert.equal(device.strokePlusValve, false);
+    });
+
+    // A read of the watch's goes out through the cluster the device is on;
+    // the device drops out and comes back through another one, and the
+    // wearer connects it again there and starts a session. That read then
+    // fails - DeviceNotConnectedError, from the cluster it has left - after
+    // the new link confirmed the device at rest. It says nothing of the
+    // device: the read is made again through the new link, and the alarm
+    // goes up only when that one cannot see the device either.
+    for (const [what, newLinkSees] of [['the new link reads it', true], ['the new link cannot read it either', false]]) {
+        it(`a watch read that fails on the cluster the device has left, after it was connected again on its new one: ${what}`, async () => {
+            await connectOk();
+            VACUGLIDE_TIMINGS.lateCommandWatchBeatMs = 50;
+            VACUGLIDE_TIMINGS.lateCommandWatchMs = 1000;
+            dispatchVacuglide(40);
+            await tick(60);
+            const held = holdNextSpeed();
+            dispatchVacuglide(55);
+            await waitFor(() => held.sentAt !== null, 1000, 'the speed to go out');
+            await disconnectVacuglide();
+            // The speed fails without an answer: it may land for a while yet,
+            // and the device is watched for it.
+            await failAndRestop(held);
+            assert.equal(isVacuglideWatchPending(), true);
+            let failRead = null;
+            routes['GET /vacuglide/state'] = ({ host, next }) => {
+                if (host !== CLUSTER || failRead) return next();
+                return new Promise((resolve) => { failRead = () => resolve(NOT_CONNECTED()); });
+            };
+            await waitFor(() => failRead !== null, 1000, 'a read of the watch on the cluster the device is on');
+            device.cluster = OTHER_CLUSTER;
+            await connectVacuglide(TOKEN);
+            sessionActive = true;
+            dispatchVacuglide(60);
+            await waitFor(() => device.targetSpeed === 60 && device.operationalMode === 'TARGET_SPEED_PLAYING', 1000, 'the session on the new link');
+            const stops = stopsOn();
+            if (!newLinkSees) routes['GET /vacuglide/state'] = ({ host, next }) => (host === OTHER_CLUSTER ? jsonResponse(null, 503) : next());
+            const before = calls.length;
+            failRead();
+            await tick(150);
+            assert.ok(calls.slice(before).some((c) => c.path === '/vacuglide/state' && c.host === OTHER_CLUSTER), 'read again through the new link');
+            if (newLinkSees) {
+                assert.deepEqual(unconfirmed, [], 'no alarm: the new link confirmed it at rest, and sees it running the session');
+                assert.equal(isVacuglideMotionUnknown(), false);
+                assert.equal(stopsOn(), stops, 'the session runs on');
+                assert.equal(device.operationalMode, 'TARGET_SPEED_PLAYING');
+            } else {
+                assert.equal(unconfirmed.length, 1, 'nothing can see it: the alarm');
+                assert.match(unconfirmed[0], /^EdgeLoop could not read the VacuGlide while a command it sent may still reach it/);
+                assert.equal(isVacuglideMotionUnknown(), true);
+            }
+        });
+    }
+
+    // Disconnect's stop is not confirmed and is being tried again when the
+    // wearer connects the same device again and starts a session: those
+    // retries landed in the session and stopped the motor, with nothing here
+    // to say so. The new link's confirmed stop ends them.
+    it('a Disconnect stop still being tried again ends once the same device is connected again here, and none of it lands in the new session', async () => {
+        await connectOk();
+        VACUGLIDE_TIMINGS.stopRetryDelaysMs = [200, 200, 200];
+        dispatchVacuglide(40);
+        await tick(60);
+        let refuse = true;
+        routes['PUT /vacuglide/target-speed/stop'] = ({ next }) => (refuse ? jsonResponse({ error: { code: 'InternalServerError', message: 'Internal server error' } }, 500) : next());
+        const disconnected = disconnectVacuglide();
+        await waitFor(() => sent('/vacuglide/target-speed/stop').length === 1, 1000, "Disconnect's stop to go out");
+        refuse = false;
+        await connectVacuglide(TOKEN);
+        sessionActive = true;
+        dispatchVacuglide(60);
+        await waitFor(() => device.targetSpeed === 60 && device.operationalMode === 'TARGET_SPEED_PLAYING', 1000, 'the session on the new link');
+        const started = sessionStarted(60);
+        await disconnected;
+        await tick(300);
+        assert.deepEqual(eventsAfter(started).filter((e) => e.what === 'stop'), [], 'no stop of the last link landed in the session');
+        assert.equal(device.operationalMode, 'TARGET_SPEED_PLAYING');
+        assert.deepEqual(unconfirmed, []);
+    });
+
+    // A stop of the last link already on its way lands in the new session
+    // all the same. The device is read when its answer comes back, and the
+    // session's speed goes out again at its next tick - the same speed, which
+    // the driver would otherwise skip as one the device already has.
+    it('a stop of the last link that lands in the new session is noticed: the device is read, and the session\'s speed goes out again', async () => {
+        await connectOk();
+        VACUGLIDE_TIMINGS.requestTimeoutMs = 20000;
+        // The new link watches for that stop too, but on a beat too long to
+        // be what reads the device here: its answer coming back is.
+        VACUGLIDE_TIMINGS.lateCommandWatchBeatMs = 5000;
+        let land = null;
+        routes['PUT /vacuglide/target-speed/stop'] = ({ next }) => (land ? next() : new Promise((resolve) => { land = () => resolve(next()); }));
+        const disconnected = disconnectVacuglide();
+        await waitFor(() => land !== null, 1000, "Disconnect's stop to go out");
+        await connectVacuglide(TOKEN);
+        sessionActive = true;
+        dispatchVacuglide(60);
+        await waitFor(() => device.targetSpeed === 60 && device.operationalMode === 'TARGET_SPEED_PLAYING', 1000, 'the session on the new link');
+        const before = calls.length;
+        land();
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PAUSED', 1000, 'the old stop to land');
+        await waitFor(() => calls.slice(before).some((c) => c.path === '/vacuglide/state'), 1000, 'the device to be read, at once');
+        await tick(20);
+        assert.ok(notices.some((m) => /had stopped while the session was driving it/.test(m)), JSON.stringify(notices));
+        dispatchVacuglide(60);
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 60, 1000, "the session's speed to go out again");
+        await disconnected;
+        assert.deepEqual(unconfirmed, []);
     });
 
     it('the same device connected again: a speed from the last link that lands in the new session is replaced by the session\'s own', async () => {
@@ -4446,7 +4754,7 @@ describe('vacuglide driver', () => {
     it('a stop waiting for a slot when another tab connects the device is not sent', async () => {
         globalThis.localStorage = memoryStorage();
         const page = await loadAnotherPage();
-        Object.assign(page.driver.VACUGLIDE_LIMITS, { ceiling: 7, reserve: 1, windowMs: 700 });
+        Object.assign(page.driver.VACUGLIDE_LIMITS, { ceiling: 7, reserve: 1, watchReserve: 0, windowMs: 700 });
         await page.driver.connectVacuglide(TOKEN);
         page.driver.VACUGLIDE_TIMINGS.requestTimeoutMs = 1000;
         page.driver.dispatchVacuglide(50);
@@ -5527,6 +5835,49 @@ describe('vacuglide driver', () => {
         assert.equal(device.strokeMinusValve, false);
         assert.match(reports[0], /did not end cleanly/);
         assert.match(reports.at(-1), /EdgeLoop sent The VacuGlide \(token ending [a-z0-9]{4}\) its whole stop - the motor stop and both valve closes\. Autoblow's server confirmed it: the motor is stopped and both valves are closed\.$/);
+    });
+
+    // The crash marker is all a crashed page leaves. A whole stop that the
+    // device - not online all through its window - never confirmed is owed
+    // to the next page to open, as a Handy's stop is, and sent again there.
+    it('a crash stop that gave up while the device was not online is sent again by the next page to open, and stops it then', async () => {
+        VACUGLIDE_TIMINGS.offlineStopRetryMs = 10;
+        const store = new Map();
+        const storage = {
+            get length() { return store.size; },
+            key: (i) => [...store.keys()][i] ?? null,
+            getItem: (k) => (store.has(k) ? store.get(k) : null),
+            setItem: (k, v) => { store.set(k, String(v)); },
+            removeItem: (k) => { store.delete(k); }
+        };
+        createLiveSessionTracker({ owner: 'crashed', storage }).note({ handyKey: '', intiface: false, tcode: false, vacuglide: { token: TOKEN, cluster: CLUSTER } });
+        device.operationalMode = 'TARGET_SPEED_PLAYING';
+        device.targetSpeed = 45;
+        device.online = false;
+        const pass = (reports) => settled(runCrashRecovery({
+            storage,
+            locks: null,
+            stopVacuglide: stopVacuglideAfterCrash,
+            vacuglideRetryMinutes: 5,
+            onReport: (text) => reports.push(text)
+        }));
+        const reports = [];
+        const first = await pass(reports);
+        assert.equal(first.settled, false);
+        assert.match(reports.at(-1), /EdgeLoop stopped sending it after 5 minutes and sends it again the next time it opens\.$/);
+        assert.equal(device.operationalMode, 'TARGET_SPEED_PLAYING', 'nothing reached it');
+        // That page closes; the device comes back online; the next page opens.
+        endVacuglideForTests();
+        device.online = true;
+        const nextReports = [];
+        const second = await pass(nextReports);
+        assert.equal(second.settled, true);
+        assert.match(nextReports[0], /^An earlier session did not end cleanly/);
+        assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
+        assert.equal(device.strokePlusValve, false);
+        assert.equal(device.strokeMinusValve, false);
+        const third = [];
+        assert.equal((await pass(third)).recovered, false, 'and nothing is owed any more');
     });
 });
 

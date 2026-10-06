@@ -99,6 +99,7 @@ import {
     createCrashRecoveryStorage,
     whenActivated,
     clearPendingCrashStop,
+    clearPendingVacuglideStop,
     drivesHandyNow
 } from './crash-recovery.js';
 import { openDurableStore } from './durable-store.js';
@@ -5193,6 +5194,37 @@ function setVacuglideValveMessage(text, tone = 'idle') {
 // one is its own entry, by its token: one device's confirmed stop must not
 // take down the warning about another.
 const vacuglideStopsOwed = new Map();
+// What the panel's status line says while it reports an unconfirmed stop of
+// the device `token`, with the badge "Stop unconfirmed" - and the badge the
+// panel had before, to go back to - or null. A whole stop of that device
+// confirmed later takes back exactly that line and that badge, and nothing
+// another message has painted over them since (onStopConfirmed): after a
+// lost link, the background stop's confirmation left "Stop unconfirmed" and
+// "Stop not confirmed: ..." up beside a device at rest.
+let vacuglidePanelOwed = null;
+const VACUGLIDE_RESTING_BADGES = ['Offline', 'Device error', 'Disconnected'];
+
+function noteVacuglidePanelOwed(token, status) {
+    const badge = (document.getElementById('badgeVacuglideText')?.textContent || '').trim();
+    const before = badge === 'Stop unconfirmed' && vacuglidePanelOwed ? vacuglidePanelOwed.badge : badge;
+    vacuglidePanelOwed = { token, status: `Status: ${status}`, badge: before };
+}
+
+function settleVacuglidePanel(token) {
+    const owed = vacuglidePanelOwed;
+    if (!owed || owed.token !== token) return;
+    vacuglidePanelOwed = null;
+    const status = (document.getElementById('modalVacuglideMsg')?.textContent || '').trim();
+    const badge = (document.getElementById('badgeVacuglideText')?.textContent || '').trim();
+    if (status !== owed.status || badge !== 'Stop unconfirmed') return;
+    if (isVacuglideConnected()) {
+        setVacuglideStatus(vacuglideConnectedLabel, 'ok');
+        setBadgeState('Vacuglide', 'connected', 'VacuGlide', null);
+        return;
+    }
+    setVacuglideStatus("Autoblow's server confirmed the stop: the motor is stopped and both valves are closed.", 'idle');
+    setBadgeState('Vacuglide', 'disconnected', VACUGLIDE_RESTING_BADGES.includes(owed.badge) ? owed.badge : 'Disconnected');
+}
 
 function vacuglideOwedSentence() {
     const details = [...vacuglideStopsOwed.values()];
@@ -5268,18 +5300,21 @@ setVacuglideHandlers({
     // one thing the wearer must hear about.
     onStopUnconfirmed: (message, token) => {
         const connected = isVacuglideConnected();
+        const key = typeof token === 'string' ? token : '';
+        noteVacuglidePanelOwed(key, message);
         setVacuglideStatus(message, 'error');
         setBadgeState('Vacuglide', connected ? 'warning' : 'disconnected', 'Stop unconfirmed', null);
         renderVacuglideValves();
-        const key = typeof token === 'string' ? token : '';
         vacuglideStopsOwed.delete(key);
         vacuglideStopsOwed.set(key, typeof message === 'string' ? message.trim() : '');
         reportOwedVacuglideStops({ fresh: true });
     },
     // A whole stop of that device confirmed: what its unconfirmed stop
-    // warned about is over, and the banner says what is left.
+    // warned about is over - on the banner, which says what is left, and on
+    // the panel's line and badge, unless something else is on them since.
     onStopConfirmed: (token) => {
         if (vacuglideStopsOwed.delete(typeof token === 'string' ? token : '')) reportOwedVacuglideStops();
+        settleVacuglidePanel(typeof token === 'string' ? token : '');
     }
 });
 
@@ -5304,6 +5339,10 @@ document.getElementById('modalVacuglideConnectBtn')?.addEventListener('click', a
     paintVacuglideButtons();
     try {
         const result = await connectVacuglide(token);
+        // Connecting brought this very device to a confirmed whole stop:
+        // whatever a crashed session left it doing is over, so no crash
+        // stop is owed to it any more (crash-recovery.js), as for The Handy.
+        if (!isRemotePage) clearPendingVacuglideStop(token, crashStorage);
         vacuglideConnectedLabel = result.description ? `Connected (${result.description})` : 'Connected';
         setVacuglideStatus(vacuglideConnectedLabel, 'ok');
         setBadgeState('Vacuglide', 'connected', 'VacuGlide', null);
@@ -5325,6 +5364,7 @@ document.getElementById('modalVacuglideConnectBtn')?.addEventListener('click', a
 document.getElementById('modalVacuglideDisconnectBtn')?.addEventListener('click', async () => {
     // The link drops at once; the whole stop it sends - motor and both
     // valves - is awaited so the modal can say whether the device confirmed it.
+    const token = getVacuglideToken();
     const stopped = disconnectVacuglide();
     setVacuglideStatus('Stopping the device and closing both valves...', 'busy');
     setBadgeState('Vacuglide', 'disconnected', 'Stopping...');
@@ -5344,7 +5384,9 @@ document.getElementById('modalVacuglideDisconnectBtn')?.addEventListener('click'
         else setVacuglideStatus('Offline', 'idle');
         setBadgeState('Vacuglide', 'disconnected', 'Disconnected');
     } else if (result.mayHaveMoved) {
-        setVacuglideStatus('Disconnected, but the stop was not confirmed: check that the VacuGlide is not running and that neither valve is open.', 'error');
+        const line = 'Disconnected, but the stop was not confirmed: check that the VacuGlide is not running and that neither valve is open.';
+        noteVacuglidePanelOwed(token, line);
+        setVacuglideStatus(line, 'error');
         setBadgeState('Vacuglide', 'disconnected', 'Stop unconfirmed');
     } else {
         setVacuglideStatus('Disconnected. The device did not answer its stop, but EdgeLoop had not started it or opened a valve.', 'idle');

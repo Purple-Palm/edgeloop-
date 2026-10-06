@@ -61,12 +61,15 @@
 //      short of the ceiling, and only a stop or a valve close may spend the
 //      reserve - 6 whole stops in any 66 s however busy the rest of it was.
 //      A stop that has to wait for a slot past that still goes the moment
-//      one frees, and raises the alarm the moment it starts waiting. The
-//      count is kept in localStorage, so a reloaded page or a second tab
-//      counts what was sent before it. The speed is sent only when it
-//      changes, at most once a second, one request at a time and never while
-//      a stop is out, so two speeds, or a speed and a stop, can never reach
-//      the device in the wrong order.
+//      one frees, and raises the alarm the moment it starts waiting. A read
+//      the watch makes is a safety read: routine traffic leaves it a share of
+//      its own below the reserve, so a busy session cannot leave the watch
+//      unable to read the device, and the watch never takes a slot a stop is
+//      kept. The count is kept in localStorage, so a reloaded page or a
+//      second tab counts what was sent before it. The speed is sent only when
+//      it changes, at most once a second, one request at a time and never
+//      while a stop is out, so two speeds, or a speed and a stop, can never
+//      reach the device in the wrong order.
 //
 // All fetch calls go through vgRequest(), which counts, classifies and
 // reports them through the handlers app.js installs.
@@ -79,6 +82,7 @@ import {
     RATE_WINDOW_MS,
     RATE_CEILING,
     RATE_RESERVE,
+    RATE_WATCH_RESERVE,
     MAX_VALVE_OPENS_PER_WINDOW,
     VALVE_PULSE_DEFAULT_MS,
     sanitizeDeviceToken,
@@ -200,6 +204,7 @@ export const VACUGLIDE_LIMITS = {
     windowMs: RATE_WINDOW_MS,
     ceiling: RATE_CEILING,
     reserve: RATE_RESERVE,
+    watchReserve: RATE_WATCH_RESERVE,
     maxOpens: MAX_VALVE_OPENS_PER_WINDOW
 };
 
@@ -273,6 +278,10 @@ let lastFailedDispatch = -1;
 let consecutiveDispatchFailures = 0;
 let consecutivePollFailures = 0;
 let pollTimer = null;
+// When the link check the timer holds is due, and whether it was timed for a
+// session (schedulePoll, quickenPollForSession).
+let pollDueAt = 0;
+let pollPaceActive = false;
 // Bumped whenever polling stops, so a poll that was already out cannot
 // start a second timer chain when it comes back.
 let pollEpoch = 0;
@@ -319,6 +328,8 @@ const PAGE_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2,
 const takeovers = new Map();
 // Tokens a stop request is waiting on the budget for (noteStopHeldBack).
 const heldBack = new Set();
+// token -> when Autoblow's server last answered a request for it with 429.
+const serverRefusedAt = new Map();
 // Devices this page answers for without driving them - it took one over, or
 // let go of one with a command still out, or a stop, a watch or a chase is
 // still running for it - and keeps a held entry in storage for, so that a
@@ -577,9 +588,11 @@ function unref(timer) {
 //
 // `kind` is the budget class: 'critical' for a stop or a valve close, which
 // is delayed until a slot frees and never refused; 'open' for a valve open;
-// 'normal' for everything else. The refusal of a routine request happens
-// before the first await, so a caller that checked the budget and then
-// called this cannot be overtaken in between.
+// 'watch' for a read of the device's state that makes sure of it (the
+// watch's, and one after a stop of an earlier link came back), which has a
+// share of its own; 'normal' for everything else. The refusal of a routine
+// request happens before the first await, so a caller that checked the
+// budget and then called this cannot be overtaken in between.
 //
 // A request made for `link` has the device state its reply carries read
 // by observeReply before the caller sees it, whatever the caller wanted
@@ -661,6 +674,7 @@ async function vgRequest(base, path, { method = 'GET', body = undefined, token, 
     const verdict = classifyVacuglideResponse(res.ok, res.status, data, path);
     if (!verdict.ok) {
         if (verdict.rateLimited) {
+            serverRefusedAt.set(token, Date.now());
             budget.noteServerRefusal(Date.now(), VACUGLIDE_TIMINGS.serverRefusalBackoffMs);
             noteServerRefusal(link);
         }
@@ -691,13 +705,21 @@ async function vgRequest(base, path, { method = 'GET', body = undefined, token, 
 // request still goes the moment a slot frees - it is never dropped - but
 // until then the device may be moving with nothing on its way to stop it,
 // and the wearer hears that now, not after the wait. Once per token until
-// a stop gets through again.
+// a stop gets through again. What holds it is EdgeLoop's own count, which
+// stays under Autoblow's limit and counts every request sent, answered or
+// not - one that failed on the way may never have reached Autoblow at all -
+// so that is what it says; Autoblow's limit only when its server did refuse
+// this token for rate within the window.
 function noteStopHeldBack(token, path, wait) {
     if (heldBack.has(token)) return;
     heldBack.add(token);
     const seconds = Math.max(1, Math.ceil(wait / 1000));
     const what = path === VACUGLIDE_VALVES.plus || path === VACUGLIDE_VALVES.minus ? 'valve close' : 'stop';
-    const message = `A ${what} is held back: this device token has used up Autoblow's request limit for the minute, and EdgeLoop sends it in ${seconds} s`;
+    const refused = serverRefusedAt.has(token) && serverRefusedAt.get(token) > Date.now() - VACUGLIDE_LIMITS.windowMs;
+    const why = refused
+        ? "Autoblow's server has refused requests for this device token as over its limit, and EdgeLoop's own count of them for the minute is full"
+        : "EdgeLoop's own count of requests for this device token is full for the minute - it counts every request it sent, answered or not, to stay under Autoblow's limit";
+    const message = `A ${what} is held back: ${why}. EdgeLoop sends it in ${seconds} s`;
     if (live && live.token === token) reportError(path, message);
     callHandler('onStopUnconfirmed', message, token);
 }
@@ -827,7 +849,10 @@ function observeReply(link, data, seq, sentAt) {
 // motor at a target speed other than the one EdgeLoop last had confirmed is
 // that older speed - sent before a Disconnect and a reconnect, maybe under a
 // higher cap - and the session's own speed goes out again at once rather
-// than at its next change.
+// than at its next change. A motor found stopped by a stop - paused - while
+// a session drives it at a speed the device confirmed is no longer taken to
+// run at that speed: a stop an earlier link sent landed after that speed, or
+// another app stopped it, and the session's next tick sends its speed again.
 function observeDriven(link, state, seq, sentAt) {
     const moving = motionAfterStop(link, state, seq);
     if (moving && !drivenSinceStop(link)) {
@@ -835,7 +860,14 @@ function observeDriven(link, state, seq, sentAt) {
         return;
     }
     for (const valve of strayValvesIn(link, state, seq)) closeStrayValve(link, valve);
-    if (!motorRunningIn(state)) return;
+    if (!motorRunningIn(state)) {
+        if (state.operationalMode === 'TARGET_SPEED_PAUSED' && drivenSinceStop(link) && link.lastSpeedSent > 0 && !link.speedInFlight && seq > link.speedSettledSeq) {
+            link.lastSpeedSent = -1;
+            link.lastSpeedReported = null;
+            callHandler('onNotice', "The VacuGlide had stopped while the session was driving it - a stop Autoblow's server delivered late, or another app using this device token. EdgeLoop sends the session's speed again.");
+        }
+        return;
+    }
     if (watchCoversSpeed(link.token) && link.lastSpeedSent > 0 && !link.speedInFlight
         && link.pendingSpeed === null && link.lastSpeedReported !== null && state.targetSpeed !== null
         && state.targetSpeed !== link.lastSpeedReported && seq > link.speedSettledSeq) {
@@ -951,20 +983,24 @@ function closeStrayValve(link, valve) {
 
 // PUT `path` with `body` until the reply confirms it, up to four attempts
 // with backoff - and no more of them once another page drives the device
-// (answersFor): they would stop the session that page runs, or cut a press
-// there short. `isConfirmed(state)` reads the device state the reply
-// carries, `onSent(seq, sentAt)` hears each attempt go out, and
-// `onReply(state, confirmed, seq, sentAt)` hears every reply that comes
-// back, with the number its request went out with and when. A part of a
-// whole stop (`stopPart`) is in flight while each of its attempts is
-// unanswered, so a stop that goes out after it watches the device for as
-// long as it could still land (watchForLateCommand). Never throws. Resolves
-// { ok, state, error }.
+// (answersFor), or once this page has connected it again through a newer
+// link (connectedAgain), whose connect confirmed a stop after anything this
+// link sent: they would stop the session that page or that link runs, or
+// cut a press there short. A motor stop of this link's answered after that,
+// while the newer link drives the device, may have landed in its session,
+// and the device is read at once (readAfterStaleStop). `isConfirmed(state)`
+// reads the device state the reply carries, `onSent(seq, sentAt)` hears each
+// attempt go out, and `onReply(state, confirmed, seq, sentAt)` hears every
+// reply that comes back, with the number its request went out with and
+// when. A part of a whole stop (`stopPart`) is in flight while each of its
+// attempts is unanswered, so a stop that goes out after it watches the
+// device for as long as it could still land (watchForLateCommand). Never
+// throws. Resolves { ok, state, error }.
 async function attemptCommand(target, path, body, isConfirmed, { link = null, countFailure = false, quiet = false, stopPart = false, onSent = null, onReply = null } = {}) {
     const delays = VACUGLIDE_TIMINGS.stopRetryDelaysMs;
     let lastErr = null;
     for (let attempt = 0; attempt <= delays.length; attempt++) {
-        if (attempt > 0 && !answersFor(target.token)) break;
+        if (attempt > 0 && (!answersFor(target.token) || connectedAgain(target))) break;
         const flight = stopPart ? beginFlight(target, 'stop') : null;
         let seq = 0;
         let sentAt = 0;
@@ -975,6 +1011,7 @@ async function attemptCommand(target, path, body, isConfirmed, { link = null, co
         };
         try {
             const data = await vgRequest(target.cluster, path, { method: 'PUT', body, token: target.token, kind: 'critical', link, countFailure, quiet, stopPart, onSent: sent });
+            if (path === VACUGLIDE_PATHS.stop) readAfterStaleStop(target);
             const state = parseVacuglideState(data);
             noteDeviceState(link, state);
             const confirmed = isConfirmed(state);
@@ -1199,6 +1236,18 @@ function connectedAgain(link) {
     return Boolean(live && live !== link && live.token === link.token);
 }
 
+// A motor stop of `link`'s that Autoblow's server answered once the device
+// had been connected again through a newer link, and driven since that
+// link's own stop: it reached the device, maybe after the session's speed,
+// and its answer is not read for the new link (observeStopReply). The
+// device is read at once through the link that drives it, which then finds
+// the motor stopped under it (observeDriven) rather than take it to run.
+function readAfterStaleStop(link) {
+    const now = live;
+    if (!connectedAgain(link) || !drivenSinceStop(now)) return;
+    vgRequest(now.cluster, VACUGLIDE_PATHS.state, { token: now.token, kind: 'watch', link: now }).catch(() => {});
+}
+
 function holdStopping(link) {
     link.stoppingHolds += 1;
     stopping.add(link);
@@ -1400,6 +1449,7 @@ function pumpSpeed(link) {
 export function dispatchVacuglide(speed, force = false, { urgent = false } = {}) {
     const link = live;
     if (!link) return;
+    quickenPollForSession();
     dispatchSequence += 1;
     const target = clampTargetSpeed(speed);
     if (target === 0) {
@@ -1715,15 +1765,34 @@ function startPolling() {
     schedulePoll();
 }
 
-function schedulePoll() {
+function sessionActive() {
+    return typeof handlers.isSessionActive === 'function' && Boolean(handlers.isSessionActive());
+}
+
+// The next link check, in a session's pace or in the pace between sessions -
+// or `wait` from now when it is given.
+function schedulePoll(wait = null) {
     const epoch = pollEpoch;
-    const active = typeof handlers.isSessionActive === 'function' && Boolean(handlers.isSessionActive());
-    const wait = active ? VACUGLIDE_TIMINGS.pollActiveMs : VACUGLIDE_TIMINGS.pollIdleMs;
+    pollPaceActive = sessionActive();
+    const delay = wait !== null ? wait : (pollPaceActive ? VACUGLIDE_TIMINGS.pollActiveMs : VACUGLIDE_TIMINGS.pollIdleMs);
+    pollDueAt = Date.now() + delay;
     pollTimer = unref(setTimeout(async () => {
         pollTimer = null;
         await pollVacuglideConnected();
         if (epoch === pollEpoch && live) schedulePoll();
-    }, wait));
+    }, delay));
+}
+
+// A session has started while the next link check was timed between
+// sessions: it comes within the session's pace from now, not at the end of
+// the gap a Connect just before START set - the first check of such a
+// session came about 30 s in. Every dispatch asks, so START does at once.
+function quickenPollForSession() {
+    if (pollTimer === null || pollPaceActive || !sessionActive()) return;
+    const wait = Math.max(0, Math.min(pollDueAt - Date.now(), VACUGLIDE_TIMINGS.pollActiveMs));
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    schedulePoll(wait);
 }
 
 function stopPolling() {
@@ -2049,24 +2118,25 @@ function scheduleWatch(job, delay = VACUGLIDE_TIMINGS.lateCommandWatchBeatMs) {
 // the newest link it was reached through, quietly, so a device that is no
 // longer connected paints no error onto the panel of whatever is. A read
 // that cannot see the device raises the alarm (cannotSee). The last read
-// goes out once the window has closed.
+// goes out once the window has closed. A read is a safety read, made in the
+// watch's own share of the budget, which a busy session's routine traffic
+// cannot spend. One sent through a link the device has been connected again
+// past since - to the cluster it has left, as often as not - that fails
+// says nothing of the device: the newer link confirmed it at rest after
+// that read went out. The read is made again through that link at once,
+// and only when that one cannot see the device either is the alarm raised.
 async function watchRound(job) {
     if (!job.active) return;
     // Let go of, and with it this watch, once another page drives it.
     if (!answersFor(job.token)) return;
     if (live && live.token === job.token) job.link = live;
-    const link = job.link;
+    let link = job.link;
     const last = !(job.until > Date.now());
-    let failure = null;
-    try {
-        const data = await vgRequest(link.cluster, VACUGLIDE_PATHS.state, { token: job.token, kind: 'normal', link, quiet: live !== link });
-        noteDeviceState(link, parseVacuglideState(data));
-    } catch (e) {
-        failure = e || new Error('no answer');
-        // A device that is not on this cluster any more may have dropped
-        // out and come back through another one, still running what landed
-        // before it dropped: the next read looks where it is now.
-        if (e && e.notConnected && live !== link) await followDevice(link);
+    let failure = await watchRead(job, link);
+    if (failure && job.active && answersFor(job.token) && connectedAgain(link)) {
+        job.link = live;
+        link = live;
+        failure = await watchRead(job, link);
     }
     if (!job.active) return;
     if (!failure) {
@@ -2080,6 +2150,23 @@ async function watchRound(job) {
         return;
     }
     finishWatch(job);
+}
+
+// One read of the watch's through `link`. Resolves null, or what it failed
+// with.
+async function watchRead(job, link) {
+    try {
+        const data = await vgRequest(link.cluster, VACUGLIDE_PATHS.state, { token: job.token, kind: 'watch', link, quiet: live !== link });
+        noteDeviceState(link, parseVacuglideState(data));
+        return null;
+    } catch (e) {
+        // A device that is not on this cluster any more may have dropped
+        // out and come back through another one, still running what landed
+        // before it dropped: the next read looks where it is now - unless
+        // it has been connected again here, through its new link.
+        if (e && e.notConnected && live !== link && !connectedAgain(link)) await followDevice(link);
+        return e || new Error('no answer');
+    }
 }
 
 // Ask the router where a device EdgeLoop no longer drives is now, and send

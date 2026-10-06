@@ -36,6 +36,8 @@ import {
     addPendingCrashStops,
     clearPendingCrashStop,
     notePendingCrashStopGaveUp,
+    readPendingVacuglideStops,
+    clearPendingVacuglideStop,
     planCrashRecovery,
     describeHandyCrashStop,
     describeCrashRecovery,
@@ -4124,7 +4126,70 @@ describe('a VacuGlide in the crash marker', () => {
         const result = await settle(pass);
         assert.equal(result.settled, false);
         assert.equal(reports.at(-1).open, true, 'nothing says it is at rest');
-        assert.match(reports.at(-1).text, /EdgeLoop stopped sending it after 5 minutes\.$/);
+        assert.match(reports.at(-1).text, /EdgeLoop stopped sending it after 5 minutes and sends it again the next time it opens\.$/);
+    });
+
+    // As The Handy's: a whole stop not confirmed in its window is owed to the
+    // next page to open, which sends it again - whatever sessions run in
+    // between - and the promise is that one more try.
+    it('a whole stop not confirmed in its window is owed to the next page to open, which sends it again through the cluster it was reached by', async () => {
+        const { storage, locks } = crashedPage(VG);
+        const reports = [];
+        const offline = vgStop({ [TOKEN]: { outcome: 'offline', detail: 'The VacuGlide is not online' } });
+        const first = await runCrashRecovery({ storage, locks, stopVacuglide: offline, onReport: (t) => reports.push(t) });
+        assert.equal(first.settled, false);
+        assert.match(reports.at(-1), /EdgeLoop stopped sending it after 5 minutes and sends it again the next time it opens\.$/);
+        assert.equal(onlyMarker(storage), null, 'the marker is handed over to the stops still owed');
+        assert.deepEqual(readPendingVacuglideStops(storage), [{ token: TOKEN, cluster: CLUSTER }]);
+        // A session run in between, and stopped cleanly, takes nothing back.
+        const session = createLiveSessionTracker({ owner: 'page-b', storage, locks });
+        session.note(HANDY);
+        session.clear();
+        const online = vgStop();
+        const nextReports = [];
+        const second = await runCrashRecovery({ storage, locks, stopHandy: fakeStop(), stopVacuglide: online, onReport: (t) => nextReports.push(t) });
+        assert.deepEqual(online.asked, [{ token: TOKEN, cluster: CLUSTER }], 'the promised stop goes out');
+        assert.equal(second.settled, true);
+        assert.ok(nextReports[0].startsWith(EARLIER_CRASH_HEADLINE), nextReports[0]);
+        assert.match(nextReports.at(-1), /EdgeLoop sent The VacuGlide \(token ending abcd\) its whole stop - the motor stop and both valve closes\. Autoblow's server confirmed it/);
+        assert.deepEqual(readPendingVacuglideStops(storage), []);
+        // That settles it.
+        const later = vgStop();
+        assert.equal((await runCrashRecovery({ storage, locks, stopVacuglide: later })).recovered, false);
+        assert.deepEqual(later.asked, []);
+    });
+
+    it('the promised try is the last: when it gives up too, nothing more is owed or promised', async () => {
+        const { storage, locks } = crashedPage(VG);
+        const OFFLINE_VG = { [TOKEN]: { outcome: 'offline', detail: 'The VacuGlide is not online' } };
+        await runCrashRecovery({ storage, locks, stopVacuglide: vgStop(OFFLINE_VG), onReport: () => {} });
+        const again = vgStop(OFFLINE_VG);
+        const reports = [];
+        const second = await runCrashRecovery({ storage, locks, stopVacuglide: again, onReport: (t) => reports.push(t) });
+        assert.equal(again.asked.length, 1);
+        assert.equal(second.settled, false);
+        assert.match(reports.at(-1), /switch it off with its power button\. EdgeLoop stopped sending it after 5 minutes\.$/);
+        assert.deepEqual(readPendingVacuglideStops(storage), []);
+        const third = vgStop();
+        assert.equal((await runCrashRecovery({ storage, locks, stopVacuglide: third, onReport: () => assert.fail('no report') })).recovered, false);
+        assert.deepEqual(third.asked, []);
+    });
+
+    it('a Connect of that VacuGlide settles what is owed, and one of another does not; a Handy owed beside it keeps its own', async () => {
+        const { storage, locks } = crashedPage({ ...VG, handyKey: 'KEY-ONE-1234' });
+        const gaveUp = { outcome: 'offline', detail: 'not online', final: true };
+        await runCrashRecovery({ storage, locks, stopHandy: fakeStop({ 'KEY-ONE-1234': gaveUp }), stopVacuglide: vgStop({ [TOKEN]: gaveUp }) });
+        assert.deepEqual(readPendingCrashStops(storage), ['KEY-ONE-1234']);
+        assert.deepEqual(readPendingVacuglideStops(storage), [{ token: TOKEN, cluster: CLUSTER }]);
+        assert.equal(clearPendingVacuglideStop('vgtokenother99', storage), true);
+        assert.equal(readPendingVacuglideStops(storage).length, 1);
+        assert.equal(clearPendingVacuglideStop(TOKEN, storage), true);
+        assert.deepEqual(readPendingVacuglideStops(storage), []);
+        assert.deepEqual(readPendingCrashStops(storage), ['KEY-ONE-1234'], 'the Handy is still owed');
+        assert.equal(clearPendingCrashStop('KEY-ONE-1234', storage), true);
+        const { version, ...rest } = JSON.parse(storage.getItem(PENDING_CRASH_STOPS_KEY));
+        assert.deepEqual(rest, { handy: [] }, 'a record of no VacuGlide reads as it always has');
+        assert.ok(version > 0);
     });
 
     it('a VacuGlide another open page has connected is left to that page, and the banner says so', async () => {
@@ -4231,6 +4296,15 @@ describe('app.js puts the crash recovery in the page', () => {
         assert.match(src.slice(store, made), /durable: openDurableStore\(\{ indexedDB: browserStore\('indexedDB'\) \}\)/);
         assert.equal((src.match(/\.atBoot\(\)/g) || []).length, 1, 'one boot pass');
         assert.match(src, /if \(crashRecovery\) whenActivated\(document, \(\) => \{ crashRecovery\.atBoot\(\); \}\);/);
+    });
+
+    it('a VacuGlide Connect settles the whole stop owed to it after a crash, as a Handy Connect does', () => {
+        const start = src.indexOf("document.getElementById('modalVacuglideConnectBtn')?.addEventListener('click'");
+        assert.ok(start >= 0);
+        const handler = src.slice(start, src.indexOf('} catch (e) {', start));
+        const connected = handler.indexOf('await connectVacuglide(token);');
+        const cleared = handler.indexOf('if (!isRemotePage) clearPendingVacuglideStop(token, crashStorage);');
+        assert.ok(connected >= 0 && cleared > connected, 'cleared once the connect - and its confirmed whole stop - succeeded');
     });
 
     it('notes what a live session drives before any command of it reaches a toy', () => {
