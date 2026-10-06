@@ -19,8 +19,10 @@
 //      on the day it is true. That one record is all anything reads about
 //      whether a device has confirmed its stop: the page's "may still be
 //      moving" (onStopConfirmed / onStopUnconfirmed), the background stop
-//      job, Disconnect's answer, and handyRestState, which app.js asks
-//      before it opens a dialog over the toys.
+//      job, Disconnect's answer, handyRestState, which app.js asks before
+//      it opens a dialog over the toys, and handyMayBeMoving, which tells
+//      other pages whether this one drives its Handy (crash-recovery.js).
+//      A crash-recovery stop the API confirms is entered in it too.
 //   2. Never exceed the user's hardware envelope; the stroke range sent to
 //      PUT /slide is always normalised through handy-protocol.js, then moved
 //      off the mechanical ends by the end-stop margin (inside that same
@@ -38,20 +40,30 @@
 //      Handy is connected, in a session or not, and START / RESUME ask the
 //      API again before anything moves (pollHandyConnected, used by app.js).
 //
-// All fetch calls go through handyRequest(), which classifies the reply and
-// reports failures through the error handler installed by app.js.
+// Every call the driver makes for its own link goes through handyRequest(),
+// which classifies the reply and reports failures through the error handler
+// installed by app.js. The crash-recovery stop (stopHandyAfterCrash) is for
+// a device this page never connected, so it uses the bare exchange() and
+// reports no error, no offline link and no unconfirmed stop: it must never
+// paint an error on, or take offline, the link the wearer connects next. A
+// stop of it that the API confirms is entered against the device like every
+// other confirmed stop (noteStopConfirmed), so the one record of whether a
+// device has confirmed its stop stays the one record.
 
 import {
     HANDY_API_BASE,
     HANDY_MODE,
     HANDY_DEFAULT_END_MARGIN,
+    RECOVERY_STOP,
     applyEndMargin,
     classifyHandyResponse,
+    classifyRecoveryStop,
     clampVelocity,
     describeDeviceStop,
     describeSlideAdjustment,
     isDeviceNotConnectedError,
     isHampModeError,
+    isRecoveryStopConclusive,
     normalizeSlideRange,
     parseBatteryLevel,
     describeHandyInfo
@@ -77,13 +89,23 @@ export const HANDY_TIMINGS = {
     requestTimeoutMs: 6000,
     // PUT /hamp/stop backoff between the four attempts of one verified stop.
     stopRetryDelaysMs: [250, 500, 1000],
-    // Pause between rounds of the background stop sent to an offline device.
+    // Pause between rounds of the background stop sent to an offline device,
+    // and between rounds of the crash-recovery stop.
     offlineStopRetryMs: 5000,
     // The GET /connected poll: one tick per pollMs while a Handy is
     // connected, a request on every tick during a session and on every
     // idlePollMs / pollMs-th tick outside one (see startOfflinePolling).
     pollMs: 10000,
-    idlePollMs: 30000
+    idlePollMs: 30000,
+    // How long the crash-recovery stop keeps being sent before it gives up:
+    // five minutes, and the banner tells the wearer so. A time, not a count
+    // of rounds: while the API does not answer, every attempt waits out
+    // requestTimeoutMs, a round of four lasts half a minute, and sixty such
+    // rounds would run for half an hour. Much later than five minutes, a
+    // Handy coming back online is more likely in use by another app than
+    // still running the dead session's motion; the next page to open tries
+    // again anyway.
+    crashStopWindowMs: 5 * 60 * 1000
 };
 
 let handyKey = '';
@@ -467,6 +489,20 @@ export function handyStopTally() {
     return { confirmed: stopsConfirmed, unanswered: stopsUnanswered };
 }
 
+// True while there is a link and the driver cannot vouch that its device is
+// stopped: it is moving, a start is on its way, or the device's record says
+// a start may have landed unconfirmed or a stop to it is still owed - this
+// link's own doubt, or one an earlier link with the same key left (see
+// deviceMotion). It is read from the same record as everything else that
+// says whether a device has confirmed its stop, and it is exactly when the
+// driver sends the device a stop of its own on every way out - a zero-speed
+// dispatch, Disconnect, a switch to another key, the page going away, a lost
+// link - which is what lets another page leave that Handy to this one
+// (crash-recovery.js, drivesHandyNow).
+export function handyMayBeMoving() {
+    return handyConnected && Boolean(handyKey) && (handyStartInFlight || motorMayBeMoving());
+}
+
 // Every "once per connection" latch, cleared when the link changes.
 function resetDeviceNotices() {
     hampFaultNotified = false;
@@ -506,6 +542,42 @@ function unref(timer) {
     return timer;
 }
 
+// One HTTP exchange with the API and nothing else: no classification, no
+// reporting, no counting. Resolves { httpOk, status, body } (body null when
+// the reply was not JSON). When no reply arrives - our own timeout or a
+// network error - it throws an Error that leaves open whether the device
+// acted on the request: `undelivered` is false, and `timedOut` says whether
+// it was our own timeout that gave up on it.
+async function exchange(path, { method = 'GET', body = undefined, key }) {
+    const headers = { 'X-Connection-Key': key };
+    const init = { method, headers };
+    if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+    }
+    let abortTimer = null;
+    if (typeof AbortController === 'function') {
+        const controller = new AbortController();
+        init.signal = controller.signal;
+        abortTimer = setTimeout(() => controller.abort(), HANDY_TIMINGS.requestTimeoutMs);
+    }
+
+    try {
+        const res = await fetch(`${HANDY_API_BASE}${path}`, init);
+        let data = null;
+        try { data = await res.json(); } catch (e) { data = null; }
+        return { httpOk: res.ok, status: res.status, body: data };
+    } catch (e) {
+        const timedOut = Boolean(e && e.name === 'AbortError');
+        const err = new Error(timedOut ? `Request timed out (${path})` : `Network error (${path})`);
+        err.undelivered = false;
+        err.timedOut = timedOut;
+        throw err;
+    } finally {
+        if (abortTimer !== null) clearTimeout(abortTimer);
+    }
+}
+
 // One API call. Resolves with the parsed body on success, throws an Error with
 // a human-readable message on any failure (network, HTTP status, error object,
 // result -1). The error is flagged `undelivered` when the API itself said the
@@ -517,48 +589,29 @@ function unref(timer) {
 // while connected.
 async function handyRequest(path, { method = 'GET', body = undefined, key = handyKey, countFailure = true } = {}) {
     if (!key) throw new Error('No Handy connection key');
-    const headers = { 'X-Connection-Key': key };
-    const init = { method, headers };
-    if (body !== undefined) {
-        headers['Content-Type'] = 'application/json';
-        init.body = JSON.stringify(body);
-    }
     const tick = dispatchSequence;
-    let abortTimer = null;
-    if (typeof AbortController === 'function') {
-        const controller = new AbortController();
-        init.signal = controller.signal;
-        abortTimer = setTimeout(() => controller.abort(), HANDY_TIMINGS.requestTimeoutMs);
-    }
 
-    let res;
-    let data = null;
+    let reply;
     try {
-        res = await fetch(`${HANDY_API_BASE}${path}`, init);
-        try { data = await res.json(); } catch (e) { data = null; }
+        reply = await exchange(path, { method, body, key });
     } catch (e) {
-        const msg = (e && e.name === 'AbortError') ? `Request timed out (${path})` : `Network error (${path})`;
-        noteFailure(path, msg, countFailure, tick);
-        const err = new Error(msg);
-        err.undelivered = false;
-        throw err;
-    } finally {
-        if (abortTimer !== null) clearTimeout(abortTimer);
+        noteFailure(path, e.message, countFailure, tick);
+        throw e;
     }
 
-    const verdict = classifyHandyResponse(res.ok, res.status, data, path);
+    const verdict = classifyHandyResponse(reply.httpOk, reply.status, reply.body, path);
     if (!verdict.ok) {
         noteFailure(path, verdict.message, countFailure, tick);
         // Every call the driver makes is one the session asked for, so a HAMP
         // refusal of it is worth explaining to the wearer.
         noteHampFault(verdict.code);
         const err = new Error(verdict.message);
-        err.undelivered = isDeviceNotConnectedError(data);
+        err.undelivered = isDeviceNotConnectedError(reply.body);
         throw err;
     }
     if (countFailure) consecutiveDispatchFailures = 0;
     reportRecovered(path);
-    return data;
+    return reply.body;
 }
 
 function noteFailure(path, message, countFailure, tick) {
@@ -917,6 +970,26 @@ export async function connectHandy(key) {
     const trimmed = (key || '').trim();
     if (!trimmed) throw new Error('Connection key is empty');
 
+    // A crash-recovery stop working on this key hands the device over (see
+    // stopHandyAfterCrash): nothing of it may land after this link's first
+    // start, and if this connect fails the device is still its job.
+    verifyingKeys.set(trimmed, (verifyingKeys.get(trimmed) || 0) + 1);
+    let linked = false;
+    try {
+        if (crashStops.has(trimmed)) await holdCrashStop(trimmed);
+        const result = await linkHandy(trimmed);
+        linked = true;
+        return result;
+    } finally {
+        const left = (verifyingKeys.get(trimmed) || 1) - 1;
+        if (left > 0) verifyingKeys.set(trimmed, left);
+        else verifyingKeys.delete(trimmed);
+        releaseCrashStop(crashStops.get(trimmed) || null, linked);
+        if (linked) settleGivenUpCrashStop(trimmed);
+    }
+}
+
+async function linkHandy(trimmed) {
     // Nothing below touches the live link until the new key has passed.
     const info = await verifyKey(trimmed);
 
@@ -1314,6 +1387,287 @@ export function stopHandyOnUnload() {
     return true;
 }
 
+// ---- crash recovery ------------------------------------------------------------
+
+// A page that crashed, was force-quit or was killed by the phone never sent
+// the stop above: HAMP motion runs on the device, so The Handy keeps stroking
+// at the last speed it was given. The next page to open sends the stop
+// instead, with the key the dead page was driving (crash-recovery.js decides
+// when). What the v2 API makes of that stop is read in handy-protocol.js
+// (classifyRecoveryStop): no connect or mode call is needed first.
+//
+// Rules:
+//   * Nothing but PUT /hamp/stop is ever sent, and nothing is reported
+//     through the live link: no error, no offline link and no unconfirmed
+//     stop is reported, and no failure is counted. A stop the API confirms
+//     (result 0 or 1) is still entered against the device like any other
+//     verified stop (noteStopConfirmed), with the number it left with: a
+//     stop confirmed for that very Handy, whoever sent it, ends a "may
+//     still be moving" this page said about it (onStopConfirmed), and one
+//     that left before a start to it came back settles nothing. An answer
+//     that settles nothing puts nothing in doubt there either: the job
+//     reports it itself.
+//   * A key that is this page's live link is sent nothing from here: a stop
+//     racing the session's own start would land behind the driver's back.
+//     But being linked is not driving it. A page that died was driving that
+//     Handy, and this page's driver may believe it stopped - it confirmed a
+//     stop at Connect, or since - while this session drives it at zero
+//     speed, or not at all (its role switched off): its ticks then send
+//     nothing, and the Handy kept the dead page's motion for as long as the
+//     session ran, under a report that said it was stopped. So the driver
+//     is told it can no longer vouch that the device is stopped, on the
+//     link (handyMotionUnknown) and in the device's record, as a keepalive
+//     stop nobody heard back from is (noteMayHaveStarted): its next
+//     zero-speed dispatch sends a verified stop through the link, unless
+//     this session starts it first, and only a stop sent after this moment
+//     settles it.
+//   * Like every stop in this driver it is retried until the API answers
+//     for the device. An attempt that got no usable answer is retried inside
+//     the round with the verified-stop backoff; a device the API reports
+//     offline, or a phone whose network is not up yet, gets a fresh round
+//     every HANDY_TIMINGS.offlineStopRetryMs, as long as that round starts
+//     inside HANDY_TIMINGS.crashStopWindowMs of the job.
+//   * Connect for the same key takes over. It waits for an attempt still on
+//     the wire first: a crash stop landing after the new session's
+//     /hamp/start would stop that session behind the driver's back. Its own
+//     verification then stops the device and settles the question.
+//   * A job that gave up is still told when a Connect with its key succeeds
+//     later on this page. Its report ends with the promise of another stop
+//     the next time EdgeLoop opens, and that stop is owed no more once
+//     Connect has confirmed one: left alone, the banner would keep promising
+//     a stop that the next page to open does not send.
+//   * One job per key, and whoever asks for a stop to that key while it is
+//     being sent hears every answer the job gets. A page runs a recovery when
+//     it opens and another when a session starts in it, and both can be
+//     after the same Handy: the one that asked second would otherwise say
+//     "sending..." until the end, and never hear that Connect has since
+//     settled what it promised.
+//   * Whoever heard a stop give up is told when a later stop to that key
+//     settles it, and nothing else. Its report ended on a promise, which an
+//     answer that settles the key must not leave standing; but a give-up is
+//     not only news to it - it notes or ends the promise of another try
+//     (crash-recovery.js) - so hearing a second one would renew a promise
+//     that the page sending this stop may be the try of.
+//
+// Jobs by key: { key, active, held, rounds, startedAt, timer, inFlight,
+// last, listeners, settleListeners, resolve, done }.
+const crashStops = new Map();
+// Jobs that gave up, by key, until a Connect with that key succeeds.
+const givenUpCrashStops = new Map();
+// Keys a Connect is verifying right now, with how many Connects are on it.
+const verifyingKeys = new Map();
+
+function reportCrashStop(job, update) {
+    const prev = job.last;
+    job.last = update;
+    if (prev && prev.outcome === update.outcome && prev.detail === update.detail && prev.final === update.final) return;
+    const told = isRecoveryStopConclusive(update.outcome) ? job.listeners.concat(job.settleListeners) : job.listeners.slice();
+    for (const listener of told) {
+        try { listener(update); } catch (e) {}
+    }
+}
+
+function endCrashStop(job, update) {
+    if (!job.active) return;
+    job.active = false;
+    job.held = false;
+    if (job.timer) { clearTimeout(job.timer); job.timer = null; }
+    if (crashStops.get(job.key) === job) crashStops.delete(job.key);
+    if (!isRecoveryStopConclusive(update.outcome)) givenUpCrashStops.set(job.key, job);
+    reportCrashStop(job, update);
+    job.resolve(update);
+}
+
+// A Connect with `key` has just confirmed a stop of its own. A crash stop
+// for that key that gave up earlier on this page hears it, once.
+function settleGivenUpCrashStop(key) {
+    const job = givenUpCrashStops.get(key);
+    if (!job) return;
+    givenUpCrashStops.delete(key);
+    reportCrashStop(job, { outcome: RECOVERY_STOP.CONNECTED, detail: '', final: true });
+}
+
+// One attempt: resolves the classified reply and never rejects. It is
+// numbered as it leaves, like every verified stop, and kept on the device's
+// record while it is out, like a round of the background stop (roundsOut:
+// nothing waits for it). A reply that confirms the stop is entered against
+// the device (noteStopConfirmed).
+function sendCrashStop(job) {
+    const key = job.key;
+    const sentAs = ++stopsSent;
+    motionRecord(key).roundsOut += 1;
+    const pending = exchange('/hamp/stop', { method: 'PUT', key }).then(
+        (reply) => classifyRecoveryStop(reply),
+        (e) => classifyRecoveryStop({ noReply: true, timedOut: Boolean(e && e.timedOut) })
+    ).then((verdict) => {
+        if (verdict.outcome === RECOVERY_STOP.STOPPED || verdict.outcome === RECOVERY_STOP.ALREADY_STOPPED) {
+            noteStopConfirmed(key, sentAs);
+        }
+        // Kept while it was out (dropIfSettled), unless a test has forgotten it.
+        const record = deviceMotion.get(key);
+        if (record) {
+            record.roundsOut = Math.max(0, record.roundsOut - 1);
+            dropIfSettled(key, record);
+        }
+        return verdict;
+    });
+    job.inFlight = pending;
+    pending.then(() => { if (job.inFlight === pending) job.inFlight = null; });
+    return pending;
+}
+
+function scheduleCrashStopRound(job) {
+    job.timer = unref(setTimeout(() => {
+        job.timer = null;
+        runCrashStopRound(job);
+    }, HANDY_TIMINGS.offlineStopRetryMs));
+}
+
+async function crashStopRound(job) {
+    if (!job.active || job.held) return;
+    job.rounds += 1;
+    const delays = HANDY_TIMINGS.stopRetryDelaysMs;
+    let verdict = null;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+        verdict = await sendCrashStop(job);
+        if (!job.active) return;
+        // An answer that settles it ends the job even while Connect waits on
+        // this very attempt: it is the truest thing known about the device.
+        if (isRecoveryStopConclusive(verdict.outcome)) {
+            endCrashStop(job, { ...verdict, final: true });
+            return;
+        }
+        if (job.held) return;
+        // The API answered for the device: asking again at once cannot
+        // change "offline". Only an attempt with no usable answer is retried.
+        if (verdict.outcome !== RECOVERY_STOP.FAILED) break;
+        if (attempt < delays.length) {
+            await sleep(delays[attempt]);
+            if (!job.active || job.held) return;
+        }
+    }
+    // Another round only if it would start inside the window the wearer was
+    // told about.
+    if (Date.now() - job.startedAt + HANDY_TIMINGS.offlineStopRetryMs > HANDY_TIMINGS.crashStopWindowMs) {
+        endCrashStop(job, { ...verdict, final: true });
+        return;
+    }
+    reportCrashStop(job, { ...verdict, final: false });
+    scheduleCrashStopRound(job);
+}
+
+function runCrashStopRound(job) {
+    crashStopRound(job).catch((e) => {
+        endCrashStop(job, { outcome: RECOVERY_STOP.FAILED, detail: e && e.message ? e.message : 'unknown error', final: true });
+    });
+}
+
+// A crash stop that needs no request at all.
+function settledCrashStop(update, onUpdate) {
+    if (typeof onUpdate === 'function') {
+        try { onUpdate(update); } catch (e) {}
+    }
+    return Promise.resolve(update);
+}
+
+// Send the crash-recovery stop for `key`. `onUpdate({ outcome, detail,
+// final })` is called whenever what the wearer should be told changes: after
+// the first round, when a later round gets a different answer, and once at
+// the end. Resolves with the final update. Outcomes are RECOVERY_STOP's; a
+// final one that isRecoveryStopConclusive() rejects means the job gave up,
+// and then onUpdate is called once more, with CONNECTED, if a Connect with
+// the key succeeds later. A key that is the live link answers LINKED at
+// once, and sends nothing. A second call for a key already being stopped
+// joins that job: it is told the latest answer at once, then every later
+// one, and shares its result. Never throws.
+export function stopHandyAfterCrash(key, { onUpdate } = {}) {
+    const trimmed = typeof key === 'string' ? key.trim() : '';
+    if (!trimmed) {
+        return settledCrashStop({ outcome: RECOVERY_STOP.FAILED, detail: 'no connection key', final: true }, onUpdate);
+    }
+    // A new stop for the key answers for it from here on, and whoever heard
+    // an earlier one give up is told when this one settles it.
+    const gaveUp = givenUpCrashStops.get(trimmed) || null;
+    givenUpCrashStops.delete(trimmed);
+    // Already the live link: its own verified stops answer for the device,
+    // once it no longer vouches for it being stopped (see the rules above).
+    if (handyConnected && handyKey === trimmed) {
+        handyMotionUnknown = true;
+        noteMayHaveStarted(trimmed);
+        return settledCrashStop({ outcome: RECOVERY_STOP.LINKED, detail: '', final: true }, onUpdate);
+    }
+    const existing = crashStops.get(trimmed);
+    if (existing) {
+        if (typeof onUpdate === 'function') {
+            existing.listeners.push(onUpdate);
+            if (existing.last) {
+                try { onUpdate(existing.last); } catch (e) {}
+            }
+        }
+        return existing.done;
+    }
+    let resolve;
+    const done = new Promise((r) => { resolve = r; });
+    const job = {
+        key: trimmed,
+        active: true,
+        // A Connect already verifying this key owns the device until it is
+        // over: the job waits for it rather than racing its first start.
+        held: verifyingKeys.has(trimmed),
+        rounds: 0,
+        startedAt: Date.now(),
+        timer: null,
+        inFlight: null,
+        last: null,
+        listeners: typeof onUpdate === 'function' ? [onUpdate] : [],
+        settleListeners: gaveUp ? gaveUp.listeners.concat(gaveUp.settleListeners) : [],
+        resolve,
+        done
+    };
+    crashStops.set(trimmed, job);
+    if (!job.held) runCrashStopRound(job);
+    return done;
+}
+
+// Connect is about to verify `key`: no further crash-stop attempt goes out,
+// and one already on the wire is waited for. Returns the job, or null.
+async function holdCrashStop(key) {
+    const job = crashStops.get(key);
+    if (!job || !job.active) return null;
+    job.held = true;
+    if (job.timer) { clearTimeout(job.timer); job.timer = null; }
+    if (job.inFlight) await job.inFlight;
+    return job;
+}
+
+// A Connect is over. A verified link ends the job - connectHandy's own stop
+// has just been confirmed for this very device - and a failed one hands the
+// device back to it for its next round, unless another Connect is still
+// verifying the same key: that one hands it back when it is over.
+function releaseCrashStop(job, linked) {
+    if (!job || !job.active) return;
+    if (linked) {
+        endCrashStop(job, { outcome: RECOVERY_STOP.CONNECTED, detail: '', final: true });
+        return;
+    }
+    if (verifyingKeys.has(job.key)) return;
+    job.held = false;
+    // A job that has not sent anything yet does not wait a round for it.
+    if (job.rounds === 0) runCrashStopRound(job);
+    else scheduleCrashStopRound(job);
+}
+
+// Drops every crash-stop job without sending anything more. Tests only.
+export function resetHandyCrashStopsForTests() {
+    for (const job of Array.from(crashStops.values())) {
+        job.active = false;
+        if (job.timer) { clearTimeout(job.timer); job.timer = null; }
+        job.resolve(job.last || { outcome: RECOVERY_STOP.FAILED, detail: 'reset', final: true });
+    }
+    crashStops.clear();
+    givenUpCrashStops.clear();
+}
+
 // The v2 spec has no battery endpoint. GET /info is the only place a level
 // could appear; returns null when it does not.
 export async function queryHandyBattery(key = handyKey) {
@@ -1325,9 +1679,12 @@ export async function queryHandyBattery(key = handyKey) {
     }
 }
 
-// Test hook: forget what each device is owed and what is on its way to it.
-// Both outlive a disconnect on purpose, so one test's unanswered stop would
-// otherwise decide what the next test reads.
+// Test hook: forget what each device is owed and what is on its way to it,
+// and the last error the page was shown. All of them outlive a disconnect
+// on purpose, so one test's unanswered stop would otherwise decide what the
+// next test reads - its error included, which the next Connect's own
+// verification then reported as recovered (onError(null)).
 export function resetHandyRestForTests() {
     deviceMotion.clear();
+    lastReportedError = null;
 }

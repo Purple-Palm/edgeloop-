@@ -8,6 +8,8 @@ import {
     dispatchHandy,
     stopHandy,
     stopHandyOnUnload,
+    stopHandyAfterCrash,
+    resetHandyCrashStopsForTests,
     pollHandyConnected,
     handyPollTick,
     queryHandyBattery,
@@ -19,6 +21,7 @@ import {
     handyRestState,
     handyStopTally,
     resetHandyRestForTests,
+    handyMayBeMoving,
     handyConnected
 } from './handy.js';
 import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed, applyEndMargin, normalizeSlideRange } from './handy-protocol.js';
@@ -146,6 +149,8 @@ describe('handy driver', () => {
         // driven tick by tick through handyPollTick() instead.
         HANDY_TIMINGS.pollMs = SHIPPED_POLL.pollMs;
         HANDY_TIMINGS.idlePollMs = SHIPPED_POLL.idlePollMs;
+        // Longer than any test runs, unless a test sets its own.
+        HANDY_TIMINGS.crashStopWindowMs = 60000;
         // What the last test left on its way, or in doubt, is not this one's.
         resetHandyRestForTests();
         installFetch();
@@ -161,6 +166,7 @@ describe('handy driver', () => {
 
     afterEach(async () => {
         routes = {};
+        resetHandyCrashStopsForTests();
         disconnectHandy();
         await tick(0);
     });
@@ -1329,6 +1335,43 @@ describe('handy driver', () => {
         await tick(5);
         assert.equal(sent('/hamp/stop').length, 1);
         assert.equal(isHandyMotionUnknown(), false);
+    });
+
+    // What another page is told through the crash-recovery marker: while
+    // this holds, the Handy is this driver's to stop, and it does so on every
+    // way out; once a stop is confirmed, a stop from elsewhere takes nothing.
+    it('may be moving from the moment a start is sent until a stop is confirmed, and whenever it cannot tell', async () => {
+        assert.equal(handyMayBeMoving(), false, 'no link');
+        await connectOk();
+        assert.equal(handyMayBeMoving(), false, 'Connect confirmed a stop');
+        let releaseStart = null;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        assert.equal(handyMayBeMoving(), true, 'a start is on its way as soon as the dispatch returns');
+        await until(() => releaseStart !== null, 'the start going out');
+        releaseStart();
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        assert.equal(handyMayBeMoving(), true);
+        let releaseStop = null;
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => { releaseStop = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => releaseStop !== null, 'the stop going out');
+        assert.equal(handyMayBeMoving(), true, 'a stop the API has not confirmed yet');
+        releaseStop();
+        await tick(5);
+        assert.equal(handyMayBeMoving(), false, 'the stop is confirmed');
+        // A start that timed out may still have reached the device.
+        HANDY_TIMINGS.requestTimeoutMs = 40;
+        routes['PUT /hamp/stop'] = undefined;
+        routes['PUT /hamp/start'] = () => new Promise(() => {});
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(70);
+        assert.equal(isHandyMoving(), false);
+        assert.equal(handyMayBeMoving(), true);
+        // Without a link nothing is driven through it, whatever the device does.
+        disconnectHandy();
+        assert.equal(handyMayBeMoving(), false);
     });
 
     it('a success on another path does not clear a velocity error', async () => {
@@ -3637,5 +3680,450 @@ describe('handy driver', () => {
         // That the runs reached the warning at all, not a count to tune: the
         // interleavings shift with how busy the machine is.
         assert.ok(checks > 40, `the warning stood at only ${checks} checks`);
+    });
+
+    // ---- crash recovery: the stop for a device an earlier page left driving ------------
+
+    const OFFLINE_REPLY = { error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected', connected: false } };
+    // The rounds run on unref'd timers, which never keep a node:test process
+    // alive: a test that needs a later round waits for it on a timer of its own.
+    const nextRound = () => tick(HANDY_TIMINGS.offlineStopRetryMs + 40);
+
+    it('the crash stop sends PUT /hamp/stop with the given key and nothing else', async () => {
+        const updates = [];
+        const final = await stopHandyAfterCrash(` ${KEY} `, { onUpdate: (u) => updates.push(u) });
+        // No /connected, no PUT /mode, no /info: the API needs none of them
+        // before a stop, and a mode switch could only disturb another app.
+        assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), ['PUT /hamp/stop']);
+        assert.equal(calls[0].key, KEY);
+        assert.equal(calls[0].body, undefined);
+        assert.deepEqual(final, { outcome: 'stopped', detail: 'result 0', final: true });
+        assert.deepEqual(updates, [final]);
+        // Nothing was connected, and nothing was reported to app.js.
+        assert.equal(handyConnected, false);
+        assert.equal(getHandyKey(), '');
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('an idle Handy answers that it was already stopped, and that settles it', async () => {
+        routes['PUT /hamp/stop'] = jsonResponse({ result: 1 });
+        const final = await stopHandyAfterCrash(KEY);
+        assert.deepEqual(final, { outcome: 'already-stopped', detail: 'result 1', final: true });
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 1, 'nothing more is sent');
+    });
+
+    it('a Handy in another mode ends it at once: no HAMP motion runs there', async () => {
+        routes['PUT /hamp/stop'] = jsonResponse({ error: { code: 2002, name: 'MethodNotFound', message: 'No such method', connected: true } });
+        const final = await stopHandyAfterCrash(KEY);
+        assert.equal(final.outcome, 'not-hamp');
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 1, 'nothing more is sent');
+        assert.equal(sent('/mode').length, 0, 'and the mode is never touched');
+    });
+
+    it('retries an attempt that got no answer inside the round, and reports the answer once', async () => {
+        let attempts = 0;
+        routes['PUT /hamp/stop'] = () => {
+            attempts += 1;
+            if (attempts < 3) throw new TypeError('Failed to fetch');
+            return jsonResponse({ result: 0 });
+        };
+        const updates = [];
+        const final = await stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        assert.equal(attempts, 3);
+        assert.equal(final.outcome, 'stopped');
+        assert.deepEqual(updates, [final], 'the wearer is told the answer, not every attempt');
+        assert.deepEqual(errors, [], "nothing reaches the live link's error line");
+    });
+
+    it('keeps sending the stop to an offline Handy and says so when it gets through', async () => {
+        let online = false;
+        routes['PUT /hamp/stop'] = () => (online ? jsonResponse({ result: 0 }) : jsonResponse(OFFLINE_REPLY));
+        const updates = [];
+        const done = stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        await tick(20);
+        assert.equal(sent('/hamp/stop').length, 1, 'an offline answer is not asked again inside the round');
+        assert.deepEqual(updates, [{ outcome: 'offline', detail: 'Device not connected', final: false }]);
+        await tick(HANDY_TIMINGS.offlineStopRetryMs + 20);
+        // At least: on a machine short of CPU the wait can outlast one more round.
+        assert.ok(sent('/hamp/stop').length >= 2, 'a fresh round went out');
+        assert.equal(updates.length, 1, 'the same answer again is not news');
+        online = true;
+        await nextRound();
+        const final = await done;
+        assert.deepEqual(final, { outcome: 'stopped', detail: 'result 0', final: true });
+        assert.deepEqual(updates[updates.length - 1], final);
+        assert.ok(sent('/hamp/stop').every((c) => c.key === KEY));
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('gives up once its window is over, and the last update says so', async () => {
+        // Rounds 200 ms apart in a 300 ms window: the second round starts
+        // inside it, a third would not.
+        HANDY_TIMINGS.offlineStopRetryMs = 200;
+        HANDY_TIMINGS.crashStopWindowMs = 300;
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const updates = [];
+        const done = stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        await nextRound();
+        // Bounded: a job that never gives up must fail here, not hang.
+        const final = await Promise.race([done, tick(1000).then(() => 'still sending')]);
+        assert.deepEqual(final, { outcome: 'offline', detail: 'Device not connected', final: true });
+        assert.deepEqual(updates.map((u) => u.final), [false, true]);
+        assert.equal(sent('/hamp/stop').length, 2);
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 2, 'nothing after giving up');
+    });
+
+    it('a Handy API that never answers cannot stretch the window the wearer was told', async () => {
+        // Every attempt waits out the request timeout, so one round of four
+        // lasts longer than the whole window here - as sixty rounds of four
+        // timed-out attempts would last half an hour against five minutes.
+        HANDY_TIMINGS.requestTimeoutMs = 30;
+        HANDY_TIMINGS.crashStopWindowMs = 150;
+        routes['PUT /hamp/stop'] = () => new Promise(() => {});
+        const updates = [];
+        const done = stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        const final = await Promise.race([done, tick(1000).then(() => 'still sending')]);
+        assert.deepEqual(final, { outcome: 'failed', detail: 'the request timed out', final: true });
+        assert.deepEqual(updates, [final], 'it gave up after the round that ran past the window');
+        assert.equal(sent('/hamp/stop').length, 4, 'one full round of attempts, each timed out');
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 4, 'and no round after it');
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('never touches the live link, not even while its own stops fail', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        // No second round: the window closes with the first.
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        routes['PUT /hamp/stop'] = ({ key }) => (key === 'dead-key'
+            ? jsonResponse({ error: { code: 3000, name: 'HampError', message: 'HampError', connected: true } })
+            : jsonResponse({ result: 0 }));
+        const final = await stopHandyAfterCrash('dead-key');
+        assert.deepEqual(final, { outcome: 'failed', detail: 'HampError', final: true });
+        assert.equal(sent('/hamp/stop').filter((c) => c.key === 'dead-key').length, 4, 'one full verified-stop round');
+        assert.equal(sent('/hamp/stop').filter((c) => c.key === KEY).length, 0, 'the live device was not stopped');
+        // A HAMP refusal of this stop is not the live device's news either.
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+        assert.equal(handyConnected, true);
+        assert.equal(getHandyKey(), KEY);
+        assert.equal(isHandyMoving(), true);
+    });
+
+    // One record of whether a device has confirmed its stop (deviceMotion):
+    // a crash stop the API confirms is entered there like any other.
+    it('a crash stop the API confirms settles a stop this page still owed that very Handy', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        routes['PUT /hamp/stop'] = jsonResponse(DEVICE_TIMEOUT);
+        assert.equal(await disconnectHandy(), false);
+        assert.deepEqual(unconfirmedKeys, [KEY], 'the page was told it may still be moving');
+        assert.equal(handyRestState(), 'unconfirmed');
+        routes['PUT /hamp/stop'] = jsonResponse({ result: 0 });
+        const final = await stopHandyAfterCrash(KEY);
+        assert.deepEqual(final, { outcome: 'stopped', detail: 'result 0', final: true });
+        assert.deepEqual(confirmedKeys, [KEY], 'and is told that very Handy confirmed a stop');
+        assert.equal(handyRestState(), 'none');
+        // A crash stop that settles nothing puts nothing in doubt here: the
+        // job says so itself, on the crash report.
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        assert.equal((await stopHandyAfterCrash('dead-key')).outcome, 'offline');
+        assert.equal(handyRestState(), 'none');
+        assert.deepEqual(unconfirmedKeys, [KEY]);
+    });
+
+    it('a stop already on its way when the crash stop finds the key linked settles nothing it raised', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        let releaseStop = null;
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => { releaseStop = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await until(() => releaseStop !== null, 'the stop going out');
+        // The dead page may have moved it after that stop left.
+        assert.deepEqual(await stopHandyAfterCrash(KEY), { outcome: 'linked', detail: '', final: true });
+        routes['PUT /hamp/stop'] = undefined;
+        releaseStop();
+        await tick(5);
+        assert.equal(isHandyMoving(), false);
+        assert.equal(handyMayBeMoving(), true, 'only a stop sent after it can vouch for the device');
+        assert.equal(isHandyMotionUnknown(), true);
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await until(() => !handyMayBeMoving(), 'the stop sent after it');
+        assert.equal(sent('/hamp/stop').length, 2, 'a fresh verified stop went out through the link');
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('a key that is already the live link is sent nothing, and its driver no longer vouches for it being stopped', async () => {
+        await connectOk();
+        assert.equal(handyMayBeMoving(), false, 'Connect confirmed a stop');
+        const final = await stopHandyAfterCrash(KEY);
+        assert.deepEqual(final, { outcome: 'linked', detail: '', final: true });
+        assert.equal(calls.length, 0, "no stop behind the live link's back");
+        assert.equal(isHandyMotionUnknown(), true);
+        assert.equal(handyMayBeMoving(), true);
+        // A session that does not drive it - its role switched off, or a
+        // zero-speed beat - used to send it nothing: the driver believed it
+        // stopped. Now its next zero dispatch stops it through the link.
+        dispatchHandy(0, 0, 100, false, 0, 100);
+        await tick(5);
+        assert.deepEqual(calls.map((c) => `${c.method} ${c.path} ${c.key}`), [`PUT /hamp/stop ${KEY}`]);
+        assert.equal(handyMayBeMoving(), false);
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('a session that drives the live link starts it as ever, and that start answers for it', async () => {
+        await connectOk();
+        await stopHandyAfterCrash(KEY);
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+        assert.equal(sent('/hamp/stop').length, 0, 'no stop ahead of the start');
+        assert.equal(isHandyMoving(), true);
+        assert.equal(isHandyMotionUnknown(), false);
+    });
+
+    it('one job per key, and no key means no request', async () => {
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const a = stopHandyAfterCrash(KEY);
+        const b = stopHandyAfterCrash(KEY);
+        await tick(20);
+        assert.equal(sent('/hamp/stop').length, 1);
+        routes['PUT /hamp/stop'] = undefined;
+        await nextRound();
+        const [fa, fb] = await Promise.all([a, b]);
+        assert.equal(fa, fb);
+        assert.equal(fa.outcome, 'stopped');
+        calls = [];
+        const none = await stopHandyAfterCrash('   ');
+        assert.equal(none.outcome, 'failed');
+        assert.equal(calls.length, 0);
+    });
+
+    it('Connect for the same key waits for the stop on the wire, then takes over', async () => {
+        let releaseStop = null;
+        let first = true;
+        routes['PUT /hamp/stop'] = () => {
+            if (!first) return jsonResponse({ result: 0 });
+            first = false;
+            return new Promise((resolve) => { releaseStop = () => resolve(jsonResponse(null, 503)); });
+        };
+        routes['/connected'] = jsonResponse({ connected: true });
+        routes['/info'] = jsonResponse({ fwVersion: '3.2.3' });
+        const updates = [];
+        const done = stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        await tick(5);
+        const connecting = connectHandy(KEY);
+        await tick(20);
+        // Were it sent now, the crash stop could land after this link's first
+        // /hamp/start and stop the new session behind the driver's back.
+        assert.equal(sent('/connected').length, 0, 'Connect waits for the crash stop on the wire');
+        releaseStop();
+        await connecting;
+        const final = await done;
+        assert.deepEqual(final, { outcome: 'connected', detail: '', final: true });
+        assert.deepEqual(updates, [final], 'the unanswered attempt Connect waited for is not reported');
+        assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), [
+            'PUT /hamp/stop', 'GET /connected', 'PUT /mode', 'PUT /hamp/stop', 'GET /info'
+        ]);
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 2, 'no crash stop after the link took over');
+        assert.equal(isHandyMoving(), true);
+    });
+
+    it('an answer that settles it while Connect waits is the one reported', async () => {
+        let releaseStop = null;
+        let first = true;
+        routes['PUT /hamp/stop'] = () => {
+            if (!first) return jsonResponse({ result: 1 });
+            first = false;
+            return new Promise((resolve) => { releaseStop = () => resolve(jsonResponse({ result: 0 })); });
+        };
+        routes['/connected'] = jsonResponse({ connected: true });
+        const done = stopHandyAfterCrash(KEY);
+        await tick(5);
+        const connecting = connectHandy(KEY);
+        await tick(5);
+        releaseStop();
+        assert.deepEqual(await done, { outcome: 'stopped', detail: 'result 0', final: true });
+        await connecting;
+        assert.equal(handyConnected, true);
+    });
+
+    it('a Connect that fails hands the device back to the crash stop', async () => {
+        let online = false;
+        routes['PUT /hamp/stop'] = () => (online ? jsonResponse({ result: 0 }) : jsonResponse(OFFLINE_REPLY));
+        routes['/connected'] = jsonResponse({ connected: false });
+        const done = stopHandyAfterCrash(KEY);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
+        await assert.rejects(connectHandy(KEY), /offline/i);
+        online = true;
+        await nextRound();
+        const final = await done;
+        assert.deepEqual(final, { outcome: 'stopped', detail: 'result 0', final: true });
+        assert.equal(sent('/hamp/stop').length, 2, 'the crash stop carried on after the failed Connect');
+        assert.equal(handyConnected, false);
+    });
+
+    it('a crash stop asked for while Connect verifies the same key waits for that Connect', async () => {
+        let releaseConnected = null;
+        routes['/connected'] = () => new Promise((resolve) => { releaseConnected = () => resolve(jsonResponse({ connected: true })); });
+        routes['/info'] = jsonResponse({ fwVersion: '3.2.3' });
+        const connecting = connectHandy(KEY);
+        await tick(5);
+        const done = stopHandyAfterCrash(KEY);
+        await tick(20);
+        assert.equal(sent('/hamp/stop').length, 0, 'nothing may race the Connect that owns the device');
+        releaseConnected();
+        await connecting;
+        assert.deepEqual(await done, { outcome: 'connected', detail: '', final: true });
+        assert.equal(sent('/hamp/stop').length, 1, "only the Connect's own verified stop");
+        await nextRound();
+        assert.equal(sent('/hamp/stop').length, 1);
+    });
+
+    it('and when that Connect fails, the crash stop goes out at once', async () => {
+        let releaseConnected = null;
+        routes['/connected'] = () => new Promise((resolve) => { releaseConnected = () => resolve(jsonResponse({ connected: false })); });
+        const connecting = connectHandy(KEY);
+        await tick(5);
+        const done = stopHandyAfterCrash(KEY);
+        await tick(5);
+        releaseConnected();
+        await assert.rejects(connecting, /offline/i);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1, 'no round of waiting for a job that never sent');
+        assert.deepEqual(await done, { outcome: 'stopped', detail: 'result 0', final: true });
+    });
+
+    it('Connect with another key leaves the crash stop to its own device', async () => {
+        // Rounds 200 ms apart in a 500 ms window: three rounds.
+        HANDY_TIMINGS.offlineStopRetryMs = 200;
+        HANDY_TIMINGS.crashStopWindowMs = 500;
+        routes['PUT /hamp/stop'] = ({ key }) => (key === 'dead-key' ? jsonResponse(OFFLINE_REPLY) : jsonResponse({ result: 0 }));
+        const done = stopHandyAfterCrash('dead-key');
+        await tick(5);
+        await connectOk();
+        await nextRound();
+        await nextRound();
+        const final = await Promise.race([done, tick(1000).then(() => 'still sending')]);
+        assert.deepEqual(final, { outcome: 'offline', detail: 'Device not connected', final: true });
+        assert.equal(sent('/hamp/stop').filter((c) => c.key === 'dead-key').length, 2, 'its remaining rounds went out');
+        assert.equal(handyConnected, true);
+        assert.equal(getHandyKey(), KEY);
+        assert.deepEqual([errors, offline, unconfirmed, notices], [[], [], [], []]);
+    });
+
+    it('a crash stop that gave up is told, once, when Connect with its key confirms a stop later', async () => {
+        // No second round: the window closes with the first.
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const updates = [];
+        const final = await stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        assert.deepEqual(final, { outcome: 'offline', detail: 'Device not connected', final: true });
+        // The Handy is back, and the wearer connects it on the same page.
+        routes['PUT /hamp/stop'] = undefined;
+        await connectOk();
+        assert.deepEqual(updates, [final, { outcome: 'connected', detail: '', final: true }]);
+        disconnectHandy();
+        await connectOk();
+        assert.equal(updates.length, 2, 'a later Connect is not news');
+    });
+
+    it('a failed Connect, or one with another key, tells a crash stop that gave up nothing', async () => {
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        routes['PUT /hamp/stop'] = ({ key }) => (key === 'dead-key' ? jsonResponse(OFFLINE_REPLY) : jsonResponse({ result: 0 }));
+        const updates = [];
+        await stopHandyAfterCrash('dead-key', { onUpdate: (u) => updates.push(u) });
+        routes['/connected'] = jsonResponse({ connected: false });
+        await assert.rejects(connectHandy('dead-key'), /offline/i);
+        await connectOk();
+        assert.equal(getHandyKey(), KEY);
+        assert.equal(updates.length, 1);
+        assert.equal(updates[0].outcome, 'offline');
+    });
+
+    it('a crash stop that settled is not told about a later Connect', async () => {
+        const updates = [];
+        await stopHandyAfterCrash(KEY, { onUpdate: (u) => updates.push(u) });
+        await connectOk();
+        assert.deepEqual(updates, [{ outcome: 'stopped', detail: 'result 0', final: true }]);
+    });
+
+    it('a new crash stop for the key answers for it, and whoever heard the one before it give up is told when it settles', async () => {
+        // A page's boot recovery gave up on the Handy and promised the next
+        // page to open another stop; a session started in that page then
+        // sends it a stop of its own. The first report must not keep that
+        // promise standing once the device has answered.
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const before = [];
+        await stopHandyAfterCrash(KEY, { onUpdate: (u) => before.push(u) });
+        HANDY_TIMINGS.crashStopWindowMs = 60000;
+        const now = [];
+        const done = stopHandyAfterCrash(KEY, { onUpdate: (u) => now.push(u) });
+        await until(() => now.length === 1, 'the first round answered');
+        routes['PUT /hamp/stop'] = undefined;
+        await connectOk();
+        assert.deepEqual(await done, { outcome: 'connected', detail: '', final: true });
+        assert.deepEqual(now.map((u) => u.outcome), ['offline', 'connected']);
+        assert.deepEqual(before.map((u) => [u.outcome, u.final]), [['offline', true], ['connected', true]]);
+        disconnectHandy();
+        await connectOk();
+        assert.equal(now.length, 2, 'a later Connect is not news');
+    });
+
+    it('whoever heard a stop give up is not told a later stop giving up too, only what settles it', async () => {
+        // A give-up is not news alone to crash-recovery.js: it notes, or
+        // ends, the promise of another try. Told twice, it would renew a
+        // promise that the later stop's page may be the try of.
+        HANDY_TIMINGS.crashStopWindowMs = 0;
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const first = [];
+        await stopHandyAfterCrash(KEY, { onUpdate: (u) => first.push(u) });
+        const second = [];
+        await stopHandyAfterCrash(KEY, { onUpdate: (u) => second.push(u) });
+        assert.equal(first.length, 1, 'not told the second give-up');
+        assert.deepEqual(second.map((u) => [u.outcome, u.final]), [['offline', true]]);
+        // A third stop gets through: everyone who heard a give-up hears it.
+        routes['PUT /hamp/stop'] = jsonResponse({ result: 1 });
+        const third = [];
+        await stopHandyAfterCrash(KEY, { onUpdate: (u) => third.push(u) });
+        const settled = { outcome: 'already-stopped', detail: 'result 1', final: true };
+        assert.deepEqual(third, [settled]);
+        assert.deepEqual(first[first.length - 1], settled);
+        assert.deepEqual(second[second.length - 1], settled);
+        assert.equal(first.length, 2);
+        assert.equal(second.length, 2);
+    });
+
+    it('a second stop for a key already being stopped joins that job: one request at a time, every answer to both', async () => {
+        routes['PUT /hamp/stop'] = jsonResponse(OFFLINE_REPLY);
+        const first = [];
+        const a = stopHandyAfterCrash(KEY, { onUpdate: (u) => first.push(u) });
+        await until(() => first.length === 1, 'the first round answered');
+        assert.deepEqual(first.map((u) => [u.outcome, u.final]), [['offline', false]]);
+        const second = [];
+        const sentBefore = sent('/hamp/stop').length;
+        const b = stopHandyAfterCrash(KEY, { onUpdate: (u) => second.push(u) });
+        assert.deepEqual(second, first, 'told the latest answer at once');
+        assert.equal(sent('/hamp/stop').length, sentBefore, 'joining sends nothing of its own');
+        routes['PUT /hamp/stop'] = undefined;
+        await nextRound();
+        const [fa, fb] = await Promise.all([a, b]);
+        assert.equal(fa, fb);
+        assert.deepEqual(fa, { outcome: 'stopped', detail: 'result 0', final: true });
+        assert.deepEqual(first[first.length - 1], fa);
+        assert.deepEqual(second[second.length - 1], fa);
+        assert.ok(sent('/hamp/stop').every((c) => c.key === KEY));
     });
 });

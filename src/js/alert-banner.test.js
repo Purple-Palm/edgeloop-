@@ -774,7 +774,7 @@ describe('app.js routes every banner write through the ranking', () => {
             assert.ok(m, `a report without a source of its own: showAlertBanner(${args.slice(0, 80)}...)`);
             note(m[1], args);
         }
-        for (const expected of ['hrSignal', 'hrMonitor', 'handyLink', 'handyStop', 'intiface', 'tcode', 'supervision', 'remote', 'mic', 'peerVersion', 'voice', 'voice-choice']) {
+        for (const expected of ['hrSignal', 'hrMonitor', 'handyLink', 'handyStop', 'intiface', 'tcode', 'supervision', 'remote', 'mic', 'peerVersion', 'voice', 'voice-choice', 'crashRecovery']) {
             assert.ok(sources.has(expected), `no report found for ${expected}`);
         }
         for (const [source, where] of sources) {
@@ -822,6 +822,20 @@ describe('app.js routes every banner write through the ranking', () => {
         assert.ok(within('function settleDrivenHandyStop').includes('handyStopReport.sessionDrives({ connected: handyConnected, key: getHandyKey(), role: state.handyRole })'));
         // A role given while the session runs drives the Handy from there.
         assert.match(within('const applyRole = (role) =>', '\n    };'), /if \(state\.sessionStatus === 'RUNNING' \|\| state\.sessionStatus === 'RAMPDOWN'\) settleDrivenHandyStop\(\);/);
+
+        // The report of a session that did not end cleanly: the recovery
+        // hands over an empty text once its cause is over - no Handy it names
+        // may still be moving and a session has started or resumed since
+        // (crash-recovery.js, carryOn) - and that withdraws it. A stop that
+        // settled rewords it; news that a Handy may still be moving raises it.
+        // It is about the toys a dead page left, and pauses nothing here.
+        const crash = within('function showCrashReport');
+        const withdrawn = crash.indexOf("hideAlertBanner('crashRecovery')");
+        assert.ok(withdrawn >= 0 && withdrawn < crash.indexOf('showAlertBanner('), 'an empty report withdraws it');
+        assert.ok(crash.includes("if (fresh) showAlertBanner(text, { severity: 'safety', source: 'crashRecovery' });"));
+        assert.ok(crash.includes("else reviseAlertBanner(text, { severity: 'safety', source: 'crashRecovery' });"));
+        assert.ok(!crash.includes('triggerDisconnectAlert(') && !crash.includes('pauseSession('), 'it pauses nothing');
+        assert.ok(src.includes('onReport: showCrashReport,'), 'the recovery reports through it');
     });
 
     it('the line a refused START leaves is withdrawn by every event that ends it', () => {

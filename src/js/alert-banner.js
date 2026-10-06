@@ -3,13 +3,14 @@
  *
  * Every safety report in the app lands in the same `#disconnectBanner`:
  * heart-rate signal loss, a disconnected monitor, an offline Handy, a remote
- * link that died, a page the browser stopped running, and the worst of them,
- * "the Handy did not confirm a stop and may still be moving". Advisories
- * land there too: the microphone, the voice, and the notice that the
- * partner's page runs another version. With no rank, whichever fired LAST
- * won and the earlier text was gone without trace, so a microphone taken by
- * another app a second later could erase the only warning that a machine
- * attached to the wearer might still be running.
+ * link that died, a page the browser stopped running, a session that did not
+ * end cleanly and what was done about the toys it left (crash-recovery.js),
+ * and the worst of them, "the Handy did not confirm a stop and may still be
+ * moving". Advisories land there too: the microphone, the voice, and the
+ * notice that the partner's page runs another version. With no rank,
+ * whichever fired LAST won and the earlier text was gone without trace, so a
+ * microphone taken by another app a second later could erase the only
+ * warning that a machine attached to the wearer might still be running.
  *
  * Three rules:
  *  - a lower-priority notice never overwrites a higher-priority one; it is

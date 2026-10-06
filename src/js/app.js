@@ -78,7 +78,30 @@ import {
 } from './supervision.js';
 import { createScreenWakeLock } from './screen-wake-lock.js';
 import { createTickDispatch, guardEngagedBy } from './tick-dispatch.js';
-import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected, getHandyKey, handyRestState, handyStopTally } from './hardware/handy.js';
+import {
+    HANDY_TIMINGS,
+    connectHandy,
+    disconnectHandy,
+    dispatchHandy,
+    stopHandyOnUnload,
+    stopHandyAfterCrash,
+    handyConnected,
+    setHandyHandlers,
+    pollHandyConnected,
+    getHandyKey,
+    handyMayBeMoving,
+    handyRestState,
+    handyStopTally
+} from './hardware/handy.js';
+import {
+    newPageId,
+    createCrashRecovery,
+    createCrashRecoveryStorage,
+    whenActivated,
+    clearPendingCrashStop,
+    drivesHandyNow
+} from './crash-recovery.js';
+import { openDurableStore } from './durable-store.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
@@ -342,6 +365,87 @@ if (isRemotePage) {
     const hrTag = document.getElementById('hrWarningTag');
     if (hrTag) hrTag.textContent = "WEARER TELEMETRY";
 }
+
+// The crash report (crash-recovery.js) is a source of its own on the alert
+// banner, 'crashRecovery'. It is about a Handy of a session that is over,
+// and it keeps changing for minutes - every answer the retried stop gets -
+// while the wearer may already be running a new session with another Handy.
+// No report takes another source's sentence off the banner (alert-banner.js),
+// so a late "it has stopped" about the old Handy cannot erase the warning
+// that the Handy connected now may still be moving, and no report of the new
+// session can erase the warning that the old one may be. It pauses nothing
+// and says nothing about a pause. An answer that settles nothing - the first
+// word of a report, a stop the device did not answer, one that gave up - is
+// a new report, read first among the safety reports and back after a
+// Dismiss. A stop that settled rewords it where it stands, and a report the
+// wearer dismissed stays dismissed. The same text again is not news. And it
+// leaves when its cause is over (createCrashRecovery): once no Handy it
+// names may still be moving and the wearer has carried on from it, by
+// starting or resuming a session; then the text it is given is empty.
+let crashReportText = '';
+function showCrashReport(text, { fresh = true } = {}) {
+    if (!text) {
+        crashReportText = '';
+        hideAlertBanner('crashRecovery');
+        return;
+    }
+    if (text === crashReportText) return;
+    crashReportText = text;
+    if (fresh) showAlertBanner(text, { severity: 'safety', source: 'crashRecovery' });
+    else reviseAlertBanner(text, { severity: 'safety', source: 'crashRecovery' });
+}
+
+// Crash recovery (crash-recovery.js). While this page's session may drive
+// hardware it keeps a marker of its own in storage, named by this page's
+// id. A page that crashes, is force-quit or is killed by the phone leaves
+// its marker behind, and the next host page to open sends The Handy a stop -
+// with the key the marker names and the key saved here - and says on the
+// banner that the session did not end cleanly and what the stop returned.
+// So does a page that was already open, when a session starts in it: the
+// wearer may carry on there, next to the Handy the dead page left moving. A
+// stop that does not get through is sent again by the next host page to
+// open, whatever sessions run in between. Nothing is connected, started or
+// changed. The boot pass starts here, before the rest of boot, so nothing
+// that fails further down can keep the stop from going out - but not before
+// the wearer has opened the page: a page Chrome prerenders (from the address
+// bar, as a URL it predicts is typed) runs this module hidden, where it
+// could not tell a session running in another tab from a crash
+// (whenActivated). A marker whose page was still open at boot is looked at
+// once more a few seconds later: it may be the page this one replaced in its
+// own tab, not yet torn down. The keys are read when a pass runs, not when
+// this module loads: a prerendered page may be opened minutes later, with
+// another key saved. A remote page drives no hardware and never touches the
+// markers or the stops still owed: they belong to the host.
+// The markers and the stops still owed are kept in localStorage and, change
+// by change, committed to IndexedDB as well (durable-store.js): Chromium
+// writes localStorage to disk a minute or more late, so a browser force-quit
+// or killed by the phone took a marker written at START, or kept one
+// removed at STOP, and the next page to open stopped nothing, or reported a
+// crash that had not happened.
+function browserStore(name) {
+    try {
+        return window[name] || null;
+    } catch (e) {
+        // Site data blocked for this site.
+        return null;
+    }
+}
+const crashStorage = isRemotePage ? null : createCrashRecoveryStorage({
+    local: browserStore('localStorage'),
+    durable: openDurableStore({ indexedDB: browserStore('indexedDB') })
+});
+const crashRecovery = isRemotePage ? null : createCrashRecovery({
+    owner: newPageId(),
+    storage: crashStorage,
+    locks: navigator.locks,
+    savedHandyKey: () => safeGet('handy_connection_key', '') || '',
+    liveHandyKey: () => (handyConnected ? getHandyKey() : ''),
+    stopHandy: stopHandyAfterCrash,
+    retryMinutes: HANDY_TIMINGS.crashStopWindowMs / 60000,
+    onReport: showCrashReport,
+    onDurable: () => { resumeHeldDispatch(); }
+});
+if (crashRecovery) whenActivated(document, () => { crashRecovery.atBoot(); });
 
 // Master DOM Elements
 const playPauseBtn = document.getElementById('sessionPlayPauseBtn');
@@ -1266,11 +1370,54 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
 // was decided, and never first the speed it overrules.
 const tickDispatch = createTickDispatch();
 
+// What a live session is driving right now, for its crash-recovery marker.
+// Called before every dispatch, and whenever a toy joins mid-session: a role
+// change or a Test press can move an Intiface or T-Code axis before the
+// next engine tick does, and the marker must name the toy by then. Called
+// after every dispatch as well, and when the page is frozen, so that every
+// other page knows at once whether this session drives its Handy right now,
+// a start the dispatch has just sent included: a page recovering a crash
+// leaves a Handy to this one only while it does (drivesHandyNow). That is a
+// Web Lock, never a storage write: the marker is written when a session
+// starts or a toy joins it, not at the starts and stops of the Handy
+// (crash-recovery.js). The first call of a session also recovers any page
+// that died while this one was open (createCrashRecovery): the wearer may be
+// carrying on here next to the Handy that page left moving.
+let liveSessionUnsaved = false;
+// Set from 'freeze' to 'resume': a frozen page runs nothing, so it drives
+// nothing, whatever its driver last believed.
+let pageFrozen = false;
+function noteLiveHardware() {
+    if (!crashRecovery || state.sessionStatus === 'IDLE') return;
+    const handyKey = handyConnected ? getHandyKey() : '';
+    const current = crashRecovery.note({
+        handyKey,
+        driving: drivesHandyNow({ sessionStatus: state.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving(), frozen: pageFrozen }),
+        intiface: isIntifaceConnected() && intifaceDevices.size > 0,
+        tcode: isTCodeConnected()
+    });
+    if (!current && !liveSessionUnsaved) {
+        liveSessionUnsaved = true;
+        console.warn('The crash-recovery marker is not in localStorage (storage full or unavailable): only its IndexedDB copy, if it has one, can tell the next page to stop The Handy if this page dies mid-session.');
+    }
+}
+
+// Set while a dispatch has left a toy out because the marker on disk does
+// not name it yet (crash-recovery.js, waitingForDisk). The commit that names
+// it runs the engine again at once (resumeHeldDispatch).
+let heldDispatch = false;
+const NOTHING_HELD = Object.freeze({ handy: false, intiface: false, tcode: false });
+
 // `urgent`: the decision of a tick a guard engaged in, or in which Force
 // Orgasm's time limit handed the run to its landing (the master clock
 // passes it with the tick's decision).
 function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, force = false, urgent = false) {
     if (isRemotePage) return;
+    // Before any command of a live session reaches a toy: no moment in which
+    // a crash could leave hardware moving without a marker for the next page
+    // to find. PAUSED counts too: the session has not ended, and a pause is
+    // often the answer to a device that stopped confirming anything.
+    noteLiveHardware();
 
     // Inside a tick an ordinary dispatch waits for the end of the tick. A
     // forced one (STOP, a pause, the watchdog) goes out now and nothing the
@@ -1281,6 +1428,21 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // stroker on the leg in flight - whichever channel it follows.
     const release = tickDispatch.admit([primarySpeed, secondarySpeed, strokeMin, strokeMax], { force, urgent });
     if (!release) return;
+    // And not before the marker naming the toy is on disk. localStorage
+    // reaches the disk a minute or more late, so a browser force-quit early
+    // in a session left the next page no marker, and The Handy kept
+    // stroking. The wait is the IndexedDB commit, milliseconds: for the
+    // first command of a session, and the first to a toy that joins one,
+    // the engine runs again the moment it lands, or once IndexedDB has had
+    // DURABLE_WRITE_TIMEOUT_MS to answer. Once the marker naming a toy has
+    // reached the disk or had that long, the toy is never held again in the
+    // session (waitingForDisk): it may be moving by then, and what the
+    // engine sends it next may be a stop - Full Stop at the ceiling, the
+    // stall guard - and a stop is never held back; nor is a forced
+    // dispatch, which is one. Asked of what goes out, never of what a tick
+    // holds for its end: that is asked again when the tick sends it.
+    const held = force || !crashRecovery ? NOTHING_HELD : crashRecovery.waitingForDisk();
+    heldDispatch = held.handy || held.intiface || held.tcode;
     // Only what goes out is what the toys were sent. A decision a tick held
     // and replaced never reached them, and Force Orgasm's ramp and its
     // landing start from what did: a landing must never begin above the
@@ -1299,14 +1461,28 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // driver and the funscript export still records what the engine asked
     // for. A T-Code or Intiface linear axis takes a wider zone as a longer,
     // slower stroke rather than a faster one, so they keep the envelope as is.
-    dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
+    if (!held.handy) dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
     // Intiface linear axes run on their own per-leg timers; this call only
     // updates the planner inputs (and, with force, issues StopAllDevices;
     // urgent re-times the leg in flight).
-    dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
+    if (!held.intiface) dispatchIntiface(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
     // Same for the direct T-Code serial device: a forced zero dispatch is an
     // immediate stop (every axis to rest on one line).
-    dispatchTCode(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
+    if (!held.tcode) dispatchTCode(primarySpeed, secondarySpeed, range.min, range.max, range.env.min, range.env.max, force, { urgent: release.urgent });
+    // And once more after it: every other page learns of a start this
+    // dispatch just sent before it can take The Handy for one nobody drives.
+    noteLiveHardware();
+}
+
+// A change of the crash-recovery records has reached the disk, failed or
+// timed out. A dispatch that left a toy out for it goes out now, with what
+// the engine asks for now. A session stopped or paused meanwhile has had
+// its forced stop, and is left alone.
+function resumeHeldDispatch() {
+    if (!heldDispatch) return;
+    heldDispatch = false;
+    if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'RAMPDOWN') return;
+    updateEngine();
 }
 
 // Queue a spoken cue (voice.js keeps a short queue, so back-to-back cues are
@@ -2288,6 +2464,10 @@ function startOrResumeSession() {
     } else {
         // Resume into the rampdown where it left off, not back to RUNNING.
         resumingRampdown = state.resumeStatus === 'RAMPDOWN' && state.rampdownSecondsLeft > 0;
+        // A tab that died while this session was paused may have left a
+        // Handy moving, and the wearer carries on here next to it: the pass
+        // a session start runs (crash-recovery.js).
+        crashRecovery?.sessionResumed();
     }
     // The wearer carries on: a Came Early or Finished me press the Handy
     // turned away is not what the next press is about any more.
@@ -2446,6 +2626,8 @@ function stopSession(outcome = "Stopped", voiceText = null, voiceVars = null) {
     state.prostateSpeed = 0;
     dispatchHardware(0, 0, 0, 100, true);
     syncScreenWakeLock();
+    // Ended cleanly: nothing for the next page to recover (crash-recovery.js).
+    crashRecovery?.clear();
     setOrgasmMode(false);
     clearHrSignalPause();
     // No paused session is left for a supervision report to ask a RESUME of,
@@ -2487,6 +2669,7 @@ resetBtn?.addEventListener('click', () => {
     state.resumeStatus = null;
     dispatchHardware(0, 0, 0, 100, true);
     syncScreenWakeLock();
+    crashRecovery?.clear();
     setOrgasmMode(false);
     clearHrSignalPause();
     // As after STOP: no paused session is left to resume, or to report.
@@ -4746,6 +4929,11 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
 
     try {
         const result = await connectHandy(key);
+        // Connecting sent this very device a stop and the API confirmed it:
+        // whatever a crashed session left it doing is over, so no
+        // crash-recovery stop is owed to it any more (crash-recovery.js),
+        // and the next page to open neither sends one nor reports one.
+        if (!isRemotePage) clearPendingCrashStop(key, crashStorage);
         state.handyBattery = result.battery;
         handyConnectedLabel = result.description ? `Connected (${result.description})` : 'Connected';
         setHandyStatus(handyConnectedLabel, 'ok');
@@ -4849,6 +5037,7 @@ document.getElementById('modalIntifaceConnectBtn')?.addEventListener('click', ()
             renderIntifaceStatus(status);
         },
         onDevicesChanged: () => {
+            noteLiveHardware();
             renderIntifaceDevices();
             syncTelemetry();
         },
@@ -5064,6 +5253,7 @@ setTCodeHandlers({
         renderTCodeStatus(status);
     },
     onDevicesChanged: () => {
+        noteLiveHardware();
         renderTCodeDevice();
         syncTelemetry();
     },
@@ -5235,10 +5425,21 @@ function handlePageBack() {
 }
 
 window.addEventListener('pagehide', (event) => handlePageAway(event.persisted ? 'bfcache' : 'unload'));
-document.addEventListener('freeze', () => handlePageAway('freeze'));
+// A frozen page runs nothing until it is resumed, so once every toy has had
+// its stop it tells every other page that this session no longer drives The
+// Handy (crash-recovery.js): another page that recovers a crash meanwhile
+// must not leave a Handy to a page that cannot stop it.
+document.addEventListener('freeze', () => {
+    handlePageAway('freeze');
+    pageFrozen = true;
+    noteLiveHardware();
+});
 // Chrome fires resume and then pageshow for a page back from the
 // back/forward cache; the banner goes up once.
-document.addEventListener('resume', handlePageBack);
+document.addEventListener('resume', () => {
+    pageFrozen = false;
+    handlePageBack();
+});
 window.addEventListener('pageshow', (event) => { if (event.persisted) handlePageBack(); });
 
 // A page that is hidden is not paused for it: a video in another tab is not

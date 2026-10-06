@@ -39,6 +39,8 @@ const PRECACHE = [
     './src/js/tick-dispatch.js',
     './src/js/funscript.js',
     './src/js/storage.js',
+    './src/js/crash-recovery.js',
+    './src/js/durable-store.js',
     './src/js/write-coalescer.js',
     './src/js/backup.js',
     './src/js/alert-banner.js',

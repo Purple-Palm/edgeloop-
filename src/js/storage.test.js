@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
+import { safeGet, safeParse, safeSet, safeRemove, safeKeys, saveHistoryTrimmed } from './storage.js';
 
 // Minimal localStorage stand-in with an optional byte quota.
 function fakeStorage(quotaBytes = Infinity) {
@@ -69,6 +69,21 @@ describe('safeGet', () => {
         assert.equal(safeGet('missing', 'x', s), 'x');
         assert.equal(safeGet('k', 'x', { getItem: () => { throw new Error('blocked'); } }), 'x');
         assert.equal(safeGet('k', 'x', null), 'x');
+    });
+});
+
+describe('safeKeys', () => {
+    it('lists every stored key, and nothing when the storage cannot be listed', () => {
+        const map = new Map([['a', '1'], ['b', '2']]);
+        const listable = {
+            get length() { return map.size; },
+            key: (i) => Array.from(map.keys())[i] ?? null
+        };
+        assert.deepEqual(safeKeys(listable), ['a', 'b']);
+        assert.deepEqual(safeKeys(null), []);
+        assert.deepEqual(safeKeys({ get length() { throw new Error('SecurityError'); } }), []);
+        assert.deepEqual(safeKeys({ length: 2, key: () => { throw new Error('blocked'); } }), []);
+        assert.deepEqual(safeKeys({ length: 3, key: (i) => (i === 1 ? null : `k${i}`) }), ['k0', 'k2']);
     });
 });
 

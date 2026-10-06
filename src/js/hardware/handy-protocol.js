@@ -1,5 +1,8 @@
 // Pure helpers for The Handy REST API v2 (HAMP mode). No fetch, no DOM, so
 // everything here is unit-testable under node:test. handy.js does the I/O.
+//
+// The API described here is the official v2 OpenAPI spec, served at
+// https://www.handyfeeling.com/api/handy-rest/v2/docs/spec.yaml.
 
 export const HANDY_API_BASE = 'https://www.handyfeeling.com/api/handy/v2';
 
@@ -426,6 +429,85 @@ export function classifyHandyResponse(httpOk, status, body, path = '') {
         return { ok: false, message: `Device rejected command${where}`, code: HANDY_RESULT_ERROR };
     }
     return { ok: true, message: '', code: null };
+}
+
+// What a PUT /hamp/stop reply says about a Handy this page never connected:
+// the stop a freshly opened page sends when an earlier one crashed, was
+// force-quit or was killed by the phone while its session was driving the
+// device (crash-recovery.js decides when, handy.js sends it). Read against
+// the official v2 OpenAPI spec (spec.yaml, 2.0.0-beta-3):
+//   * The API keeps no session. The key travels in the X-Connection-Key
+//     header of every request, so nothing has to be connected first.
+//   * HAMP operations exist only in HAMP mode, and HAMP motion only runs in
+//     HAMP mode, so a device EdgeLoop left moving answers /hamp/stop with no
+//     PUT /mode before it. Setting the mode first could only disturb a
+//     device that another app has switched to a mode of its own since.
+//   * The answer is a StateResult: 0 (SUCCESS_NEW_STATE) it was moving and
+//     has stopped, 1 (SUCCESS_SAME_STATE) it was already stopped - "no
+//     effect if the device is already stopped" - and -1 an error.
+//   * For an offline device the server answers with an error object whose
+//     `connected` is false ("Device not connected"). The spec numbers that
+//     error 1001 in one place and 1002 in another, so the flag is read and
+//     the number never is.
+//   * A device in another mode answers METHOD_NOT_FOUND (2002), "No such
+//     method": no HAMP motion is running on it.
+export const RECOVERY_STOP = Object.freeze({
+    STOPPED: 'stopped',
+    ALREADY_STOPPED: 'already-stopped',
+    NOT_HAMP: 'not-hamp',
+    OFFLINE: 'offline',
+    FAILED: 'failed',
+    // Not a reply to this stop: Connect was pressed for the same key, and
+    // its own verified stop (connectHandy) answered for the device instead.
+    CONNECTED: 'connected',
+    // Not a reply either: the key is this page's live link, whose driver
+    // answers for the device from here on and has been told that it cannot
+    // vouch for it being stopped (handy.js, stopHandyAfterCrash).
+    LINKED: 'linked'
+});
+
+export const HANDY_METHOD_NOT_FOUND = 2002;
+
+// The outcomes that settle it: the device is stopped, is not running HAMP
+// motion at all, or is this page's own link, whose driver stops it itself.
+// Every other outcome leaves it possibly still moving.
+export function isRecoveryStopConclusive(outcome) {
+    return outcome === RECOVERY_STOP.STOPPED
+        || outcome === RECOVERY_STOP.ALREADY_STOPPED
+        || outcome === RECOVERY_STOP.NOT_HAMP
+        || outcome === RECOVERY_STOP.CONNECTED
+        || outcome === RECOVERY_STOP.LINKED;
+}
+
+// `reply` is one exchange: { httpOk, status, body } when the API answered,
+// { noReply: true, timedOut } when nothing came back. Returns { outcome,
+// detail }; the detail is what the API said, in its own words where it gave
+// any, so the wearer is told what the stop actually returned. The ok/fail
+// line is classifyHandyResponse's, so a crash stop is "confirmed" by exactly
+// the reply that confirms every other stop in the driver.
+export function classifyRecoveryStop(reply) {
+    const r = reply && typeof reply === 'object' ? reply : {};
+    if (r.noReply) {
+        return {
+            outcome: RECOVERY_STOP.FAILED,
+            detail: r.timedOut ? 'the request timed out' : 'the Handy API could not be reached'
+        };
+    }
+    const body = r.body && typeof r.body === 'object' ? r.body : null;
+    const verdict = classifyHandyResponse(r.httpOk, r.status, body);
+    if (verdict.ok) {
+        const result = body ? body.result : undefined;
+        if (result === 1) return { outcome: RECOVERY_STOP.ALREADY_STOPPED, detail: 'result 1' };
+        // Only a 0 says the device was moving until now. A reply with no
+        // StateResult is still a confirmed stop, and claims nothing more.
+        return { outcome: RECOVERY_STOP.STOPPED, detail: result === 0 ? 'result 0' : '' };
+    }
+    const err = body && body.error && typeof body.error === 'object' ? body.error : null;
+    if (err && err.connected === false) return { outcome: RECOVERY_STOP.OFFLINE, detail: verdict.message };
+    if (err && Number(err.code) === HANDY_METHOD_NOT_FOUND) {
+        return { outcome: RECOVERY_STOP.NOT_HAMP, detail: `error ${HANDY_METHOD_NOT_FOUND}, ${verdict.message}` };
+    }
+    return { outcome: RECOVERY_STOP.FAILED, detail: verdict.message };
 }
 
 // Pull a battery percentage out of a GET /info reply. The v2 spec has no

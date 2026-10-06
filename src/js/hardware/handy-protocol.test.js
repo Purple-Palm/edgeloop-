@@ -25,7 +25,11 @@ import {
     parseBatteryLevel,
     describeHandyInfo,
     HANDY_MIN_VELOCITY,
-    handyTargetSpeed
+    handyTargetSpeed,
+    RECOVERY_STOP,
+    HANDY_METHOD_NOT_FOUND,
+    classifyRecoveryStop,
+    isRecoveryStopConclusive
 } from './handy-protocol.js';
 import { fieldEventOf } from './handy-fields.js';
 
@@ -1114,5 +1118,67 @@ describe('isDeviceNotConnectedError', () => {
         assert.equal(isDeviceNotConnectedError({ error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected' } }), false);
         const notIt = [null, undefined, {}, { result: -1 }, { error: 'Device not connected' }, { error: { code: 1000, name: 'Error', message: 'Unspecified error', connected: false } }];
         for (const body of notIt) assert.equal(isDeviceNotConnectedError(body), false, JSON.stringify(body));
+    });
+});
+
+// The crash-recovery stop is sent for a device this page never connected, so
+// everything the wearer is told comes from reading its one reply. The bodies
+// below are the v2 spec's own examples for PUT /hamp/stop.
+describe('classifyRecoveryStop', () => {
+    const answered = (body, status = 200) => ({ httpOk: status >= 200 && status < 300, status, body });
+    const NOT_CONNECTED = { error: { code: 1001, name: 'DeviceNotConnected', message: 'Device not connected', connected: false } };
+    const DEVICE_TIMEOUT = { error: { code: 1002, name: 'DeviceTimeout', message: 'Device timeout', connected: true } };
+    const HAMP_ERROR = { error: { code: 3000, name: 'HampError', message: 'HampError', connected: true } };
+
+    it('reads the StateResult of a confirmed stop', () => {
+        assert.deepEqual(classifyRecoveryStop(answered({ result: 0 })), { outcome: RECOVERY_STOP.STOPPED, detail: 'result 0' });
+        assert.deepEqual(classifyRecoveryStop(answered({ result: 1 })), { outcome: RECOVERY_STOP.ALREADY_STOPPED, detail: 'result 1' });
+    });
+
+    it('a confirmed stop without a StateResult claims no motion it did not see', () => {
+        // Only a 0 says the device was moving until now.
+        assert.deepEqual(classifyRecoveryStop(answered({})), { outcome: RECOVERY_STOP.STOPPED, detail: '' });
+        assert.deepEqual(classifyRecoveryStop(answered(null)), { outcome: RECOVERY_STOP.STOPPED, detail: '' });
+        assert.deepEqual(classifyRecoveryStop(answered({ result: '0' })), { outcome: RECOVERY_STOP.STOPPED, detail: '' });
+    });
+
+    it('reads an offline device from the connected flag, whatever number the error carries', () => {
+        // The spec numbers DEVICE_NOT_CONNECTED 1002 in its enum and 1001 in
+        // its example: neither number can be trusted, the flag can.
+        for (const code of [1001, 1002, 1000]) {
+            const body = { error: { ...NOT_CONNECTED.error, code } };
+            assert.deepEqual(classifyRecoveryStop(answered(body)), { outcome: RECOVERY_STOP.OFFLINE, detail: 'Device not connected' });
+        }
+        // The same body on the 502 "Machine not connected" status.
+        assert.equal(classifyRecoveryStop(answered(NOT_CONNECTED, 502)).outcome, RECOVERY_STOP.OFFLINE);
+        // A device that is online but slow is not offline.
+        assert.equal(classifyRecoveryStop(answered(DEVICE_TIMEOUT)).outcome, RECOVERY_STOP.FAILED);
+    });
+
+    it('a device in another mode is not running HAMP motion', () => {
+        const body = { error: { code: HANDY_METHOD_NOT_FOUND, name: 'MethodNotFound', message: 'No such method', connected: true } };
+        assert.deepEqual(classifyRecoveryStop(answered(body)), { outcome: RECOVERY_STOP.NOT_HAMP, detail: 'error 2002, No such method' });
+    });
+
+    it('anything else leaves the device possibly moving, and says what came back', () => {
+        assert.deepEqual(classifyRecoveryStop(answered(DEVICE_TIMEOUT)), { outcome: RECOVERY_STOP.FAILED, detail: 'Device timeout' });
+        assert.deepEqual(classifyRecoveryStop(answered(HAMP_ERROR)), { outcome: RECOVERY_STOP.FAILED, detail: 'HampError' });
+        assert.deepEqual(classifyRecoveryStop(answered({ result: -1 })), { outcome: RECOVERY_STOP.FAILED, detail: 'Device rejected command' });
+        assert.deepEqual(classifyRecoveryStop(answered(null, 503)), { outcome: RECOVERY_STOP.FAILED, detail: 'HTTP 503' });
+        assert.deepEqual(classifyRecoveryStop(answered(null, 502)), { outcome: RECOVERY_STOP.FAILED, detail: 'HTTP 502' });
+        assert.deepEqual(classifyRecoveryStop({ noReply: true, timedOut: false }), { outcome: RECOVERY_STOP.FAILED, detail: 'the Handy API could not be reached' });
+        assert.deepEqual(classifyRecoveryStop({ noReply: true, timedOut: true }), { outcome: RECOVERY_STOP.FAILED, detail: 'the request timed out' });
+        assert.equal(classifyRecoveryStop(undefined).outcome, RECOVERY_STOP.FAILED);
+    });
+
+    it('settles only on an answer that rules out motion, or on a link that stops it itself', () => {
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.STOPPED), true);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.ALREADY_STOPPED), true);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.NOT_HAMP), true);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.CONNECTED), true);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.LINKED), true);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.OFFLINE), false);
+        assert.equal(isRecoveryStopConclusive(RECOVERY_STOP.FAILED), false);
+        assert.equal(isRecoveryStopConclusive(undefined), false);
     });
 });

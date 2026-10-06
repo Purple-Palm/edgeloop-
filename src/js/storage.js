@@ -77,6 +77,24 @@ export function safeRemove(key, storage = defaultStorage()) {
     }
 }
 
+// Every key stored right now, in the storage's own order; [] when the
+// storage is unavailable or cannot be listed. A snapshot: a key another tab
+// removes a moment later simply reads back as missing through safeGet.
+export function safeKeys(storage = defaultStorage()) {
+    if (!storage) return [];
+    try {
+        const keys = [];
+        const count = Number(storage.length) || 0;
+        for (let i = 0; i < count; i++) {
+            const key = storage.key(i);
+            if (typeof key === 'string') keys.push(key);
+        }
+        return keys;
+    } catch (e) {
+        return [];
+    }
+}
+
 // Persist a newest-first history list. When the store is full the OLDEST
 // entries (the tail) are dropped one by one until the list fits. If even the
 // newest entry alone will not fit, its motion trace is stripped so at least
