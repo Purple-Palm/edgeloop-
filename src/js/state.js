@@ -4,6 +4,7 @@
 import { safeGet } from './storage.js';
 import { HANDY_DEFAULT_END_MARGIN } from './hardware/handy-protocol.js';
 import { DEFAULT_FORCE_ORGASM_MAX_SECONDS } from './session-rules.js';
+import { VACUGLIDE_DEFAULT_ROLE, VALVE_PULSE_DEFAULT_MS } from './hardware/vacuglide-protocol.js';
 
 export const state = {
     sessionStatus: 'IDLE',
@@ -196,6 +197,15 @@ export const advancedSettings = {
     // linear axes are servo position targets and never gain carriage speed
     // from a wider zone, so they share the envelope but not this.
     handyEndMargin: HANDY_DEFAULT_END_MARGIN,
+    // The Autoblow VacuGlide 2 (hardware/vacuglide.js): the engine channel
+    // its speed follows, the cap on that speed (the same 10-100 slider as the
+    // Handy's), and how long one press of a valve button holds that valve
+    // open. It takes a speed and nothing else, so there is no stroke
+    // setting to keep. Kept here rather than in entries of their own so a
+    // backup carries them and an import bounds them like every other value.
+    vacuglideRole: VACUGLIDE_DEFAULT_ROLE,
+    vacuglideMaxCap: 100,
+    vacuglideValvePulseMs: VALVE_PULSE_DEFAULT_MS,
     stallGuard: true,
     stallGuardSeconds: 20,
     stallPauseSeconds: 8,

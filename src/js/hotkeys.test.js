@@ -566,7 +566,7 @@ describe('the page', () => {
     it('every dialog is a body of that modal, closed by its one X, which names its key', () => {
         const modal = html.slice(html.indexOf('<div id="modalOverlay"'), html.indexOf('<div id="wizardOverlay"'));
         const bodies = [...html.matchAll(/id="modalBody([A-Za-z]+)"/g)].map((m) => m[1]).sort();
-        assert.deepEqual(bodies, ['Ble', 'Changelog', 'Handy', 'History', 'HrGuide', 'Intiface', 'Legal', 'Params', 'Partner', 'TCode']);
+        assert.deepEqual(bodies, ['Ble', 'Changelog', 'Handy', 'History', 'HrGuide', 'Intiface', 'Legal', 'Params', 'Partner', 'TCode', 'Vacuglide']);
         for (const body of bodies) assert.ok(modal.includes(`id="modalBody${body}"`), `${body} is outside the modal`);
         // Each one is opened by openModal, and nothing else is.
         const opened = [...new Set([...app.matchAll(/openModal\('([A-Za-z]+)'\)/g)].map((m) => m[1]))].sort();

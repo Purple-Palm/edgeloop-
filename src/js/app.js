@@ -58,7 +58,7 @@ import {
     pressAbout
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
-import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys, pruneRetiredKeys } from './backup.js';
+import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys, pruneRetiredKeys, VACUGLIDE_SETTING_NAMES } from './backup.js';
 import { applySettingSchema } from './settings-schema.js';
 import { createWriteCoalescer } from './write-coalescer.js';
 import { cancelWheelWhileFocused, releaseFocusOnCommit, releaseFocusOnPointerUp } from './input-hygiene.js';
@@ -106,6 +106,34 @@ import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, de
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
 import { createStartGate } from './start-gate.js';
+import {
+    connectVacuglide,
+    disconnectVacuglide,
+    dispatchVacuglide,
+    pulseValve,
+    attachVacuglideToPage,
+    setVacuglideHandlers,
+    isVacuglideConnected,
+    isVacuglideValveOpen,
+    isVacuglideWatching,
+    getValvePulse,
+    getVacuglideToken,
+    getVacuglideCluster,
+    stopVacuglideAfterCrash,
+    vacuglideStopChaseMs
+} from './hardware/vacuglide.js';
+import {
+    VACUGLIDE_TOKEN_STORAGE_KEY,
+    VALVE_PULSE_MIN_MS,
+    VALVE_PULSE_MAX_MS,
+    sanitizeDeviceToken,
+    sanitizeVacuglideRole,
+    clampSpeedCap,
+    clampValvePulseMs,
+    pulseSecondsToMs,
+    formatPulseSeconds,
+    vacuglideSpeedFor
+} from './hardware/vacuglide-protocol.js';
 import { APP_VERSION, parseChangelog, GITHUB_CHANGELOG_URL, GITHUB_RELEASES_URL } from './version.js';
 import {
     connectIntifaceServer,
@@ -399,8 +427,11 @@ function showCrashReport(text, { fresh = true } = {}) {
 // hardware it keeps a marker of its own in storage, named by this page's
 // id. A page that crashes, is force-quit or is killed by the phone leaves
 // its marker behind, and the next host page to open sends The Handy a stop -
-// with the key the marker names and the key saved here - and says on the
-// banner that the session did not end cleanly and what the stop returned.
+// with the key the marker names and the key saved here - and each VacuGlide
+// the marker names its whole stop, motor and both valves, and says on the
+// banner that the session did not end cleanly and what each stop returned.
+// A crash sends the VacuGlide no unload stop and leaves no handover entry
+// (vacuglide.js), so this is the only stop it gets.
 // So does a page that was already open, when a session starts in it: the
 // wearer may carry on there, next to the Handy the dead page left moving. A
 // stop that does not get through is sent again by the next host page to
@@ -442,6 +473,10 @@ const crashRecovery = isRemotePage ? null : createCrashRecovery({
     liveHandyKey: () => (handyConnected ? getHandyKey() : ''),
     stopHandy: stopHandyAfterCrash,
     retryMinutes: HANDY_TIMINGS.crashStopWindowMs / 60000,
+    savedVacuglideToken: () => safeGet(VACUGLIDE_TOKEN_STORAGE_KEY, '') || '',
+    liveVacuglideToken: () => (isVacuglideConnected() ? getVacuglideToken() : ''),
+    stopVacuglide: stopVacuglideAfterCrash,
+    vacuglideRetryMinutes: vacuglideStopChaseMs() / 60000,
     onReport: showCrashReport,
     onDurable: () => { resumeHeldDispatch(); }
 });
@@ -790,6 +825,7 @@ function hardwareReadiness() {
     const hrReady = isBleConnected() || state.simEngaged;
     const toyReady = Boolean(
         handyConnected
+        || isVacuglideConnected()
         || (isIntifaceConnected() && intifaceDevices.size > 0)
         || (isTCodeConnected() && countAssignedTCodeAxes() > 0)
     );
@@ -1078,12 +1114,14 @@ function initHandyRoleUI() {
 // is on - are made by workingCeilingInputs, with Force Orgasm's boost.
 function ceilingInputs(minHr, typedMaxHr) {
     // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
-    // (secondary) are both live. The Handy counts for whichever role it holds;
-    // Intiface and TCode axes count for the role they are assigned.
+    // (secondary) are both live. The Handy and the VacuGlide count for
+    // whichever role they hold; Intiface and TCode axes count for the role
+    // they are assigned.
     const intifaceHasRole = (role) => Array.from(intifaceDevices.values()).some(d => d.axes.some(a => a.role === role));
     const serialHasRole = (role) => isTCodeConnected() && tcodeHasRole(role);
-    const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary') || serialHasRole('primary');
-    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
+    const vacuglideHasRole = (role) => isVacuglideConnected() && sanitizeVacuglideRole(advancedSettings.vacuglideRole) === role;
+    const hasPrimary = (handyConnected && state.handyRole === 'primary') || vacuglideHasRole('primary') || intifaceHasRole('primary') || serialHasRole('primary');
+    const hasSecondary = (handyConnected && state.handyRole === 'secondary') || vacuglideHasRole('secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
     return workingCeilingInputs({
         minHr,
         maxHr: typedMaxHr,
@@ -1394,7 +1432,11 @@ function noteLiveHardware() {
         handyKey,
         driving: drivesHandyNow({ sessionStatus: state.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving(), frozen: pageFrozen }),
         intiface: isIntifaceConnected() && intifaceDevices.size > 0,
-        tcode: isTCodeConnected()
+        tcode: isTCodeConnected(),
+        // A VacuGlide joins the marker with the cluster it is reached
+        // through: a crash sends it no unload stop and leaves no handover
+        // entry, so the marker is all the next page has to stop it with.
+        vacuglide: isVacuglideConnected() ? { token: getVacuglideToken(), cluster: getVacuglideCluster() } : null
     });
     if (!current && !liveSessionUnsaved) {
         liveSessionUnsaved = true;
@@ -1406,7 +1448,7 @@ function noteLiveHardware() {
 // not name it yet (crash-recovery.js, waitingForDisk). The commit that names
 // it runs the engine again at once (resumeHeldDispatch).
 let heldDispatch = false;
-const NOTHING_HELD = Object.freeze({ handy: false, intiface: false, tcode: false });
+const NOTHING_HELD = Object.freeze({ handy: false, intiface: false, tcode: false, vacuglide: false });
 
 // `urgent`: the decision of a tick a guard engaged in, or in which Force
 // Orgasm's time limit handed the run to its landing (the master clock
@@ -1442,7 +1484,7 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // dispatch, which is one. Asked of what goes out, never of what a tick
     // holds for its end: that is asked again when the tick sends it.
     const held = force || !crashRecovery ? NOTHING_HELD : crashRecovery.waitingForDisk();
-    heldDispatch = held.handy || held.intiface || held.tcode;
+    heldDispatch = held.handy || held.intiface || held.tcode || held.vacuglide;
     // Only what goes out is what the toys were sent. A decision a tick held
     // and replaced never reached them, and Force Orgasm's ramp and its
     // landing start from what did: a landing must never begin above the
@@ -1462,6 +1504,14 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // for. A T-Code or Intiface linear axis takes a wider zone as a longer,
     // slower stroke rather than a faster one, so they keep the envelope as is.
     if (!held.handy) dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
+    // The VacuGlide takes one speed and nothing else: the channel its role
+    // names, under its cap. It has no stroke range to follow and no second
+    // motor for the other channel, and its valves are the wearer's alone -
+    // nothing on this path can open one. A cut to 0 is its whole stop, which
+    // goes at once; urgent lets the tick's decision past the one-second gap
+    // between speeds, as a routine request that never spends the reserve its
+    // request budget keeps for a stop.
+    if (!held.vacuglide) dispatchVacuglide(vacuglideSpeedFor(advancedSettings.vacuglideRole, primarySpeed, secondarySpeed, advancedSettings.vacuglideMaxCap), force, { urgent: release.urgent });
     // Intiface linear axes run on their own per-leg timers; this call only
     // updates the planner inputs (and, with force, issues StopAllDevices;
     // urgent re-times the leg in flight).
@@ -3325,6 +3375,7 @@ const modalTitle = document.getElementById('modalTitle');
 const modals = {
     Ble: document.getElementById('modalBodyBle'),
     Handy: document.getElementById('modalBodyHandy'),
+    Vacuglide: document.getElementById('modalBodyVacuglide'),
     Intiface: document.getElementById('modalBodyIntiface'),
     TCode: document.getElementById('modalBodyTCode'),
     History: document.getElementById('modalBodyHistory'),
@@ -3346,6 +3397,11 @@ function openModal(type) {
         modalTitle.textContent = "The Handy (Wi-Fi API)";
         modals.Handy?.classList.remove('hidden');
         updateHwEnvelopeDisplay();
+    }
+    else if (type === 'Vacuglide' && modalTitle) {
+        modalTitle.textContent = "Autoblow VacuGlide 2 (Wi-Fi API)";
+        modals.Vacuglide?.classList.remove('hidden');
+        renderVacuglideValves();
     }
     else if (type === 'Intiface' && modalTitle) { modalTitle.textContent = "Intiface Central & Toy Roles"; modals.Intiface?.classList.remove('hidden'); renderIntifaceDevices(); }
     else if (type === 'TCode' && modalTitle) {
@@ -3381,6 +3437,7 @@ function closeModal() {
 
 document.getElementById('cardBle')?.addEventListener('click', () => { if (!isRemotePage) openModal('Ble'); });
 document.getElementById('cardHandy')?.addEventListener('click', () => { if (!isRemotePage) openModal('Handy'); });
+document.getElementById('cardVacuglide')?.addEventListener('click', () => { if (!isRemotePage) openModal('Vacuglide'); });
 document.getElementById('cardIntiface')?.addEventListener('click', () => { if (!isRemotePage) openModal('Intiface'); });
 document.getElementById('cardTCode')?.addEventListener('click', () => { if (!isRemotePage) openModal('TCode'); });
 document.getElementById('historyBtn')?.addEventListener('click', () => openModal('History'));
@@ -4380,11 +4437,13 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
     const live = currentVoiceCues();
     const includeKey = document.getElementById('exportIncludeKey')?.checked === true;
     const savedKey = safeGet('handy_connection_key', '') || '';
+    const savedToken = safeGet(VACUGLIDE_TOKEN_STORAGE_KEY, '') || '';
     const file = buildBackup({
         settings: { ...advancedSettings, voiceCues: live.cues, voiceEncourageSeconds: live.encourageSeconds },
         handyRole: state.handyRole,
         handyMaxCap: state.handyMaxCap,
         handyConnectionKey: savedKey,
+        vacuglideDeviceToken: savedToken,
         intifaceDevices: safeParse(INTIFACE_STORAGE_KEY, {}),
         tcodeDevices: safeParse(TCODE_STORAGE_KEY, {}),
         ageVerified: safeGet('edgeloop_age_verified') === 'true',
@@ -4398,7 +4457,11 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
     // Painted before the download starts, so "this file CONTAINS your key"
     // is on screen (and announced, the notice is a live region) by the time
     // the save dialog asks where to put it - not after it is already on disk.
-    paintExportNotice(describeBackupExport(file, { requestedKey: includeKey, hasSavedKey: savedKey.trim().length > 0 }));
+    paintExportNotice(describeBackupExport(file, {
+        requestedKey: includeKey,
+        hasSavedKey: savedKey.trim().length > 0,
+        hasSavedToken: savedToken.trim().length > 0
+    }));
     try {
         a.click();
     } catch (err) {
@@ -4425,6 +4488,11 @@ function applyImportedBackup(result) {
         if (!safeSet('handy_connection_key', result.handyConnectionKey)) unsaved.push('key');
         const input = document.getElementById('modalHandyInput');
         if (input) input.value = result.handyConnectionKey;
+    }
+    if (result.tokenPresent) {
+        if (!safeSet(VACUGLIDE_TOKEN_STORAGE_KEY, result.vacuglideDeviceToken)) unsaved.push('token');
+        const input = document.getElementById('modalVacuglideInput');
+        if (input) input.value = result.vacuglideDeviceToken;
     }
     if (result.handy.role) {
         // The role buttons own the badge and the button painting, so the
@@ -4481,9 +4549,12 @@ function canonical(value) {
 }
 const sameValue = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 
+// The VacuGlide's values are named on their own by describeBackupImport,
+// with their values, so they are not counted among the Session Setup ones.
 function countStoredSettings(fileSettings) {
     let kept = 0;
     for (const [name, value] of Object.entries(fileSettings)) {
+        if (VACUGLIDE_SETTING_NAMES.includes(name)) continue;
         if (name === 'voiceCues') {
             // mergeVoiceCues fills in every bank the file did not mention,
             // so only the banks the file DID carry can be compared. A
@@ -4540,6 +4611,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             const existingKey = safeGet('handy_connection_key', '') || '';
             const hadExistingKey = Boolean(existingKey);
             const keyReplaced = result.keyPresent && hadExistingKey && existingKey !== result.handyConnectionKey;
+            const existingToken = safeGet(VACUGLIDE_TOKEN_STORAGE_KEY, '') || '';
+            const hadExistingToken = Boolean(existingToken);
+            const tokenReplaced = result.tokenPresent && hadExistingToken && existingToken !== result.vacuglideDeviceToken;
             // An older build merged every unknown top-level field into the
             // settings store, so a connection key could be sitting in there
             // and ride along in every future export. Clear those names out
@@ -4549,6 +4623,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             // whether anything actually changed rather than inferring it
             // from how many values came through untouched.
             const settingsBefore = JSON.stringify(advancedSettings);
+            // The VacuGlide's values as they were, so the message can say
+            // which ones this file changed.
+            const vacuglideBefore = Object.fromEntries(VACUGLIDE_SETTING_NAMES.map((name) => [name, advancedSettings[name]]));
             Object.assign(advancedSettings, result.settings);
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
@@ -4564,6 +4641,9 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             // message cannot name a part as lost and as restored at once.
             const unsaved = persistSettings() ? [] : ['settings'];
             syncParamsUI();
+            // The VacuGlide's role, cap and pulse length are settings too,
+            // and its panel shows them.
+            syncVacuglidePanel();
             // Before the engine tick, so a restored Handy speed cap reaches
             // the device on the same pass as the settings it came with.
             const applied = applyImportedBackup(result);
@@ -4573,6 +4653,8 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             alert(describeBackupImport(result, {
                 hadExistingKey,
                 keyReplaced,
+                hadExistingToken,
+                tokenReplaced,
                 settingsStored,
                 settingsChanged: JSON.stringify(advancedSettings) !== settingsBefore,
                 // The numbers themselves, so "the Handy speed cap" does not
@@ -4580,6 +4662,7 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
                 // it now is.
                 handyCap: result.handy.maxCap,
                 handyRole: result.handy.role,
+                vacuglideBefore,
                 droppedDeviceMaps: applied.droppedDeviceMaps,
                 unsaved: [...unsaved, ...applied.unsaved]
             }));
@@ -4993,6 +5076,378 @@ document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', as
         setBadgeState('Handy', 'disconnected', 'Stop unconfirmed');
     }
 });
+
+// The Autoblow VacuGlide 2 Connection. Speed only, from the channel its role
+// names; the two valve buttons are the only thing that ever opens a valve.
+const vacuglideInput = document.getElementById('modalVacuglideInput');
+if (vacuglideInput) vacuglideInput.value = safeGet(VACUGLIDE_TOKEN_STORAGE_KEY, '') || '';
+let vacuglideConnectedLabel = 'Connected';
+let vacuglideConnectInFlight = false;
+
+// Modal "Status:" line. tone: 'idle' | 'busy' | 'ok' | 'error'
+function setVacuglideStatus(text, tone = 'idle') {
+    const el = document.getElementById('modalVacuglideMsg');
+    if (!el) return;
+    el.textContent = `Status: ${text}`;
+    const toneClass = tone === 'ok' ? 'text-emerald-400'
+        : tone === 'error' ? 'text-rose-400'
+        : tone === 'busy' ? 'text-amber-300'
+        : 'text-slate-500';
+    el.className = `text-xs leading-snug ${toneClass}`;
+}
+
+// The lock that tells every other page's crash recovery that this page has
+// the VacuGlide connected and answers for it (crash-recovery.js
+// holdVacuglideLink): held while the device is connected here, and let go
+// of while the page is frozen - a frozen page runs nothing, so it answers
+// for nothing until it is resumed, as with The Handy's driving lock.
+function syncVacuglideLinkLock() {
+    crashRecovery?.holdVacuglideLink(isVacuglideConnected() && !pageFrozen ? getVacuglideToken() : '');
+}
+
+// One device at a time: Connect while connected would have to take the link
+// over from a device that may be running, so the panel offers Disconnect
+// in its place until the link is gone. Every change of the link comes
+// through here, and so does the lock above.
+function paintVacuglideButtons() {
+    const connected = isVacuglideConnected();
+    syncVacuglideLinkLock();
+    const connectBtn = document.getElementById('modalVacuglideConnectBtn');
+    if (connectBtn) {
+        connectBtn.classList.toggle('hidden', connected);
+        connectBtn.disabled = vacuglideConnectInFlight;
+        connectBtn.classList.toggle('opacity-50', vacuglideConnectInFlight);
+        connectBtn.textContent = vacuglideConnectInFlight ? 'Connecting...' : 'Connect VacuGlide';
+    }
+    document.getElementById('modalVacuglideDisconnectBtn')?.classList.toggle('hidden', !connected);
+    if (vacuglideInput) vacuglideInput.disabled = connected || vacuglideConnectInFlight;
+}
+
+const VALVE_BUTTONS = { plus: 'vacuglideValvePlusBtn', minus: 'vacuglideValveMinusBtn' };
+const VALVE_LABELS = { plus: 'Valve +', minus: 'Valve −' };
+
+// The valve buttons and the line above them follow the driver: usable only
+// while connected and no pulse is running, so a press can never be queued
+// behind another.
+function renderVacuglideValves() {
+    const connected = isVacuglideConnected();
+    const running = getValvePulse();
+    for (const [valve, id] of Object.entries(VALVE_BUTTONS)) {
+        const btn = document.getElementById(id);
+        if (!btn) continue;
+        const blocked = !connected || Boolean(running);
+        btn.disabled = blocked;
+        btn.setAttribute('aria-disabled', blocked ? 'true' : 'false');
+        btn.classList.toggle('opacity-50', blocked && !(running && running.valve === valve));
+        btn.classList.toggle('cursor-not-allowed', blocked);
+        btn.classList.toggle('ring-2', Boolean(running && running.valve === valve));
+        btn.classList.toggle('ring-amber-400', Boolean(running && running.valve === valve));
+    }
+    const el = document.getElementById('vacuglideValveState');
+    if (!el) return;
+    let text;
+    let tone = 'text-teal-400';
+    if (running) {
+        const label = VALVE_LABELS[running.valve];
+        text = running.stage === 'closing' ? `Closing ${label}...`
+            : running.stage === 'opening' ? `Opening ${label}...`
+            : `${label} open`;
+        tone = 'text-amber-300';
+    } else if (!connected) {
+        text = 'Not connected';
+        tone = 'text-slate-500';
+    } else {
+        const open = Object.keys(VALVE_BUTTONS).filter((valve) => isVacuglideValveOpen(valve));
+        if (open.length) {
+            text = `${open.map((valve) => VALVE_LABELS[valve]).join(' and ')} may still be open`;
+            tone = 'text-rose-400';
+        } else if (isVacuglideWatching()) {
+            // Closed as far as anything has confirmed, but a press whose
+            // open was never answered may still land: "Both valves closed"
+            // would be a promise the driver cannot make yet. Short enough to
+            // stay on one line beside the title on a 360 px phone.
+            text = 'Watching for a late open';
+            tone = 'text-amber-300';
+        } else {
+            text = 'Both valves closed';
+        }
+    }
+    el.textContent = text;
+    el.className = `font-mono text-[10px] font-bold ${tone}`;
+}
+
+function setVacuglideValveMessage(text, tone = 'idle') {
+    const el = document.getElementById('vacuglideValveMsg');
+    if (!el) return;
+    el.textContent = text;
+    el.className = `text-[10px] leading-snug ${tone === 'error' ? 'text-rose-400' : 'text-slate-400'}${text ? '' : ' hidden'}`;
+}
+
+// The VacuGlide reports on the banner under two sources, as The Handy does,
+// because they end at different times: 'vacuglideLink' for a link that is
+// gone (offline, disconnected), which is over once a VacuGlide is connected
+// again, and 'vacuglideStop' for a stop or a valve close the device never
+// confirmed, which is over once a whole stop of that very device has been
+// confirmed (onStopConfirmed) - by the pause the report itself makes, the
+// background stop, Disconnect, or connecting it again. Each device that owes
+// one is its own entry, by its token: one device's confirmed stop must not
+// take down the warning about another.
+const vacuglideStopsOwed = new Map();
+
+function vacuglideOwedSentence() {
+    const details = [...vacuglideStopsOwed.values()];
+    if (details.length === 0) return '';
+    const lead = details.length === 1
+        ? 'The VacuGlide did not confirm a stop and may still be running, or have a valve open: check the device.'
+        : `${details.length} VacuGlides did not confirm a stop and may still be running, or have a valve open: check each device.`;
+    const newest = details[details.length - 1];
+    return newest ? `${lead} (${newest})` : lead;
+}
+
+function reportOwedVacuglideStops({ fresh = false } = {}) {
+    const sentence = vacuglideOwedSentence();
+    if (!sentence) hideAlertBanner('vacuglideStop');
+    else if (fresh) triggerDisconnectAlert(sentence, 'vacuglideStop');
+    else reviseAlertBanner(sentence, { severity: 'safety', source: 'vacuglideStop' });
+}
+
+setVacuglideHandlers({
+    isSessionActive: () => state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN',
+    onError: (message) => {
+        if (!isVacuglideConnected()) return;
+        if (message) {
+            const short = message.length > 70 ? `${message.slice(0, 67)}...` : message;
+            setVacuglideStatus(`API error: ${short}`, 'error');
+            setBadgeState('Vacuglide', 'warning', 'API Error', null);
+        } else {
+            setVacuglideStatus(vacuglideConnectedLabel, 'ok');
+            setBadgeState('Vacuglide', 'connected', 'VacuGlide', null);
+        }
+    },
+    onOffline: (reason, label) => {
+        setVacuglideStatus(reason || 'Offline', 'error');
+        setBadgeState('Vacuglide', 'disconnected', label || 'Offline');
+        paintVacuglideButtons();
+        renderVacuglideValves();
+        // Pauses the session and issues a stop to every other toy. The
+        // pause is said by the banner, which takes it back once the session
+        // runs again on the toys that are left.
+        triggerDisconnectAlert(reason || 'The VacuGlide went offline.', 'vacuglideLink', { motorsPaused: true });
+    },
+    onNotice: (message) => {
+        if (!isVacuglideConnected() || !message) return;
+        setVacuglideStatus(message, 'busy');
+    },
+    onPulse: () => renderVacuglideValves(),
+    // A valve a reply showed open with no press holding it, its close, and
+    // the watch after a press whose open was never answered. The message
+    // says what happened to that valve, next to the buttons that move it.
+    onValves: (message) => {
+        renderVacuglideValves();
+        if (message && isVacuglideConnected()) setVacuglideValveMessage(message, 'error');
+    },
+    // A device EdgeLoop had already let go of - Disconnect, a lost link -
+    // that a command Autoblow's server delivered late set moving again, and
+    // that EdgeLoop stopped again. The panel is that device's while no
+    // other VacuGlide is connected.
+    onLateStop: (message) => {
+        if (isVacuglideConnected() || !message) return;
+        setVacuglideStatus(message, 'busy');
+    },
+    // A device a page that went away (a reload, a closed tab) could not
+    // vouch for, which this page took over: it is watched, and stopped if it
+    // moves, without being connected. The panel is that device's until one
+    // is connected; `active` is false once the page has finished with it.
+    onTakeover: (message, active) => {
+        if (isVacuglideConnected() || !message) return;
+        setVacuglideStatus(message, active ? 'busy' : 'idle');
+        setBadgeState('Vacuglide', active ? 'warning' : 'disconnected', active ? 'Watching' : 'Disconnected');
+    },
+    // Not gated on the link: Disconnect and a lost link drop it before their
+    // stop resolves, and an unconfirmed stop or valve close there is the
+    // one thing the wearer must hear about.
+    onStopUnconfirmed: (message, token) => {
+        const connected = isVacuglideConnected();
+        setVacuglideStatus(message, 'error');
+        setBadgeState('Vacuglide', connected ? 'warning' : 'disconnected', 'Stop unconfirmed', null);
+        renderVacuglideValves();
+        const key = typeof token === 'string' ? token : '';
+        vacuglideStopsOwed.delete(key);
+        vacuglideStopsOwed.set(key, typeof message === 'string' ? message.trim() : '');
+        reportOwedVacuglideStops({ fresh: true });
+    },
+    // A whole stop of that device confirmed: what its unconfirmed stop
+    // warned about is over, and the banner says what is left.
+    onStopConfirmed: (token) => {
+        if (vacuglideStopsOwed.delete(typeof token === 'string' ? token : '')) reportOwedVacuglideStops();
+    }
+});
+
+document.getElementById('modalVacuglideConnectBtn')?.addEventListener('click', async () => {
+    const raw = vacuglideInput?.value || '';
+    if (!raw.trim()) {
+        setVacuglideStatus('Enter your VacuGlide device token first.', 'error');
+        return;
+    }
+    const token = sanitizeDeviceToken(raw);
+    if (!token) {
+        setVacuglideStatus('That is not a device token. Paste it exactly as Autoblow shows it: plain letters and digits, no spaces, at most 128 characters.', 'error');
+        return;
+    }
+    if (vacuglideConnectInFlight || isVacuglideConnected()) return;
+    vacuglideConnectInFlight = true;
+    safeSet(VACUGLIDE_TOKEN_STORAGE_KEY, token);
+    if (vacuglideInput) vacuglideInput.value = token;
+    setVacuglideStatus("Finding the VacuGlide on Autoblow's server, then stopping it and closing both valves...", 'busy');
+    setBadgeState('Vacuglide', 'connecting', 'Connecting...');
+    setVacuglideValveMessage('');
+    paintVacuglideButtons();
+    try {
+        const result = await connectVacuglide(token);
+        vacuglideConnectedLabel = result.description ? `Connected (${result.description})` : 'Connected';
+        setVacuglideStatus(vacuglideConnectedLabel, 'ok');
+        setBadgeState('Vacuglide', 'connected', 'VacuGlide', null);
+        // Connected: whatever said the link was gone is over. A stop this
+        // device owed was settled by the confirmed stop the connect made
+        // (onStopConfirmed); another device's stays reported.
+        hideAlertBanner('vacuglideLink');
+        syncTelemetry();
+    } catch (e) {
+        setVacuglideStatus(e && e.message ? e.message : 'Connection failed', 'error');
+        setBadgeState('Vacuglide', 'disconnected', 'Offline');
+    } finally {
+        vacuglideConnectInFlight = false;
+        paintVacuglideButtons();
+        renderVacuglideValves();
+    }
+});
+
+document.getElementById('modalVacuglideDisconnectBtn')?.addEventListener('click', async () => {
+    // The link drops at once; the whole stop it sends - motor and both
+    // valves - is awaited so the modal can say whether the device confirmed it.
+    const stopped = disconnectVacuglide();
+    setVacuglideStatus('Stopping the device and closing both valves...', 'busy');
+    setBadgeState('Vacuglide', 'disconnected', 'Stopping...');
+    paintVacuglideButtons();
+    renderVacuglideValves();
+    triggerDisconnectAlert('The VacuGlide disconnected.', 'vacuglideLink');
+    const result = await stopped.catch(() => ({ confirmed: false, mayHaveMoved: true }));
+    // Connected again meanwhile: the new link owns the modal and the badge.
+    if (isVacuglideConnected()) return;
+    // Connected in another tab before this stop was through: that tab drives
+    // the device now, and the panel already says this one let go of it.
+    if (result.letGo) return;
+    if (result.confirmed) {
+        // The stop is confirmed, but a command still unanswered may land
+        // after it: "Offline" alone would promise more than the driver can.
+        if (result.watching) setVacuglideStatus("Disconnected. EdgeLoop watches the VacuGlide for a minute in case a command Autoblow's server has not answered still reaches it, and stops it again if it does.", 'busy');
+        else setVacuglideStatus('Offline', 'idle');
+        setBadgeState('Vacuglide', 'disconnected', 'Disconnected');
+    } else if (result.mayHaveMoved) {
+        setVacuglideStatus('Disconnected, but the stop was not confirmed: check that the VacuGlide is not running and that neither valve is open.', 'error');
+        setBadgeState('Vacuglide', 'disconnected', 'Stop unconfirmed');
+    } else {
+        setVacuglideStatus('Disconnected. The device did not answer its stop, but EdgeLoop had not started it or opened a valve.', 'idle');
+        setBadgeState('Vacuglide', 'disconnected', 'Disconnected');
+    }
+});
+
+// A valve button: one press, one pulse of the length the panel shows.
+Object.entries(VALVE_BUTTONS).forEach(([valve, id]) => {
+    document.getElementById(id)?.addEventListener('click', async () => {
+        if (isRemotePage || !isVacuglideConnected() || getValvePulse()) return;
+        setVacuglideValveMessage('');
+        const result = await pulseValve(valve, advancedSettings.vacuglideValvePulseMs);
+        renderVacuglideValves();
+        if (!result.ok) setVacuglideValveMessage(result.message, result.reason === 'busy' || result.reason === 'let-go' ? 'idle' : 'error');
+    });
+});
+
+// The role, the speed cap and the pulse length are Session Setup values
+// (advancedSettings), so they are painted from the store here - on boot and
+// again after a backup import - and every control writes back through the
+// same sanitizers the schema uses.
+function paintVacuglideRole(role) {
+    const pBtn = document.getElementById('vacuglideRolePrimaryBtn');
+    const sBtn = document.getElementById('vacuglideRoleSecondaryBtn');
+    const oBtn = document.getElementById('vacuglideRoleOffBtn');
+    const badge = document.getElementById('modalVacuglideRoleBadge');
+    const idle = "py-1.5 rounded-lg bg-slate-800 text-slate-400 font-bold text-xs hover:text-white transition cursor-pointer";
+    if (pBtn) pBtn.className = role === 'primary' ? "py-1.5 rounded-lg bg-rose-600 text-white font-bold text-xs transition cursor-pointer" : idle;
+    if (sBtn) sBtn.className = role === 'secondary' ? "py-1.5 rounded-lg bg-purple-600 text-white font-bold text-xs transition cursor-pointer" : idle;
+    if (oBtn) oBtn.className = role === 'off' ? "py-1.5 rounded-lg bg-slate-700 text-amber-300 font-bold text-xs transition cursor-pointer" : idle;
+    [[pBtn, 'primary'], [sBtn, 'secondary'], [oBtn, 'off']].forEach(([btn, name]) => btn?.setAttribute('aria-pressed', role === name ? 'true' : 'false'));
+    if (badge) {
+        if (role === 'primary') { badge.textContent = "Primary speed"; badge.className = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-800"; }
+        else if (role === 'secondary') { badge.textContent = "Secondary speed"; badge.className = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-purple-950 text-purple-300 border border-purple-800"; }
+        else { badge.textContent = "Disabled (OFF)"; badge.className = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-900 text-amber-400 border border-slate-700"; }
+    }
+}
+
+function syncVacuglidePanel() {
+    advancedSettings.vacuglideRole = sanitizeVacuglideRole(advancedSettings.vacuglideRole);
+    advancedSettings.vacuglideMaxCap = clampSpeedCap(advancedSettings.vacuglideMaxCap);
+    advancedSettings.vacuglideValvePulseMs = clampValvePulseMs(advancedSettings.vacuglideValvePulseMs);
+    paintVacuglideRole(advancedSettings.vacuglideRole);
+    const capSlider = document.getElementById('vacuglideCapSlider');
+    const capVal = document.getElementById('vacuglideCapVal');
+    if (capSlider) capSlider.value = String(advancedSettings.vacuglideMaxCap);
+    if (capVal) capVal.textContent = `${advancedSettings.vacuglideMaxCap}%`;
+    const pulseInput = document.getElementById('vacuglidePulseInput');
+    if (pulseInput) pulseInput.value = formatPulseSeconds(advancedSettings.vacuglideValvePulseMs);
+}
+
+// Same shape as the end-stop margin input: while typing, a half-typed
+// number is left alone; on commit the corrected value is written back.
+function applyVacuglidePulseInput(commit = false) {
+    const el = document.getElementById('vacuglidePulseInput');
+    if (!el) return;
+    const ms = el.value === '' ? clampValvePulseMs(advancedSettings.vacuglideValvePulseMs) : pulseSecondsToMs(el.value);
+    advancedSettings.vacuglideValvePulseMs = ms;
+    if (commit) el.value = formatPulseSeconds(ms);
+    persistSettings();
+}
+
+function initVacuglidePanel() {
+    const roles = { vacuglideRolePrimaryBtn: 'primary', vacuglideRoleSecondaryBtn: 'secondary', vacuglideRoleOffBtn: 'off' };
+    Object.entries(roles).forEach(([id, role]) => {
+        document.getElementById(id)?.addEventListener('click', () => {
+            advancedSettings.vacuglideRole = role;
+            persistSettings();
+            paintVacuglideRole(role);
+            updateEngine();
+        });
+    });
+    const capSlider = document.getElementById('vacuglideCapSlider');
+    capSlider?.addEventListener('input', (e) => {
+        advancedSettings.vacuglideMaxCap = clampSpeedCap(e.target.value);
+        const capVal = document.getElementById('vacuglideCapVal');
+        if (capVal) capVal.textContent = `${advancedSettings.vacuglideMaxCap}%`;
+        persistSettings();
+        updateEngine();
+    });
+    const pulseInput = document.getElementById('vacuglidePulseInput');
+    if (pulseInput) {
+        pulseInput.min = String(VALVE_PULSE_MIN_MS / 1000);
+        pulseInput.max = String(VALVE_PULSE_MAX_MS / 1000);
+        pulseInput.addEventListener('input', () => applyVacuglidePulseInput(false));
+        pulseInput.addEventListener('change', () => applyVacuglidePulseInput(true));
+    }
+    syncVacuglidePanel();
+    paintVacuglideButtons();
+    renderVacuglideValves();
+}
+
+// The device has no watchdog: if this page dies, it keeps running at its
+// last speed with its valves as they were. attachVacuglideToPage sends it
+// the whole stop with keepalive on pagehide and freeze, like The Handy's,
+// and takes over what a page that went away left once this page has loaded,
+// and again when it comes back - never in a tab that was merely open when
+// that page went away. All of that is in the driver, where node can test it
+// with a window and a document of its own: app.js only says whether this is
+// a partner page. The partner viewer and controller pages run no hardware of
+// their own, and never read, stop or take over a VacuGlide.
+attachVacuglideToPage({ remote: isRemotePage, win: window, doc: document });
 
 // Intiface Central WebSocket. The driver reports its state through
 // onStatus; the modal label, the summary badge and the buttons follow it.
@@ -5433,11 +5888,13 @@ document.addEventListener('freeze', () => {
     handlePageAway('freeze');
     pageFrozen = true;
     noteLiveHardware();
+    syncVacuglideLinkLock();
 });
 // Chrome fires resume and then pageshow for a page back from the
 // back/forward cache; the banner goes up once.
 document.addEventListener('resume', () => {
     pageFrozen = false;
+    syncVacuglideLinkLock();
     handlePageBack();
 });
 window.addEventListener('pageshow', (event) => { if (event.persisted) handlePageBack(); });
@@ -5706,7 +6163,7 @@ function setupPartnerHost() {
 const VIEWER_LOCKED_IDS = [
     'sessionPlayPauseBtn', 'sessionStopBtn', 'sessionResetBtn', 'cameEarlyBtn', 'orgasmBtn',
     'intensitySlider', 'openParamsBtn', 'sessionParamsHeaderBtn',
-    'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
+    'partnerShareBtn', 'historyBtn', 'cardBle', 'cardHandy', 'cardVacuglide', 'cardIntiface', 'cardTCode',
     // Nested in the Edge Training card: a disabled ancestor does not stop a
     // browser from focusing and editing them, so they are disabled themselves.
     'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle'
@@ -5728,7 +6185,7 @@ function lockViewerControls() {
 // leaves the page), so it is locked rather than left looking clickable.
 const CONTROLLER_LOCKED_IDS = [
     'cameEarlyBtn', 'intensitySlider', 'openParamsBtn', 'sessionParamsHeaderBtn',
-    'partnerShareBtn', 'cardBle', 'cardHandy', 'cardIntiface', 'cardTCode',
+    'partnerShareBtn', 'cardBle', 'cardHandy', 'cardVacuglide', 'cardIntiface', 'cardTCode',
     // The mode cards stay live (MODE_CHANGE is a legal command), but the two
     // Edge Training numbers inside one of them are host-only settings.
     'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle'
@@ -5973,6 +6430,7 @@ document.getElementById('copyGroupUrlBtn')?.addEventListener('click', () => {
 
 // Boot Initialization
 initHandyRoleUI();
+initVacuglidePanel();
 renderLearningStatus();
 syncParamsUI();
 // A persisted mic setting waits for a tap (browser gesture rule).

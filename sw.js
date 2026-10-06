@@ -59,6 +59,8 @@ const PRECACHE = [
     './src/js/hardware/handy-protocol.js',
     './src/js/hardware/handy-fields.js',
     './src/js/hardware/handy-stop-report.js',
+    './src/js/hardware/vacuglide.js',
+    './src/js/hardware/vacuglide-protocol.js',
     './src/js/hardware/intiface.js',
     './src/js/hardware/buttplug-protocol.js',
     './src/js/hardware/stroke-planner.js',
@@ -104,10 +106,12 @@ self.addEventListener('fetch', (event) => {
     const request = event.request;
     if (request.method !== 'GET') return;
     const url = new URL(request.url);
-    // Never intercept device APIs or signalling: the Handy cloud API, Intiface
-    // websockets and PeerJS must always go to the network.
+    // Never intercept device APIs or signalling: the Handy and Autoblow cloud
+    // APIs, Intiface websockets and PeerJS must always go to the network. A
+    // cached { connected: true } answering the VacuGlide's link check while
+    // the network is down would report a lost device as present.
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
-    if (url.hostname.endsWith('handyfeeling.com') || url.hostname.endsWith('peerjs.com')) return;
+    if (url.hostname.endsWith('handyfeeling.com') || url.hostname.endsWith('autoblowapi.com') || url.hostname.endsWith('peerjs.com')) return;
 
     event.respondWith(
         fetch(request)

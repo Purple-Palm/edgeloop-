@@ -24,6 +24,7 @@ import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, 
 import { clampEdgeHoldPercent } from './engine.js';
 import { clampStaleSeconds } from './hr-watchdog.js';
 import { clampEndMargin } from './hardware/handy-protocol.js';
+import { sanitizeVacuglideRole, clampSpeedCap, clampValvePulseMs } from './hardware/vacuglide-protocol.js';
 import { clampMicGate, clampMicBoostBpm } from './voice.js';
 import { clampEncourageSeconds, mergeVoiceCues } from './voice-cues.js';
 
@@ -158,6 +159,16 @@ export const SETTING_SANITIZERS = {
     handyHwMax: passToOwner,
     envelopeMigrated: boolean('envelopeMigrated'),
     handyEndMargin: (value) => clampEndMargin(value),
+
+    // The two VacuGlide values that decide how hard it runs do NOT fall back
+    // to the factory value: for them the factory value is the permissive
+    // one. A role nobody can type is OFF rather than a live `primary`, and
+    // an unreadable cap is the slider's floor rather than 100%, snapped
+    // down onto the slider's own grid like the Handy cap. The pulse length
+    // is clamped to the range the panel offers.
+    vacuglideRole: (value) => sanitizeVacuglideRole(value),
+    vacuglideMaxCap: (value) => clampSpeedCap(value),
+    vacuglideValvePulseMs: (value) => clampValvePulseMs(value),
 
     stallGuard: boolean('stallGuard'),
     stallGuardSeconds: (value) => clampStallGuardSeconds(value),

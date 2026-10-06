@@ -21,9 +21,20 @@
 // again), so for those the banner says what the device does by itself and
 // what the wearer can do.
 //
+// The Autoblow VacuGlide 2 is driven through a cloud too, and has no
+// watchdog either: it keeps running at the last speed with its valves as
+// they were. A page that goes away gracefully sends it the whole stop and
+// leaves the next page what it could not vouch for (vacuglide.js); a page
+// that crashes does neither, and the marker is all that is left. So the
+// marker names each VacuGlide the session drove, by its device token and the
+// cluster it was reached through, and the recovery sends each of them the
+// whole stop - the motor stop and both valve closes - through
+// stopVacuglideAfterCrash, and reports what came of it on the same banner.
+//
 // Rules:
 //   * Nothing is started, connected or changed: the one command ever sent is
-//     PUT /hamp/stop (handy.js, stopHandyAfterCrash).
+//     PUT /hamp/stop (handy.js, stopHandyAfterCrash), and to a VacuGlide its
+//     whole stop.
 //   * A remote controller or viewer page neither writes nor reads the marker
 //     or the stops still owed (app.js never calls this module there).
 //   * Every page keeps a marker of its own, under a key named after its id
@@ -166,6 +177,7 @@
 
 import { safeGet, safeSet, safeRemove, safeKeys } from './storage.js';
 import { sanitizeConnectionKey } from './backup.js';
+import { sanitizeDeviceToken, normalizeCluster } from './hardware/vacuglide-protocol.js';
 import { RECOVERY_STOP, isRecoveryStopConclusive } from './hardware/handy-protocol.js';
 import { DURABLE_READ_TIMEOUT_MS, createDurableMirror } from './durable-store.js';
 
@@ -177,6 +189,14 @@ export const LIVE_SESSION_LOCK_PREFIX = 'edgeloop-live-session:';
 // prefix, the page's id, ':' and that Handy's connection key
 // (drivingLockName).
 export const DRIVING_LOCK_PREFIX = 'edgeloop-drives-handy:';
+// The lock a page holds for as long as it has a VacuGlide connected: this
+// prefix, the page's id, ':' and that device's token
+// (vacuglideLinkLockName). A VacuGlide another open page has connected is
+// that page's to answer for: its driver stops it on every way out of its
+// session and stops it again whenever it is seen moving after a stop, and a
+// stop or a watch from here would land in whatever session it runs.
+export const VACUGLIDE_LINK_LOCK_PREFIX = 'edgeloop-vacuglide-link:';
+
 // The Handy keys of sessions that did not end cleanly whose stop is still
 // owed, oldest first: { handy: [{ key, promised }], version }. `promised` is
 // the token of the last page whose stop gave up and promised the next page
@@ -195,6 +215,9 @@ export const ENDED_RECORD_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 // A session that switched Handy keys mid-run drove each of them; the old one
 // was brought to a confirmed stop before the switch, so a handful is plenty.
 export const MAX_MARKER_HANDY_KEYS = 4;
+
+// The same for the VacuGlides a session drove.
+export const MAX_MARKER_VACUGLIDES = 4;
 
 // Stops still owed can come from more than one crash, each bringing up to
 // MAX_MARKER_HANDY_KEYS keys. Nobody owns more Handys than this; the cap only
@@ -259,6 +282,25 @@ function parseDrivingLockName(name) {
     return { owner, key };
 }
 
+// The lock the page `owner` holds while it has the VacuGlide `token`
+// connected.
+export function vacuglideLinkLockName(owner, token) {
+    return `${VACUGLIDE_LINK_LOCK_PREFIX}${owner}:${token}`;
+}
+
+// { owner, token } of a lock vacuglideLinkLockName named, or null for any
+// other lock, and for one whose page id or token no page could have written.
+function parseVacuglideLinkLockName(name) {
+    if (typeof name !== 'string' || !name.startsWith(VACUGLIDE_LINK_LOCK_PREFIX)) return null;
+    const rest = name.slice(VACUGLIDE_LINK_LOCK_PREFIX.length);
+    const colon = rest.indexOf(':');
+    if (colon < 0) return null;
+    const owner = cleanOwner(rest.slice(0, colon));
+    const token = rest.slice(colon + 1);
+    if (!owner || sanitizeDeviceToken(token) !== token) return null;
+    return { owner, token };
+}
+
 // Where the page `owner` keeps its marker.
 export function liveSessionKey(owner) {
     return `${LIVE_SESSION_PREFIX}${owner}`;
@@ -275,6 +317,31 @@ export function newPageId(source = globalThis.crypto) {
         // A missing or throwing crypto falls through to the clock.
     }
     return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+}
+
+// The VacuGlides a marker names: [{ token, cluster }], each token once (the
+// last cluster it names wins), never more than MAX_MARKER_VACUGLIDES. A
+// token the Connect field would refuse is none, and a cluster it would not
+// send a token to is '' (the stop then asks Autoblow's router first).
+function cleanVacuglides(value) {
+    const out = [];
+    if (!Array.isArray(value)) return out;
+    for (const item of value) {
+        const token = sanitizeDeviceToken(item && typeof item === 'object' ? item.token : null);
+        if (!token) continue;
+        const cluster = normalizeCluster(item.cluster) || '';
+        const seen = out.find((entry) => entry.token === token);
+        if (seen) seen.cluster = cluster;
+        else out.push({ token, cluster });
+        if (out.length >= MAX_MARKER_VACUGLIDES) break;
+    }
+    return out;
+}
+
+function sameVacuglides(a, b) {
+    const x = Array.isArray(a) ? a : [];
+    const y = Array.isArray(b) ? b : [];
+    return x.length === y.length && x.every((entry, i) => entry.token === y[i].token && entry.cluster === y[i].cluster);
 }
 
 function cleanHandyKeys(value, cap = MAX_MARKER_HANDY_KEYS) {
@@ -372,7 +439,8 @@ function sameHardware(a, b) {
         && a.intiface === b.intiface
         && a.tcode === b.tcode
         && a.handyKeys.length === b.handyKeys.length
-        && a.handyKeys.every((key) => b.handyKeys.includes(key));
+        && a.handyKeys.every((key) => b.handyKeys.includes(key))
+        && sameVacuglides(a.vacuglides, b.vacuglides);
 }
 
 // The keys every page's records are kept under: localStorage's, in its own
@@ -559,7 +627,7 @@ function parseLiveSession(key, text, { raw = text } = {}) {
         parsed = null;
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return { key, owner, raw, handyKeys: [], intiface: false, tcode: false, gen: null, readable: false };
+        return { key, owner, raw, handyKeys: [], intiface: false, tcode: false, vacuglides: [], gen: null, readable: false };
     }
     if (Object.prototype.hasOwnProperty.call(parsed, 'ended')) return null;
     return {
@@ -569,6 +637,7 @@ function parseLiveSession(key, text, { raw = text } = {}) {
         handyKeys: cleanHandyKeys(parsed.handy),
         intiface: parsed.intiface === true,
         tcode: parsed.tcode === true,
+        vacuglides: cleanVacuglides(parsed.vacuglide),
         gen: cleanGeneration(parsed.gen),
         readable: true
     };
@@ -596,15 +665,17 @@ export function drivesHandyNow({ sessionStatus, handyKey, mayBeMoving, frozen = 
         && frozen !== true;
 }
 
-const NOTHING_CONNECTED = Object.freeze({ handyKey: '', intiface: false, tcode: false });
+const NOTHING_CONNECTED = Object.freeze({ handyKey: '', intiface: false, tcode: false, vacuglideToken: '' });
 
 // The marker a host page keeps while its session may drive hardware.
-//   note({ handyKey, driving, intiface, tcode })
+//   note({ handyKey, driving, intiface, tcode, vacuglide })
 //                                        what is connected right now, and
 //                                        whether the session drives that
 //                                        Handy right now (drivesHandyNow);
-//                                        called around every dispatch of a
-//                                        live session
+//                                        `vacuglide` is { token, cluster } of
+//                                        the VacuGlide connected now, or
+//                                        null; called around every dispatch
+//                                        of a live session
 //   clear()                              the session ended cleanly
 // Hardware only ever joins a session's marker: a Handy that dropped offline
 // mid-session may still be moving, so losing its link does not take it off.
@@ -636,7 +707,8 @@ const NOTHING_CONNECTED = Object.freeze({ handyKey: '', intiface: false, tcode: 
 // after it (readLiveSessions). A pause or resume is no new generation, and no
 // write to either store.
 //   waitingForDisk()   which of the toys connected now must not be sent a
-//                      command yet: { handy, intiface, tcode }, see below
+//                      command yet: { handy, intiface, tcode, vacuglide },
+//                      see below
 // `onDurable()` is called whenever a change of a record commits, fails or
 // times out, which is when waitingForDisk() may have changed. `now()` is the
 // clock the end of a session is stamped with (ENDED_RECORD_KEEP_MS).
@@ -654,6 +726,10 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
     // lets go of that lock.
     let drivingKey = '';
     let releaseDriving = null;
+    // The VacuGlide this page has connected ('' for none), and what lets go
+    // of the lock that says so (vacuglideLinkLockName).
+    let linkedToken = '';
+    let releaseLinked = null;
     let generation = 0;
     // The text this page last stored under its key - its marker, or the end
     // clear() put in its place - and null while localStorage holds nothing
@@ -707,6 +783,34 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
         drivingKey = handyKey;
     }
 
+    // Holds the lock that tells every other page that this page has the
+    // VacuGlide `token` connected, and lets go of the one held for any other
+    // ('' for none). It is about the link, not the session: a page that has
+    // the device connected answers for it in or out of a session. Asking for
+    // it writes nothing to storage, and the browser drops it with the page,
+    // crash included.
+    function holdVacuglideLink(token) {
+        const clean = sanitizeDeviceToken(token) || '';
+        if (clean === linkedToken) return;
+        if (releaseLinked) {
+            const release = releaseLinked;
+            releaseLinked = null;
+            release();
+        }
+        linkedToken = '';
+        if (!clean || !locks || typeof locks.request !== 'function') return;
+        let release;
+        const held = new Promise((resolve) => { release = resolve; });
+        try {
+            const granted = locks.request(vacuglideLinkLockName(id, clean), () => held);
+            if (granted && typeof granted.catch === 'function') granted.catch(() => {});
+        } catch (e) {
+            return;
+        }
+        releaseLinked = release;
+        linkedToken = clean;
+    }
+
     function note(hardware = {}) {
         const starting = live === null;
         const keys = live ? live.handyKeys.slice() : [];
@@ -715,10 +819,26 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
             keys.push(handyKey);
             if (keys.length > MAX_MARKER_HANDY_KEYS) keys.shift();
         }
+        // A VacuGlide joins like a Handy key, with the cluster it is reached
+        // through: the stop a recovery sends it goes there when Autoblow's
+        // router cannot be asked. One that has moved cluster since is named
+        // with the new one.
+        const vacuglides = live ? live.vacuglides.map((entry) => ({ ...entry })) : [];
+        const vacuglide = hardware.vacuglide && typeof hardware.vacuglide === 'object' ? cleanVacuglides([hardware.vacuglide])[0] || null : null;
+        if (vacuglide) {
+            const seen = vacuglides.find((entry) => entry.token === vacuglide.token);
+            if (seen) {
+                if (vacuglide.cluster) seen.cluster = vacuglide.cluster;
+            } else {
+                vacuglides.push(vacuglide);
+                if (vacuglides.length > MAX_MARKER_VACUGLIDES) vacuglides.shift();
+            }
+        }
         const next = {
             handyKeys: keys,
             intiface: Boolean(live && live.intiface) || hardware.intiface === true,
-            tcode: Boolean(live && live.tcode) || hardware.tcode === true
+            tcode: Boolean(live && live.tcode) || hardware.tcode === true,
+            vacuglides
         };
         // A new generation for what an end already written could otherwise
         // pass for the end of: a session that starts, a toy that joins, and
@@ -728,16 +848,21 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
             || next.intiface !== live.intiface
             || next.tcode !== live.tcode
             || next.handyKeys.length !== live.handyKeys.length
-            || next.handyKeys.some((k, i) => live.handyKeys[i] !== k);
+            || next.handyKeys.some((k, i) => live.handyKeys[i] !== k)
+            || !sameVacuglides(next.vacuglides, live.vacuglides);
         const found = safeGet(key, null, storage);
         const displaced = stored !== null && found !== stored;
         if (joined || displaced) generation += 1;
         live = next;
-        connected = { handyKey, intiface: hardware.intiface === true, tcode: hardware.tcode === true };
+        connected = { handyKey, intiface: hardware.intiface === true, tcode: hardware.tcode === true, vacuglideToken: vacuglide ? vacuglide.token : '' };
         // The lock is asked for before the marker exists, so no page can find
         // this marker while its owner looks closed.
         holdLock();
-        const text = JSON.stringify({ handy: live.handyKeys, intiface: live.intiface, tcode: live.tcode, gen: generation });
+        // A session that never drove a VacuGlide writes the marker it always
+        // has, byte for byte.
+        const text = live.vacuglides.length > 0
+            ? JSON.stringify({ handy: live.handyKeys, intiface: live.intiface, tcode: live.tcode, vacuglide: live.vacuglides, gen: generation })
+            : JSON.stringify({ handy: live.handyKeys, intiface: live.intiface, tcode: live.tcode, gen: generation });
         const current = found === text || safeSet(key, text, storage);
         stored = current ? text : null;
         // On its way to disk now, not once the dispatch that noted it is
@@ -777,7 +902,7 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
     // nothing once its end has been written (a STOP just before this START):
     // that end reaches the disk first. Nothing waits without a durable store.
     function waitingForDisk() {
-        const none = { handy: false, intiface: false, tcode: false };
+        const none = { handy: false, intiface: false, tcode: false, vacuglide: false };
         if (!live || !storage || typeof storage.state !== 'function') return none;
         const record = storage.state(key);
         if (!record || record.status !== 'pending') return none;
@@ -786,7 +911,8 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
         return {
             handy: Boolean(connected.handyKey) && !(named && named.handyKeys.includes(connected.handyKey)),
             intiface: connected.intiface && !(named && named.intiface),
-            tcode: connected.tcode && !(named && named.tcode)
+            tcode: connected.tcode && !(named && named.tcode),
+            vacuglide: Boolean(connected.vacuglideToken) && !(named && named.vacuglides.some((entry) => entry.token === connected.vacuglideToken))
         };
     }
 
@@ -840,7 +966,7 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
         return removed;
     }
 
-    return { owner: id, note, clear, waitingForDisk };
+    return { owner: id, note, clear, waitingForDisk, holdVacuglideLink };
 }
 
 // How long the lock manager gets to say whether a marker's page is open. The
@@ -852,15 +978,17 @@ export const OWNER_QUERY_TIMEOUT_MS = 2000;
 // drives right now: one snapshot of the lock manager, since a page holds or
 // asks for its lock for as long as it owns a marker, and the lock
 // drivingLockName names for as long as its session drives that Handy.
-// Resolves { alive, driving }: the owners that are open, and by owner the
-// Handy keys it drives - only for a page that is open, and only a key a page
-// could have written. Without a lock manager (an http:// origin that is not
+// Resolves { alive, driving, vacuglideLinked }: the owners that are open, by
+// owner the Handy keys it drives - only for a page that is open, and only a
+// key a page could have written - and by owner the VacuGlide tokens it has
+// connected, for any page that holds that lock: the browser drops it with
+// the page, so a page that holds it is open whether or not it has a session. Without a lock manager (an http:// origin that is not
 // localhost has none), or without an answer from it in time, nothing can
 // tell, and every one of them is treated as gone, driving nothing: stopping
 // a Handy that turns out to be in use in another tab is the safe way to be
 // wrong.
 export async function openPages(owners, locks, timeoutMs = OWNER_QUERY_TIMEOUT_MS) {
-    const none = { alive: new Set(), driving: new Map() };
+    const none = { alive: new Set(), driving: new Map(), vacuglideLinked: new Map() };
     const asked = (Array.isArray(owners) ? owners : []).filter((owner) => cleanOwner(owner));
     if (asked.length === 0 || !locks || typeof locks.query !== 'function') return none;
     let timer = null;
@@ -874,14 +1002,22 @@ export async function openPages(owners, locks, timeoutMs = OWNER_QUERY_TIMEOUT_M
         }
         const alive = new Set(asked.filter((owner) => names.has(liveSessionLockName(owner))));
         const driving = new Map();
+        const vacuglideLinked = new Map();
         for (const name of names) {
+            const linked = parseVacuglideLinkLockName(name);
+            if (linked) {
+                const tokens = vacuglideLinked.get(linked.owner) || [];
+                if (!tokens.includes(linked.token)) tokens.push(linked.token);
+                vacuglideLinked.set(linked.owner, tokens);
+                continue;
+            }
             const lock = parseDrivingLockName(name);
             if (!lock || !alive.has(lock.owner)) continue;
             const keys = driving.get(lock.owner) || [];
             if (!keys.includes(lock.key)) keys.push(lock.key);
             driving.set(lock.owner, keys);
         }
-        return { alive, driving };
+        return { alive, driving, vacuglideLinked };
     } catch (e) {
         // Cannot tell: every one of them counts as gone.
         return none;
@@ -1076,7 +1212,16 @@ export function notePendingCrashStopGaveUp(key, { seen = '', token = newPageId()
 // anything from here. `earlier: false` leaves the stops still owed out (a
 // session start: they are promised to the next page to open), and
 // `otherPage` says the markers were found by a page that was open while
-// theirs died. Returns null when there is nothing to do.
+// theirs died. Every VacuGlide a dead session drove gets its whole stop
+// (`vacuglide`, [{ token, cluster, driven }]), except one another page still
+// open has connected (`vacuglideInUse`): that page answers for it, and the
+// banner says so (`vacuglideLeftInUse`). A marker that says nothing usable
+// sends the token saved here (`savedVacuglideToken`) the whole stop too,
+// through Autoblow's router, since nothing says where it was reached. There
+// is no record of VacuGlide stops still owed: the stop is chased for five
+// minutes with the alarm up, as the driver chases any device it lost, and a
+// page that goes away meanwhile leaves the chase to the next one
+// (vacuglide.js). Returns null when there is nothing to do.
 export function planCrashRecovery({
     marker = null,
     markers = marker ? [marker] : [],
@@ -1084,7 +1229,9 @@ export function planCrashRecovery({
     pending = [],
     inUse = [],
     earlier: withEarlier = true,
-    otherPage = false
+    otherPage = false,
+    savedVacuglideToken = '',
+    vacuglideInUse = []
 } = {}) {
     const busy = new Set(cleanHandyKeys(inUse, 64));
     const saved = sanitizeConnectionKey(savedHandyKey);
@@ -1098,11 +1245,28 @@ export function planCrashRecovery({
     let known = true;
     let intiface = false;
     let tcode = false;
+    const vacuglide = [];
+    const vacuglideLeftInUse = [];
     if (found.length > 0) {
         const driven = [];
+        const linkedElsewhere = new Set((Array.isArray(vacuglideInUse) ? vacuglideInUse : []).map((token) => sanitizeDeviceToken(token)).filter(Boolean));
+        const addVacuglide = (token, cluster, wasDriven) => {
+            if (linkedElsewhere.has(token)) {
+                if (!vacuglideLeftInUse.includes(token)) vacuglideLeftInUse.push(token);
+                return;
+            }
+            const seen = vacuglide.find((entry) => entry.token === token);
+            if (seen) {
+                if (!seen.cluster && cluster) seen.cluster = cluster;
+                seen.driven = seen.driven || wasDriven;
+                return;
+            }
+            vacuglide.push({ token, cluster, driven: wasDriven });
+        };
         for (const m of found) {
+            const vacuglides = Array.isArray(m.vacuglides) ? m.vacuglides : [];
             const usable = m.readable === true
-                && (m.handyKeys.length > 0 || m.intiface === true || m.tcode === true);
+                && (m.handyKeys.length > 0 || m.intiface === true || m.tcode === true || vacuglides.length > 0);
             if (!usable) {
                 known = false;
                 continue;
@@ -1110,7 +1274,10 @@ export function planCrashRecovery({
             for (const key of m.handyKeys) if (!busy.has(key) && !driven.includes(key)) driven.push(key);
             if (m.intiface === true) intiface = true;
             if (m.tcode === true) tcode = true;
+            for (const entry of vacuglides) addVacuglide(entry.token, entry.cluster, true);
         }
+        const savedToken = sanitizeDeviceToken(savedVacuglideToken);
+        if (!known && savedToken) addVacuglide(savedToken, '', false);
         handy = driven.map((key) => ({ key, saved: key === saved, driven: true }));
         // A saved key an earlier session still owes a stop is that
         // session's, not one this session left alone.
@@ -1130,7 +1297,7 @@ export function planCrashRecovery({
         ? owed.filter((key) => !inLastSession.includes(key)).map((key) => ({ key, saved: key === saved, driven: true }))
         : [];
     if (found.length === 0 && earlier.length === 0) return null;
-    return { lastSession: found.length > 0, otherPage: otherPage === true, handy, leftInUse, intiface, tcode, known, earlier };
+    return { lastSession: found.length > 0, otherPage: otherPage === true, handy, leftInUse, intiface, tcode, known, earlier, vacuglide, vacuglideLeftInUse };
 }
 
 function retryWindow(minutes) {
@@ -1189,6 +1356,44 @@ export function describeHandyLeftInUse(key) {
     return `The Handy (key ending ${String(key).slice(-4)}) is being driven by a session running in another EdgeLoop tab or window, so EdgeLoop sent it nothing and left it to that session: pausing or stopping that session stops it.`;
 }
 
+// What one VacuGlide was sent and what came back: its whole stop - the motor
+// stop and both valve closes - which the driver chases until Autoblow's
+// server confirms it (vacuglide.js, stopVacuglideAfterCrash). `update` is
+// null while nothing has come back yet. `driven: false` is the token saved
+// here, sent the stop because the marker could not be read.
+export function describeVacuglideCrashStop(update, { label = '', driven = true, retryMinutes = 5 } = {}) {
+    const who = label ? `The VacuGlide (token ending ${label})` : 'The VacuGlide';
+    const how = driven ? '' : ' (the token saved here: EdgeLoop could not read whether that session drove it)';
+    const sent = `EdgeLoop sent ${who}${how} its whole stop - the motor stop and both valve closes`;
+    if (!update) return `EdgeLoop is sending ${who}${how} its whole stop - the motor stop and both valve closes...`;
+    const detail = update.detail ? ` (${update.detail})` : '';
+    switch (update.outcome) {
+        case RECOVERY_STOP.STOPPED:
+            return `${sent}. Autoblow's server confirmed it: the motor is stopped and both valves are closed.`;
+        case RECOVERY_STOP.LINKED:
+            return `${who} is connected on this page: EdgeLoop stops it and closes both valves through that connection, unless the session on this page is driving it.`;
+        case RECOVERY_STOP.CONNECTED:
+            return update.detail === 'elsewhere'
+                ? `Another EdgeLoop tab or window has connected ${who.replace(/^The /, 'the ')}, or is connecting it, and answers for it from there.`
+                : `${who} has been connected again, and connecting it stopped it and closed both valves.`;
+        default: {
+            const why = update.outcome === RECOVERY_STOP.OFFLINE
+                ? `, but Autoblow's server answered that the device is not online${detail}, so the stop could not reach it`
+                : `, but the stop was not confirmed${detail}`;
+            const next = update.final
+                ? `EdgeLoop stopped sending it after ${retryWindow(retryMinutes)}.`
+                : `EdgeLoop keeps sending it for ${retryWindow(retryMinutes)}.`;
+            return `${sent}${why}. If ${who} is running or a valve is open, switch it off with its power button. ${next}`;
+        }
+    }
+}
+
+// A VacuGlide the dead session drove that another page still open has
+// connected: that page answers for it, and nothing was sent from here.
+export function describeVacuglideLeftInUse(token) {
+    return `The VacuGlide (token ending ${String(token).slice(-4)}) is connected in another EdgeLoop tab or window, so EdgeLoop sent it nothing and left it to that page, which stops it on every way out of its session and whenever it sees it moving after a stop.`;
+}
+
 // The whole banner. `updates` maps each Handy key to its latest update, and
 // `owed` lists the keys still owed a stop right now (null: every key a
 // session drove). The last session comes first, with its advice - under a
@@ -1200,7 +1405,7 @@ export function describeHandyLeftInUse(key) {
 // another Handy while this report is still changing, and next to that
 // link's own warnings a bare "The Handy has stopped" would read as news
 // about the device connected now.
-export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes = 5, owed = null } = {}) {
+export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes = 5, owed = null, vacuglideUpdates = new Map(), vacuglideRetryMinutes = 5 } = {}) {
     if (!plan) return '';
     const line = ({ key, saved, driven }) => describeHandyCrashStop(
         updates && typeof updates.get === 'function' ? updates.get(key) || null : null,
@@ -1218,6 +1423,11 @@ export function describeCrashRecovery(plan, updates = new Map(), { retryMinutes 
         if (!plan.known) parts.push(UNKNOWN_HARDWARE_NOTE);
         for (const entry of plan.handy) parts.push(line(entry));
         for (const key of Array.isArray(plan.leftInUse) ? plan.leftInUse : []) parts.push(describeHandyLeftInUse(key));
+        for (const entry of Array.isArray(plan.vacuglide) ? plan.vacuglide : []) {
+            const update = vacuglideUpdates && typeof vacuglideUpdates.get === 'function' ? vacuglideUpdates.get(entry.token) || null : null;
+            parts.push(describeVacuglideCrashStop(update, { label: entry.token.slice(-4), driven: entry.driven !== false, retryMinutes: vacuglideRetryMinutes }));
+        }
+        for (const token of Array.isArray(plan.vacuglideLeftInUse) ? plan.vacuglideLeftInUse : []) parts.push(describeVacuglideLeftInUse(token));
         if (plan.intiface) parts.push(INTIFACE_CRASH_ADVICE);
         if (plan.tcode) parts.push(TCODE_CRASH_ADVICE);
     }
@@ -1290,8 +1500,15 @@ export function whenActivated(doc, start) {
 //   sweep         removes from both stores the ends of sessions they no
 //                 longer need (expiredEndedRecords)
 //   now()         the clock the ends it writes are stamped with
-// Resolves { recovered, plan, finals, settled } once every stop is over,
-// and what it tidied in the durable store with it.
+//   stopVacuglide(token, { cluster, onUpdate })
+//                 vacuglide.js's stopVacuglideAfterCrash: the whole stop of
+//                 each VacuGlide the dead sessions drove, reported like a
+//                 Handy's stop
+//   savedVacuglideToken, liveVacuglideToken
+//                 the VacuGlide token saved here, and the one this page has
+//                 connected, as for The Handy
+// Resolves { recovered, plan, finals, vacuglideFinals, settled } once every
+// stop is over, and what it tidied in the durable store with it.
 // In a page, createCrashRecovery runs it.
 export async function runCrashRecovery({
     storage,
@@ -1313,7 +1530,11 @@ export async function runCrashRecovery({
     readTimeoutMs = DURABLE_READ_TIMEOUT_MS,
     sentOwed = null,
     sweep = false,
-    now = Date.now
+    now = Date.now,
+    stopVacuglide,
+    savedVacuglideToken = '',
+    liveVacuglideToken = '',
+    vacuglideRetryMinutes = 5
 } = {}) {
     const self = cleanOwner(owner);
     const taken = (marker) => Boolean(claimed) && claimed.has(marker.key);
@@ -1344,7 +1565,7 @@ export async function runCrashRecovery({
         await tidied();
         return { recovered: false, alive: 0 };
     }
-    const { alive, driving } = await openPages(found.concat(stale, unwritten).map((marker) => marker.owner), locks, ownerQueryTimeoutMs);
+    const { alive, driving, vacuglideLinked } = await openPages(found.concat(stale, unwritten).map((marker) => marker.owner), locks, ownerQueryTimeoutMs);
     // A copy of a marker that the other store records as ended is no crash,
     // and once its page is gone the store that is behind is given the end:
     // a later pass that cannot read the durable store must not take a stale
@@ -1381,13 +1602,20 @@ export async function runCrashRecovery({
     const inUse = open.flatMap((marker) => driving.get(marker.owner) || []);
     const live = sanitizeConnectionKey(liveHandyKey);
     const saved = sanitizeConnectionKey(savedHandyKey);
+    // A VacuGlide another open page has connected is that page's; this
+    // page's own is stopped through its own link (stopVacuglideAfterCrash).
+    const vacuglideInUse = [...(vacuglideLinked || new Map())].filter(([page]) => page !== self).flatMap(([, tokens]) => tokens);
+    const liveToken = sanitizeDeviceToken(liveVacuglideToken);
+    const savedToken = sanitizeDeviceToken(savedVacuglideToken);
     let plan = planCrashRecovery({
         markers: dead,
         savedHandyKey: saved && saved !== live ? saved : '',
         pending: readPendingCrashStops(storage),
         inUse,
         earlier,
-        otherPage
+        otherPage,
+        savedVacuglideToken: savedToken && savedToken !== liveToken ? savedToken : '',
+        vacuglideInUse
     });
     // A stop still owed that another pass of this page is sending is left to
     // it: the boot pass and the one a late durable read brings both send them.
@@ -1436,10 +1664,12 @@ export async function runCrashRecovery({
     const token = newPageId();
 
     const updates = new Map();
+    const vacuglideUpdates = new Map();
     // Per key whose stop gave up: whether the next page to open is sure to
     // send it again (notePendingCrashStopGaveUp).
     const promised = new Map();
     const entries = plan.handy.concat(plan.earlier);
+    const vacuglides = Array.isArray(plan.vacuglide) ? plan.vacuglide : [];
     // The banner promises another try only for a key that is still owed,
     // read back from storage each time after the record has been brought up
     // to date, and that this page could promise. `fresh`: the report is news
@@ -1450,8 +1680,9 @@ export async function runCrashRecovery({
         if (typeof onReport !== 'function') return;
         try {
             const owed = readPendingCrashStops(storage).filter((key) => promised.get(key) !== false);
-            const open = entries.some(({ key }) => !isSettled(updates.get(key)));
-            onReport(describeCrashRecovery(plan, updates, { retryMinutes, owed }), { fresh, open });
+            const open = entries.some(({ key }) => !isSettled(updates.get(key)))
+                || vacuglides.some(({ token }) => !isSettled(vacuglideUpdates.get(token)));
+            onReport(describeCrashRecovery(plan, updates, { retryMinutes, owed, vacuglideUpdates, vacuglideRetryMinutes }), { fresh, open });
         } catch (e) {}
     };
     report(true);
@@ -1476,6 +1707,24 @@ export async function runCrashRecovery({
             });
     });
 
+    // Each VacuGlide's whole stop, reported the same way: news while nothing
+    // has settled it, a rewording once something has.
+    const vacuglideStops = vacuglides.map(({ token, cluster }) => {
+        const onUpdate = (update) => {
+            vacuglideUpdates.set(token, update);
+            report(!isSettled(update));
+        };
+        return Promise.resolve()
+            .then(() => (typeof stopVacuglide === 'function'
+                ? stopVacuglide(token, { cluster, onUpdate })
+                : { outcome: RECOVERY_STOP.FAILED, detail: 'no stop available', final: true }))
+            .catch((e) => ({ outcome: RECOVERY_STOP.FAILED, detail: e && e.message ? e.message : 'unknown error', final: true }))
+            .then((update) => {
+                if (vacuglideUpdates.get(token) !== update) onUpdate(update);
+                return update;
+            });
+    });
+
     if (!handedOver) {
         // A key the session never drove does not hold the markers, nor keep
         // them waiting while its own stop is still being retried.
@@ -1483,9 +1732,11 @@ export async function runCrashRecovery({
         if (lastDriven.every(isSettled)) removeMarkers();
     }
     const finals = await Promise.all(stops);
-    const settled = entries.every((entry, i) => !entry.driven || isSettled(finals[i]));
+    const vacuglideFinals = await Promise.all(vacuglideStops);
+    const settled = entries.every((entry, i) => !entry.driven || isSettled(finals[i]))
+        && vacuglides.every((entry, i) => !entry.driven || isSettled(vacuglideFinals[i]));
     await tidied();
-    return { recovered: true, plan, finals, settled, alive: open.length };
+    return { recovered: true, plan, finals, vacuglideFinals, settled, alive: open.length };
 }
 
 // The storage's swap() (durable-store.js), or nothing applied without one.
@@ -1554,7 +1805,11 @@ export const BOOT_RECHECK_MS = 3000;
 // still has a stop out, or one that gave up, stays through the session.
 // When none is left, the text is ''. `savedHandyKey()` and
 // `liveHandyKey()` (this page's own connected Handy) are read when a pass
-// starts. `storage` is createCrashRecoveryStorage()'s, and with it
+// starts, and so are `savedVacuglideToken()` and `liveVacuglideToken()`;
+// `stopVacuglide` sends a VacuGlide its whole stop (stopVacuglideAfterCrash),
+// and holdVacuglideLink(token) holds, for as long as this page has that
+// VacuGlide connected ('' lets go), the lock that keeps every other page's
+// recovery from sending it anything. `storage` is createCrashRecoveryStorage()'s, and with it
 //   waitingForDisk()         which toys the session must not command yet
 //                            (createLiveSessionTracker), and `onDurable()`
 //                            is told whenever that may have changed
@@ -1569,6 +1824,10 @@ export function createCrashRecovery({
     savedHandyKey = () => '',
     liveHandyKey = () => '',
     stopHandy,
+    savedVacuglideToken = () => '',
+    liveVacuglideToken = () => '',
+    stopVacuglide,
+    vacuglideRetryMinutes = 5,
     onReport,
     onDurable,
     retryMinutes = 5,
@@ -1637,6 +1896,10 @@ export function createCrashRecovery({
             savedHandyKey: read(savedHandyKey),
             liveHandyKey: read(liveHandyKey),
             stopHandy,
+            savedVacuglideToken: read(savedVacuglideToken),
+            liveVacuglideToken: read(liveVacuglideToken),
+            stopVacuglide,
+            vacuglideRetryMinutes,
             retryMinutes,
             ownerQueryTimeoutMs,
             readTimeoutMs,
@@ -1692,6 +1955,7 @@ export function createCrashRecovery({
         note: tracker.note,
         clear: tracker.clear,
         waitingForDisk: tracker.waitingForDisk,
+        holdVacuglideLink: tracker.holdVacuglideLink,
         atBoot,
         sessionResumed
     };

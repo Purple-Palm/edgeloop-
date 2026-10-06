@@ -34,7 +34,13 @@ import {
     NOTE_KEY_NONE_SAVED,
     NOTE_KEY_UNUSABLE,
     RETIRED_SETTING_KEYS,
-    pruneRetiredKeys
+    pruneRetiredKeys,
+    NOTE_WITH_TOKEN,
+    NOTE_WITH_BOTH,
+    NOTE_WITHOUT_KEYS,
+    NOTE_TOKEN_UNUSABLE,
+    sanitizeDeviceToken,
+    VACUGLIDE_SETTING_NAMES
 } from './backup.js';
 import { advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
 import { sanitizeSetting, SETTING_SANITIZERS } from './settings-schema.js';
@@ -914,7 +920,7 @@ describe('the third round: what the fixes themselves broke', () => {
         assert.match(fn, /unsaved\.push\('role'\)/);
         // every part the import writes reports by the same names
         const ids = [...fn.matchAll(/unsaved\.push\('([a-z]+)'\)/g)].map((m) => m[1]);
-        assert.deepEqual(ids.sort(), ['cap', 'flags', 'intiface', 'key', 'role', 'tcode']);
+        assert.deepEqual(ids.sort(), ['cap', 'flags', 'intiface', 'key', 'role', 'tcode', 'token']);
         for (const id of ids) assert.ok(RESTORE_PARTS[id], `${id} must be a known restore part`);
     });
 
@@ -1203,5 +1209,276 @@ describe('the two wave switches 1.1.0 stopped reading are retired', () => {
         const prune = src.indexOf('pruneRetiredKeys(parsed)');
         const merge = src.indexOf('Object.assign(advancedSettings, parsed)');
         assert.ok(prune >= 0 && merge > prune, 'boot must prune the retired names before the merge');
+    });
+});
+
+// The VacuGlide device token is the same kind of string as the Handy key -
+// a bearer credential Autoblow documents no way to revoke - so it rides the
+// same opt-in, is checked by the same rule, and is named by the same note
+// and filename. A Handy user with no VacuGlide must see no change at all.
+describe('the VacuGlide device token rides the same opt-in', () => {
+    const TOKEN = 'vgtok9f3c21x';
+    const WITH_TOKEN = { ...STORES, vacuglideDeviceToken: TOKEN };
+
+    it('is left out by default, and the file says so without claiming it for a browser that has none', () => {
+        const file = buildBackup(WITH_TOKEN, { now: NOW });
+        assert.equal(file.vacuglideDeviceTokenIncluded, false);
+        assert.equal(file.vacuglideDeviceToken, null);
+        assert.ok(!JSON.stringify(file).includes(TOKEN), 'the default file must not contain the token anywhere');
+        assert.equal(file.note, NOTE_WITHOUT_KEYS);
+        assert.equal(backupFilename(file), FILENAME_PLAIN);
+        // a browser with no token keeps the Handy-only sentence it always had
+        assert.equal(buildBackup(STORES, { now: NOW }).note, NOTE_WITHOUT_KEY);
+        assert.match(NOTE_WITHOUT_KEY, /Tick "Include my device keys"/, 'the note names the box the panel shows');
+        const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+        assert.match(html, /Include my device keys - the Handy connection key and the VacuGlide device token/);
+    });
+
+    it('goes in with the Handy key when the box is ticked, and the file and the filename warn about both', () => {
+        const file = buildBackup(WITH_TOKEN, { includeKey: true, now: NOW });
+        assert.equal(file.vacuglideDeviceTokenIncluded, true);
+        assert.equal(file.vacuglideDeviceToken, TOKEN);
+        assert.equal(file.handyConnectionKey, KEY);
+        assert.equal(file.note, NOTE_WITH_BOTH);
+        assert.match(JSON.stringify(file, null, 2).split('\n')[1], /WARNING: this file contains your Handy connection key and your VacuGlide device token/);
+        assert.equal(backupFilename(file), FILENAME_WITH_KEY);
+        const panel = describeBackupExport(file, { requestedKey: true, hasSavedKey: true, hasSavedToken: true });
+        assert.equal(panel.tone, 'warn');
+        assert.match(panel.message, /CONTAINS your Handy connection key and your VacuGlide device token: anyone who has the file can control your Handy and your VacuGlide/);
+    });
+
+    it('goes in alone for a browser that has only a VacuGlide', () => {
+        const file = buildBackup({ settings: {}, vacuglideDeviceToken: TOKEN }, { includeKey: true, now: NOW });
+        assert.equal(file.note, NOTE_WITH_TOKEN);
+        assert.equal(file.handyConnectionKeyIncluded, false);
+        assert.equal(file.vacuglideDeviceToken, TOKEN);
+        assert.equal(backupFilename(file), FILENAME_WITH_KEY, 'any credential gets the warning filename');
+        const panel = describeBackupExport(file, { requestedKey: true, hasSavedKey: false, hasSavedToken: true });
+        assert.match(panel.message, /CONTAINS your VacuGlide device token: anyone who has the file can control your VacuGlide\./);
+        assert.ok(!/Handy/.test(panel.message), 'no sentence about a Handy this browser does not have');
+    });
+
+    it('says a saved token was unusable rather than leaving the file silently incomplete', () => {
+        const withKey = buildBackup({ ...STORES, vacuglideDeviceToken: 'has a space' }, { includeKey: true, now: NOW });
+        assert.equal(withKey.vacuglideDeviceTokenIncluded, false);
+        assert.ok(withKey.note.startsWith(NOTE_WITH_KEY));
+        assert.match(withKey.note, /Your VacuGlide device token is NOT in it: what is saved in this browser is not a usable token/);
+        const panel = describeBackupExport(withKey, { requestedKey: true, hasSavedKey: true, hasSavedToken: true });
+        assert.match(panel.message, /The VacuGlide device token saved in this browser is not a usable token/);
+        const alone = buildBackup({ settings: {}, vacuglideDeviceToken: 'line\nbreak' }, { includeKey: true, now: NOW });
+        assert.equal(alone.note, NOTE_TOKEN_UNUSABLE);
+        const alonePanel = describeBackupExport(alone, { requestedKey: true, hasSavedKey: false, hasSavedToken: true });
+        assert.equal(alonePanel.tone, 'warn');
+        assert.match(alonePanel.message, /not a usable token/);
+        assert.ok(!/No Handy connection key is saved/.test(alonePanel.message));
+        // both unusable: both are named
+        assert.equal(backupNote(false, true, 'BAD KEY', { carries: false, saved: 'BAD TOKEN' }), `${NOTE_KEY_UNUSABLE} Your VacuGlide device token is NOT in it: what is saved in this browser is not a usable token. Re-enter it in the VacuGlide panel and export again.`);
+    });
+
+    it('says plainly when the box was ticked and there was nothing to include', () => {
+        const file = buildBackup({ settings: {} }, { includeKey: true, now: NOW });
+        assert.equal(file.note, NOTE_KEY_NONE_SAVED);
+        assert.match(NOTE_KEY_NONE_SAVED, /no Handy connection key or VacuGlide device token is saved/);
+        const panel = describeBackupExport(file, { requestedKey: true, hasSavedKey: false, hasSavedToken: false });
+        assert.equal(panel.tone, 'info');
+        assert.match(panel.message, /no VacuGlide device token either, so there was nothing to include/);
+    });
+
+    it('comes back from its own file, checked by the rule the driver sends it under', () => {
+        const read = readBackup(JSON.parse(JSON.stringify(buildBackup(WITH_TOKEN, { includeKey: true, now: NOW }))));
+        assert.equal(read.ok, true);
+        assert.equal(read.tokenPresent, true);
+        assert.equal(read.vacuglideDeviceToken, TOKEN);
+        for (const [raw, rejected] of [['has a space', true], ['a\nb', true], ['x'.repeat(129), true], [42, true], ['', false], ['   ', false], [null, false]]) {
+            const r = readBackup({ minHr: 70, vacuglideDeviceToken: raw });
+            assert.equal(r.tokenPresent, false, JSON.stringify(raw));
+            assert.equal(r.tokenRejected, rejected, JSON.stringify(raw));
+            assert.equal(sanitizeDeviceToken(raw), sanitizeConnectionKey(raw), 'the token rule is the Handy key rule');
+        }
+        assert.equal(readBackup({ minHr: 70, vacuglideDeviceToken: '  padded  ' }).vacuglideDeviceToken, 'padded');
+        const declared = readBackup(buildBackup(WITH_TOKEN, { now: NOW }));
+        assert.equal(declared.tokenDeclaredAbsent, true);
+    });
+
+    it('a file carrying only a token is a backup, not an empty file', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, vacuglideDeviceToken: TOKEN });
+        assert.equal(read.ok, true);
+        assert.equal(read.tokenPresent, true);
+    });
+
+    it('can never be carried in or out inside the settings store', () => {
+        assert.ok(RESERVED_SETTING_KEYS.includes('vacuglideDeviceToken'));
+        assert.ok(RESERVED_SETTING_KEYS.includes('vacuglideDeviceTokenIncluded'));
+        const poisoned = { ...STORES, settings: { ...STORES.settings, vacuglideDeviceToken: 'PROBE-TOKEN-1' } };
+        assert.ok(!JSON.stringify(buildBackup(poisoned, { now: NOW })).includes('PROBE-TOKEN-1'));
+        const legacy = readBackup({ minHr: 70, vacuglideDeviceToken: TOKEN });
+        assert.equal('vacuglideDeviceToken' in legacy.settings, false);
+        assert.equal(legacy.vacuglideDeviceToken, TOKEN, 'still read as the token it is');
+        const store = { minHr: 70, vacuglideDeviceToken: 'x', vacuglideDeviceTokenIncluded: true };
+        assert.deepEqual(pruneReservedKeys(store).sort(), ['vacuglideDeviceToken', 'vacuglideDeviceTokenIncluded']);
+    });
+
+    it('the import answers the token question only where there is one to ask', () => {
+        const withToken = readBackup({ minHr: 70, vacuglideDeviceToken: TOKEN });
+        assert.match(describeBackupImport(withToken, {}), /Your VacuGlide device token was restored\. Open the VacuGlide panel and press Connect/);
+        assert.match(describeBackupImport(withToken, { hadExistingToken: true, tokenReplaced: true }), /device token saved in this browser was REPLACED/);
+        const refused = describeBackupImport(withToken, { unsaved: ['token'] });
+        assert.match(refused.split('\n')[0], /REFUSED TO SAVE your VacuGlide device token/);
+        assert.ok(!/device token was restored/.test(refused));
+        assert.match(describeBackupImport(readBackup({ minHr: 70, vacuglideDeviceToken: 'has a space' }), { hadExistingToken: true }), /not a usable token, so it was ignored and the one saved here was kept/);
+        assert.match(describeBackupImport(readBackup(buildBackup(WITH_TOKEN, { now: NOW })), { hadExistingToken: true }), /exported without a VacuGlide device token, so the one saved in this browser was kept/);
+        assert.match(describeBackupImport(readBackup({ minHr: 70 }), { hadExistingToken: true }), /contained no VacuGlide device token, so the one saved in this browser was kept/);
+        // A Handy user with no VacuGlide, restoring a file with no token: not a word about it.
+        assert.ok(!/VacuGlide/.test(describeBackupImport(readBackup(buildBackup(STORES, { includeKey: true, now: NOW })), {})));
+    });
+
+    const CONTRADICTIONS = [
+        [/device token was restored/, /REFUSED TO SAVE your VacuGlide device token/],
+        [/device token was restored/, /not a usable token/],
+        [/REPLACED by the one in this file - they are different tokens/, /REFUSED TO SAVE your VacuGlide device token/]
+    ];
+    const FILES = {
+        'both credentials': [buildBackup(WITH_TOKEN, { includeKey: true, now: NOW }), {}],
+        'token only': [{ format: BACKUP_FORMAT, version: 2, settings: {}, vacuglideDeviceToken: TOKEN }, {}],
+        'a token that replaces one': [{ minHr: 70, vacuglideDeviceToken: 'OTHER-TOKEN' }, { hadExistingToken: true, tokenReplaced: true }],
+        'a token the browser refused': [{ minHr: 70, vacuglideDeviceToken: TOKEN }, { unsaved: ['token'], hadExistingToken: true }],
+        'a hostile token': [{ minHr: 70, vacuglideDeviceToken: 'has a space' }, { hadExistingToken: false }],
+        'nothing saved at all': [buildBackup(WITH_TOKEN, { includeKey: true, now: NOW }), { unsaved: ['settings', 'key', 'token', 'role', 'cap', 'intiface', 'tcode', 'flags'], settingsChanged: true }]
+    };
+    for (const [label, [file, context]] of Object.entries(FILES)) {
+        it(`reads coherently: ${label}`, () => {
+            const text = describeBackupImport(readBackup(file), context);
+            for (const [a, b] of CONTRADICTIONS) {
+                assert.ok(!(a.test(text) && b.test(text)), `these two lines cannot both be true:\n${a}\n${b}\n---\n${text}`);
+            }
+            assert.ok(!/undefined|NaN|\[object|null/.test(text), text);
+            assert.ok(!/ {2}/.test(text), text);
+            for (const para of text.split('\n\n')) assert.match(para.trim(), /[.!]$/, `paragraph does not end in a full stop: ${para}`);
+        });
+    }
+
+    // The VacuGlide's role, cap and pulse live in the settings store, but
+    // they are the VacuGlide panel's, and two of them decide how hard the
+    // device runs. Folded into "N Session Setup values", an import raised a
+    // cap from 40% to 100%, turned an OFF channel back on and doubled the
+    // valve pulse without a word.
+    const FACTORY_VG = { vacuglideRole: 'primary', vacuglideMaxCap: 100, vacuglideValvePulseMs: 1000 };
+    const WEARER_VG = { vacuglideRole: 'off', vacuglideMaxCap: 40, vacuglideValvePulseMs: 1000 };
+    const OLDER = { format: BACKUP_FORMAT, version: 2, settings: { minHr: 70, maxHr: 140, vacuglideRole: 'primary', vacuglideMaxCap: 100, vacuglideValvePulseMs: 2000 }, handy: { role: 'primary', maxCap: 100 } };
+
+    it('names every VacuGlide value a file changes, with its value, and counts none of them as Session Setup', () => {
+        assert.deepEqual([...VACUGLIDE_SETTING_NAMES].sort(), ['vacuglideMaxCap', 'vacuglideRole', 'vacuglideValvePulseMs']);
+        // settingsStored is what app.js counts: the Session Setup values
+        // stored as written, the VacuGlide's left out.
+        const text = describeBackupImport(readBackup(OLDER), { settingsStored: 2, vacuglideBefore: WEARER_VG, settingsChanged: true });
+        assert.equal(text.split('\n')[0], 'Settings imported: 2 Session Setup values, the Handy channel role (now primary), the Handy speed cap (now 100%), the VacuGlide channel role (now primary), the VacuGlide speed cap (now 100%) and the VacuGlide valve pulse (now 2.0 s).');
+        assert.ok(!/outside what this app accepts/.test(text), 'every value was taken as written');
+    });
+
+    it('a caller that counted the VacuGlide values as stored cannot inflate the Session Setup count', () => {
+        const text = describeBackupImport(readBackup(OLDER), { settingsStored: 5, vacuglideBefore: WEARER_VG });
+        assert.match(text, /^Settings imported: 2 Session Setup values, /);
+    });
+
+    it('says what a VacuGlide value the app would not take became, and where it is - not Session Setup', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: 2, settings: { vacuglideRole: 'turbo', vacuglideMaxCap: 250, vacuglideValvePulseMs: 60000 } });
+        const text = describeBackupImport(read, { settingsStored: 0, settingsChanged: true, vacuglideBefore: WEARER_VG });
+        const paragraphs = text.split('\n\n');
+        assert.equal(paragraphs[0], 'No value in this file could be used exactly as written, but it did change settings here - see below.');
+        const corrected = paragraphs.find((p) => /VacuGlide channel role in this file/.test(p));
+        assert.ok(corrected, text);
+        assert.match(corrected, /The VacuGlide channel role in this file is not primary, secondary or off, so it is now off: an import never hands a toy a channel the file does not clearly name\./);
+        assert.match(corrected, /The VacuGlide speed cap in this file is not one its panel offers \(10-100% in steps of 5\), so it is now 100%\./);
+        assert.match(corrected, /The VacuGlide valve pulse in this file is not one its panel offers \(0\.3-2\.0 s in steps of 0\.1 s\), so it is now 2\.0 s\./);
+        assert.match(corrected, /All three are in the VacuGlide panel, not in Session Setup\.$/);
+        assert.ok(!/open Session Setup to see where/.test(text), 'Session Setup does not show them');
+        assert.ok(!/a limit, or the factory setting/.test(text), 'off is neither');
+        assert.ok(!/the VacuGlide (channel role|speed cap|valve pulse) \(now/.test(text), 'a corrected value is not reported as restored');
+        // An unreadable cap is the floor, and one value alone is "It".
+        const one = describeBackupImport(readBackup({ vacuglideMaxCap: 'fast' }), { settingsStored: 0, vacuglideBefore: FACTORY_VG });
+        assert.match(one, /The VacuGlide speed cap in this file is not one its panel offers \(10-100% in steps of 5\), so it is now 10%\. It is in the VacuGlide panel, not in Session Setup\./);
+    });
+
+    it('does not tell a browser without a VacuGlide about VacuGlide values its own backup left as they were', () => {
+        // Every export carries the three values, at the factory numbers for
+        // a Handy user who has never opened the VacuGlide panel.
+        const own = buildBackup({ ...STORES, settings: { ...STORES.settings, ...FACTORY_VG } }, { now: NOW });
+        const read = readBackup(own);
+        const text = describeBackupImport(read, { settingsStored: 5, vacuglideBefore: FACTORY_VG, hadExistingToken: false });
+        assert.ok(!/VacuGlide/.test(text), text);
+        assert.match(text, /^Settings imported: 5 Session Setup values, the Handy channel role \(now secondary\), the Handy speed cap \(now 65%\), 1 Intiface device map/);
+    });
+
+    it('names them all for a browser that has a VacuGlide, changed or not', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: 2, settings: { minHr: 70, ...WEARER_VG } });
+        const text = describeBackupImport(read, { settingsStored: 1, vacuglideBefore: WEARER_VG, hadExistingToken: true });
+        assert.match(text, /^Settings imported: 1 Session Setup value, the VacuGlide channel role \(now off\), the VacuGlide speed cap \(now 40%\) and the VacuGlide valve pulse \(now 1\.0 s\)\./);
+        // A token the file restores makes this browser one that has a VacuGlide.
+        const withToken = readBackup({ format: BACKUP_FORMAT, version: 2, settings: { ...FACTORY_VG }, vacuglideDeviceToken: 'abc123def456' });
+        assert.match(describeBackupImport(withToken, { vacuglideBefore: FACTORY_VG }), /the VacuGlide speed cap \(now 100%\)/);
+    });
+
+    it('names a value it cannot compare, rather than leave a change unsaid', () => {
+        const text = describeBackupImport(readBackup({ vacuglideMaxCap: 55 }), {});
+        assert.match(text, /^Settings imported: the VacuGlide speed cap \(now 55%\)\./);
+        assert.match(text, /This file carried no Session Setup values, so nothing in Session Setup changed\./);
+    });
+
+    it('names the VacuGlide values the browser refused to save as lost, and never as restored', () => {
+        const text = describeBackupImport(readBackup(OLDER), { settingsStored: 2, vacuglideBefore: WEARER_VG, unsaved: ['settings'] });
+        assert.match(text.split('\n')[0], /^THIS BROWSER REFUSED TO SAVE your Session Setup values and your VacuGlide channel role, speed cap and valve pulse\./);
+        assert.ok(!/\(now primary\), the VacuGlide|the VacuGlide speed cap \(now/.test(text), text);
+        // Only the ones this report would have named.
+        const one = describeBackupImport(readBackup({ vacuglideMaxCap: 55, vacuglideRole: 'primary' }), { vacuglideBefore: FACTORY_VG, unsaved: ['settings'] });
+        assert.match(one.split('\n')[0], /^THIS BROWSER REFUSED TO SAVE your VacuGlide speed cap\./);
+    });
+
+    const VG_CONTRADICTIONS = [
+        [/the VacuGlide (channel role|speed cap|valve pulse) \(now/, /REFUSED TO SAVE[^\n]*your VacuGlide/],
+        [/Nothing in this file changed a setting here/, /the VacuGlide (channel role|speed cap|valve pulse) \(now/],
+        [/open Session Setup to see where/, /^(?![\s\S]*Session Setup value)[\s\S]*$/]
+    ];
+    const VG_FILES = {
+        'an older backup over a capped, switched-off VacuGlide': [OLDER, { settingsStored: 2, vacuglideBefore: WEARER_VG, settingsChanged: true }],
+        'a hostile VacuGlide block': [{ settings: { vacuglideRole: 'boss', vacuglideMaxCap: -3, vacuglideValvePulseMs: 'x' } }, { settingsStored: 0, settingsChanged: true, vacuglideBefore: WEARER_VG }],
+        'a refused write': [OLDER, { settingsStored: 2, vacuglideBefore: WEARER_VG, unsaved: ['settings', 'role', 'cap'] }],
+        'unchanged, no VacuGlide here': [{ settings: { ...FACTORY_VG } }, { settingsStored: 0, vacuglideBefore: FACTORY_VG }],
+        'mixed: one corrected, one changed': [{ settings: { minHr: 72, vacuglideMaxCap: 37, vacuglideRole: 'secondary' } }, { settingsStored: 1, vacuglideBefore: FACTORY_VG, settingsChanged: true }]
+    };
+    for (const [label, [file, context]] of Object.entries(VG_FILES)) {
+        it(`reads coherently about the VacuGlide: ${label}`, () => {
+            const text = describeBackupImport(readBackup(file), context);
+            for (const [a, b] of VG_CONTRADICTIONS) {
+                assert.ok(!(a.test(text) && b.test(text)), `these two cannot both be true:\n${a}\n${b}\n---\n${text}`);
+            }
+            assert.ok(!/undefined|NaN|\[object|null/.test(text), text);
+            assert.ok(!/ {2}/.test(text), text);
+            for (const para of text.split('\n\n')) assert.match(para.trim(), /[.!]$/, `paragraph does not end in a full stop: ${para}`);
+        });
+    }
+
+    it('its role, cap and pulse are settings: carried by every backup and bounded on the way in', () => {
+        const file = buildBackup({ settings: { vacuglideRole: 'secondary', vacuglideMaxCap: 55, vacuglideValvePulseMs: 700 } }, { now: NOW });
+        assert.deepEqual(
+            (({ vacuglideRole, vacuglideMaxCap, vacuglideValvePulseMs }) => ({ vacuglideRole, vacuglideMaxCap, vacuglideValvePulseMs }))(readBackup(file).settings),
+            { vacuglideRole: 'secondary', vacuglideMaxCap: 55, vacuglideValvePulseMs: 700 }
+        );
+        const hostile = readBackup({ vacuglideRole: 'boss', vacuglideMaxCap: 'fast', vacuglideValvePulseMs: 60000 });
+        assert.equal(hostile.settings.vacuglideRole, 'off', 'a role nobody can pick drives nothing');
+        assert.equal(hostile.settings.vacuglideMaxCap, 10, 'an unreadable cap is the floor, not 100');
+        assert.equal(hostile.settings.vacuglideValvePulseMs, 2000);
+    });
+});
+
+describe('app.js keeps the token where the key is kept', () => {
+    const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+
+    it('writes the token from Connect and from a restore, nowhere else, and checks the restore write', () => {
+        // Proven end to end in the page as well (Export -> wipe -> Import).
+        const writes = src.match(/safeSet\(VACUGLIDE_TOKEN_STORAGE_KEY/g) || [];
+        assert.equal(writes.length, 2);
+        const fn = src.slice(src.indexOf('function applyImportedBackup'), src.indexOf('function countStoredSettings'));
+        assert.match(fn, /if \(result\.tokenPresent\) \{\s*if \(!safeSet\(VACUGLIDE_TOKEN_STORAGE_KEY, result\.vacuglideDeviceToken\)\) unsaved\.push\('token'\);/);
+        assert.ok(RESTORE_PARTS.token, 'the refused part has a name the message can use');
     });
 });

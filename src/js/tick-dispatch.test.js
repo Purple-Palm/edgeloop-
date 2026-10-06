@@ -682,7 +682,8 @@ describe('app.js runs its master clock through it', () => {
         const body = bodyOf('dispatchHardware');
         assert.match(body, /const release = tickDispatch\.admit\(\[primarySpeed, secondarySpeed, strokeMin, strokeMax\], \{ force, urgent \}\);\s*if \(!release\) return;/);
         assert.ok(body.indexOf('tickDispatch.admit(') < body.indexOf('dispatchHandy('), 'the gate comes before any driver');
-        for (const driver of ['dispatchHandy', 'dispatchIntiface', 'dispatchTCode']) {
+        for (const driver of ['dispatchHandy', 'dispatchVacuglide', 'dispatchIntiface', 'dispatchTCode']) {
+            assert.ok(body.indexOf('tickDispatch.admit(') < body.indexOf(`${driver}(`), `the gate comes before ${driver}`);
             assert.match(body, new RegExp(`${driver}\\([^;]*\\{ urgent: release\\.urgent \\}\\);`), driver);
         }
     });

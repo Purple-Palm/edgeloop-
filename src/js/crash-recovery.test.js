@@ -17,8 +17,12 @@ import {
     TCODE_CRASH_ADVICE,
     UNKNOWN_HARDWARE_NOTE,
     DRIVING_LOCK_PREFIX,
+    VACUGLIDE_LINK_LOCK_PREFIX,
+    MAX_MARKER_VACUGLIDES,
     liveSessionLockName,
     drivingLockName,
+    vacuglideLinkLockName,
+    describeVacuglideCrashStop,
     liveSessionKey,
     newPageId,
     readLiveSession,
@@ -106,7 +110,9 @@ function fakeLocks() {
         },
         crash(owner) {
             held.delete(liveSessionLockName(owner));
-            for (const name of Array.from(held.keys())) if (name.startsWith(`${DRIVING_LOCK_PREFIX}${owner}:`)) held.delete(name);
+            for (const name of Array.from(held.keys())) {
+                if (name.startsWith(`${DRIVING_LOCK_PREFIX}${owner}:`) || name.startsWith(`${VACUGLIDE_LINK_LOCK_PREFIX}${owner}:`)) held.delete(name);
+            }
         },
         holds(owner) { return held.has(liveSessionLockName(owner)); },
         names() { return Array.from(held.keys()); }
@@ -2569,7 +2575,7 @@ function onDisk(b, owner = 'page-a') {
 }
 
 describe('a browser that is killed: the durable copy', () => {
-    const NOTHING = { handy: false, intiface: false, tcode: false };
+    const NOTHING = { handy: false, intiface: false, tcode: false, vacuglide: false };
 
     it('killed before localStorage wrote the marker: the next start finds it on disk, stops the Handy and says so', async () => {
         const first = await startBrowser();
@@ -2579,7 +2585,7 @@ describe('a browser that is killed: the durable copy', () => {
         first.commitLocalStorage();
         const tracker = createLiveSessionTracker({ owner: 'page-a', storage: first.storage, locks: first.locks });
         tracker.note({ ...HANDY, driving: true });
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false }, 'no command before the marker is on disk');
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false, vacuglide: false }, 'no command before the marker is on disk');
         await first.storage.settled();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         const next = await first.kill();
@@ -2791,18 +2797,18 @@ describe('a browser that is killed: the durable copy', () => {
         const tracker = createLiveSessionTracker({ owner: 'page-a', storage: b.storage, locks: b.locks, onDurable: () => { told += 1; } });
         assert.deepEqual(tracker.waitingForDisk(), NOTHING, 'no session, nothing to wait for');
         tracker.note(HANDY);
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         assert.equal(told, 1, 'told when the commit landed');
         // A toy that joins mid-session waits; the Handy already named does not.
         tracker.note({ ...HANDY, intiface: true });
-        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         // So does another Handy.
         tracker.note({ handyKey: 'KEY-TWO-5678', intiface: true, tcode: true });
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: true });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: true, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         // Pausing and resuming changes what the session drives now, which
@@ -2817,10 +2823,10 @@ describe('a browser that is killed: the durable copy', () => {
         // even with the same Handy - the last one's end is on its way.
         tracker.clear();
         tracker.note(HANDY);
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(onDisk(b), { ended: 3, at: onDisk(b).at }, 'the end landed first');
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false }, 'and the new marker is still on its way');
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: false, tcode: false, vacuglide: false }, 'and the new marker is still on its way');
         await b.durable.commit();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         assert.equal(onDisk(b).gen, 4);
@@ -2839,13 +2845,13 @@ describe('a browser that is killed: the durable copy', () => {
             // Intiface toy joins; the pulse then reaches the ceiling, set to
             // Full Stop: the Handy's stop must go out at once.
             tracker.note({ ...HANDY, driving: true, intiface: true });
-            assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false }, `${how}: only the toy that joined waits`);
+            assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false, vacuglide: false }, `${how}: only the toy that joined waits`);
             const toldBefore = told;
             assert.equal(await settle(until(() => !tracker.waitingForDisk().intiface, 2000)), true, `${how}: no longer than the timeout either`);
             assert.ok(told > toldBefore, `${how}: and whoever held it back is told`);
             // A T-Code device that joins after that holds back neither of them.
             tracker.note({ ...HANDY, driving: false, intiface: true, tcode: true });
-            assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: false, tcode: true }, how);
+            assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: false, tcode: true, vacuglide: false }, how);
             assert.equal(await settle(until(() => !tracker.waitingForDisk().tcode, 2000)), true, how);
             // A new session waits for a marker of its own again.
             tracker.clear();
@@ -2888,12 +2894,12 @@ describe('a browser that is killed: the durable copy', () => {
         tracker.note(HANDY);
         await tick(1);
         tracker.note({ ...HANDY, intiface: true });
-        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: true, tcode: false });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: true, intiface: true, tcode: false, vacuglide: false });
         // The first change fails; the second is still on its way.
         b.durable.dead = true;
         await b.durable.commit();
         b.durable.dead = false;
-        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false });
+        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: true, tcode: false, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(tracker.waitingForDisk(), NOTHING);
         assert.deepEqual(onDisk(b), { handy: ['KEY-ONE-1234'], intiface: true, tcode: false, gen: 2 });
@@ -2914,7 +2920,7 @@ describe('a browser that is killed: the durable copy', () => {
         });
         assert.deepEqual(recovery.waitingForDisk(), NOTHING);
         recovery.note(HANDY);
-        assert.deepEqual(recovery.waitingForDisk(), { handy: true, intiface: false, tcode: false });
+        assert.deepEqual(recovery.waitingForDisk(), { handy: true, intiface: false, tcode: false, vacuglide: false });
         await b.durable.commit();
         assert.deepEqual(recovery.waitingForDisk(), NOTHING);
         assert.ok(told >= 1);
@@ -4024,6 +4030,157 @@ describe('a browser killed at any moment of a session', () => {
     });
 });
 
+// The VacuGlide has no watchdog, and a page that crashes sends it no unload
+// stop and leaves no handover entry (vacuglide.js): the marker is all the
+// next page has. Its whole stop is vacuglide.js's stopVacuglideAfterCrash,
+// run against a fake Autoblow cloud in vacuglide.test.js; here a stand-in
+// answers for it.
+describe('a VacuGlide in the crash marker', () => {
+    const TOKEN = 'vgtoken1234abcd';
+    const CLUSTER = 'https://eu-central-1.autoblowapi.com';
+    const VG = { handyKey: '', intiface: false, tcode: false, vacuglide: { token: TOKEN, cluster: CLUSTER } };
+
+    // A whole stop that answers at once, recording what it was asked for.
+    function vgStop(answers = {}) {
+        const asked = [];
+        const stop = (token, { cluster, onUpdate } = {}) => {
+            asked.push({ token, cluster });
+            const update = { final: true, detail: '', outcome: 'stopped', ...(answers[token] || {}) };
+            if (onUpdate) onUpdate(update);
+            return Promise.resolve(update);
+        };
+        stop.asked = asked;
+        return stop;
+    }
+
+    it('names the VacuGlide a session drove, with its cluster, and a session without one writes the marker it always has', () => {
+        const storage = fakeStorage();
+        const tracker = createLiveSessionTracker({ owner: 'page-a', storage });
+        tracker.note(HANDY);
+        assert.equal(storage.getItem(liveSessionKey('page-a')), JSON.stringify({ handy: ['KEY-ONE-1234'], intiface: false, tcode: false, gen: 1 }), 'byte for byte as before');
+        tracker.note({ ...HANDY, vacuglide: { token: TOKEN, cluster: CLUSTER } });
+        const marker = readLiveSession(storage, 'page-a');
+        assert.deepEqual(marker.vacuglides, [{ token: TOKEN, cluster: CLUSTER }]);
+        assert.deepEqual(marker.handyKeys, ['KEY-ONE-1234']);
+        assert.equal(marker.gen, 2, 'a toy that joins is a new generation');
+        // Its link gone, it stays named: it may still be running.
+        tracker.note(HANDY);
+        assert.deepEqual(readLiveSession(storage, 'page-a').vacuglides, [{ token: TOKEN, cluster: CLUSTER }]);
+        // Moved to another cluster: named with the new one.
+        tracker.note({ ...HANDY, vacuglide: { token: TOKEN, cluster: 'https://us-east-2.autoblowapi.com' } });
+        assert.deepEqual(readLiveSession(storage, 'page-a').vacuglides, [{ token: TOKEN, cluster: 'https://us-east-2.autoblowapi.com' }]);
+        // Nothing stored is trusted: a token the Connect field would refuse
+        // is none, and a host no token may be sent to is no cluster.
+        storage.setItem(liveSessionKey('page-b'), JSON.stringify({ handy: [], vacuglide: [{ token: 'not a token!', cluster: CLUSTER }, { token: TOKEN, cluster: 'https://evil.example.com' }], gen: 1 }));
+        assert.deepEqual(readLiveSession(storage, 'page-b').vacuglides, [{ token: TOKEN, cluster: '' }]);
+        const many = Array.from({ length: MAX_MARKER_VACUGLIDES + 2 }, (_, i) => ({ token: `vgtoken${i}`, cluster: CLUSTER }));
+        storage.setItem(liveSessionKey('page-c'), JSON.stringify({ handy: [], vacuglide: many, gen: 1 }));
+        assert.equal(readLiveSession(storage, 'page-c').vacuglides.length, MAX_MARKER_VACUGLIDES);
+    });
+
+    it('holds back the first command to a VacuGlide until the marker on disk names it', async () => {
+        const b = await startBrowser({ mode: 'manual' });
+        const tracker = createLiveSessionTracker({ owner: 'page-a', storage: b.storage, locks: b.locks });
+        tracker.note(VG);
+        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: false, tcode: false, vacuglide: true });
+        await b.durable.commit();
+        assert.deepEqual(tracker.waitingForDisk(), { handy: false, intiface: false, tcode: false, vacuglide: false });
+        assert.deepEqual(onDisk(b).vacuglide, [{ token: TOKEN, cluster: CLUSTER }], 'the durable copy names it');
+    });
+
+    it('a crashed session: the next page sends the VacuGlide its whole stop through the cluster the marker names, and the banner says what came back', async () => {
+        const { storage, locks } = crashedPage(VG);
+        const reports = [];
+        const stopVacuglide = vgStop();
+        const stopHandy = fakeStop();
+        const result = await runCrashRecovery({ storage, locks, stopHandy, stopVacuglide, onReport: (t) => reports.push(t) });
+        assert.deepEqual(stopVacuglide.asked, [{ token: TOKEN, cluster: CLUSTER }]);
+        assert.deepEqual(stopHandy.asked, [], 'no Handy was driven or saved');
+        assert.equal(reports.length, 2, 'once at once, once with the answer');
+        assert.ok(reports[0].startsWith(CRASH_HEADLINE));
+        assert.match(reports[0], /EdgeLoop is sending The VacuGlide \(token ending abcd\) its whole stop - the motor stop and both valve closes\.\.\./);
+        assert.match(reports[1], /Autoblow's server confirmed it: the motor is stopped and both valves are closed\.$/);
+        assert.equal(result.settled, true);
+        assert.equal(onlyMarker(storage), null, 'the marker is taken over');
+    });
+
+    it('a stop not confirmed yet is news; one that gave up says to switch the device off, and the report stays open', async () => {
+        const { storage, locks } = crashedPage(VG);
+        const reports = [];
+        let answer = null;
+        const stopVacuglide = (token, { onUpdate }) => new Promise((resolve) => {
+            answer = (update) => {
+                onUpdate(update);
+                if (update.final) resolve(update);
+            };
+        });
+        const pass = runCrashRecovery({ storage, locks, stopVacuglide, vacuglideRetryMinutes: 5, onReport: (text, flags) => reports.push({ text, ...flags }) });
+        await until(() => answer !== null);
+        answer({ outcome: 'offline', detail: 'The VacuGlide is not online', final: false });
+        assert.equal(reports.at(-1).fresh, true, 'a stop that settles nothing is news');
+        assert.equal(reports.at(-1).open, true);
+        assert.match(reports.at(-1).text, /answered that the device is not online \(The VacuGlide is not online\), so the stop could not reach it\. If The VacuGlide \(token ending abcd\) is running or a valve is open, switch it off with its power button\. EdgeLoop keeps sending it for 5 minutes\.$/);
+        answer({ outcome: 'offline', detail: 'The VacuGlide is not online', final: true });
+        const result = await settle(pass);
+        assert.equal(result.settled, false);
+        assert.equal(reports.at(-1).open, true, 'nothing says it is at rest');
+        assert.match(reports.at(-1).text, /EdgeLoop stopped sending it after 5 minutes\.$/);
+    });
+
+    it('a VacuGlide another open page has connected is left to that page, and the banner says so', async () => {
+        const { storage, locks } = crashedPage(VG);
+        // page-b is open with that VacuGlide connected, between sessions.
+        const other = createLiveSessionTracker({ owner: 'page-b', storage: fakeStorage(), locks });
+        other.holdVacuglideLink(TOKEN);
+        await tick();
+        assert.ok(locks.names().includes(vacuglideLinkLockName('page-b', TOKEN)));
+        const stopVacuglide = vgStop();
+        const reports = [];
+        const result = await runCrashRecovery({ storage, locks, stopVacuglide, onReport: (t) => reports.push(t) });
+        assert.deepEqual(stopVacuglide.asked, [], 'nothing is sent into what that page runs');
+        assert.deepEqual(result.plan.vacuglideLeftInUse, [TOKEN]);
+        assert.match(reports.at(-1), /The VacuGlide \(token ending abcd\) is connected in another EdgeLoop tab or window, so EdgeLoop sent it nothing and left it to that page/);
+        // Let go of (Disconnect, a lost link): the lock goes with it.
+        other.holdVacuglideLink('');
+        await tick();
+        assert.ok(!locks.names().some((name) => name.startsWith(VACUGLIDE_LINK_LOCK_PREFIX)));
+    });
+
+    it("this page's own link is not another page's: the stop goes to the driver, which answers through that link", async () => {
+        const { storage, locks } = crashedPage(VG);
+        const self = createLiveSessionTracker({ owner: 'page-c', storage: fakeStorage(), locks });
+        self.holdVacuglideLink(TOKEN);
+        await tick();
+        const stopVacuglide = vgStop({ [TOKEN]: { outcome: 'linked' } });
+        const reports = [];
+        await runCrashRecovery({ storage, locks, owner: 'page-c', liveVacuglideToken: TOKEN, stopVacuglide, onReport: (t) => reports.push(t) });
+        assert.deepEqual(stopVacuglide.asked, [{ token: TOKEN, cluster: CLUSTER }]);
+        assert.match(reports.at(-1), /The VacuGlide \(token ending abcd\) is connected on this page: EdgeLoop stops it and closes both valves through that connection, unless the session on this page is driving it\./);
+    });
+
+    it('a marker that cannot be read sends the token saved here the whole stop, through the router', async () => {
+        const storage = fakeStorage([[liveSessionKey('page-a'), '{not json']]);
+        const locks = fakeLocks();
+        const stopVacuglide = vgStop();
+        const reports = [];
+        const result = await runCrashRecovery({ storage, locks, savedVacuglideToken: TOKEN, stopVacuglide, onReport: (t) => reports.push(t) });
+        assert.deepEqual(stopVacuglide.asked, [{ token: TOKEN, cluster: '' }], 'no cluster is known: the stop asks the router');
+        assert.equal(result.plan.vacuglide[0].driven, false);
+        assert.match(reports.at(-1), /The VacuGlide \(token ending abcd\) \(the token saved here: EdgeLoop could not read whether that session drove it\) its whole stop/);
+        // A marker that can be read and names no VacuGlide sends it nothing.
+        const clean = crashedPage(HANDY);
+        const none = vgStop();
+        await runCrashRecovery({ storage: clean.storage, locks: clean.locks, savedVacuglideToken: TOKEN, stopHandy: fakeStop(), stopVacuglide: none, onReport: () => {} });
+        assert.deepEqual(none.asked, []);
+    });
+
+    it('says what each answer means in words a wearer can act on', () => {
+        assert.match(describeVacuglideCrashStop({ outcome: 'connected', detail: 'here', final: true }, { label: 'abcd' }), /has been connected again, and connecting it stopped it and closed both valves\./);
+        assert.match(describeVacuglideCrashStop({ outcome: 'connected', detail: 'elsewhere', final: true }, { label: 'abcd' }), /^Another EdgeLoop tab or window has connected the VacuGlide \(token ending abcd\), or is connecting it, and answers for it from there\.$/);
+        assert.match(describeVacuglideCrashStop({ outcome: 'failed', detail: 'Request timed out', final: false }, { label: 'abcd', retryMinutes: 5 }), /but the stop was not confirmed \(Request timed out\)\. If .* switch it off with its power button\. EdgeLoop keeps sending it for 5 minutes\.$/);
+    });
+});
+
 describe('newPageId', () => {
     it('is different for every page, and survives a missing or broken crypto', () => {
         const ids = new Set(Array.from({ length: 200 }, () => newPageId()));
@@ -4060,6 +4217,9 @@ describe('app.js puts the crash recovery in the page', () => {
         assert.match(args, /savedHandyKey: \(\) => safeGet\('handy_connection_key', ''\) \|\| ''/);
         assert.match(args, /liveHandyKey: \(\) => \(handyConnected \? getHandyKey\(\) : ''\)/);
         assert.match(args, /stopHandy: stopHandyAfterCrash/);
+        assert.match(args, /savedVacuglideToken: \(\) => safeGet\(VACUGLIDE_TOKEN_STORAGE_KEY, ''\) \|\| ''/);
+        assert.match(args, /liveVacuglideToken: \(\) => \(isVacuglideConnected\(\) \? getVacuglideToken\(\) : ''\)/);
+        assert.match(args, /stopVacuglide: stopVacuglideAfterCrash/);
         assert.match(args, /locks: navigator\.locks/);
         assert.match(args, /onReport: showCrashReport/);
         // The records go to IndexedDB as well, and a commit that lands sends
@@ -4077,7 +4237,7 @@ describe('app.js puts the crash recovery in the page', () => {
         const dispatch = functionBody('function dispatchHardware(');
         const noted = dispatch.indexOf('noteLiveHardware();');
         assert.ok(noted >= 0, 'dispatchHardware notes the live hardware');
-        for (const send of ['dispatchHandy(', 'dispatchIntiface(', 'dispatchTCode(']) {
+        for (const send of ['dispatchHandy(', 'dispatchVacuglide(', 'dispatchIntiface(', 'dispatchTCode(']) {
             const at = dispatch.indexOf(send);
             assert.ok(at > noted, `${send} is called after the marker is noted`);
         }
@@ -4088,6 +4248,31 @@ describe('app.js puts the crash recovery in the page', () => {
         const note = functionBody('function noteLiveHardware(');
         assert.match(note, /if \(!crashRecovery \|\| state\.sessionStatus === 'IDLE'\) return;/);
         assert.match(note, /crashRecovery\.note\(\{/);
+        // The VacuGlide connected now, with the cluster it is reached through.
+        assert.match(note, /vacuglide: isVacuglideConnected\(\) \? \{ token: getVacuglideToken\(\), cluster: getVacuglideCluster\(\) \} : null/);
+    });
+
+    it('holds the lock that leaves a connected VacuGlide to this page for exactly as long as it is connected and the page is not frozen', () => {
+        const sync = functionBody('function syncVacuglideLinkLock(');
+        assert.match(sync, /crashRecovery\?\.holdVacuglideLink\(isVacuglideConnected\(\) && !pageFrozen \? getVacuglideToken\(\) : ''\);/);
+        assert.equal((src.match(/holdVacuglideLink\(/g) || []).length, 1, 'nothing else holds or lets go of it');
+        // Every change of the link paints the panel's buttons, and that is
+        // where the lock follows it: Connect, Disconnect, a lost link.
+        assert.match(functionBody('function paintVacuglideButtons('), /syncVacuglideLinkLock\(\);/);
+        // A frozen page lets go of it, and takes it again when resumed.
+        const freeze = src.slice(src.indexOf("document.addEventListener('freeze', () => {"), src.indexOf('});', src.indexOf("document.addEventListener('freeze', () => {")));
+        assert.ok(freeze.indexOf('syncVacuglideLinkLock();') > freeze.indexOf('pageFrozen = true;'), 'let go of once the page counts as frozen');
+        const resume = src.slice(src.indexOf("document.addEventListener('resume', () => {"), src.indexOf('});', src.indexOf("document.addEventListener('resume', () => {")));
+        assert.ok(resume.indexOf('syncVacuglideLinkLock();') > resume.indexOf('pageFrozen = false;'), 'held again once it is not');
+        const offline = src.slice(src.indexOf('onOffline: (reason, label) => {'), src.indexOf('onNotice:', src.indexOf('onOffline: (reason, label) => {')));
+        assert.match(offline, /paintVacuglideButtons\(\);/, 'a lost link lets go of it');
+        const handler = (id) => {
+            const at = src.indexOf(`document.getElementById('${id}')?.addEventListener('click'`);
+            assert.ok(at >= 0, `the ${id} handler not found`);
+            return src.slice(at, src.indexOf('\n});', at));
+        };
+        assert.match(handler('modalVacuglideDisconnectBtn'), /paintVacuglideButtons\(\);/, 'so does Disconnect');
+        assert.match(handler('modalVacuglideConnectBtn'), /finally \{[\s\S]*paintVacuglideButtons\(\);/, 'and a connect, whichever way it ends, holds it or not');
     });
 
     it('tells other pages whether this session drives its Handy right now: after every dispatch, and when the page is frozen', () => {
@@ -4138,11 +4323,11 @@ describe('app.js puts the crash recovery in the page', () => {
         const dispatch = functionBody('function dispatchHardware(');
         const held = dispatch.indexOf('const held = force || !crashRecovery ? NOTHING_HELD : crashRecovery.waitingForDisk();');
         assert.ok(held > dispatch.indexOf('noteLiveHardware();'), 'asked once the marker is noted');
-        for (const [kind, send] of [['handy', 'dispatchHandy('], ['intiface', 'dispatchIntiface('], ['tcode', 'dispatchTCode(']]) {
+        for (const [kind, send] of [['handy', 'dispatchHandy('], ['vacuglide', 'dispatchVacuglide('], ['intiface', 'dispatchIntiface('], ['tcode', 'dispatchTCode(']]) {
             const at = dispatch.indexOf(`if (!held.${kind}) ${send}`);
             assert.ok(at > held, `${send} only for a toy the disk names`);
         }
-        assert.match(dispatch, /heldDispatch = held\.handy \|\| held\.intiface \|\| held\.tcode;/);
+        assert.match(dispatch, /heldDispatch = held\.handy \|\| held\.intiface \|\| held\.tcode \|\| held\.vacuglide;/);
         const resume = functionBody('function resumeHeldDispatch(');
         assert.match(resume, /if \(!heldDispatch\) return;/);
         assert.match(resume, /if \(state\.sessionStatus !== 'RUNNING' && state\.sessionStatus !== 'RAMPDOWN'\) return;/);

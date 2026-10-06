@@ -774,7 +774,7 @@ describe('app.js routes every banner write through the ranking', () => {
             assert.ok(m, `a report without a source of its own: showAlertBanner(${args.slice(0, 80)}...)`);
             note(m[1], args);
         }
-        for (const expected of ['hrSignal', 'hrMonitor', 'handyLink', 'handyStop', 'intiface', 'tcode', 'supervision', 'remote', 'mic', 'peerVersion', 'voice', 'voice-choice', 'crashRecovery']) {
+        for (const expected of ['hrSignal', 'hrMonitor', 'handyLink', 'handyStop', 'vacuglideLink', 'vacuglideStop', 'intiface', 'tcode', 'supervision', 'remote', 'mic', 'peerVersion', 'voice', 'voice-choice', 'crashRecovery']) {
             assert.ok(sources.has(expected), `no report found for ${expected}`);
         }
         for (const [source, where] of sources) {
@@ -822,6 +822,18 @@ describe('app.js routes every banner write through the ranking', () => {
         assert.ok(within('function settleDrivenHandyStop').includes('handyStopReport.sessionDrives({ connected: handyConnected, key: getHandyKey(), role: state.handyRole })'));
         // A role given while the session runs drives the Handy from there.
         assert.match(within('const applyRole = (role) =>', '\n    };'), /if \(state\.sessionStatus === 'RUNNING' \|\| state\.sessionStatus === 'RAMPDOWN'\) settleDrivenHandyStop\(\);/);
+
+        // The VacuGlide's lost link ends once a VacuGlide is connected again;
+        // its unconfirmed stop, by the token the driver names, once a whole
+        // stop of that device is confirmed - and no other device's.
+        assert.ok(within("document.getElementById('modalVacuglideConnectBtn')?.addEventListener('click'", '} catch (e) {').includes("hideAlertBanner('vacuglideLink')"), 'a VacuGlide connected again ends the lost-link report');
+        const vgHandlers = within('setVacuglideHandlers({', '\n});');
+        const vgUnconfirmed = functionBody(vgHandlers, 'onStopUnconfirmed: (message, token) =>', '\n    },');
+        assert.ok(vgUnconfirmed.includes('vacuglideStopsOwed.set(key,') && vgUnconfirmed.includes('reportOwedVacuglideStops({ fresh: true })'));
+        const vgConfirmed = functionBody(vgHandlers, 'onStopConfirmed: (token) =>', '\n    }');
+        assert.ok(vgConfirmed.includes("if (vacuglideStopsOwed.delete(typeof token === 'string' ? token : '')) reportOwedVacuglideStops()"));
+        const vgOwed = within('function reportOwedVacuglideStops');
+        assert.ok(vgOwed.includes("hideAlertBanner('vacuglideStop')") && vgOwed.includes("triggerDisconnectAlert(sentence, 'vacuglideStop')") && vgOwed.includes("reviseAlertBanner(sentence, { severity: 'safety', source: 'vacuglideStop' })"));
 
         // The report of a session that did not end cleanly: the recovery
         // hands over an empty text once its cause is over - no Handy it names
@@ -880,5 +892,8 @@ describe('app.js routes every banner write through the ranking', () => {
             assert.ok(all.length > 0 && all.every((args) => args.endsWith(`'${source}', { motorsPaused: true }`)), `every '${source}' report says the session was paused`);
         }
         assert.ok(says('handyLink').some((args) => args.startsWith("'The Handy connection was lost while reconnecting.'") && args.endsWith('{ motorsPaused: true }')));
+        // A VacuGlide that went offline paused the session: the driver's
+        // reason says what happened, and the banner says the pause.
+        assert.ok(says('vacuglideLink').some((args) => args.startsWith("reason || 'The VacuGlide went offline.'") && args.endsWith('{ motorsPaused: true }')));
     });
 });

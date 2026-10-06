@@ -17,7 +17,10 @@
 //    for it at export time, the file says in plain words which kind it is,
 //    and the download is named differently when the key is in it. A file with
 //    no key still says so, so an export can never again be SILENTLY
-//    incomplete - that was the other half of the report.
+//    incomplete - that was the other half of the report. The VacuGlide
+//    device token is the same kind of string (and Autoblow documents no way
+//    to revoke one either), so it rides the same opt-in, is checked by the
+//    same rule, and is named by the same note and the same filename.
 // 2. Nothing in a file is trusted. A name this version does not have is
 //    dropped rather than merged, in both directions: the old import was a
 //    bare Object.assign, so an unknown top-level field landed inside the
@@ -44,7 +47,21 @@ import { SETTING_KEYS } from './state.js';
 // re-exported here because this module's own tests and callers reach for it
 // alongside the rest of the file's shaping.
 import { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM, SETTING_SANITIZERS } from './settings-schema.js';
-export { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM };
+// The token's rule lives with the driver that sends it as a header; the
+// file is held to exactly that rule, so a token that restores is a token
+// the driver will send. The panel's ranges are named from the same place,
+// so the import quotes the ranges the sanitizers actually enforce.
+import {
+    sanitizeDeviceToken,
+    MAX_DEVICE_TOKEN_LENGTH,
+    SPEED_CAP_MIN,
+    SPEED_CAP_STEP,
+    VALVE_PULSE_MIN_MS,
+    VALVE_PULSE_MAX_MS,
+    VALVE_PULSE_STEP_MS,
+    formatPulseSeconds
+} from './hardware/vacuglide-protocol.js';
+export { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM, sanitizeDeviceToken };
 
 export const BACKUP_FORMAT = 'edgeloop-backup';
 
@@ -78,12 +95,23 @@ export const FILENAME_WITH_KEY = 'edgeloop_settings_with_key.json';
 
 // The first thing a human sees on opening the file.
 export const NOTE_WITH_KEY = 'WARNING: this file contains your Handy connection key. Anyone who has this file can control your Handy from anywhere, without any password. Do not mail it, upload it or post it.';
-export const NOTE_WITHOUT_KEY = 'This file does NOT contain your Handy connection key. Tick "Include my Handy connection key" in the Backup tab before exporting if you want it carried over.';
+export const NOTE_WITH_TOKEN = 'WARNING: this file contains your VacuGlide device token. Anyone who has this file can control your VacuGlide from anywhere, without any password. Do not mail it, upload it or post it.';
+export const NOTE_WITH_BOTH = 'WARNING: this file contains your Handy connection key and your VacuGlide device token. Anyone who has this file can control your Handy and your VacuGlide from anywhere, without any password. Do not mail it, upload it or post it.';
+// The box is named as the Backup tab names it. The token is only mentioned
+// when this browser has one: a Handy user without a VacuGlide has no token
+// to wonder about.
+export const NOTE_WITHOUT_KEY = 'This file does NOT contain your Handy connection key. Tick "Include my device keys" in the Backup tab before exporting if you want it carried over.';
+export const NOTE_WITHOUT_KEYS = 'This file does NOT contain your Handy connection key or your VacuGlide device token. Tick "Include my device keys" in the Backup tab before exporting if you want them carried over.';
 // Telling someone to tick a box they did tick is worse than saying nothing.
-// These two are for the export that was asked to carry the key and could
+// These are for the export that was asked to carry the keys and could
 // not, and they match what the panel says at the same instant.
-export const NOTE_KEY_NONE_SAVED = 'This file does NOT contain your Handy connection key: you asked for it, but no key is saved in this browser. Enter it in the Handy panel and export again.';
+export const NOTE_KEY_NONE_SAVED = 'This file does NOT contain a device key: you asked for one, but no Handy connection key or VacuGlide device token is saved in this browser. Enter yours in its device panel and export again.';
 export const NOTE_KEY_UNUSABLE = 'This file does NOT contain your Handy connection key: you asked for it, but what is saved in this browser is not a usable key. Re-enter it in the Handy panel and export again.';
+export const NOTE_TOKEN_UNUSABLE = 'This file does NOT contain your VacuGlide device token: you asked for it, but what is saved in this browser is not a usable token. Re-enter it in the VacuGlide panel and export again.';
+// Added after a warning when the OTHER credential was saved but unusable:
+// the file carries one and not the other, and says why.
+const KEY_LEFT_OUT = 'Your Handy connection key is NOT in it: what is saved in this browser is not a usable key. Re-enter it in the Handy panel and export again.';
+const TOKEN_LEFT_OUT = 'Your VacuGlide device token is NOT in it: what is saved in this browser is not a usable token. Re-enter it in the VacuGlide panel and export again.';
 
 // Top-level field names the file itself uses. They are never settings, so
 // they are stripped from the settings object both on the way out and on the
@@ -117,7 +145,9 @@ export const RESERVED_SETTING_KEYS = [
     'devices',
     'flags',
     'handyConnectionKey',
-    'handyConnectionKeyIncluded'
+    'handyConnectionKeyIncluded',
+    'vacuglideDeviceToken',
+    'vacuglideDeviceTokenIncluded'
 ];
 
 function isPlainObject(value) {
@@ -326,11 +356,15 @@ export function filterSettings(raw, allowed = SETTING_KEYS) {
 // ---- writing ------------------------------------------------------------------
 
 // Build the file. `stores` is what the app read out of its localStorage
-// entries; `includeKey` is the checkbox under the Export button.
+// entries; `includeKey` is the checkbox under the Export button, which asks
+// for both device credentials - the Handy connection key and the VacuGlide
+// device token - because they are the same kind of risk.
 export function buildBackup(stores = {}, options = {}) {
     const includeKey = options.includeKey === true;
     const key = sanitizeConnectionKey(stores.handyConnectionKey);
     const carriesKey = includeKey && key !== null;
+    const token = sanitizeDeviceToken(stores.vacuglideDeviceToken);
+    const carriesToken = includeKey && token !== null;
     // Write the fields this version has and nothing else. That covers the
     // file's own field names (a build that merged a stray handyConnectionKey
     // into the settings store would otherwise export that copy of the
@@ -348,12 +382,14 @@ export function buildBackup(stores = {}, options = {}) {
     // answers "is my key in this?" on line 2 without scrolling or knowing
     // the format. The reader does not care about key order.
     return {
-        note: backupNote(carriesKey, includeKey, stores.handyConnectionKey),
+        note: backupNote(carriesKey, includeKey, stores.handyConnectionKey, { carries: carriesToken, saved: stores.vacuglideDeviceToken }),
         format: BACKUP_FORMAT,
         version: BACKUP_VERSION,
         exportedAt: new Date(now).toISOString(),
         handyConnectionKeyIncluded: carriesKey,
         handyConnectionKey: carriesKey ? key : null,
+        vacuglideDeviceTokenIncluded: carriesToken,
+        vacuglideDeviceToken: carriesToken ? token : null,
         settings,
         handy,
         devices: {
@@ -367,54 +403,88 @@ export function buildBackup(stores = {}, options = {}) {
     };
 }
 
-// Which of the four notes belongs in the file. It answers the same question
-// the panel answers, from the same three facts, so the two can never
-// disagree - they did: a file exported WITH the box ticked but no usable key
-// still told the user to tick the box.
-export function backupNote(carriesKey, requestedKey, savedKey) {
-    if (carriesKey) return NOTE_WITH_KEY;
-    if (requestedKey !== true) return NOTE_WITHOUT_KEY;
-    const raw = typeof savedKey === 'string' ? savedKey.trim() : '';
-    return raw ? NOTE_KEY_UNUSABLE : NOTE_KEY_NONE_SAVED;
+// Which note belongs in the file. It answers the same question the panel
+// answers, from the same facts, so the two can never disagree - they did: a
+// file exported WITH the box ticked but no usable key still told the user
+// to tick the box. `token` is the VacuGlide half: { carries, saved }. A
+// credential that is not saved here at all is only mentioned when nothing
+// at all went in - a file is incomplete when it lacks something this
+// browser HAS, and a Handy user with no VacuGlide lacks nothing.
+export function backupNote(carriesKey, requestedKey, savedKey, token = {}) {
+    const carriesToken = token && token.carries === true;
+    const rawKey = typeof savedKey === 'string' ? savedKey.trim() : '';
+    const rawToken = token && typeof token.saved === 'string' ? token.saved.trim() : '';
+    // Asked for, saved, and still not carried: what is saved is unusable.
+    const keyUnusable = requestedKey === true && !carriesKey && rawKey !== '';
+    const tokenUnusable = requestedKey === true && !carriesToken && rawToken !== '';
+    if (carriesKey && carriesToken) return NOTE_WITH_BOTH;
+    if (carriesKey) return tokenUnusable ? `${NOTE_WITH_KEY} ${TOKEN_LEFT_OUT}` : NOTE_WITH_KEY;
+    if (carriesToken) return keyUnusable ? `${NOTE_WITH_TOKEN} ${KEY_LEFT_OUT}` : NOTE_WITH_TOKEN;
+    if (requestedKey !== true) return rawToken ? NOTE_WITHOUT_KEYS : NOTE_WITHOUT_KEY;
+    if (keyUnusable) return tokenUnusable ? `${NOTE_KEY_UNUSABLE} ${TOKEN_LEFT_OUT}` : NOTE_KEY_UNUSABLE;
+    if (tokenUnusable) return NOTE_TOKEN_UNUSABLE;
+    return NOTE_KEY_NONE_SAVED;
 }
 
-// The filename carries the warning into the mail client.
+// The filename carries the warning into the mail client, for either
+// credential.
 export function backupFilename(file) {
-    return file && file.handyConnectionKeyIncluded === true ? FILENAME_WITH_KEY : FILENAME_PLAIN;
+    const carries = Boolean(file) && (file.handyConnectionKeyIncluded === true || file.vacuglideDeviceTokenIncluded === true);
+    return carries ? FILENAME_WITH_KEY : FILENAME_PLAIN;
 }
 
 // What the panel says the moment the file is written, so the answer to "is my
-// key in this?" is on screen before the file goes anywhere.
+// key in this?" is on screen before the file goes anywhere. `context` says
+// whether the box was ticked and whether anything is saved for each
+// credential (hasSavedKey, hasSavedToken).
 export function describeBackupExport(file, context = {}) {
     const carriesKey = Boolean(file && file.handyConnectionKeyIncluded === true);
+    const carriesToken = Boolean(file && file.vacuglideDeviceTokenIncluded === true);
     const filename = backupFilename(file);
-    if (carriesKey) {
+    const requested = context.requestedKey === true;
+    // Asked for, saved, and still not carried: what is saved is unusable.
+    const keyUnusable = requested && !carriesKey && context.hasSavedKey === true;
+    const tokenUnusable = requested && !carriesToken && context.hasSavedToken === true;
+    const keyWhy = `The Handy connection key saved in this browser is not a usable key (it must be plain printable text, at most ${MAX_CONNECTION_KEY_LENGTH} characters), so it was left out. Re-enter it in the Handy panel and export again.`;
+    const tokenWhy = `The VacuGlide device token saved in this browser is not a usable token (it must be plain printable text, at most ${MAX_DEVICE_TOKEN_LENGTH} characters), so it was left out. Re-enter it in the VacuGlide panel and export again.`;
+    if (carriesKey || carriesToken) {
+        const what = carriesKey && carriesToken
+            ? 'your Handy connection key and your VacuGlide device token'
+            : (carriesKey ? 'your Handy connection key' : 'your VacuGlide device token');
+        const who = carriesKey && carriesToken ? 'your Handy and your VacuGlide' : (carriesKey ? 'your Handy' : 'your VacuGlide');
+        const leftOut = [keyUnusable ? keyWhy : '', tokenUnusable ? tokenWhy : ''].filter(Boolean).join(' ');
         return {
             filename,
-            carriesKey: true,
+            carriesKey,
+            carriesToken,
             tone: 'warn',
-            message: `Exported ${filename}. This file CONTAINS your Handy connection key: anyone who has the file can control your Handy. Keep it off shared drives and out of forum posts.`
+            message: `Exported ${filename}. This file CONTAINS ${what}: anyone who has the file can control ${who}. Keep it off shared drives and out of forum posts.${leftOut ? ` ${leftOut}` : ''}`
         };
     }
-    if (context.requestedKey === true) {
+    if (requested) {
         // "Nothing was saved" and "what is saved is not a usable key" are
         // different answers, and only the second one asks the user to do
         // something. Saying the first when the second is true would be the
         // silently incomplete export all over again.
+        const reasons = [keyUnusable ? keyWhy : '', tokenUnusable ? tokenWhy : ''].filter(Boolean).join(' ');
         return {
             filename,
             carriesKey: false,
-            tone: context.hasSavedKey === true ? 'warn' : 'info',
-            message: context.hasSavedKey === true
-                ? `Exported ${filename}. The Handy connection key saved in this browser is not a usable key (it must be plain printable text, at most ${MAX_CONNECTION_KEY_LENGTH} characters), so nothing was put in the file. Re-enter it in the Handy panel and export again.`
-                : `Exported ${filename}. No Handy connection key is saved in this browser, so none was included.`
+            carriesToken: false,
+            tone: reasons ? 'warn' : 'info',
+            message: reasons
+                ? `Exported ${filename}. ${reasons}`
+                : `Exported ${filename}. No Handy connection key is saved in this browser, and no VacuGlide device token either, so there was nothing to include.`
         };
     }
     return {
         filename,
         carriesKey: false,
+        carriesToken: false,
         tone: 'info',
-        message: `Exported ${filename}. Your Handy connection key is NOT in it; tick the box above before exporting if you want it carried over.`
+        message: context.hasSavedToken === true
+            ? `Exported ${filename}. Your Handy connection key and your VacuGlide device token are NOT in it; tick the box above before exporting if you want them carried over.`
+            : `Exported ${filename}. Your Handy connection key is NOT in it; tick the box above before exporting if you want it carried over.`
     };
 }
 
@@ -475,6 +545,12 @@ export function readBackup(parsed, options = {}) {
     const keyBlank = rawKey === undefined || rawKey === null
         || (typeof rawKey === 'string' && rawKey.trim() === '');
     const keyRejected = !keyBlank && handyConnectionKey === null;
+    // The VacuGlide device token, read exactly as the key is.
+    const rawToken = parsed.vacuglideDeviceToken;
+    const vacuglideDeviceToken = sanitizeDeviceToken(rawToken);
+    const tokenBlank = rawToken === undefined || rawToken === null
+        || (typeof rawToken === 'string' && rawToken.trim() === '');
+    const tokenRejected = !tokenBlank && vacuglideDeviceToken === null;
 
     // No gate: `handy`, `devices` and `flags` are never setting names, so a
     // file that carries one means it, whatever shape the rest of it is in.
@@ -504,7 +580,8 @@ export function readBackup(parsed, options = {}) {
         || Object.keys(devices.tcode).length > 0
         || flags.ageVerified
         || flags.wizardSeen
-        || handyConnectionKey !== null;
+        || handyConnectionKey !== null
+        || vacuglideDeviceToken !== null;
     if (!carriesSomething) {
         return {
             ok: false,
@@ -532,7 +609,11 @@ export function readBackup(parsed, options = {}) {
         keyRejected,
         // The file explicitly said it left the key out (as opposed to being
         // too old to have an opinion).
-        keyDeclaredAbsent: parsed.handyConnectionKeyIncluded === false
+        keyDeclaredAbsent: parsed.handyConnectionKeyIncluded === false,
+        vacuglideDeviceToken,
+        tokenPresent: vacuglideDeviceToken !== null,
+        tokenRejected,
+        tokenDeclaredAbsent: parsed.vacuglideDeviceTokenIncluded === false
     };
 }
 
@@ -543,12 +624,81 @@ export function readBackup(parsed, options = {}) {
 export const RESTORE_PARTS = {
     settings: 'your Session Setup values',
     key: 'your Handy connection key',
+    token: 'your VacuGlide device token',
     role: 'the Handy channel role',
     cap: 'the Handy speed cap',
     intiface: 'your Intiface device maps',
     tcode: 'your T-Code device maps',
     flags: 'the age / wizard flags'
 };
+
+// The VacuGlide's own values. The settings store keeps them, so a file
+// carries them in its settings block and an import bounds them with the
+// same sanitizers as everything else there - but they are not Session
+// Setup values. The VacuGlide panel shows them, and two of them decide how
+// hard the device runs: an import that folded a speed cap raised from 40%
+// to 100%, an OFF channel turned back on and a doubled valve pulse into "5
+// Session Setup values" was the silent restore the Handy's cap once was.
+// So none of them is counted there, and each is named with its value.
+export const VACUGLIDE_SETTING_NAMES = Object.freeze(['vacuglideRole', 'vacuglideMaxCap', 'vacuglideValvePulseMs']);
+
+const VACUGLIDE_WORDS = {
+    vacuglideRole: 'channel role',
+    vacuglideMaxCap: 'speed cap',
+    vacuglideValvePulseMs: 'valve pulse'
+};
+
+function vacuglideNamed(name, value) {
+    if (name === 'vacuglideRole') return `the VacuGlide channel role (now ${value})`;
+    if (name === 'vacuglideMaxCap') return `the VacuGlide speed cap (now ${value}%)`;
+    return `the VacuGlide valve pulse (now ${formatPulseSeconds(value)} s)`;
+}
+
+// A value the app would not take as written, and what it became. Not "the
+// nearest value it accepts": a role nobody can pick becomes OFF, which is
+// neither a limit nor the factory setting, and an unreadable cap becomes
+// the slowest one on offer.
+function vacuglideCorrected(name, value) {
+    if (name === 'vacuglideRole') {
+        return `The VacuGlide channel role in this file is not primary, secondary or off, so it is now ${value}: an import never hands a toy a channel the file does not clearly name.`;
+    }
+    if (name === 'vacuglideMaxCap') {
+        return `The VacuGlide speed cap in this file is not one its panel offers (${SPEED_CAP_MIN}-100% in steps of ${SPEED_CAP_STEP}), so it is now ${value}%.`;
+    }
+    return `The VacuGlide valve pulse in this file is not one its panel offers (${formatPulseSeconds(VALVE_PULSE_MIN_MS)}-${formatPulseSeconds(VALVE_PULSE_MAX_MS)} s in steps of ${VALVE_PULSE_STEP_MS / 1000} s), so it is now ${formatPulseSeconds(value)} s.`;
+}
+
+// What the import has to say about each VacuGlide value the file carried.
+// One the app corrected is always said, with what it became. One taken as
+// written is named with its value whenever it changed what this browser
+// had, and always for a browser that has a VacuGlide - a token saved here
+// before the import, or restored by it. A Handy user without one, whose
+// own backup carries the factory values, is not told about a device they
+// do not have on every restore; they are told the moment a file changes
+// one. `context.vacuglideBefore` holds the values from before the import;
+// without it every value counts as changed, so nothing can go unsaid.
+function vacuglideReport(result, context) {
+    const own = (object, name) => Boolean(object) && Object.prototype.hasOwnProperty.call(object, name);
+    const before = context.vacuglideBefore && typeof context.vacuglideBefore === 'object' ? context.vacuglideBefore : null;
+    const hasVacuglide = context.hadExistingToken === true || result.tokenPresent === true;
+    const restored = [];
+    const corrected = [];
+    const mentioned = [];
+    for (const name of VACUGLIDE_SETTING_NAMES) {
+        if (!own(result.settings, name)) continue;
+        const value = result.settings[name];
+        if (!own(result.requested, name) || result.requested[name] !== value) {
+            corrected.push(vacuglideCorrected(name, value));
+            mentioned.push(name);
+            continue;
+        }
+        if (hasVacuglide || !before || before[name] !== value) {
+            restored.push(vacuglideNamed(name, value));
+            mentioned.push(name);
+        }
+    }
+    return { restored, corrected, mentioned };
+}
 
 // What the import tells the user it did. It names every part it restored and
 // always answers the key question, because "did my key come back?" was the
@@ -577,9 +727,12 @@ export function describeBackupImport(result, context = {}) {
     // only place that can know: a pair like minHr 5 / maxHr 9999 is refused
     // by sanitizeSessionLimits and comes back at the factory numbers, and
     // announcing "2 values imported" over two defaults is the same kind of
-    // quiet the silent export was.
-    const offered = Object.keys(result.settings).length;
+    // quiet the silent export was. The VacuGlide's values are not Session
+    // Setup values and are named on their own, so neither number counts
+    // them; `settingsStored` is the caller's count of the rest.
+    const offered = Object.keys(result.settings).filter((name) => !VACUGLIDE_SETTING_NAMES.includes(name)).length;
     const settingsCount = Number.isFinite(context.settingsStored) ? Math.min(context.settingsStored, offered) : offered;
+    const vacuglide = vacuglideReport(result, context);
     if (settingsCount && !refused.has('settings')) restored.push(`${settingsCount} Session Setup value${settingsCount === 1 ? '' : 's'}`);
     // Named with their values: "the Handy speed cap" alone left the reader
     // opening the Handy panel to find out what it now is, and the whole
@@ -590,6 +743,9 @@ export function describeBackupImport(result, context = {}) {
     const capIn = result.handy.maxCap !== null && !refused.has('cap');
     if (roleIn) restored.push(`the Handy channel role (now ${result.handy.role})`);
     if (capIn) restored.push(`the Handy speed cap (now ${result.handy.maxCap}%)`);
+    // The same for the VacuGlide. They travel in the settings write, so a
+    // refused one takes them with it.
+    if (!refused.has('settings')) restored.push(...vacuglide.restored);
     const intiface = refused.has('intiface') ? 0 : Object.keys(result.devices.intiface).length;
     if (intiface) restored.push(`${intiface} Intiface device map${intiface === 1 ? '' : 's'}`);
     const tcode = refused.has('tcode') ? 0 : Object.keys(result.devices.tcode).length;
@@ -608,7 +764,18 @@ export function describeBackupImport(result, context = {}) {
     // write, and a full or blocked store is a live condition in this app -
     // session history is what fills it. Saying "restored" over a store that
     // refused the write would promise a restore that a reload undoes.
-    const unsaved = [...refused].map((id) => RESTORE_PARTS[id]);
+    const unsaved = [];
+    for (const id of refused) {
+        if (id !== 'settings') {
+            unsaved.push(RESTORE_PARTS[id]);
+            continue;
+        }
+        // The one write that holds Session Setup holds the VacuGlide's
+        // values too, and whichever of them this report would have named
+        // is named as lost instead.
+        if (offered > 0 || !vacuglide.mentioned.length) unsaved.push(RESTORE_PARTS.settings);
+        if (vacuglide.mentioned.length) unsaved.push(`your VacuGlide ${joinList(vacuglide.mentioned.map((name) => VACUGLIDE_WORDS[name]))}`);
+    }
     if (refusedUnnamed) unsaved.push(refusedUnnamed === 1 ? 'one more part of this restore' : `${refusedUnnamed} more parts of this restore`);
     if (unsaved.length) {
         lines.push(`THIS BROWSER REFUSED TO SAVE ${joinList(unsaved)}. It is in use right now, but a reload will lose it - the store is full or unavailable (private mode, or blocked site data). Free some space, or delete old sessions from History, and import again.`);
@@ -642,6 +809,12 @@ export function describeBackupImport(result, context = {}) {
         // default would send them looking for a number that is not there.
         lines.push(`${adjusted} value${adjusted === 1 ? '' : 's'} in the file ${adjusted === 1 ? 'was' : 'were'} outside what this app accepts, so ${adjusted === 1 ? 'it' : 'they'} came back at the nearest value it does - a limit, or the factory setting. It is the same check a value typed into the panel gets; open Session Setup to see where ${adjusted === 1 ? 'it' : 'they'} landed.`);
     }
+    // The VacuGlide's corrected values, each with what it became - and
+    // where to find it, which is not Session Setup.
+    if (vacuglide.corrected.length && !refused.has('settings')) {
+        const n = vacuglide.corrected.length;
+        lines.push(`${vacuglide.corrected.join(' ')} ${n === 1 ? 'It is' : (n === 2 ? 'Both are' : 'All three are')} in the VacuGlide panel, not in Session Setup.`);
+    }
 
     if (result.keyPresent && refused.has('key')) {
         // The refusal line above already named it; do not also say it was
@@ -667,6 +840,26 @@ export function describeBackupImport(result, context = {}) {
         lines.push('This file contained no Handy connection key, so the one saved in this browser was kept.');
     } else {
         lines.push('This file contained no Handy connection key. Enter yours in the Handy panel.');
+    }
+
+    // The same question for the VacuGlide device token, asked only where
+    // there is one to ask about: in the file, or saved in this browser. A
+    // Handy user with no VacuGlide gets no line about a device they do not
+    // have, on every restore.
+    if (result.tokenPresent && refused.has('token')) {
+        lines.push('The VacuGlide device token in this file is in use right now but was not saved, so this browser goes back to the token it had (or to none) when you reload.');
+    } else if (result.tokenPresent && context.tokenReplaced === true) {
+        lines.push('The VacuGlide device token saved in this browser was REPLACED by the one in this file - they are different tokens. If you did not mean to pair this browser with another VacuGlide, enter your own token again in the VacuGlide panel. Nothing is connected either way.');
+    } else if (result.tokenPresent) {
+        lines.push('Your VacuGlide device token was restored. Open the VacuGlide panel and press Connect when you want to use it - an import never connects a toy by itself.');
+    } else if (result.tokenRejected) {
+        lines.push(context.hadExistingToken
+            ? 'What this file carried in place of a VacuGlide device token is not a usable token, so it was ignored and the one saved here was kept.'
+            : 'What this file carried in place of a VacuGlide device token is not a usable token, so it was ignored. Enter yours in the VacuGlide panel.');
+    } else if (context.hadExistingToken) {
+        lines.push(result.tokenDeclaredAbsent
+            ? 'This file was exported without a VacuGlide device token, so the one saved in this browser was kept.'
+            : 'This file contained no VacuGlide device token, so the one saved in this browser was kept.');
     }
 
     if (result.settingsUnreadable) {
