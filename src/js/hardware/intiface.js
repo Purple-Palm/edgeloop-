@@ -361,6 +361,7 @@ export function disconnectIntiface() {
 // an OSSM in position mode, and only the end of its segments stops it.
 export function stopAllIntiface() {
     intifaceDevices.forEach((dev) => dev.axes.forEach((axis) => {
+        cancelTest(axis);
         if (axis.holds) holdNow(axis);
         if (!axis.pulse) return;
         cutPulse(axis);
@@ -906,16 +907,32 @@ function cancelSegments(axis) {
     if (axis.segTimer) { clearTimeout(axis.segTimer); axis.segTimer = null; }
 }
 
+// A Test still under way ends at a stop: its second move must not follow
+// it - a Test on an OSSM and a STOP half a second later sent the Test's
+// "stream:20:450" after the stop. A linear axis is left where the Test's
+// first move put it, as its second move would have recorded; a scalar or
+// rotator gets its 0 from the stop itself.
+function cancelTest(axis) {
+    if (!axis.testTimer) return;
+    clearTimeout(axis.testTimer);
+    axis.testTimer = null;
+    if (axis.kind !== 'linear') return;
+    axis.planner.reset();
+    if (axis.holds) axis.planner.place(axis.sentPos === null ? null : physicalPosition(axis, axis.sentPos));
+}
+
 // Stop a held axis where it is: nothing more goes out, and the planner is
 // told the position the last segment sent will leave it at.
 function holdAxis(axis) {
     cancelSegments(axis);
     if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
+    cancelTest(axis);
     axis.planner.place(axis.sentPos === null ? null : physicalPosition(axis, axis.sentPos));
 }
 
 // The same from outside a dispatch (page-away): the planner stops as well.
 function holdNow(axis) {
+    cancelTest(axis);
     axis.planner.setInput({ enabled: false });
     axis.planner.next(Date.now());
     holdAxis(axis);
@@ -1053,7 +1070,10 @@ export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, st
     if (force && lastSpeeds.primary === 0 && lastSpeeds.secondary === 0) {
         // STOP / pause: the server-side stop first, then the per-axis rest
         // moves and zeros (a stop interrupts a linear axis's leg in flight,
-        // so its rest move goes out now: stroke-planner.js).
+        // so its rest move goes out now: stroke-planner.js). A Test still
+        // under way ends with it. (Not on every dispatch of zeros: an idle
+        // page dispatches them on each heart-rate reading.)
+        intifaceDevices.forEach((dev) => dev.axes.forEach(cancelTest));
         send(buildStopAllDevices(nextId()));
     }
     applyLastSpeeds(Date.now(), { urgent });
@@ -1069,6 +1089,7 @@ export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, st
 // to 0 whatever the travel envelope - setting an OSSM's Position axis OFF
 // before a session sent it to the end of its rail.
 function restAxisNow(dev, axis) {
+    cancelTest(axis);
     if (axis.kind === 'linear') {
         axis.planner.setInput({ enabled: false, zoneMin: lastZone.min, zoneMax: lastZone.max });
         if (axis.legTarget === null) return;
@@ -1197,6 +1218,13 @@ export function testSingleAxis(devIdx, axisIdx, envelope = null) {
         const up = physicalPosition(axis, lastZone.max);
         const down = physicalPosition(axis, lastZone.min);
         const moveMs = INTIFACE_TIMINGS.testMoveMs;
+        // A held axis's planner is put at rest first, so the zeros an idle
+        // page dispatches on every heart-rate reading do not count as the
+        // stop that ends this Test (holdAxis).
+        if (axis.holds) {
+            axis.planner.setInput({ enabled: false });
+            axis.planner.next(Date.now());
+        }
         sendLinear(dev, axis, up, moveMs);
         // Where the next leg starts from (travelCovered).
         axis.legTarget = up;

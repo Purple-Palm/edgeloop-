@@ -5704,7 +5704,7 @@ function renderIntifaceDevices() {
             const railBlocked = fullRail && (env.min > 0 || env.max < 100);
             let twinNote = '';
             if (axis.twin && axis.kind === 'linear') {
-                twinNote = `<p class="text-[9px] text-slate-500 leading-snug">Same motor as ${twinLabel}: only one of the two can be on. This one strokes inside your Travel Envelope, and on STOP it holds where it is.</p>`;
+                twinNote = `<p class="text-[9px] text-slate-500 leading-snug">Same motor as ${twinLabel}: only one of the two can be on. This one strokes inside your Travel Envelope, and on STOP it holds where it is - except during its first stroke after connecting or after Oscillate: that is one slow move STOP cannot cut short, and it ends within 2.2 s.</p>`;
             } else if (railBlocked) {
                 twinNote = `<p class="text-[9px] text-amber-300/80 leading-snug">Not available while your Travel Envelope is ${env.min}-${env.max}%: Oscillate runs the machine's own stroke over its whole rail at full depth - Intiface sets depth and stroke to 100% - and cannot keep to the envelope.${axis.role !== 'off' ? ' It stays at 0 until then.' : ''} Set the envelope to 0-100% to use it, or use ${twinLabel}.</p>`;
             } else if (fullRail) {

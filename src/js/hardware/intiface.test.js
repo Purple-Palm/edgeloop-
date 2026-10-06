@@ -1345,3 +1345,88 @@ describe('a held axis is never sent the same step twice and never left idle mid-
         assert.ok(checked >= 2, `${checked} segment joints checked`);
     });
 });
+
+describe('nothing a Test or a yielded twin still had due goes out after a stop', () => {
+    for (const [name, stop] of [
+        ['STOP', () => dispatchIntiface(0, 0, 0, 100, 20, 80, true)],
+        ['page-away', () => { stopAllIntiface(); dispatchIntiface(0, 0, 0, 100, 20, 80, true); }],
+        ['OFF', () => setAxisRole(4, 1, 'off')]
+    ]) {
+        it(`a Test on the OSSM, then ${name}: the Test's second move never goes out`, async () => {
+            const ws = connectWith([OSSM]);
+            assert.equal(testSingleAxis(4, 1, { min: 20, max: 80 }), true);
+            await sleep(200);
+            const at = ossmLegs(ws).length;
+            assert.equal(at, 1, 'the first move of the Test');
+            stop();
+            await sleep(INTIFACE_TIMINGS.testMoveMs + 300);
+            assert.equal(ossmLegs(ws).length, at);
+        });
+    }
+
+    it('a Test on an OSR2, then STOP: the rest move, and not the Test\'s second move after it', async () => {
+        const ws = connectWith([OSR2]);
+        assert.equal(testSingleAxis(1, 0, { min: 20, max: 80 }), true);
+        await sleep(200);
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        const at = ws.messages('LinearCmd').length;
+        await sleep(INTIFACE_TIMINGS.testMoveMs + 300);
+        assert.equal(ws.messages('LinearCmd').length, at);
+        assert.equal(ws.messages('LinearCmd').at(-1).Vectors[0].Duration, REST_MOVE_MS);
+    });
+
+    for (const [name, stop] of [['OFF', () => setAxisRole(1, 0, 'off')], ['page-away', () => stopAllIntiface()]]) {
+        it(`a Test on an OSR2, then ${name}: not the Test's second move`, async () => {
+            const ws = connectWith([OSR2]);
+            testSingleAxis(1, 0, { min: 20, max: 80 });
+            await sleep(200);
+            stop();
+            const at = ws.messages('LinearCmd').length;
+            await sleep(INTIFACE_TIMINGS.testMoveMs + 300);
+            assert.equal(ws.messages('LinearCmd').length, at);
+        });
+    }
+
+    it('a Test on the OSSM survives an idle page\'s zeros, and ends with a session\'s cut', async () => {
+        let ws = connectWith([OSSM]);
+        testSingleAxis(4, 1, { min: 20, max: 80 });
+        await sleep(100);
+        dispatchIntiface(0, 0, 0, 100, 20, 80);
+        await sleep(INTIFACE_TIMINGS.testMoveMs + 200);
+        assert.equal(ossmLegs(ws).length, 2, 'an idle page dispatches zeros on every heart-rate reading: the Test still comes back');
+        resetIntifaceForTests();
+        memory.clear();
+        ws = connectWith([OSSM]);
+        testSingleAxis(4, 1, { min: 20, max: 80 });
+        await sleep(50);
+        dispatchIntiface(60, 0, 30, 70, 20, 80);
+        await sleep(50);
+        dispatchIntiface(0, 0, 0, 100, 20, 80);
+        const at = ossmLegs(ws).length;
+        await sleep(INTIFACE_TIMINGS.testMoveMs + 200);
+        assert.equal(ossmLegs(ws).length, at, 'the cut holds the OSSM; the Test does not move it afterwards');
+    });
+
+    it('a Position segment still due when Oscillate takes over never goes out', async () => {
+        const ws = connectWith([OSSM]);
+        dispatchIntiface(5, 0, 30, 70, 0, 100);
+        await sleep(2600);
+        const at = ossmLegs(ws).length;
+        assert.equal(setAxisRole(4, 0, 'primary', { envelope: { min: 0, max: 100 } }), true);
+        await sleep(600);
+        assert.equal(ossmLegs(ws).length, at, 'a segment after the switch would send the OSSM back to position mode');
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a cap chosen as any step of a 15-step toy gives exactly that step', () => {
+        const DOT = { DeviceIndex: 10, DeviceName: 'Fifteen', DeviceMessages: { ScalarCmd: [{ StepCount: 15, ActuatorType: 'Vibrate' }], StopDeviceCmd: {} } };
+        const ws = connectWith([DOT]);
+        for (let k = 2; k <= 15; k++) {
+            setAxisMaxCap(10, 0, capStepPercent(k, 15));
+            dispatchIntiface(100, 0, 0, 100);
+            const last = ws.messages('ScalarCmd').at(-1).Scalars[0].Scalar;
+            assert.equal(Math.round(last * 15), k, `cap ${capStepPercent(k, 15)}% gave step ${Math.round(last * 15)}`);
+        }
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+});
