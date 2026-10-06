@@ -16,6 +16,9 @@ import {
     isHandyMoving,
     isHandyMotionUnknown,
     isHandyOfflineStopPending,
+    handyRestState,
+    handyStopTally,
+    resetHandyRestForTests,
     handyConnected
 } from './handy.js';
 import { HANDY_API_BASE, HANDY_MIN_VELOCITY, handyTargetSpeed, applyEndMargin, normalizeSlideRange } from './handy-protocol.js';
@@ -143,6 +146,8 @@ describe('handy driver', () => {
         // driven tick by tick through handyPollTick() instead.
         HANDY_TIMINGS.pollMs = SHIPPED_POLL.pollMs;
         HANDY_TIMINGS.idlePollMs = SHIPPED_POLL.idlePollMs;
+        // What the last test left on its way, or in doubt, is not this one's.
+        resetHandyRestForTests();
         installFetch();
         setHandyHandlers({
             onError: (m) => errors.push(m),
@@ -2803,5 +2808,834 @@ describe('handy driver', () => {
         assert.notEqual(edge.packet.velocity, log[at - 1].tick.velocity, 'the cut moved the secondary');
         assert.ok(edge.packet.sent.includes(`/hamp/velocity ${edge.packet.velocity}`), JSON.stringify(edge.packet));
         assertThrottled(log, 850, [`packet ${edge.second}`]);
+    });
+
+    // app.js asks Came Early's and Finished me's question only over a device
+    // this says is at rest: the question is a native dialog, which holds back
+    // every timer of the page, and the retries of a verified stop are timers.
+    it('handyRestState: nothing to wait for without a link, and a connected device starts at rest', async () => {
+        assert.equal(handyRestState(), 'none');
+        await connectOk();
+        assert.equal(handyRestState(), 'stopped', 'the connect confirmed a stop');
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        assert.equal(handyRestState(), 'pending', 'a start is on its way');
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        assert.equal(handyRestState(), 'unconfirmed', 'a running device is not at rest');
+    });
+
+    it('handyRestState: pending through every retry of a stop, stopped only once one is confirmed', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [40, 40, 40];
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        // The measured failure: the first PUT /hamp/stop gets a 502, the
+        // retry succeeds - held here until the test lets it answer.
+        let release;
+        let attempts = 0;
+        routes['PUT /hamp/stop'] = () => {
+            attempts += 1;
+            if (attempts === 1) return jsonResponse({ message: 'bad gateway' }, 502);
+            return new Promise((resolve) => { release = () => resolve(jsonResponse({ result: 0 })); });
+        };
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        assert.equal(handyRestState(), 'pending');
+        await tick(10);
+        assert.equal(attempts, 1, 'the first attempt failed and the retry waits out its backoff');
+        assert.equal(handyRestState(), 'pending', 'a failed first attempt is not the answer');
+        await tick(50);
+        assert.equal(attempts, 2);
+        assert.equal(handyRestState(), 'pending', 'the retry is on its way');
+        release();
+        await tick(5);
+        assert.equal(handyRestState(), 'stopped');
+        assert.equal(isHandyMoving(), false);
+    });
+
+    it('handyRestState: unconfirmed once every attempt of the stop has failed', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['PUT /hamp/stop'] = () => { throw new TypeError('Failed to fetch'); };
+        const stopping = stopHandy();
+        assert.equal(handyRestState(), 'pending');
+        assert.equal(await stopping, false);
+        await tick(0);
+        assert.equal(handyRestState(), 'unconfirmed');
+        // A later stop that is confirmed puts it right.
+        routes['PUT /hamp/stop'] = undefined;
+        assert.equal(await stopHandy(), true);
+        await tick(0);
+        assert.equal(handyRestState(), 'stopped');
+    });
+
+    it('handyRestState: a start that lands after the stop keeps it pending until the stop after it is confirmed', async () => {
+        await connectOk();
+        let releaseStart;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+        // The stop is confirmed at once, but the start is still out there.
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 1);
+        assert.equal(handyRestState(), 'pending', 'a start on its way may still move the device');
+        // It lands: the device may be moving, and the driver stops it again.
+        let releaseStop;
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => { releaseStop = () => resolve(jsonResponse({ result: 0 })); });
+        releaseStart();
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 2, 'a safety stop follows the stale start');
+        assert.equal(handyRestState(), 'pending', 'never stopped before that stop is confirmed');
+        releaseStop();
+        await tick(5);
+        assert.equal(handyRestState(), 'stopped');
+    });
+
+    it('handyRestState: a device that went offline with its stop unconfirmed is not at rest', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        const fail = () => { throw new TypeError('Failed to fetch'); };
+        routes['/connected'] = fail;
+        routes['PUT /hamp/stop'] = fail;
+        for (let i = 0; i < 3; i++) await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        assert.equal(isHandyOfflineStopPending(), true);
+        assert.equal(handyRestState(), 'unconfirmed');
+        // The background stop gets through: nothing is owed any more.
+        routes['PUT /hamp/stop'] = undefined;
+        await until(() => !isHandyOfflineStopPending(), 'the background stop');
+        assert.equal(handyRestState(), 'none');
+    });
+
+    // The stop Disconnect sends outlives the link, and is retried like any
+    // other: a question opened before it is confirmed would hold its
+    // retries back just the same. Measured: Disconnect's PUT /hamp/stop got
+    // a 502, the question opened 130 ms later over "The toys are stopped",
+    // and the retry due 250 ms after the 502 went out four seconds later,
+    // once the question had been answered.
+    it("handyRestState: Disconnect's own stop is on its way until it is confirmed", async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [40, 40, 40];
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        let attempts = 0;
+        routes['PUT /hamp/stop'] = () => {
+            attempts += 1;
+            return attempts <= 2 ? jsonResponse({ message: 'bad gateway' }, 502) : jsonResponse({ result: 0 });
+        };
+        const stopped = disconnectHandy();
+        assert.equal(handyConnected, false);
+        assert.equal(handyRestState(), 'pending', 'the link is gone, but the device is not known to be at rest');
+        await tick(10);
+        assert.equal(attempts, 1);
+        assert.equal(handyRestState(), 'pending', 'a failed attempt is not the answer');
+        assert.equal(await stopped, true);
+        assert.equal(attempts, 3);
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('handyRestState: a device dropped with its stop never confirmed stays in doubt until a stop to it is confirmed', async () => {
+        await connectOk();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['PUT /hamp/stop'] = () => { throw new TypeError('Failed to fetch'); };
+        assert.equal(await disconnectHandy(), false);
+        assert.equal(isHandyOfflineStopPending(), false);
+        assert.equal(handyRestState(), 'unconfirmed', 'no link and nothing on its way, but the device may still be moving');
+        // Connect with the same key: the device confirms a stop first.
+        routes['PUT /hamp/stop'] = undefined;
+        await connectOk();
+        assert.equal(handyRestState(), 'stopped');
+        assert.equal(await disconnectHandy(), true);
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('handyRestState: a start still on its way when the link is dropped keeps it pending until the stop after it is confirmed', async () => {
+        await connectOk();
+        let releaseStart;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 1);
+        // Disconnect's stop is confirmed at once, but the start is still out there.
+        assert.equal(await disconnectHandy(), true);
+        assert.equal(handyRestState(), 'pending', 'a start on its way may still move the device');
+        let releaseStop;
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => { releaseStop = () => resolve(jsonResponse({ result: 0 })); });
+        releaseStart();
+        await tick(5);
+        assert.equal(sent('/hamp/stop').length, 2, 'the start landed: the dropped device is stopped again');
+        assert.equal(sent('/hamp/stop')[1].key, KEY);
+        assert.equal(handyRestState(), 'pending');
+        releaseStop();
+        await tick(5);
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('handyRestState: of two stops to one device, the one sent last decides, whichever is answered last', async () => {
+        const ok = () => jsonResponse({ result: 0 });
+        const failed = () => jsonResponse({ message: 'bad gateway' }, 502);
+        // The press's stop and then Disconnect's, both held until answered:
+        // answers[0] and answers[1] are their first attempts, and each retry
+        // of whichever fails comes after them.
+        const race = async (answer) => {
+            routes['PUT /hamp/stop'] = undefined;
+            await connectOk();
+            HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+            dispatchHandy(50, 0, 100, true, 0, 100);
+            await tick(5);
+            const answers = [];
+            routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+            dispatchHandy(0, 0, 100, true, 0, 100);
+            const stopped = disconnectHandy();
+            assert.equal(answers.length, 2);
+            await answer(answers, stopped);
+            await until(() => handyRestState() !== 'pending', 'the last stop to be answered');
+            return handyRestState();
+        };
+        const failTheRetries = async (answers) => {
+            for (let i = 2; i < 5; i += 1) {
+                await until(() => answers.length > i, 'the next attempt');
+                answers[i](failed());
+            }
+        };
+        // Disconnect's stop is confirmed; the press's, sent before it, then
+        // fails every attempt: the device is at rest.
+        assert.equal(await race(async (answers, stopped) => {
+            answers[1](ok());
+            assert.equal(await stopped, true);
+            answers[0](failed());
+            await failTheRetries(answers);
+        }), 'none');
+        // The other way round: the last stop sent was never confirmed, and
+        // the driver does not vouch for the device, as it would not on the
+        // live link either.
+        assert.equal(await race(async (answers, stopped) => {
+            answers[0](ok());
+            answers[1](failed());
+            await failTheRetries(answers);
+            assert.equal(await stopped, false);
+        }), 'unconfirmed');
+    });
+
+    // A round of an offline device's background stop is not waited for: the
+    // device is in doubt until one is confirmed, round or no round, and a
+    // round is four attempts - 26 s when each times out.
+    it('handyRestState: an offline device is in doubt while a round of its background stop is on its way, not pending', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = 10000;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        const answers = [];
+        routes['/connected'] = () => { throw new TypeError('Failed to fetch'); };
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+        for (let i = 0; i < 3; i++) await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        assert.equal(answers.length, 1, 'the first round is on its way');
+        assert.equal(isHandyOfflineStopPending(), true);
+        assert.equal(handyRestState(), 'unconfirmed');
+        answers[0](jsonResponse({ message: 'bad gateway' }, 502));
+        await until(() => answers.length === 2, 'the round\'s second attempt');
+        assert.equal(handyRestState(), 'unconfirmed', 'the round retries, and the device is still in doubt');
+        // The retry is confirmed: the device is at rest and no stop is owed.
+        answers[1](jsonResponse({ result: 0 }));
+        await until(() => !isHandyOfflineStopPending(), 'the background stop');
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('handyRestState: a stop still on its way when the device goes offline is waited for, and the device is in doubt after it', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = 10000;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        const answers = [];
+        routes['/connected'] = () => { throw new TypeError('Failed to fetch'); };
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+        // The session's stop is sent, and the device goes offline before it
+        // is answered.
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        for (let i = 0; i < 3; i++) await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        assert.equal(answers.length, 2, "the session's stop and the first background round");
+        assert.equal(handyRestState(), 'pending', "the session's stop may still be confirmed");
+        // Its four attempts fail; the background round is still unanswered.
+        answers[0](jsonResponse({ message: 'bad gateway' }, 502));
+        for (let i = 2; i < 5; i += 1) {
+            await until(() => answers.length > i, 'the next attempt');
+            answers[i](jsonResponse({ message: 'bad gateway' }, 502));
+        }
+        await until(() => handyRestState() !== 'pending', 'the last stop to be answered');
+        assert.equal(handyRestState(), 'unconfirmed');
+        assert.equal(isHandyOfflineStopPending(), true);
+        // The background round is confirmed: nothing is owed any more.
+        answers[1](jsonResponse({ result: 0 }));
+        await until(() => !isHandyOfflineStopPending(), 'the background stop');
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('handyRestState: a stop confirmed after a later one that was confirmed first leaves the device at rest', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        // The first stop's first attempt is held; everything after it is
+        // answered at once.
+        let releaseFirst = null;
+        let stops = 0;
+        routes['PUT /hamp/stop'] = () => {
+            stops += 1;
+            if (stops === 1) return new Promise((resolve) => { releaseFirst = () => resolve(jsonResponse({ result: 0 })); });
+            return jsonResponse({ result: 0 });
+        };
+        // A forced stop to a device at rest, a start while it is still on its
+        // way - Reset in IDLE, then START and PAUSE while Reset's stop is
+        // still being answered - and a stop again.
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(isHandyMoving(), true);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await tick(5);
+        assert.equal(stops, 2);
+        assert.equal(isHandyMoving(), false, 'the later stop is confirmed');
+        assert.equal(handyRestState(), 'pending', 'the first stop is still on its way');
+        releaseFirst();
+        await tick(5);
+        assert.equal(handyRestState(), 'stopped', 'the late answer to the first stop does not undo the later one');
+    });
+
+    it('handyRestState: an offline device the background stop gave up on stays in doubt until Connect has it confirm a stop', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = 1;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await tick(5);
+        routes['/connected'] = () => { throw new TypeError('Failed to fetch'); };
+        routes['PUT /hamp/stop'] = () => { throw new TypeError('Failed to fetch'); };
+        for (let i = 0; i < 3; i++) await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        await until(() => !isHandyOfflineStopPending(), 'every round of the background stop', 10000);
+        await until(() => handyRestState() !== 'pending', 'the last stop to be answered');
+        assert.ok(sent('/hamp/stop').length >= 60 * 4, 'every round was tried');
+        assert.equal(handyRestState(), 'unconfirmed', 'giving up is no answer');
+        routes['PUT /hamp/stop'] = undefined;
+        await connectOk();
+        assert.equal(handyRestState(), 'stopped');
+    });
+
+    // ---- one record of whether a device has confirmed its stop ---------------------------
+    //
+    // Three things ask it: the page's "may still be moving" (onStopUnconfirmed /
+    // onStopConfirmed, kept per key by handy-stop-report.js), the background
+    // stop job an offline device is sent, and handyRestState, which Came Early
+    // and Finished me ask before their question. All three read the device's
+    // record (deviceMotion), so none of them can call a device at rest while
+    // another says it may still be moving.
+
+    // KEY runs; the paused session's stop and then Disconnect's go out, every
+    // attempt of each held until the test answers it: answers[0] and
+    // answers[1] are their first attempts, and each retry comes after them.
+    async function pauseThenDisconnect() {
+        await connectOk();
+        const report = wireStopReport();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        const answers = [];
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        const disconnected = disconnectHandy();
+        assert.equal(answers.length, 2, 'the pause\'s stop and Disconnect\'s');
+        return { report, answers, disconnected };
+    }
+    const stopOk = () => jsonResponse({ result: 0 });
+    const stopFailed = () => jsonResponse({ message: 'bad gateway' }, 502);
+
+    // Fails the three retries of the stop whose first attempt was failed.
+    async function failTheRetries(answers) {
+        for (let i = 2; i < 5; i += 1) {
+            await until(() => answers.length > i, 'the next attempt');
+            answers[i](stopFailed());
+        }
+    }
+
+    it('a stop that fails after a later one was confirmed is no warning: the page and handyRestState both read the device at rest', async () => {
+        // Disconnect's stop, sent last, is confirmed; the pause's, sent before
+        // it, then fails every attempt. It used to be reported all the same,
+        // and the banner said "may still be moving" over a device the
+        // driver's own record had at rest.
+        const { report, answers, disconnected } = await pauseThenDisconnect();
+        answers[1](stopOk());
+        assert.equal(await disconnected, true);
+        answers[0](stopFailed());
+        await failTheRetries(answers);
+        await until(() => handyRestState() !== 'pending', 'the pause\'s last attempt');
+        assert.equal(handyRestState(), 'none');
+        assert.deepEqual(unconfirmedKeys, [], 'the stop that failed was not the last word');
+        assert.deepEqual(confirmedKeys, [KEY]);
+        assert.equal(report.sentence(), null);
+    });
+
+    it('the stop sent last decides: one that fails after an earlier one was confirmed is the warning, until a stop after it is confirmed', async () => {
+        const { report, answers, disconnected } = await pauseThenDisconnect();
+        answers[0](stopOk());
+        await until(() => confirmedKeys.length === 1, 'the pause\'s stop');
+        answers[1](stopFailed());
+        await failTheRetries(answers);
+        assert.equal(await disconnected, false);
+        await until(() => handyRestState() !== 'pending', 'Disconnect\'s last attempt');
+        assert.equal(handyRestState(), 'unconfirmed');
+        assert.deepEqual(unconfirmedKeys, [KEY]);
+        assert.match(report.sentence(), /may still be moving/);
+        // Connect with the same key: the stop that verifies it settles both.
+        routes['PUT /hamp/stop'] = undefined;
+        routes['/connected'] = jsonResponse({ connected: true });
+        await connectHandy(KEY);
+        assert.deepEqual(confirmedKeys, [KEY, KEY]);
+        assert.equal(report.sentence(), null);
+        assert.equal(handyRestState(), 'stopped');
+    });
+
+    it('whichever is answered last: an earlier stop confirmed after the later one failed settles nothing, for the page or for handyRestState', async () => {
+        const { report, answers, disconnected } = await pauseThenDisconnect();
+        answers[1](stopFailed());
+        await failTheRetries(answers);
+        assert.equal(await disconnected, false);
+        assert.deepEqual(unconfirmedKeys, [KEY]);
+        assert.equal(handyRestState(), 'pending', 'the pause\'s stop is still on its way');
+        const warning = report.sentence();
+        assert.match(warning, /may still be moving/);
+        // The pause's stop, sent before Disconnect's, is confirmed now.
+        answers[0](stopOk());
+        await until(() => handyRestState() !== 'pending', 'the pause\'s stop');
+        assert.equal(handyRestState(), 'unconfirmed');
+        assert.deepEqual(confirmedKeys, []);
+        assert.equal(report.sentence(), warning);
+    });
+
+    it('a device brought to rest while its background stop is out reads at rest everywhere, and a round that then fails is a new warning', async () => {
+        await connectOk();
+        const report = wireStopReport();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = ONE_CHASE_ROUND;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        const answers = [];
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+        routes['/connected'] = jsonResponse({ connected: false });
+        // The pause's stop goes out, then the device is found offline: the
+        // background job's first round goes out behind it.
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await pollHandyConnected();
+        assert.equal(offline.length, 1);
+        assert.equal(answers.length, 2, 'the pause\'s stop and the first round');
+        assert.equal(isHandyOfflineStopPending(), true);
+        // The pause's stop is confirmed: the device is at rest, the job runs on.
+        answers[0](stopOk());
+        await until(() => confirmedKeys.length === 1, 'the pause\'s stop');
+        assert.equal(handyRestState(), 'none', 'a round of the background stop is not waited for');
+        assert.equal(report.sentence(), null);
+        assert.equal(isHandyOfflineStopPending(), true);
+        // The round, sent after the pause's stop, fails every attempt: it is
+        // the stop sent last, and the page and handyRestState say so together.
+        answers[1](stopFailed());
+        await failTheRetries(answers);
+        await until(() => unconfirmedKeys.length === 1, 'the round\'s report');
+        assert.match(report.sentence(), /may still be moving/);
+        assert.equal(handyRestState(), 'unconfirmed');
+        assert.equal(isHandyOfflineStopPending(), true);
+    });
+
+    it('a round that fails after the warning was taken back is a new warning, so the page never reads at rest a device in doubt', async () => {
+        await connectOk();
+        const report = wireStopReport();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = 20;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        const answers = [];
+        routes['PUT /hamp/stop'] = () => new Promise((resolve) => answers.push(resolve));
+        routes['/connected'] = jsonResponse({ connected: false });
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await pollHandyConnected();
+        assert.equal(answers.length, 2, 'the pause\'s stop and the first round');
+        // The first round fails every attempt: the warning.
+        answers[1](stopFailed());
+        for (let i = 2; i < 5; i += 1) {
+            await until(() => answers.length > i, 'the round\'s next attempt');
+            answers[i](stopFailed());
+        }
+        await until(() => unconfirmedKeys.length === 1, 'the first round\'s report');
+        assert.match(report.sentence(), /may still be moving/);
+        assert.equal(handyRestState(), 'pending', 'the pause\'s stop is still on its way');
+        // The pause's stop fails its first attempt; its retry, sent after the
+        // round, is confirmed: the device is at rest, and the warning goes.
+        answers[0](stopFailed());
+        await until(() => answers.length > 5, 'the pause\'s retry');
+        answers[5](stopOk());
+        await until(() => confirmedKeys.length === 1, 'the pause\'s retry');
+        assert.equal(report.sentence(), null);
+        assert.equal(handyRestState(), 'none');
+        assert.equal(isHandyOfflineStopPending(), true, 'the job runs on until a round of its own is confirmed');
+        // The next round, sent after that, fails every attempt: the device is
+        // in doubt again, and the page is told again.
+        for (let i = 6; i < 10; i += 1) {
+            await until(() => answers.length > i, 'the second round\'s next attempt');
+            answers[i](stopFailed());
+        }
+        await until(() => unconfirmedKeys.length === 2, 'the second round\'s report');
+        assert.match(report.sentence(), /may still be moving/);
+        assert.equal(handyRestState(), 'unconfirmed');
+        // Let the job finish: its third round is confirmed.
+        await until(() => answers.length > 10, 'the third round');
+        answers[10](stopOk());
+        await until(() => !isHandyOfflineStopPending(), 'the background stop');
+        assert.equal(report.sentence(), null);
+        assert.equal(handyRestState(), 'none');
+    });
+
+    it('a Connect lets go of an offline Handy without a word when a start that never reached it was the only thing that could have moved it', async () => {
+        // PAUSE while a start is out is confirmed at once, and the device is
+        // found offline with the start still out: it is chased. The start
+        // then comes back with the API's word that it never reached the
+        // device, which puts the record at rest. The job used to keep a flag
+        // of its own for a stop confirmed since it began, which the pause's
+        // stop - confirmed before - never set, so the Connect that let the
+        // device go reported it as one that may still be moving.
+        await connectOk();
+        const report = wireStopReport();
+        const start = holdStart();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => sent('/hamp/start').length === 1, 'the start going out');
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => sent('/hamp/stop').length === 1, 'the pause\'s stop');
+        await tick(5);
+        assert.deepEqual(confirmedKeys, [], 'confirmed with the start still out');
+        const held = [];
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? new Promise((resolve) => held.push(resolve)) : jsonResponse({ result: 0 }));
+        routes['/connected'] = ({ key }) => jsonResponse({ connected: key !== KEY });
+        await pollHandyConnected();
+        assert.equal(isHandyOfflineStopPending(), true, 'a start on its way is chased');
+        await until(() => held.length === 1, 'the job\'s first stop');
+        start.release(DEVICE_NOT_CONNECTED);
+        await until(() => confirmedKeys.length === 1, 'the start coming back');
+        assert.equal(handyRestState(), 'none');
+        await connectHandy('second-key');
+        assert.equal(isHandyOfflineStopPending(), false);
+        assert.deepEqual(unconfirmedKeys, [], 'a device the record has at rest is not let go as one that may be moving');
+        assert.equal(report.sentence(), null);
+        assert.equal(handyRestState(), 'stopped');
+        // The round still out says nothing when it fails.
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? jsonResponse(DEVICE_TIMEOUT) : jsonResponse({ result: 0 }));
+        held[0](jsonResponse(DEVICE_TIMEOUT));
+        await until(() => stopsTo(KEY).length === 5, 'the rest of the round');
+        await tick(20);
+        assert.deepEqual(unconfirmedKeys, []);
+        assert.equal(handyRestState(), 'stopped');
+    });
+
+    it('a warning said as an offline Handy is let go with a start still out to it is taken back when that start comes back having moved nothing', async () => {
+        await connectOk();
+        const report = wireStopReport();
+        const start = holdStart();
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => sent('/hamp/start').length === 1, 'the start going out');
+        const held = [];
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? new Promise((resolve) => held.push(resolve)) : jsonResponse({ result: 0 }));
+        routes['/connected'] = ({ key }) => jsonResponse({ connected: key !== KEY });
+        await pollHandyConnected();
+        await until(() => held.length === 1, 'the job\'s first stop');
+        await connectHandy('second-key');
+        assert.deepEqual(unconfirmedKeys, [KEY], 'let go with a start out to it');
+        assert.match(report.sentence(), /may still be moving/);
+        assert.equal(handyRestState(), 'pending', 'that start may still reach it');
+        // The API never reached the device with it, and nothing had moved the
+        // device before it: the record is at rest, and the warning goes with
+        // it. It used to stand until a stop to that device was confirmed.
+        start.release(DEVICE_NOT_CONNECTED);
+        await until(() => confirmedKeys.includes(KEY), 'the start coming back');
+        assert.equal(report.sentence(), null);
+        assert.equal(handyRestState(), 'stopped');
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? jsonResponse(DEVICE_TIMEOUT) : jsonResponse({ result: 0 }));
+        held[0](jsonResponse(DEVICE_TIMEOUT));
+        await until(() => stopsTo(KEY).length === 4, 'the rest of the round');
+        await tick(20);
+        assert.deepEqual(unconfirmedKeys, [KEY], 'the round of a job let go says nothing more');
+        assert.equal(report.sentence(), null);
+    });
+
+    it('the keepalive stop leaves its device in doubt in the record, so a Handy let go before a verified stop to it is answered is still reported', async () => {
+        await connectOk();
+        // A start still waiting for its slide range when the page goes away:
+        // the keepalive stop goes out, and nobody reads its answer.
+        let releaseSlide;
+        routes['PUT /slide'] = () => new Promise((resolve) => { releaseSlide = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => typeof releaseSlide === 'function', 'the slide range going out');
+        assert.equal(stopHandyOnUnload(), true);
+        assert.equal(handyRestState(), 'pending', 'the start is still waiting for its slide range');
+        // Found offline before any verified stop: it is chased, and a Connect
+        // lets it go before the first round comes back.
+        HANDY_TIMINGS.offlineStopRetryMs = ONE_CHASE_ROUND;
+        const held = [];
+        routes['PUT /hamp/stop'] = ({ key }) => (key === KEY ? new Promise((resolve) => held.push(resolve)) : jsonResponse({ result: 0 }));
+        routes['/connected'] = ({ key }) => jsonResponse({ connected: key !== KEY });
+        await pollHandyConnected();
+        assert.equal(isHandyOfflineStopPending(), true);
+        await until(() => held.length === 1, 'the job\'s first stop');
+        assert.equal(handyRestState(), 'unconfirmed', 'the link is gone, the doubt is not');
+        await connectHandy('second-key');
+        assert.deepEqual(unconfirmedKeys, [KEY]);
+        assert.equal(handyRestState(), 'unconfirmed');
+        // A stop of that round confirmed afterwards puts it at rest for every reader.
+        held[0](jsonResponse({ result: 0 }));
+        await until(() => confirmedKeys.includes(KEY), 'the late confirmation');
+        assert.equal(handyRestState(), 'stopped');
+        releaseSlide();
+        await tick(5);
+        assert.equal(sent('/hamp/start').length, 0, 'the start that was waiting never goes out');
+    });
+
+    it('a forced stop a Handy never moved leaves unanswered is no doubt: the press may ask, as the page says nothing', async () => {
+        // STOP or Reset in IDLE, PAUSE with role OFF, or the stop Came Early
+        // sends: this base reports none of them as "may still be moving",
+        // and handyRestState, which the press reads, agrees.
+        await connectOk();
+        const tallyBefore = handyStopTally();
+        routes['PUT /hamp/stop'] = jsonResponse(DEVICE_TIMEOUT);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        assert.equal(handyRestState(), 'pending', 'the stop is on its way');
+        await until(() => handyRestState() !== 'pending', 'the stop\'s last attempt');
+        assert.equal(sent('/hamp/stop').length, 4);
+        assert.deepEqual(unconfirmed, []);
+        assert.equal(handyRestState(), 'stopped', 'the stop that verified the key is the last word, and nothing has moved the device since');
+        // The press asks, but is told this stop went unanswered: "The Handy
+        // has confirmed its stop" would be false.
+        assert.deepEqual(handyStopTally(), { confirmed: tallyBefore.confirmed, unanswered: tallyBefore.unanswered + 1 });
+        // Once the motor has run, the same unanswered stop is the doubt.
+        routes['PUT /hamp/stop'] = undefined;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        routes['PUT /hamp/stop'] = jsonResponse(DEVICE_TIMEOUT);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => unconfirmed.length === 1, 'the unanswered stop');
+        assert.equal(handyRestState(), 'unconfirmed');
+    });
+
+    // Came Early and Finished me read it before and after they wait for the
+    // stops on their way (session-rules.stopThenAsk), so the line that ends
+    // the wait never says the Handy confirmed a stop it left unanswered.
+    it('handyStopTally counts the verified stops confirmed and those that give up with no later stop to their device confirmed, rounds apart', async () => {
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        const before = handyStopTally();
+        const tally = (confirmed, unanswered) => ({ confirmed: before.confirmed + confirmed, unanswered: before.unanswered + unanswered });
+        // Confirmed at once, and confirmed on a retry: one stop each.
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => handyRestState() !== 'pending', 'the stop');
+        let attempts = 0;
+        routes['PUT /hamp/stop'] = () => (++attempts === 1 ? jsonResponse({ message: 'bad gateway' }, 502) : jsonResponse({ result: 0 }));
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => handyRestState() !== 'pending', 'the retried stop');
+        assert.equal(attempts, 2);
+        assert.deepEqual(handyStopTally(), tally(2, 0));
+        // Every attempt refused over a device at rest: unanswered, though
+        // handyRestState goes on calling it at rest.
+        routes['PUT /hamp/stop'] = jsonResponse(DEVICE_NOT_CONNECTED);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => handyRestState() !== 'pending', 'the refused stop');
+        assert.equal(handyRestState(), 'stopped');
+        assert.deepEqual(unconfirmed, []);
+        assert.deepEqual(handyStopTally(), tally(2, 1));
+        // Over a running device, which it leaves in doubt: unanswered too.
+        routes['PUT /hamp/stop'] = undefined;
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => isHandyMoving(), 'the start');
+        routes['PUT /hamp/stop'] = jsonResponse(DEVICE_TIMEOUT);
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => handyRestState() !== 'pending', 'the unanswered stop');
+        assert.equal(handyRestState(), 'unconfirmed');
+        assert.deepEqual(handyStopTally(), tally(2, 2));
+        // A round of the background stop an offline device is sent is not
+        // waited for, and counted neither way.
+        const sentBefore = sent('/hamp/stop').length;
+        routes['/connected'] = jsonResponse({ connected: false });
+        await pollHandyConnected();
+        assert.equal(isHandyOfflineStopPending(), true);
+        await until(() => sent('/hamp/stop').length >= sentBefore + 8, 'two rounds of the background stop');
+        await tick(20);
+        assert.equal(isHandyOfflineStopPending(), true, 'every round so far went unanswered');
+        routes['PUT /hamp/stop'] = undefined;
+        await until(() => !isHandyOfflineStopPending(), 'a confirmed round');
+        assert.equal(handyRestState(), 'none');
+        assert.deepEqual(handyStopTally(), tally(2, 2));
+    });
+
+    it('handyStopTally: a stop that gives up after a later one to its device was confirmed is no unanswered stop; Disconnect\'s own is', async () => {
+        // The pause's stop, then Disconnect's; Disconnect's is confirmed and
+        // the pause's then fails every attempt: the device answered a stop
+        // sent after it.
+        let run = await pauseThenDisconnect();
+        let before = handyStopTally();
+        run.answers[1](stopOk());
+        assert.equal(await run.disconnected, true);
+        run.answers[0](stopFailed());
+        await failTheRetries(run.answers);
+        await until(() => handyRestState() !== 'pending', 'the pause\'s last attempt');
+        assert.equal(handyRestState(), 'none');
+        assert.deepEqual(handyStopTally(), { confirmed: before.confirmed + 1, unanswered: before.unanswered });
+        // The other way round: Disconnect's stop, sent last, gives up.
+        resetHandyRestForTests();
+        routes = {};
+        run = await pauseThenDisconnect();
+        before = handyStopTally();
+        run.answers[0](stopOk());
+        await until(() => confirmedKeys.length === 1, 'the pause\'s stop');
+        run.answers[1](stopFailed());
+        await failTheRetries(run.answers);
+        assert.equal(await run.disconnected, false);
+        assert.deepEqual(handyStopTally(), { confirmed: before.confirmed + 1, unanswered: before.unanswered + 1 });
+    });
+
+    it('handyStopTally: a stop that gives up while a start is still out, and the stop after that start is confirmed, shows the confirmation', async () => {
+        // Came Early pressed with a start still on its way: the press's stop
+        // gives up unanswered, the start lands, and the stop sent after it
+        // is confirmed. The device is at rest on that confirmation, and the
+        // press says the Handy confirmed its stop, not that it had confirmed
+        // an earlier one.
+        await connectOk();
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        let releaseStart;
+        routes['PUT /hamp/start'] = () => new Promise((resolve) => { releaseStart = () => resolve(jsonResponse({ result: 0 })); });
+        dispatchHandy(50, 0, 100, true, 0, 100);
+        await until(() => typeof releaseStart === 'function', 'the start on its way');
+        const before = handyStopTally();
+        routes['PUT /hamp/stop'] = stopFailed;
+        dispatchHandy(0, 0, 100, true, 0, 100);
+        await until(() => sent('/hamp/stop').length === 4, 'every attempt of the press\'s stop');
+        await until(() => handyStopTally().unanswered === before.unanswered + 1, 'the stop that gave up');
+        assert.equal(handyRestState(), 'pending', 'the start is still on its way');
+        routes['PUT /hamp/stop'] = undefined;
+        releaseStart();
+        await until(() => handyRestState() !== 'pending', 'the stop after the late start');
+        assert.equal(sent('/hamp/stop').length, 5, 'a stop follows the start that landed late');
+        assert.equal(handyRestState(), 'stopped');
+        assert.deepEqual(handyStopTally(), { confirmed: before.confirmed + 1, unanswered: before.unanswered + 1 });
+    });
+
+    // Interleavings drawn from a fixed seed: starts and stops answered in any
+    // order, with any outcome, across Disconnect, a reconnect with the same
+    // key, another key, the offline verdict and the keepalive stop. Whenever
+    // the page's record says a Handy may still be moving, handyRestState must
+    // not call the toys at rest - while anything is still out, and once
+    // everything has been answered.
+    it('the page\'s warning and handyRestState never disagree, over seeded interleavings', async () => {
+        const OTHER = 'second-key';
+        let seed = 0x5eed1e55;
+        const random = () => {
+            seed = (seed * 1103515245 + 12345) >>> 0;
+            return seed / 0x100000000;
+        };
+        // `choices` is [[weight, value], ...].
+        const pick = (choices) => {
+            let r = random() * choices.reduce((sum, [w]) => sum + w, 0);
+            for (const [w, value] of choices) {
+                r -= w;
+                if (r < 0) return value;
+            }
+            return choices[choices.length - 1][1];
+        };
+        HANDY_TIMINGS.stopRetryDelaysMs = [0, 0, 0];
+        HANDY_TIMINGS.offlineStopRetryMs = 1;
+        let checks = 0;
+        for (let run = 0; run < 40; run++) {
+            resetHandyRestForTests();
+            routes = {};
+            await connectOk();
+            const report = wireStopReport();
+            let connecting = false;
+            const pending = [];
+            const hold = ({ path, key }) => new Promise((resolve, reject) => pending.push({ path, key, resolve, reject }));
+            routes['PUT /hamp/stop'] = hold;
+            routes['PUT /hamp/start'] = hold;
+            routes['PUT /slide'] = () => jsonResponse({ result: 0 });
+            routes['PUT /hamp/velocity'] = () => jsonResponse({ result: 0 });
+            routes['/connected'] = () => jsonResponse({ connected: true });
+            const ok = (p) => p.resolve(jsonResponse({ result: 0 }));
+            const failed = (p) => p.resolve(jsonResponse({ message: 'bad gateway' }, 502));
+            const timedOut = (p) => p.resolve(jsonResponse(DEVICE_TIMEOUT));
+            const lost = (p) => p.reject(new TypeError('Failed to fetch'));
+            const notConnected = (p) => p.resolve(jsonResponse(DEVICE_NOT_CONNECTED));
+            // The API answers each device's stops alike for a stretch: down,
+            // every attempt fails, as a device off its Wi-Fi does; up, nearly
+            // every one goes through.
+            const down = new Set();
+            const answerOne = () => {
+                if (pending.length === 0) return;
+                const p = pending.splice(Math.floor(random() * pending.length), 1)[0];
+                const isDown = down.has(p.key);
+                const outcome = p.path === '/hamp/start'
+                    ? (isDown ? pick([[1, timedOut], [1, notConnected], [1, lost]]) : pick([[6, ok], [1, timedOut], [1, notConnected]]))
+                    : (isDown ? pick([[1, failed], [1, timedOut], [1, lost]]) : pick([[6, ok], [1, failed]]));
+                outcome(p);
+            };
+            const action = () => pick([
+                [4, () => dispatchHandy(50, 0, 100, true, 0, 100)],
+                [4, () => dispatchHandy(0, 0, 100, true, 0, 100)],
+                [1, () => { disconnectHandy(); }],
+                [1, () => {
+                    if (connecting) return;
+                    connecting = true;
+                    connectHandy(random() < 0.5 ? KEY : OTHER).catch(() => {}).finally(() => { connecting = false; });
+                }],
+                [0.5, () => {
+                    routes['/connected'] = () => jsonResponse({ connected: false });
+                    pollHandyConnected().finally(() => { routes['/connected'] = () => jsonResponse({ connected: true }); });
+                }],
+                [0.5, () => { stopHandyOnUnload(); }],
+                [3, () => {
+                    const key = random() < 0.5 ? KEY : OTHER;
+                    if (down.has(key)) down.delete(key);
+                    else down.add(key);
+                }],
+                [10, answerOne]
+            ]);
+            for (let step = 0; step < 60; step++) {
+                action()();
+                await tick(0);
+                const rest = handyRestState();
+                for (const key of [KEY, OTHER]) {
+                    if (!report.owes(key)) continue;
+                    checks += 1;
+                    assert.ok(rest === 'pending' || rest === 'unconfirmed',
+                        `run ${run}, step ${step}: the page says ${key} may still be moving, handyRestState says ${rest}`);
+                }
+            }
+            // Answer everything still out, every stop confirmed, and let the
+            // retries and the background job run out.
+            routes['PUT /hamp/stop'] = () => jsonResponse({ result: 0 });
+            routes['PUT /hamp/start'] = () => jsonResponse(DEVICE_NOT_CONNECTED);
+            while (pending.length > 0) {
+                const p = pending.shift();
+                (p.path === '/hamp/start' ? notConnected : ok)(p);
+                await tick(0);
+            }
+            await until(() => !connecting && handyRestState() !== 'pending' && !isHandyOfflineStopPending(), `run ${run} to settle`);
+            const rest = handyRestState();
+            for (const key of [KEY, OTHER]) {
+                if (report.owes(key)) {
+                    assert.equal(rest, 'unconfirmed', `run ${run}: the page says ${key} may still be moving once everything was answered`);
+                }
+            }
+            disconnectHandy();
+            await until(() => handyRestState() !== 'pending', `run ${run}'s Disconnect`);
+        }
+        // That the runs reached the warning at all, not a count to tune: the
+        // interleavings shift with how busy the machine is.
+        assert.ok(checks > 40, `the warning stood at only ${checks} checks`);
     });
 });

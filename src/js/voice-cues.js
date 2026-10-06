@@ -165,10 +165,18 @@ export const VOICE_CUE_CATALOG = [
             'You held them. Come now.'
         ]
     },
+    // Came Early speaks one of two banks, chosen by what the press really did
+    // (session-rules.cameEarlyCue). The Resting HR floor and the 30 BPM cap
+    // can swallow a press whole, and these lines promise a tighter limit, so
+    // they are only for a press that lowers the ceiling the next session
+    // starts at: spoken over a ceiling that had not moved, they told the
+    // wearer they were held further from climax than they were. {hr} here is
+    // the pulse the step was judged on - the peak of the minute before the
+    // press - not the cockpit's reading at the press.
     {
         id: 'cameEarly',
         group: 'Premature',
-        label: 'Came early / premature ejaculation',
+        label: 'Came early: the ceiling is lowered',
         lines: [
             'Came early. Limit tightened.',
             'Premature. Ceiling drops next time.',
@@ -178,6 +186,30 @@ export const VOICE_CUE_CATALOG = [
             'Breakthrough logged. Hold better next time.',
             'You spilled. Working climax HR goes down.',
             'Premature ejaculation. The next session is meaner.'
+        ]
+    },
+    // The press was logged but the ceiling the next session starts at did
+    // not move. Nothing here may claim a drop, and nothing may claim the
+    // ceiling is as low as it goes either: the Resting HR floor is only one
+    // of the reasons a press moves nothing. The other is the 30 BPM cap on
+    // the learned offset, and at the cap the ceiling can sit far above the
+    // floor - Resting 60 and Climax 160 with the offset capped give a
+    // ceiling of 130 over a floor of 75, which dual-stim dampening, decay or
+    // a lower typed Climax HR still take lower. "The ceiling is already as
+    // low as it goes" told that wearer something false, and stayed painted
+    // in the cockpit until the next cue. So these lines say only what every
+    // such press has in common: the event is logged, and the ceiling stays
+    // where it was.
+    {
+        id: 'cameEarlyHeld',
+        group: 'Premature',
+        label: 'Came early: the ceiling stays where it is',
+        lines: [
+            'Came early. Logged. The ceiling stays put.',
+            'Too soon. Noted. Your limit stays the same.',
+            'Accidental release. {hr} BPM. Logged. The ceiling stays where it is.',
+            'Premature. Recorded. The ceiling holds.',
+            'You spilled. Logged. The ceiling is unchanged.'
         ]
     },
     { id: 'idle', group: 'Session', label: 'Resting prompt', lines: ['Calm and steady. Breathe.'] },
@@ -263,8 +295,45 @@ export function sanitizeCueList(value, fallbackLines = [], maxLines = MAX_PHRASE
     return isWritableCueValue(value) ? [] : fallback;
 }
 
+// A bank split off an older one takes that bank's mute. Anything written
+// before the split - the settings store of an earlier version, a Backup it
+// wrote, or a phrase list it exported - has no entry for the new bank, and
+// filling it with factory lines would start speaking at a wearer who had
+// silenced the event: someone who muted Came Early would hear the new
+// 'cameEarlyHeld' lines on the first press the floor or the cap swallowed.
+// Only the mute carries over - keeping the older bank's lines out of the new
+// one is what the split is for - and once the set is saved with the new
+// entry, the two banks are edited, muted and restored on their own.
+const SPLIT_FROM = { cameEarlyHeld: 'cameEarly' };
+
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+// A value that silences its bank: one an import may write, with no line in it.
+function isMuteValue(value) {
+    return isWritableCueValue(value) && sanitizeCueList(value, []).length === 0;
+}
+
+// `src` as it would read had it been written after the split: a newer bank it
+// has no entry for is muted when the older bank it names is. Every reader of
+// a set or a file of banks goes through this - mergeVoiceCues for the store
+// and a Backup restore, applyImportedCues and describeImport for Import
+// phrases - so none of them can read the same data differently. Import
+// phrases used to write only the banks a file named: a phrase list exported
+// by 1.1.0 with Came Early emptied left the new bank on its factory lines,
+// every press the floor swallowed was spoken and painted, and the alert said
+// "(1 muted)" - while the same data restored through a Backup stayed silent.
+function withSplitMutes(src) {
+    let out = src;
+    for (const [id, older] of Object.entries(SPLIT_FROM)) {
+        if (hasOwn(src, id) || !hasOwn(src, older) || !isMuteValue(src[older])) continue;
+        if (out === src) out = { ...src };
+        out[id] = [];
+    }
+    return out;
+}
+
 export function mergeVoiceCues(raw) {
-    const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const src = withSplitMutes(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {});
     const out = {};
     for (const cue of VOICE_CUE_CATALOG) {
         out[cue.id] = sanitizeCueList(src[cue.id], cue.lines);
@@ -272,14 +341,42 @@ export function mergeVoiceCues(raw) {
     return out;
 }
 
+// A token with nothing behind it renders as nothing.
+function tokenIsEmpty(value) {
+    return value === undefined || value === null || value === '';
+}
+
 export function interpolateCue(template, vars = {}) {
     if (typeof template !== 'string' || !template) return '';
     return template.replace(/\{([a-zA-Z]+)\}/g, (full, name) => {
         if (!VOICE_CUE_VARS.includes(name)) return full;
         const value = vars[name];
-        if (value === undefined || value === null || value === '') return '';
+        if (tokenIsEmpty(value)) return '';
         return String(value);
     }).replace(/\s+/g, ' ').trim();
+}
+
+// Does every token in this line have a value to fill it this time? Unknown
+// braces are not tokens and are left as written, so they do not count.
+export function cueLineIsComplete(template, vars = {}) {
+    if (typeof template !== 'string') return false;
+    for (const match of template.matchAll(/\{([a-zA-Z]+)\}/g)) {
+        if (VOICE_CUE_VARS.includes(match[1]) && tokenIsEmpty(vars[match[1]])) return false;
+    }
+    return true;
+}
+
+// The lines of a bank that can be said in full with these values. A line
+// whose token has no value this time is not a sentence: "Accidental release.
+// {hr} BPM. Limits tighter." with no pulse read comes out as "Accidental
+// release. BPM. Limits tighter." - and the value it used to be given instead
+// was the cockpit's 70 BPM default, a pulse nobody measured. So while another
+// line of the bank can be said in full, the pick is made among those; only a
+// bank with no such line falls back to all of its lines.
+export function sayableCueLines(lines, vars = {}) {
+    const list = Array.isArray(lines) ? lines : [];
+    const complete = list.filter((line) => cueLineIsComplete(line, vars));
+    return complete.length > 0 ? complete : list;
 }
 
 export function pickCueLine(lines, lastText = '', random = Math.random) {
@@ -301,7 +398,7 @@ export function resolveVoiceCue(cues, key, vars = {}, { lastTemplate = '', rando
         return { text: interpolateCue(template, vars), template };
     }
     const merged = mergeVoiceCues(cues);
-    const template = pickCueLine(merged[key], lastTemplate, random);
+    const template = pickCueLine(sayableCueLines(merged[key], vars), lastTemplate, random);
     return { text: interpolateCue(template, vars), template };
 }
 
@@ -327,17 +424,21 @@ function extractCueMap(parsed) {
     return null;
 }
 
+// Import phrases writes the banks a file names and leaves the rest as they
+// stand in the editor. A file written before a split names the older bank
+// for both halves, so its mute is read into the newer one (withSplitMutes).
 export function applyImportedCues(current, incoming) {
     const base = mergeVoiceCues(current);
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return base;
+    const file = withSplitMutes(incoming);
     for (const cue of VOICE_CUE_CATALOG) {
         // Presence of the key is the whole test. An emptied bank is a real,
         // persisted state ("say nothing for this cue") and Export writes it
         // out as `[]`, so a file that mentions the cue with an empty list is
         // restoring a mute, not saying nothing. Only an unusable value (not a
         // string, not an array) falls back to what is already there.
-        if (!Object.prototype.hasOwnProperty.call(incoming, cue.id)) continue;
-        base[cue.id] = sanitizeCueList(incoming[cue.id], base[cue.id]);
+        if (!hasOwn(file, cue.id)) continue;
+        base[cue.id] = sanitizeCueList(file[cue.id], base[cue.id]);
     }
     return base;
 }
@@ -349,20 +450,24 @@ export function applyImportedCues(current, incoming) {
 // `applyImportedCues` answers, key by key: a cue whose value is not writable
 // (null, a number - hand-edited files do that) keeps the lines the user
 // already had, so it is neither imported nor muted. Reporting it as a mute
-// sent the wearer hunting for a silent bank that was never touched.
+// sent the wearer hunting for a silent bank that was never touched. A bank
+// muted because the file mutes the one it was split from is written too, so
+// it is counted: a 1.1.0 list with Came Early emptied silences both halves of
+// Came Early, and the editor then shows both as muted.
 export function describeImport(incoming) {
     const applied = [];
     const muted = [];
     const skipped = [];
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return { applied, muted, skipped };
+    const file = withSplitMutes(incoming);
     for (const cue of VOICE_CUE_CATALOG) {
-        if (!Object.prototype.hasOwnProperty.call(incoming, cue.id)) continue;
-        if (!isWritableCueValue(incoming[cue.id])) {
+        if (!hasOwn(file, cue.id)) continue;
+        if (!isWritableCueValue(file[cue.id])) {
             skipped.push(cue.id);
             continue;
         }
         applied.push(cue.id);
-        if (sanitizeCueList(incoming[cue.id], []).length === 0) muted.push(cue.id);
+        if (sanitizeCueList(file[cue.id], []).length === 0) muted.push(cue.id);
     }
     return { applied, muted, skipped };
 }

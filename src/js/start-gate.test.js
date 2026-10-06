@@ -2,9 +2,11 @@
 // sequencing is what keeps one press to one session, and STOP meaning STOP,
 // while the API is answering. The page wiring on top of it (the button
 // label, the banner, which answer counts as a yes) lives in app.js and is
-// proved in the browser; the last two suites only check, against app.js's
-// text, that the page cancels a waiting question where it has to, and that
-// a start takes back the banner lines it outdates before its own cue.
+// proved in the browser; the last three suites only check, against app.js's
+// text, that the page cancels a waiting question where it has to, that it
+// starts nothing while Came Early or Finished me stops the toys and asks,
+// and that a start takes back the banner lines it outdates before its own
+// cue.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -139,8 +141,12 @@ describe('start gate', () => {
 // frozen page is resumed with its answer still to land, and the answer
 // would start the toys after a stretch nobody watched - the watchdog's
 // auto-resume among them, which no longer reads as a watchdog pause while
-// it waits. app.js needs a DOM, so it is read as text, the way the other
-// app.js guards in this suite are.
+// it waits. Came Early and Finished me drop it too: they stop the toys and
+// keep them stopped until the wearer has answered, and an answer landing
+// meanwhile would start the session while the press waits for the stop,
+// or after the question - after Cancel, which leaves the session paused.
+// app.js needs a DOM, so it is read as text, the way the other app.js
+// guards in this suite are.
 const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 function bodyFrom(anchor, end = '\n}') {
     const at = APP.indexOf(anchor);
@@ -148,7 +154,7 @@ function bodyFrom(anchor, end = '\n}') {
     return APP.slice(at, APP.indexOf(end, at));
 }
 
-describe('the page drops a waiting START on STOP, Reset and the page going away', () => {
+describe('the page drops a waiting START on STOP, Reset, the page going away and a Came Early press', () => {
     it('STOP cancels it before the session is set down', () => {
         const body = bodyFrom('function stopSession(');
         const cancelAt = body.indexOf('startGate.cancel()');
@@ -171,6 +177,33 @@ describe('the page drops a waiting START on STOP, Reset and the page going away'
         const before = body.slice(0, cancelAt).replace(/\/\/.*$/gm, '');
         assert.match(before, /if \(isRemotePage\) return;/);
         assert.deepEqual(before.match(/\breturn\b[^;]*;/g), ['return;'], 'only the remote page may return before the cancel');
+    });
+
+    it('Came Early and Finished me cancel it as they stop the toys for their question', () => {
+        const body = bodyFrom('function haltForTheQuestion(');
+        const cancelAt = body.indexOf('startGate.cancel()');
+        assert.ok(cancelAt >= 0, 'haltForTheQuestion must cancel the start gate');
+        assert.ok(cancelAt < body.indexOf('pauseSession('), 'before the pause it makes');
+    });
+});
+
+// Came Early and Finished me keep the toys stopped until the wearer has
+// answered. A START or RESUME tapped while the press waited for the stop went
+// to The Handy for its answer, was still waiting for it when the question
+// opened, and started the toys once the question was answered: after Cancel,
+// which leaves the session paused, and after OK in the minute after STOP. So
+// startOrResumeWhenReady asks the press before anything else, with the tap's
+// own time, by the rule the press judges a second press by
+// (session-rules.createQuestionGate claims).
+describe('a START or RESUME made while Came Early or Finished me runs starts nothing', () => {
+    it('startOrResumeWhenReady asks the press first', () => {
+        const body = bodyFrom('function startOrResumeWhenReady(').replace(/\/\/.*$/gm, '');
+        assert.match(body, /^function startOrResumeWhenReady\(tappedAt\) \{\s*if \(pressQuestion\.claims\(tappedAt\)\) return Promise\.resolve\(false\);/);
+    });
+
+    it('the button hands it the time of the tap', () => {
+        const body = bodyFrom("playPauseBtn?.addEventListener('click'", '\n});');
+        assert.match(body, /startOrResumeWhenReady\(Number\.isFinite\(event\?\.timeStamp\) && event\.timeStamp > 0 \? event\.timeStamp : performance\.now\(\)\)/);
     });
 });
 

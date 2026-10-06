@@ -20,7 +20,7 @@
 // after this pass; this file is per-field only.
 
 import { SETTING_DEFAULTS } from './state.js';
-import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, resolveForceOrgasmMaxSeconds, MAX_SESSION_MINUTES, DURATION_MODES, ENDGAME_TYPES } from './session-rules.js';
+import { clampStallGuardSeconds, clampStallPauseSeconds, clampTrainHoldSeconds, clampTrainEdges, resolveForceOrgasmMaxSeconds, MAX_SESSION_MINUTES, DURATION_MODES, ENDGAME_TYPES, MAX_LEARNED_OFFSET_BPM } from './session-rules.js';
 import { clampEdgeHoldPercent } from './engine.js';
 import { clampStaleSeconds } from './hr-watchdog.js';
 import { clampEndMargin } from './hardware/handy-protocol.js';
@@ -31,12 +31,13 @@ import { clampEncourageSeconds, mergeVoiceCues } from './voice-cues.js';
 // window itself belongs to the parser that refuses a length outside it.
 export { MAX_SESSION_MINUTES };
 
-// Bounds for the learning profile. The offset cap mirrors the one the "I
-// came early" button enforces; the HR is the same plausibility window a
-// typed limit gets. A negative offset would RAISE the working ceiling above
-// the Climax HR the user typed, which is the one direction that must be
-// impossible.
-export const MAX_LEARNED_OFFSET_BPM = 30;
+// Bounds for the learning profile. The offset cap is the one the Came Early
+// step itself stops at (session-rules.js), re-exported so a restored profile
+// and a pressed button can never disagree about it; the HR is the same
+// plausibility window a typed limit gets. A negative offset would RAISE the
+// working ceiling above the Climax HR the user typed, which is the one
+// direction that must be impossible.
+export { MAX_LEARNED_OFFSET_BPM };
 export const MAX_LEARNED_EVENTS = 9999;
 const MIN_PLAUSIBLE_HR = 30;
 const MAX_PLAUSIBLE_HR = 250;

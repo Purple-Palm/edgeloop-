@@ -16,7 +16,11 @@
 //      The converse is kept just as strictly: a motor this driver never
 //      started, or last saw confirmed stopped, is never reported as one
 //      that "may still be moving", so that warning still means something
-//      on the day it is true.
+//      on the day it is true. That one record is all anything reads about
+//      whether a device has confirmed its stop: the page's "may still be
+//      moving" (onStopConfirmed / onStopUnconfirmed), the background stop
+//      job, Disconnect's answer, and handyRestState, which app.js asks
+//      before it opens a dialog over the toys.
 //   2. Never exceed the user's hardware envelope; the stroke range sent to
 //      PUT /slide is always normalised through handy-protocol.js, then moved
 //      off the mechanical ends by the end-stop margin (inside that same
@@ -97,8 +101,15 @@ let handyMotionUnknown = false;
 // verifyKey), so that a stop sent after a start came back can be told from
 // one that was already on its way and may have reached the device first.
 let stopsSent = 0;
-// What each device's motor may still be doing, by connection key:
-// { startsOut, unsettledSince, restPending }. A key names a device, not a
+// What became of the verified stops, rounds of the background stop apart
+// (handyStopTally): how many the API confirmed, and how many went unanswered
+// on every attempt with no stop to their device that left after them
+// confirmed.
+let stopsConfirmed = 0;
+let stopsUnanswered = 0;
+// What each device's motor may still be doing, and what is still on its way
+// to it, by connection key: { startsOut, stopsOut, roundsOut,
+// unsettledSince, restPending, lastConfirmed }. A key names a device, not a
 // link: Connect with the key already in use - after an API error, after
 // Disconnect, or once the device was found offline - reaches the same
 // motor, so what the old link owed it must still count on the new one. It
@@ -114,11 +125,21 @@ let stopsSent = 0;
 //                   begin to turn at any moment without us hearing about
 //                   it. A start still waiting for its slide range has sent
 //                   the device nothing that moves it and is not counted.
+//   stopsOut        verified stops on their way to it, every attempt of
+//                   each until the last is answered - Disconnect's as well,
+//                   which outlives the link - and the stop that follows a
+//                   start landing behind one, from the moment it is due.
+//   roundsOut       rounds of the background stop an offline device is sent
+//                   (beginOfflineStop), on their way.
 //   unsettledSince  null, or stopsSent at the moment a start came back
 //                   that may have set the motor going: confirmed, answered
 //                   behind a stop, or failed without the API saying the
-//                   device never got it. Only a stop sent after that, and
-//                   confirmed, says the motor is at rest again.
+//                   device never got it; or at the moment the keepalive
+//                   stop went out with nobody to read its answer. Only a
+//                   stop sent after that, and confirmed, says the motor is
+//                   at rest again. A stop asked for a motor that may be
+//                   moving that is never confirmed moves the mark up to it
+//                   (noteStopFailed): the stop sent last decides.
 //   restPending     a stop the API confirmed while a start was still on its
 //                   way. It cannot say the motor is at rest yet, because
 //                   that start may reach the device after it: it does once
@@ -126,6 +147,14 @@ let stopsSent = 0;
 //                   API's word that the device was not connected; see
 //                   noteStartBack), and a start that may have set the motor
 //                   going voids it (noteMayHaveStarted).
+//   lastConfirmed   the number the newest attempt the API confirmed to it
+//                   left with, so a stop that fails after a later one was
+//                   confirmed is not taken for the last word on the device.
+// This is the one record of whether a device has confirmed its stop. The
+// page's "may still be moving" is said and taken back from it, the
+// background job is started, and lets its device go, by it, and
+// handyRestState reads it; none of them keeps a ledger of its own that
+// could disagree with it.
 const deviceMotion = new Map();
 // True while a reconnect has stopped the old device and is about to swap
 // keys: engine ticks must not restart the old device in that window.
@@ -166,10 +195,9 @@ let pollTicksSinceCheck = 0;
 // the one that is live now.
 let linkEpoch = 0;
 // The background stop job for a device that went offline: { key, timer,
-// rounds, active, reported, stopConfirmed }. Cancelled by Connect and
-// Disconnect, which report the device when nothing has yet
-// (cancelOfflineStop). stopConfirmed: the API has confirmed a stop to that
-// device since the job began, whoever sent it (noteStopConfirmed).
+// rounds, active, reported }. Cancelled by Connect and Disconnect, which
+// report the device when nothing has yet (cancelOfflineStop). `reported` is
+// taken back when the device's record comes to rest (deviceAtRest).
 let offlineStop = null;
 // The last error shown to the user: { path, message }. Only a success on
 // the SAME path clears it, so a /connected poll or a slide reply cannot
@@ -189,7 +217,7 @@ const handlers = {
 //   onError(message | null)          -> non-null: show the API error; null: the failing call succeeded again
 //   onOffline(reason)                -> the device stopped answering; motors must be treated as stopped
 //   onStopUnconfirmed(message, key)  -> a stop the device with this key may have needed was never confirmed by the API
-//   onStopConfirmed(key)             -> the API confirmed a stop that brought the device with this key to rest
+//   onStopConfirmed(key)             -> the device with this key is known to be at rest again: the API confirmed a stop that brought it there, or a start to it came back having moved nothing
 //   onNotice(message)                -> the device said something worth reading; not an error, not a fault
 //   isSessionActive()                -> true while a session is RUNNING or RAMPDOWN (sets the poll cadence)
 //
@@ -209,6 +237,11 @@ const handlers = {
 // same fact: a stop that left before a start to that device came back
 // settles neither, and one confirmed while a start to it is still on its
 // way settles neither until that start has come back having moved nothing.
+// onStopUnconfirmed is said for a stop that leaves the record in doubt
+// (noteStopFailed): one asked for a motor that may be moving, with no stop
+// to that device that left after it confirmed. A stop that fails after a
+// later one was confirmed used to be reported all the same, and the page
+// then said "may still be moving" over a device the record knew at rest.
 export function setHandyHandlers({ onError, onOffline, onStopUnconfirmed, onStopConfirmed, onNotice, isSessionActive } = {}) {
     if (onError !== undefined) handlers.onError = onError;
     if (onOffline !== undefined) handlers.onOffline = onOffline;
@@ -252,14 +285,19 @@ function motorMayBeMoving() {
 function motionRecord(key) {
     let record = deviceMotion.get(key);
     if (!record) {
-        record = { startsOut: 0, unsettledSince: null, restPending: false };
+        record = { startsOut: 0, stopsOut: 0, roundsOut: 0, unsettledSince: null, restPending: false, lastConfirmed: -1 };
         deviceMotion.set(key, record);
     }
     return record;
 }
 
+// A record is kept while anything is on its way to its device or the device
+// may be moving: a stop still out must find the confirmations made since it
+// left (lastConfirmed) when it is answered.
 function dropIfSettled(key, record) {
-    if (record.startsOut === 0 && record.unsettledSince === null) deviceMotion.delete(key);
+    if (record.startsOut === 0 && record.stopsOut === 0 && record.roundsOut === 0 && record.unsettledSince === null) {
+        deviceMotion.delete(key);
+    }
 }
 
 // True while the device behind `key` may be moving, whichever link set it
@@ -270,9 +308,10 @@ function deviceMayMove(key) {
 }
 
 // A start to `key` came back, or failed, in a way that may have set the
-// motor going. A later start moves the mark on: a stop that went out before
-// it came back settles nothing, and neither does one confirmed while it was
-// still on its way (restPending).
+// motor going, or the page sent its keepalive stop with nobody left to read
+// the answer (stopHandyOnUnload). A later start moves the mark on: a stop
+// that went out before it came back settles nothing, and neither does one
+// confirmed while it was still on its way (restPending).
 function noteMayHaveStarted(key) {
     const record = motionRecord(key);
     record.unsettledSince = stopsSent;
@@ -281,15 +320,21 @@ function noteMayHaveStarted(key) {
 
 // A PUT /hamp/start to `key` is no longer on its way, and whatever it may
 // have set going has been noted (noteMayHaveStarted). When it was the last
-// one out and nothing on the record may move the motor, a stop the API
-// confirmed while it was out (restPending) did bring the device to rest,
-// since no start reached it after that stop, and app.js hears of it now.
+// one out and nothing on the record may move the motor, the device is at
+// rest: a stop the API confirmed while it was out (restPending) did bring it
+// there, since no start reached it after that stop, or nothing had moved it
+// before and this start moved nothing (the API's word that the device was
+// not connected). app.js hears of it now (deviceAtRest), which takes back a
+// "may still be moving" said while the start was out - the one a Connect or
+// Disconnect says when it lets an offline device go with a start still out
+// to it used to stand on after that start came back having moved nothing.
 function noteStartBack(key) {
     const record = motionRecord(key);
-    record.startsOut -= 1;
+    record.startsOut = Math.max(0, record.startsOut - 1);
     if (record.startsOut > 0 || record.unsettledSince !== null) return;
-    deviceMotion.delete(key);
-    if (record.restPending) callHandler('onStopConfirmed', key);
+    record.restPending = false;
+    dropIfSettled(key, record);
+    deviceAtRest(key);
 }
 
 // The API confirmed the PUT /hamp/stop that left as number `sentAs`. Every
@@ -307,8 +352,8 @@ function noteStartBack(key) {
 // comes back having moved nothing (noteStartBack).
 function noteStopConfirmed(key, sentAs) {
     const record = deviceMotion.get(key);
+    if (record && sentAs > record.lastConfirmed) record.lastConfirmed = sentAs;
     if (record && record.unsettledSince !== null && sentAs <= record.unsettledSince) return;
-    if (offlineStop && offlineStop.key === key) offlineStop.stopConfirmed = true;
     if (record) {
         record.unsettledSince = null;
         if (record.startsOut > 0) {
@@ -317,7 +362,109 @@ function noteStopConfirmed(key, sentAs) {
         }
         dropIfSettled(key, record);
     }
+    deviceAtRest(key);
+}
+
+// A verified stop to `key`, whose first attempt left as `first`, was never
+// confirmed. `mayMove`: the motor may have been turning when the stop was
+// asked for. Returns whether that leaves the device in doubt on this stop's
+// account - the motor may have been turning and no stop to it that left
+// after this one has been confirmed since - and only then is the wearer told
+// it may still be moving. The stop sent last decides, whichever is answered
+// last: from here nothing that left before this stop can bring the device
+// to rest any more (the mark moves up to it), even when it is confirmed
+// later or was confirmed already, as a stop asked for on the live link is
+// the one that decides there. A stop that fails after a later one was
+// confirmed changes nothing. Neither does one asked for a motor that never
+// turned, or that was last seen confirmed at rest: that warning would be
+// false.
+function noteStopFailed(key, first, mayMove) {
+    if (!mayMove) return false;
+    const record = motionRecord(key);
+    if (confirmedSince(key, first)) return false;
+    record.unsettledSince = record.unsettledSince === null ? first : Math.max(record.unsettledSince, first);
+    record.restPending = false;
+    return true;
+}
+
+// Whether a stop to `key` that left after the stop whose first attempt left
+// as `first` has been confirmed: the record keeps the newest confirmed
+// attempt for as long as a stop to the device is out (dropIfSettled).
+function confirmedSince(key, first) {
+    const record = deviceMotion.get(key);
+    return Boolean(record) && record.lastConfirmed > first;
+}
+
+// The record of the device behind `key` has just come to rest: a stop to it
+// was confirmed after anything that may have moved it, or the last start out
+// to it came back having moved nothing. The page hears of it
+// (onStopConfirmed). A background stop job chasing that device runs on until
+// a round of its own is confirmed, as it always has, but what it reported is
+// now taken back: a round that fails after this and leaves the device in
+// doubt again (noteStopFailed) is a new report, or the page would read the
+// device as at rest while the record says otherwise.
+function deviceAtRest(key) {
+    if (offlineStop && offlineStop.key === key) offlineStop.reported = false;
     callHandler('onStopConfirmed', key);
+}
+
+// Whether every device this driver has driven is known to be at rest, for a
+// caller that must not go on until it is: app.js opens a native dialog only
+// over toys at rest, because the dialog holds back every timer and promise of
+// the page, the retries of a verified stop among them.
+//   'pending'     a start or a verified stop is still on its way, to the live
+//                 device or to one whose key has been dropped
+//   'unconfirmed' nothing is on its way, but a device may be moving: the live
+//                 one is running, or the record of a device - the live one,
+//                 an offline one still being sent its background stop, or a
+//                 dropped one - says no stop to it has been confirmed since
+//                 anything that may have moved it, or the stop sent to it
+//                 last was never confirmed
+//   'stopped'     the API has confirmed a stop to the live device since
+//                 anything that may have moved it (the stop that verified
+//                 its key, for a device this link never moved), and no other
+//                 device is in doubt. A stop asked for it since then that
+//                 went unanswered leaves it 'stopped': nothing has started
+//                 it, and "may still be moving" would be false (noteStopFailed).
+//                 handyStopTally says that it went unanswered.
+//   'none'        no link, and no device in doubt
+// It reads the per-key record every report of a stop is made from (see
+// deviceMotion), so it never calls the toys at rest while the page has been
+// told a Handy may still be moving. A start that lands after a stop is not
+// trusted (restopAfterStaleStart): until the stop sent after it is
+// confirmed, this says 'pending', never 'stopped'. Disconnect is no
+// exception: its stop is retried like any other, and a question opened
+// before that stop is confirmed would hold the retries back just the same.
+// Measured before it was counted: Disconnect's first PUT /hamp/stop got a
+// 502, this said 'none', the question opened 140 ms later over "The toys are
+// stopped", and the retry due 250 ms after the 502 went out four seconds
+// later, once the question had been answered. A round of the background stop
+// is not waited for (beginOfflineStop says why).
+export function handyRestState() {
+    const live = handyConnected && Boolean(handyKey);
+    if (stopInFlight !== null || (live && handyStartInFlight)) return 'pending';
+    let inDoubt = live && motorMayBeMoving();
+    for (const record of deviceMotion.values()) {
+        if (record.startsOut > 0 || record.stopsOut > 0) return 'pending';
+        if (record.unsettledSince !== null) inDoubt = true;
+    }
+    if (inDoubt) return 'unconfirmed';
+    return live ? 'stopped' : 'none';
+}
+
+// What became of the verified stops so far, to any device - the live one or
+// one whose key was dropped: how many the API confirmed, and how many went
+// unanswered on every attempt with no stop to their device that left after
+// them confirmed, leaving it in doubt or not. Rounds of the background stop
+// an offline device is sent are counted in neither, as handyRestState waits
+// for none. A caller that waits for the stops on their way reads it before
+// and after. A stop asked for a device already at rest that goes unanswered
+// leaves handyRestState at 'stopped' or 'none', and app.js must not then
+// tell the wearer the Handy confirmed its stop; one that went unanswered
+// before a stop sent after it was confirmed - the stop that follows a start
+// which landed late - is no such case, and the confirmation says so.
+export function handyStopTally() {
+    return { confirmed: stopsConfirmed, unanswered: stopsUnanswered };
 }
 
 // Every "once per connection" latch, cleared when the link changes.
@@ -439,25 +586,53 @@ function noteHampFault(code) {
 }
 
 // The retry loop behind every verified stop: PUT /hamp/stop for `key`, up
-// to four attempts with backoff. Touches no link state and never throws; a
-// confirmed attempt is entered against the device (noteStopConfirmed), by
-// the number it left with, since a retry that left after a start came back
-// is a stop that start has had. Resolves { ok, error }.
-async function attemptStop(key, { countFailure = true } = {}) {
+// to four attempts with backoff. Touches no link state and never throws.
+// Its outcome is entered against the device, and nowhere else: a confirmed
+// attempt by the number it left with (noteStopConfirmed), since a retry that
+// left after a start came back is a stop that start has had, and a stop
+// never confirmed by the number its first attempt left with
+// (noteStopFailed), asking `mayMove()` then whether the motor may have been
+// turning when it was asked for. It is on its way (stopsOut, handyRestState)
+// until its last attempt is answered, unless it is a `round` of the
+// background stop an offline device is sent (roundsOut). One that is not a
+// round is counted as confirmed, or as unanswered when neither it nor any
+// stop to its device sent after it was confirmed (handyStopTally). Resolves
+// { ok, error, decides }: `decides` when it was never confirmed and leaves
+// the device in doubt, which is when the caller says it may still be
+// moving.
+async function attemptStop(key, { countFailure = true, round = false, mayMove = () => true } = {}) {
+    const record = motionRecord(key);
+    if (round) record.roundsOut += 1;
+    else record.stopsOut += 1;
     const delays = HANDY_TIMINGS.stopRetryDelaysMs;
     let lastErr = null;
-    for (let attempt = 0; attempt <= delays.length; attempt++) {
-        const sentAs = ++stopsSent;
-        try {
-            await handyRequest('/hamp/stop', { method: 'PUT', key, countFailure });
-            noteStopConfirmed(key, sentAs);
-            return { ok: true, error: null };
-        } catch (e) {
-            lastErr = e;
-            if (attempt < delays.length) await sleep(delays[attempt]);
+    let first = null;
+    try {
+        for (let attempt = 0; attempt <= delays.length; attempt++) {
+            const sentAs = ++stopsSent;
+            if (first === null) first = sentAs;
+            try {
+                await handyRequest('/hamp/stop', { method: 'PUT', key, countFailure });
+                if (!round) stopsConfirmed += 1;
+                noteStopConfirmed(key, sentAs);
+                return { ok: true, error: null, decides: false };
+            } catch (e) {
+                lastErr = e;
+                if (attempt < delays.length) await sleep(delays[attempt]);
+            }
+        }
+        if (!round && !confirmedSince(key, first)) stopsUnanswered += 1;
+        return { ok: false, error: lastErr, decides: noteStopFailed(key, first, Boolean(mayMove())) };
+    } finally {
+        // The record is the one this stop counted on: it is kept while the
+        // stop is out (dropIfSettled), unless a test has forgotten it.
+        const current = deviceMotion.get(key);
+        if (current) {
+            if (round) current.roundsOut = Math.max(0, current.roundsOut - 1);
+            else current.stopsOut = Math.max(0, current.stopsOut - 1);
+            dropIfSettled(key, current);
         }
     }
-    return { ok: false, error: lastErr };
 }
 
 // Verified stop for a device this driver no longer owns (the key of a
@@ -468,10 +643,12 @@ async function attemptStop(key, { countFailure = true } = {}) {
 // known to be at rest: true when the stop was confirmed, and true as well
 // when it was only ever confirming a motor already known to be stopped - an
 // unanswered stop to a motor that never turned is reported nowhere, because
-// "may still be moving" would be false.
+// "may still be moving" would be false - or when a stop to it that left
+// after this one was confirmed and nothing on its record may move it.
 async function stopForeignDevice(key, mayMove = true) {
-    const result = await attemptStop(key);
+    const result = await attemptStop(key, { mayMove: () => mayMove });
     if (result.ok || !mayMove) return true;
+    if (!result.decides) return !deviceMayMove(key);
     reportStopUnconfirmed('/hamp/stop', result.error, key);
     return false;
 }
@@ -506,29 +683,45 @@ function markOffline(reason) {
 // is cancelled by Connect / Disconnect, or the round cap is reached. A device
 // that was merely slow, or comes back after a Wi-Fi blip, is brought to rest
 // by this even though the app already gave up on it. The first round that
-// goes unconfirmed reports the device as one that may still be moving; for
-// a job cancelled before that, the cancel does (cancelOfflineStop).
+// goes unconfirmed and leaves the device in doubt (noteStopFailed) reports it
+// as one that may still be moving; for a job cancelled before that, the
+// cancel does (cancelOfflineStop). A job that gives up leaves its device in
+// doubt, and handyRestState says so.
+//
+// A round is not counted as on its way, as every other stop is: the device
+// is in doubt from the offline verdict until a stop to it is confirmed,
+// round or no round. A caller that waited for a round to be answered would
+// wait up to a round's length - four attempts, 26 s when each times out -
+// and then find the device in doubt all the same, with the next round due.
 function beginOfflineStop(key) {
     cancelOfflineStop();
-    const job = { key, timer: null, rounds: 0, active: true, reported: false, stopConfirmed: false };
+    const job = { key, timer: null, rounds: 0, active: true, reported: false };
     offlineStop = job;
     const round = async () => {
         if (!job.active) return;
         job.rounds += 1;
-        const result = await attemptStop(key, { countFailure: false });
+        // A round of a job that has ended says nothing when it fails: the
+        // device was let go (cancelOfflineStop).
+        const result = await attemptStop(key, { countFailure: false, round: true, mayMove: () => job.active });
         if (!job.active) return;
         if (result.ok || job.rounds >= OFFLINE_STOP_MAX_ROUNDS) {
-            job.active = false;
-            if (offlineStop === job) offlineStop = null;
+            endOfflineStop(job);
             return;
         }
-        if (!job.reported) {
+        if (result.decides && !job.reported) {
             job.reported = true;
             reportStopUnconfirmed('/hamp/stop', result.error, key);
         }
         job.timer = unref(setTimeout(round, HANDY_TIMINGS.offlineStopRetryMs));
     };
     round();
+}
+
+// No round of `job` follows, and one still out says nothing when it fails.
+function endOfflineStop(job) {
+    job.active = false;
+    if (job.timer) clearTimeout(job.timer);
+    if (offlineStop === job) offlineStop = null;
 }
 
 // Cancel the background stop job. Connect and Disconnect let the device it
@@ -545,18 +738,20 @@ function beginOfflineStop(key) {
 // stop. Nothing is said for `verifiedKey`, the key a Connect has just
 // verified, because verifying it had the API confirm a stop to that very
 // device and whatever a start to it may have done since is the new link's
-// to settle (deviceMotion), nor for a device the API has confirmed a stop
-// to since the job began, with nothing on its record that may move it since
-// (deviceMayMove): that warning is kept for a motor that may be turning.
+// to settle (deviceMotion), nor for a device whose record has nothing on it
+// that may move it (deviceMayMove): that warning is kept for a motor that
+// may be turning. The record is what decides, as it decides every report:
+// the job used to keep a flag of its own for a stop confirmed since it
+// began, which a stop confirmed before it began - while a start was still
+// out, the start then coming back having moved nothing - never set, and the
+// cancel then reported a device the record had just put at rest.
 // Returns true when the device is let go without being known to be at rest.
 function cancelOfflineStop({ verifiedKey = null, reason = 'the Handy that went offline was let go while it was still being sent stops' } = {}) {
     const job = offlineStop;
     if (!job) return false;
-    job.active = false;
-    if (job.timer) clearTimeout(job.timer);
-    offlineStop = null;
+    endOfflineStop(job);
     if (job.key === verifiedKey) return false;
-    if (job.stopConfirmed && !deviceMayMove(job.key)) return false;
+    if (!deviceMayMove(job.key)) return false;
     if (!job.reported) {
         job.reported = true;
         reportStopUnconfirmed('/hamp/stop', new Error(reason), job.key);
@@ -814,10 +1009,11 @@ export function disconnectHandy() {
 // live link, whose motor state - its own flags and what the device behind
 // its key is still owed - decides what an unconfirmed stop means: the
 // wearer is told the device "may still be moving" only when it was running,
-// or may have been, when the stop was asked for. A forced stop to a motor
-// that never turned - PAUSE or STOP with role OFF, Reset in IDLE - that a
-// switched-off device leaves unanswered stays an API error on the status
-// line and nothing more.
+// or may have been, when the stop was asked for, and no stop to it that left
+// after this one has been confirmed since (noteStopFailed). A forced stop to
+// a motor that never turned - PAUSE or STOP with role OFF, Reset in IDLE -
+// that a switched-off device leaves unanswered stays an API error on the
+// status line and nothing more.
 function stopWithRetry(key = handyKey) {
     const mayMove = motorMayBeMoving();
     if (stopInFlight && stopInFlight.key === key && stopInFlight.generation === commandGeneration) {
@@ -828,8 +1024,13 @@ function stopWithRetry(key = handyKey) {
     const generation = ++commandGeneration;
     const record = { key, generation, mayMove, promise: null };
     record.promise = (async () => {
-        const result = await attemptStop(key);
+        const result = await attemptStop(key, { mayMove: () => record.mayMove });
         if (result.ok) {
+            // Only the last command's stop clears the link's flags, and a
+            // confirmation can only ever bring the device's record to rest
+            // (noteStopConfirmed): an earlier stop confirmed after a later
+            // one cannot put back in doubt a device the later one brought to
+            // rest.
             if (generation === commandGeneration) {
                 handyIsHampRunning = false;
                 handyMotionUnknown = false;
@@ -837,7 +1038,7 @@ function stopWithRetry(key = handyKey) {
             }
             return true;
         }
-        if (record.mayMove) reportStopUnconfirmed('/hamp/stop', result.error, key);
+        if (result.decides) reportStopUnconfirmed('/hamp/stop', result.error, key);
         return false;
     })();
     stopInFlight = record;
@@ -877,10 +1078,19 @@ function restopAfterStaleStart(key) {
     // that is already on its way would settle nothing.
     if (handyConnected && handyKey === key) commandGeneration += 1;
     const pending = stopInFlight && stopInFlight.key === key ? stopInFlight.promise : Promise.resolve();
+    // On its way from this moment (handyRestState), not only once the fresh
+    // stop is sent: the device may be moving while the earlier stop is still
+    // being answered.
+    motionRecord(key).stopsOut += 1;
     pending.catch(() => {}).then(() => {
         if (handyConnected && handyKey === key) return stopWithRetry(key);
         return stopForeignDevice(key, deviceMayMove(key));
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => {
+        const record = deviceMotion.get(key);
+        if (!record) return;
+        record.stopsOut = Math.max(0, record.stopsOut - 1);
+        dropIfSettled(key, record);
+    });
 }
 
 // Start HAMP motion. `rangeConfirmed` resolves once PUT /slide for the
@@ -1076,8 +1286,11 @@ export function dispatchHandy(primarySpeed, strokeMin, strokeMax, force = false,
 // stopped, because nobody reads the answer to a keepalive stop: its motion
 // stays unknown until a verified stop or a start settles it, so a page
 // that comes back idle sends that verified stop, and an offline verdict in
-// the meantime still chases the device with stops. Returns whether a stop
-// was sent. Never throws.
+// the meantime still chases the device with stops. The device's record says
+// so as well (noteMayHaveStarted): only a verified stop sent after this one
+// settles it, whatever link sends it, so a link dropped before that leaves
+// the device in doubt rather than at rest. Returns whether a stop was sent.
+// Never throws.
 export function stopHandyOnUnload() {
     if (!handyConnected || !handyKey) return false;
     if (!(handyStartInFlight || motorMayBeMoving())) return false;
@@ -1085,6 +1298,7 @@ export function stopHandyOnUnload() {
     commandGeneration += 1;
     handyIsHampRunning = false;
     handyMotionUnknown = true;
+    noteMayHaveStarted(key);
     handyLastVelocitySent = -1;
     handyLastStrokeSent = { min: -1, max: -1 };
     try {
@@ -1109,4 +1323,11 @@ export async function queryHandyBattery(key = handyKey) {
     } catch (e) {
         return null;
     }
+}
+
+// Test hook: forget what each device is owed and what is on its way to it.
+// Both outlive a disconnect on purpose, so one test's unanswered stop would
+// otherwise decide what the next test reads.
+export function resetHandyRestForTests() {
+    deviceMotion.clear();
 }

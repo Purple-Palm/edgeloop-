@@ -226,7 +226,7 @@
             <div class="text-[9px] text-slate-500 uppercase font-semibold">Pauses</div>
             <div id="pauseCount" class="text-lg font-black text-sky-400 font-mono leading-none mt-1">0</div>
           </div>
-          <button id="cameEarlyBtn" class="bg-amber-950/60 hover:bg-amber-900 border border-amber-800 text-amber-300 font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer" title="Log accidental release so local learning engine tightens limits next time.">
+          <button id="cameEarlyBtn" class="bg-amber-950/60 hover:bg-amber-900 border border-amber-800 text-amber-300 font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer" title="Stops the toys and pauses the session, then asks to log an accidental climax. Logged, it adds to the learned offset, which lowers your working climax ceiling on later sessions unless the Resting HR floor or the offset cap holds it. The confirmation states the ceiling before and after.">
             <span id="cameEarlyKicker" class="text-[8px] text-amber-400 font-semibold uppercase">Accidental</span>
             <span id="cameEarlyLabel" class="font-bold text-[10px] mt-0.5">Came Early</span>
           </button>
@@ -1073,7 +1073,7 @@
               Zero breakthrough events recorded. Calibrated limits active.
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Tap <strong>Came Early</strong> after an accidental climax. EdgeLoop stores that locally and lowers the working climax ceiling on every future session (your typed Climax HR stays as the baseline). Wipe memory to restore the original ceiling.
+              Tap <strong>Came Early</strong> after an accidental climax. It stops the toys and pauses the session, and asks once the Handy has confirmed its stop, or left it unanswered but had confirmed an earlier one and has not been started since, which the prompt line then says (if the Handy may still be moving, the line says so, and pressing again asks anyway): OK logs it and ends the session, Cancel logs nothing and leaves it paused. START and RESUME pressed before it is over do nothing. EdgeLoop stores the event locally and lowers the working climax ceiling on every future session (your typed Climax HR stays as the baseline): 3 BPM a press, or 5 when your pulse peaked more than 8 BPM under your Climax HR in the minute before you pressed (a session running or not), up to 30 BPM in all. The confirmation shows the ceiling before and after. No offset takes the ceiling closer than 15 BPM to your Resting HR, and the line above says when that holds part of it back. Wipe memory to restore the original ceiling.
             </p>
           </div>
         </div>
@@ -1202,7 +1202,7 @@
         <p class="text-[10px] font-bold uppercase tracking-wider text-purple-400">Step 3 of 3</p>
         <h3 class="text-base font-bold text-white">Set your ceiling and start</h3>
         <p class="text-xs text-slate-400 leading-relaxed">Enter Resting HR and Climax HR, then open <strong class="text-slate-200">Session Setup</strong> for duration, warm-up, and guards. If you do not know your top heart rate yet, start with <strong class="text-slate-200">Survival</strong>. It climbs past the number you typed until you come.</p>
-        <p class="text-[10px] text-slate-500 leading-relaxed">Leave <strong>Calibration</strong> checked, then tap <strong>Finished me</strong> and that heart rate becomes your Climax HR. After you know the number, Came Early still lowers the ceiling for an accidental release. The signal-loss timeout pauses the motors when readings stop, and auto-resume picks the session back up.</p>
+        <p class="text-[10px] text-slate-500 leading-relaxed">Leave <strong>Calibration</strong> checked, then tap <strong>Finished me</strong> when you come: the toys stop, and the highest heart rate your monitor held on two readings in a row during the run becomes your Climax HR once you confirm it. After you know the number, Came Early logs an accidental release, which lowers the working ceiling unless the Resting HR floor or the offset cap holds it. The signal-loss timeout pauses the motors when readings stop, and auto-resume picks the session back up.</p>
         <button type="button" id="wizardCalibrateBtn" class="w-full bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 font-bold py-2.5 rounded-xl text-xs cursor-pointer">Start with Survival</button>
       </div>
 

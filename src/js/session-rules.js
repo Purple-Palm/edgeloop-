@@ -1,18 +1,22 @@
 // Pure session rules shared by the cockpit: the effective heart-rate ceiling
 // (typed limit minus every safety offset), HR-limit sanitising, duration
-// parsing, the Survival climb, the stall guard, Ruin & Leak's one-ride clock
-// and Force Orgasm's time limit. No DOM and no storage, so all of it runs
-// under node:test.
+// parsing, the Survival climb and its Finished me, Came Early and the learned
+// offset, the stall guard, Ruin & Leak's one-ride clock and Force Orgasm's
+// time limit. No DOM and no storage, so all of it runs under node:test.
 
 // What this file reads from the engine: the crawl level, so the cockpit
 // banner can tell a crawling motor from a running one with the same number
 // the engine sends, which modes are games, where the stall guard has
-// nothing of its own to cut, and the modes in which a cool-down may run, so
+// nothing of its own to cut, the modes in which a cool-down may run, so
 // the counter here and the easing there can never disagree about where it
-// applies. Ruin & Leak's timings come from the patterns that draw its ride
-// and its lockout.
-import { CRAWL_PERCENT, GAME_MODES, COOLDOWN_MODES, resolveCeilingBehaviour } from './engine.js';
+// applies, and the pullback mark, so a dialog quotes the mark the engine
+// will pull back at. Ruin & Leak's timings come from the patterns that draw
+// its ride and its lockout.
+import { CRAWL_PERCENT, GAME_MODES, COOLDOWN_MODES, resolveCeilingBehaviour, resolveEdgeTriggerHr, clampEdgeHoldPercent } from './engine.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS } from './patterns.js';
+// What counts as a usable pulse, and how long two readings may lie apart and
+// still be readings of one pulse, are the watchdog's call, here as everywhere.
+import { isValidBpm, clampStaleSeconds } from './hr-watchdog.js';
 
 // The effective ceiling can never be pushed closer than this to the resting
 // HR, otherwise the tease band collapses into a permanent cut-off.
@@ -101,6 +105,19 @@ export function sanitizeHrLimits(rawMin, rawMax, lastGood = {}) {
 // the typed ceiling (never below min + MIN_CEILING_GAP, and never above the
 // typed value). Two explicit raises sit on top: Force Orgasm, and Survival's
 // per-edge overdrive while that game is on.
+//
+// Each reduction is reported twice: what was REQUESTED (the learned offset,
+// the dual-stim setting, the decay the edge count has earned) and what was
+// APPLIED once the floor had its say. Only the applied amounts may be shown
+// to the wearer. The floor swallows a request whenever the Resting HR sits
+// close under the Climax HR: with Climax 120, Resting 105 and one Came Early
+// press on file, the engine runs on 120, while a panel and a LEARNED badge
+// built from the requested 3 BPM told the wearer 117. That is a lower ceiling
+// than the one in force - the one direction this app must never err in,
+// because the wearer then believes they are held further from climax than
+// they are. The two raises are reported as applied too, after their caps,
+// and everything adds up: typedMaxHr - appliedLearned - appliedDual -
+// appliedDecay + orgasmBoost + survivalOverdrive is maxHr, exactly.
 export function computeEffectiveCeiling({
     minHr,
     maxHr,
@@ -124,28 +141,38 @@ export function computeEffectiveCeiling({
     // simply not applied) rather than the floor raising it above what they typed.
     const floorMax = Math.min(typedMax, min + MIN_CEILING_GAP);
 
-    const learned = Number.isFinite(learnedOffset) && learnedOffset > 0 ? learnedOffset : 0;
-    if (learned > 0) max = Math.max(floorMax, max - learned);
+    // Take `amount` off the ceiling, never past the floor, and say how much
+    // of it really came off.
+    const lower = (amount) => {
+        if (!(amount > 0)) return 0;
+        const next = Math.max(floorMax, max - amount);
+        const applied = max - next;
+        max = next;
+        return applied;
+    };
 
-    const dual = (dualStimActive && dualDampening)
+    const requestedLearned = Number.isFinite(learnedOffset) && learnedOffset > 0 ? learnedOffset : 0;
+    const appliedLearned = lower(requestedLearned);
+
+    const requestedDual = (dualStimActive && dualDampening)
         ? (Number.isFinite(dualDampeningBpm) && dualDampeningBpm > 0 ? dualDampeningBpm : 15)
         : 0;
-    if (dual > 0) max = Math.max(floorMax, max - dual);
+    const appliedDual = lower(requestedDual);
 
-    let totalDecay = 0;
+    let requestedDecay = 0;
     let appliedDecay = 0;
     let decayFloored = false;
     if (adaptiveDecay && Number.isFinite(edges) && edges > 0) {
         const every = Number.isFinite(decayEdgeCount) && decayEdgeCount > 0 ? decayEdgeCount : 2;
         const perDrop = Number.isFinite(decayBpm) && decayBpm > 0 ? decayBpm : 2;
-        totalDecay = Math.floor(edges / every) * perDrop;
-        if (totalDecay > 0) {
+        requestedDecay = Math.floor(edges / every) * perDrop;
+        if (requestedDecay > 0) {
             const floor = Math.max(floorMax, Number.isFinite(decayFloor) ? decayFloor : 105);
             // The floor may STOP the decay but must never raise the ceiling.
-            const decayedMax = Math.min(max, Math.max(floor, max - totalDecay));
+            const decayedMax = Math.min(max, Math.max(floor, max - requestedDecay));
             const next = Math.max(floorMax, decayedMax);
             appliedDecay = max - next;
-            decayFloored = appliedDecay < totalDecay;
+            decayFloored = appliedDecay < requestedDecay;
             max = next;
         }
     }
@@ -153,23 +180,377 @@ export function computeEffectiveCeiling({
     // Belt and braces: no offset path may leave the ceiling above the typed one.
     max = Math.min(max, typedMax);
 
-    const boost = clamp(Number.isFinite(orgasmBoost) ? orgasmBoost : 0, 0, ORGASM_BOOST_CAP);
+    const requestedOrgasmBoost = Number.isFinite(orgasmBoost) && orgasmBoost > 0 ? orgasmBoost : 0;
+    const boost = Math.min(requestedOrgasmBoost, ORGASM_BOOST_CAP);
     // Survival is the other explicit raise. It is session-only, one BPM per
     // edge counted while that game is on, and it drops the moment the game
     // is off. Offsets above still lower the base it climbs from.
-    const overdrive = clamp(Number.isFinite(survivalOverdrive) ? survivalOverdrive : 0, 0, SURVIVAL_OVERDRIVE_CAP);
+    const requestedSurvivalOverdrive = Number.isFinite(survivalOverdrive) && survivalOverdrive > 0 ? survivalOverdrive : 0;
+    const overdrive = Math.min(requestedSurvivalOverdrive, SURVIVAL_OVERDRIVE_CAP);
     max += boost + overdrive;
 
     return {
         minHr: min,
         maxHr: max,
         typedMaxHr: typedMax,
-        learnedOffset: learned,
-        dualOffset: dual,
-        totalDecay,
+        // The lowest the offsets may take the ceiling (min + MIN_CEILING_GAP,
+        // or the typed ceiling itself when that is closer).
+        offsetFloorHr: floorMax,
+        requestedLearned,
+        appliedLearned,
+        requestedDual,
+        appliedDual,
+        requestedDecay,
         appliedDecay,
         decayFloored,
-        orgasmBoost: boost
+        // The raises as asked for and, under their own names, as applied
+        // after their caps.
+        requestedOrgasmBoost,
+        orgasmBoost: boost,
+        requestedSurvivalOverdrive,
+        survivalOverdrive: overdrive
+    };
+}
+
+// Everything the working ceiling is computed from, as one object: the engine
+// hands it to computeEffectiveCeiling, and the Came Early, Wipe Memory and
+// Finished me dialogs work their numbers out from the same object, so no
+// dialog can quote a ceiling from other inputs than the motors run on.
+// Survival switches two of them itself. Adaptive decay lowers the ceiling as
+// edges pile up, and Survival is climbing past the typed max on those same
+// edges, so decay does not run during the game; and the game's overdrive
+// only counts while it is the active mode - it drops the moment the game is
+// off. Force Orgasm's boost only counts while Force Orgasm is on.
+export function workingCeilingInputs({
+    minHr,
+    maxHr,
+    activeMode,
+    settings = {},
+    dualStimActive = false,
+    edges = 0,
+    orgasmMode = false,
+    orgasmBoost = 0,
+    survivalOverdrive = 0
+} = {}) {
+    const survival = activeMode === 'survival';
+    const s = settings && typeof settings === 'object' ? settings : {};
+    return {
+        minHr,
+        maxHr,
+        learnedOffset: s.learningProfile?.suggestedMaxHrOffset || 0,
+        dualStimActive: Boolean(dualStimActive),
+        dualDampening: Boolean(s.dualDampening),
+        dualDampeningBpm: s.dualDampeningBpm,
+        adaptiveDecay: survival ? false : Boolean(s.adaptiveDecay),
+        edges,
+        decayEdgeCount: s.decayEdgeCount,
+        decayBpm: s.decayBpm,
+        decayFloor: s.decayFloor,
+        orgasmBoost: orgasmMode ? orgasmBoost : 0,
+        survivalOverdrive: survival ? survivalOverdrive : 0
+    };
+}
+
+// ---- Came Early and the learned offset --------------------------------------
+//
+// Each Came Early press adds to the learned offset, which comes off the typed
+// Climax HR on every session until the wearer wipes it. Everything the button
+// and the Session Setup line say about it is worked out here from
+// computeEffectiveCeiling, with the inputs the engine runs on, so no surface
+// can quote a ceiling the motors are not obeying.
+
+// The most all the presses together may take off. settings-schema.js clamps a
+// stored or imported profile to the same number.
+export const MAX_LEARNED_OFFSET_BPM = 30;
+
+// One press adds CAME_EARLY_STEP_BPM. A climax whose pulse peaked more than
+// CAME_EARLY_BONUS_MARGIN_BPM under the typed Climax HR adds
+// CAME_EARLY_BONUS_BPM on top: the typed number is then far above where this
+// wearer really tips over, so one press closes more of the gap.
+export const CAME_EARLY_STEP_BPM = 3;
+export const CAME_EARLY_BONUS_BPM = 2;
+export const CAME_EARLY_BONUS_MARGIN_BPM = 8;
+
+// How far back from the press the climax is looked for.
+//
+// The press comes after the climax, and by then the pulse is already falling:
+// heart rate rises most during the 10-15 s of orgasm and returns rapidly
+// towards baseline afterwards (the American Heart Association's scientific
+// statement on sexual activity, Levine et al., Circulation 2012). The step
+// used to be judged on the pulse at the moment of the press, which reads that
+// fall as a climax far under the ceiling - and with no monitor connected it
+// read the 70 BPM the app starts with, so the larger step fired on no data at
+// all. The PEAK of the last minute is the climax itself for a wearer who
+// presses within a minute of it, and this is the button that stops the toys,
+// so it is pressed at once. A minute is short against a session, so the
+// peak is the climax rather than an edge from several minutes before; if an
+// edge inside that minute did run higher, the wearer sat at that pulse without
+// tipping over, which says the typed Climax HR is not far off, and the smaller
+// step is the right one then.
+//
+// Every valid reading the pulse source delivers counts, a session running or
+// not. A wearer who hits STOP at the point of no return and tips over anyway
+// climaxes with nothing running, and the pulse the cockpit showed in that
+// minute IS the climax this button is about: counting only the readings up to
+// STOP quoted a pre-climax pulse to that wearer as their peak, took the larger
+// step on it and recorded it as the event. A press made more than a minute
+// after the climax sees only the fall from it, and a pulse falling from the
+// climax can only turn the ordinary step into the larger one - the one that
+// holds the wearer further from climax - never the reverse; the dialog names
+// the peak it judged on. With no valid reading in the window - no monitor, or
+// the signal lost for the whole minute - there is nothing to judge by, and
+// the ordinary step is taken.
+export const CAME_EARLY_PEAK_WINDOW_MS = 60 * 1000;
+
+// A strap sends about one reading a second. The cap only bounds memory for a
+// clock that steps backwards, which stops the age trim from dropping anything.
+const MAX_RECENT_READINGS = 1000;
+
+// Add one reading to the short record of recent readings, and drop what the
+// window can no longer reach, so the record holds about a minute of readings
+// however long the monitor has been on. An unusable reading is not recorded.
+// Returns the same array.
+export function rememberReading(readings, at, bpm, windowMs = CAME_EARLY_PEAK_WINDOW_MS) {
+    if (!Array.isArray(readings)) return [];
+    if (!Number.isFinite(at) || !isValidBpm(bpm)) return readings;
+    readings.push({ at, bpm });
+    const cutoff = at - windowMs;
+    let stale = 0;
+    while (stale < readings.length && !(readings[stale].at >= cutoff)) stale += 1;
+    if (stale > 0) readings.splice(0, stale);
+    if (readings.length > MAX_RECENT_READINGS) readings.splice(0, readings.length - MAX_RECENT_READINGS);
+    return readings;
+}
+
+// The highest valid reading in the window that ends at `now`, or null when
+// there is none: no monitor, a signal lost for the whole window, or nothing
+// but unusable values. A reading stamped after `now` does not count either:
+// a clock that stepped backwards is not a pulse.
+export function recentPeakHr(readings, now, windowMs = CAME_EARLY_PEAK_WINDOW_MS) {
+    if (!Array.isArray(readings) || !Number.isFinite(now)) return null;
+    const since = now - windowMs;
+    let peak = null;
+    for (const reading of readings) {
+        if (!reading || !Number.isFinite(reading.at) || reading.at < since || reading.at > now) continue;
+        if (!isValidBpm(reading.bpm)) continue;
+        if (peak === null || reading.bpm > peak) peak = reading.bpm;
+    }
+    return peak;
+}
+
+// What one Came Early press does to the learned offset. The larger step is
+// only ever taken on a measured pulse: `peakHr` has to be a valid reading
+// (recentPeakHr gives null when there is none), so a session with no monitor,
+// or with no reading in the window, gets the ordinary step - never the bonus.
+// A press never lowers the stored offset, so it can never raise the ceiling.
+export function cameEarlyStep({ offset, typedMaxHr, peakHr } = {}) {
+    const previous = Number.isFinite(offset) && offset > 0 ? offset : 0;
+    const peak = isValidBpm(peakHr) ? peakHr : null;
+    const bonus = peak !== null && Number.isFinite(typedMaxHr)
+        && peak < typedMaxHr - CAME_EARLY_BONUS_MARGIN_BPM;
+    const step = CAME_EARLY_STEP_BPM + (bonus ? CAME_EARLY_BONUS_BPM : 0);
+    const next = Math.max(previous, Math.min(MAX_LEARNED_OFFSET_BPM, previous + step));
+    return { previous, offset: next, step, added: next - previous, bonus, peakHr: peak };
+}
+
+// The two working ceilings a learned offset gives, both from
+// computeEffectiveCeiling with the inputs the engine runs on (`inputs` is the
+// very object handed to it). `learned` is what the offset alone leaves of the
+// typed Climax HR on every session - the number the Session Setup line and
+// the LEARNED badge describe. `start` is where a session begins with the toys
+// connected right now, so dual-stim dampening is in it. Adaptive decay, the
+// Force Orgasm boost and Survival's overdrive are left out of both: every
+// session starts them at zero, and the press that asks has ended the one that
+// was running.
+export function learnedOffsetCeilings(inputs = {}, learnedOffset = inputs.learnedOffset) {
+    return {
+        learned: computeEffectiveCeiling({ minHr: inputs.minHr, maxHr: inputs.maxHr, learnedOffset }),
+        start: computeEffectiveCeiling({ ...inputs, learnedOffset, edges: 0, orgasmBoost: 0, survivalOverdrive: 0 })
+    };
+}
+
+// Why a learned offset did not come off in full.
+function describeGapFloor(minHr) {
+    return `no offset may take the ceiling closer than ${MIN_CEILING_GAP} BPM to your Resting HR (${minHr})`;
+}
+
+// The start-of-session ceiling, said only where dual-stim dampening makes it
+// differ from the learned one, so the dialog never contradicts the cockpit.
+function describeStartCeiling(before, after) {
+    const from = before.start.maxHr;
+    const to = after.start.maxHr;
+    if (from === before.learned.maxHr && to === after.learned.maxHr) return '';
+    return to === from
+        ? ` With your toys connected as they are now, dual-stimulation dampening holds a session at ${from} BPM either way.`
+        : ` With your toys connected as they are now, dual-stimulation dampening takes it lower still: a session starts at ${to} BPM instead of ${from}.`;
+}
+
+// What a Came Early or Finished me dialog says about the toys behind it, the
+// `what` ('session' or 'run') being paused or not. `handyAtRest` is false for
+// a question asked although the Handy has not confirmed its stop - the
+// wearer was told so and pressed again (stopThenAsk) - and that question
+// never says the toys are stopped: it says what to do if the Handy is still
+// moving.
+function describeToysBehindQuestion({ paused, handyAtRest, what }) {
+    if (handyAtRest) return paused ? `The toys are stopped and the ${what} is paused.` : 'The toys are stopped.';
+    const doubt = 'has not confirmed its stop: if it is still moving, switch it off.';
+    return paused ? `The ${what} is paused, but the Handy ${doubt}` : `The Handy ${doubt}`;
+}
+
+// The Came Early confirmation. It used to say only that the ceiling would be
+// lowered, so a wearer who believed each press took 5 BPM off - or feared
+// what else it might do - did not press it. It now states the working ceiling
+// before and after, the size of the step and why, and says so when the floor
+// or the cap means the press changes nothing: "goes from 120 to 117" over an
+// engine that stays on 120 would be the lie the whole ceiling report exists
+// to prevent. `before` / `after` are learnedOffsetCeilings for the current and
+// the next offset; `step` is cameEarlyStep's answer. `paused` says a session
+// is paused behind the question - the press pauses one that is driving the
+// toys before it asks anything - and only OK ends it. Cancel then leaves no
+// trace: nothing learned, nothing in History, and RESUME carries on. The
+// press used to end the session before it asked, so Cancel undid nothing -
+// a mis-tap lost the session and still put "Premature Release" in History,
+// under a dialog that said "Cancel logs nothing". `handyAtRest` is false when
+// the question is asked over a Handy that has not confirmed its stop
+// (describeToysBehindQuestion). `peakFromFirstPress`: the press answers one
+// the Handy turned away, and the step was judged on the minute before that
+// first press, so the dialog names that minute rather than the last one.
+export function describeCameEarlyConfirm({ before, after, step, paused = false, handyAtRest = true, peakFromFirstPress = false } = {}) {
+    const minute = peakFromFirstPress ? 'the minute before your first press' : 'the last minute';
+    const typed = before.learned.typedMaxHr;
+    const from = before.learned.maxHr;
+    const to = after.learned.maxHr;
+    const drop = Math.max(0, from - to);
+    let ceiling;
+    if (drop > 0) {
+        ceiling = `Your working climax ceiling goes from ${from} to ${to} BPM on every session from now on. Your typed Climax HR stays ${typed}.`;
+    } else if (from === typed) {
+        ceiling = `Your working climax ceiling stays at your typed Climax HR, ${typed} BPM.`;
+    } else {
+        ceiling = `Your working climax ceiling stays at ${from} BPM (your typed Climax HR is ${typed}).`;
+    }
+    ceiling += describeStartCeiling(before, after);
+
+    let stepText;
+    if (step.added <= 0) {
+        stepText = `Your learned offset is already at its ${MAX_LEARNED_OFFSET_BPM} BPM maximum, so this press adds nothing to it; the event is still logged.`;
+    } else {
+        const larger = CAME_EARLY_STEP_BPM + CAME_EARLY_BONUS_BPM;
+        stepText = `This press adds ${step.added} BPM to the learned offset`;
+        stepText += step.added < step.step ? `, which takes it to its ${MAX_LEARNED_OFFSET_BPM} BPM maximum.` : '.';
+        if (step.peakHr === null) {
+            stepText += ` There is no heart-rate reading from ${minute} (no monitor, or the signal was lost), so the larger ${larger} BPM step for a climax well under your Climax HR does not apply.`;
+        } else if (step.bonus) {
+            stepText += ` That is the larger step: your pulse peaked at only ${step.peakHr} BPM in ${minute}, more than ${CAME_EARLY_BONUS_MARGIN_BPM} BPM under your Climax HR.`;
+        } else {
+            stepText += ` The larger ${larger} BPM step is for a pulse that peaks more than ${CAME_EARLY_BONUS_MARGIN_BPM} BPM under your Climax HR; yours peaked at ${step.peakHr} BPM in ${minute}.`;
+        }
+        if (drop < step.added) {
+            stepText += drop === 0
+                ? ` None of it lowers the ceiling: ${describeGapFloor(before.learned.minHr)}.`
+                : ` Only ${drop} BPM of it lowers the ceiling: ${describeGapFloor(before.learned.minHr)}.`;
+        }
+    }
+
+    // Over toys at rest with no session behind it, there is nothing to say
+    // about them; a Handy in doubt is said every time.
+    const toys = paused || !handyAtRest ? `${describeToysBehindQuestion({ paused, handyAtRest, what: 'session' })} ` : '';
+    const closing = paused
+        ? `${toys}OK logs the release and ends the session; Cancel logs nothing and leaves it paused, so RESUME carries on. Wipe Memory in Session Setup (Backup) clears the learned offset.`
+        : `${toys}Cancel logs nothing. Wipe Memory in Session Setup (Backup) clears the learned offset.`;
+    return ['Log an accidental release?', ceiling, stepText, closing].join('\n\n');
+}
+
+// The phrase bank the cockpit speaks and paints once the press is confirmed
+// (voice-cues.js), and the values its tokens take. It used to be the one
+// 'cameEarly' bank whatever the press did, and its lines promise a tighter
+// limit ("Limit tightened", "Ceiling drops next time"): with the Resting HR
+// floor or the 30 BPM cap swallowing the press, the wearer heard that over a
+// ceiling that had not moved, seconds after a dialog that said it stays where
+// it is. So 'cameEarly' is now only for a press that lowers the ceiling the
+// next session starts at with the toys connected now - the CEILING the
+// cockpit shows once the session has stopped, and the drop the dialog
+// promises. Any other press is announced from 'cameEarlyHeld', which says
+// only that the event is logged and the ceiling stays where it was - never
+// that it is as low as it goes, which at the 30 BPM cap it need not be
+// anywhere near: Resting 60 and Climax 160 with the offset capped give a
+// ceiling of 130 over a floor of 75, and a second toy or a lower typed
+// Climax HR still takes it lower. That includes a press that lowers the
+// learned ceiling while dual-stim dampening holds the session at the Resting
+// HR floor either way, which the dialog says in as many words: "the next
+// session is meaner" would be untrue with these toys, and a limit that did
+// move while the wearer is told it held errs towards keeping them further
+// from climax, never closer. {hr} is the peak the step was judged on, or
+// nothing when there was no reading, and then no line built on it is chosen
+// (voice-cues.sayableCueLines); it used to be the cockpit's pulse, which is
+// the 70 BPM the app starts with when no monitor is connected. {maxHr} is
+// that start-of-session ceiling, with no decay, no Force Orgasm boost and no
+// Survival climb: the running session's own, which the press ends, is not
+// the next one's.
+export function cameEarlyCue({ before, after, step } = {}) {
+    const lowered = after.start.maxHr < before.start.maxHr;
+    return {
+        cue: lowered ? 'cameEarly' : 'cameEarlyHeld',
+        vars: { hr: step.peakHr, maxHr: after.start.maxHr }
+    };
+}
+
+// The Wipe Memory confirmation, from the same two ceilings. "Your typed Climax
+// HR will be used with no offset" was not true while dual-stim dampening or
+// decay were lowering it, and said nothing about what actually moves.
+export function describeWipeLearningConfirm({ before, after } = {}) {
+    const from = before.learned.maxHr;
+    const to = after.learned.maxHr;
+    let text = 'Reset local bio-learning memory?';
+    if (!(before.learned.requestedLearned > 0)) {
+        text += ` There is no learned offset, so your working climax ceiling stays at ${from} BPM, your typed Climax HR.`;
+    } else if (to > from) {
+        text += ` Your working climax ceiling goes back up from ${from} to ${to} BPM, your typed Climax HR, on every session from now on.`;
+    } else {
+        text += ` Your working climax ceiling stays at ${from} BPM: the learned offset is not lowering it right now, because ${describeGapFloor(before.learned.minHr)}.`;
+    }
+    return text + describeStartCeiling(before, after);
+}
+
+// The learning line in Session Setup, from the ceiling the engine ran on. It
+// says what the learned offset itself does - it is applied first, so that
+// does not depend on the toys or on decay, which the cockpit badges report on
+// top of it. It used to be built from the stored offset: "Working climax
+// ceiling is 3 BPM below your typed Climax HR" was printed over an engine
+// running on the typed number itself whenever the Resting HR sat within 15
+// BPM of the lowered ceiling - and "Typed Climax HR is used as-is" over an
+// engine applying an offset restored without an event count, or taking
+// dual-stim dampening off it.
+export function describeLearningStatus({ profile, ceiling } = {}) {
+    const events = Number.isFinite(profile?.breakthroughEvents) ? Math.max(0, profile.breakthroughEvents) : 0;
+    const lastHr = profile?.lastBreakthroughHr;
+    const last = Number.isFinite(lastHr) && lastHr > 0 ? ` Last event at ${lastHr} BPM.` : '';
+    const requested = ceiling.requestedLearned;
+    const applied = ceiling.appliedLearned;
+    const typed = ceiling.typedMaxHr;
+    if (!(requested > 0)) {
+        return {
+            active: false,
+            text: events > 0
+                ? `${events} premature event(s) recorded, but no learned offset is taken off your typed Climax HR.${last}`
+                : 'Zero breakthrough events recorded. No learned offset is taken off your typed Climax HR.'
+        };
+    }
+    if (applied >= requested) {
+        return {
+            active: true,
+            text: `Active: ${events} premature event(s). The learned offset takes ${applied} BPM off your typed Climax HR on every session: ${typed - applied} instead of ${typed} BPM.${last}`
+        };
+    }
+    if (applied > 0) {
+        return {
+            active: true,
+            text: `Active: ${events} premature event(s). Learned offset ${requested} BPM, but it takes only ${applied} BPM off your typed Climax HR, because ${describeGapFloor(ceiling.minHr)}: ${typed - applied} instead of ${typed} BPM.${last}`
+        };
+    }
+    return {
+        active: true,
+        text: `Learned offset ${requested} BPM from ${events} premature event(s), but it takes nothing off your typed Climax HR of ${typed} BPM, because ${describeGapFloor(ceiling.minHr)}.${last}`
     };
 }
 
@@ -620,6 +1001,561 @@ export function survivalEdgesAfterEngine(
         edgesSeen: Math.max(0, Math.floor(Number(edgesSeen) || 0)) + (owed && newEdgeTriggered ? 1 : 0),
         owedEdgeSeen: owed && !newEdgeTriggered && Boolean(edgePending)
     };
+}
+
+// ---- Finished me: the heart rate a Survival run held ------------------------
+//
+// With Calibration checked on the Survival card, Finished me offers the heart
+// rate the run pushed the wearer to as their Climax HR: the number every
+// later session pulls back at. 1.1.2 offered the highest reading the session
+// had taken at all. One glitch was enough - a strap that read 180 for one
+// packet during a 120-150 run had 180 offered and saved - and the session's
+// readings included the ones from before Survival was switched on, the ones
+// taken while paused, and the simulator's slider.
+//
+// So the number is the SUSTAINED peak: the highest value the pulse held on
+// two consecutive readings, which is the lower of the two. One reading alone
+// can never be it, however high it went. Only the readings that belong to the
+// run count: taken since Survival was switched on in this session, while the
+// session was RUNNING - not paused, not in a Soft Landing - and from the
+// heart-rate monitor, never from the simulator, which is a number somebody
+// typed rather than one anybody measured. A reading that does not count
+// still comes between the two either side of it, so they are not
+// consecutive.
+//
+// Two readings are consecutive only when the second came within the
+// signal-loss timeout of the first. A longer gap is the one the watchdog
+// calls a lost pulse and stops the motors for: a reading from before it and
+// one from after it are not two readings of one pulse. A reading stamped
+// before the one it follows - a wall clock set back between them - says
+// nothing about how long the pulse stayed there, so it is a gap too.
+
+// The wearer who stops the toys at the point of no return, or whose session
+// ends in a Soft Landing, climaxes after the run is over. Finished me still
+// reads the run for this long after it stopped: 1.1.2 answered that press
+// with "Start Survival first" and the calibration was lost.
+export const FINISHED_ME_AFTER_STOP_MS = 60 * 1000;
+
+// No climax heart rate lies outside this window. A run that held a pulse
+// above 220 held a sensor fault - a strap reading double on poor contact -
+// and a number below 40 is no climax either. Both are refused out loud, never
+// saved and never passed over in silence.
+export const MIN_CALIBRATION_HR = 40;
+export const MAX_CALIBRATION_HR = 220;
+
+function isReading(reading) {
+    return Boolean(reading) && Number.isFinite(reading.at) && isValidBpm(reading.bpm);
+}
+
+// The value the pulse held on `earlier` and `later`, two readings in the
+// order they arrived - the lower of the two - or null when they are not two
+// consecutive readings of one pulse. `staleSeconds` is the signal-loss
+// timeout, held to the 3-20 s the app allows.
+export function heldOnTwoReadings(earlier, later, { staleSeconds } = {}) {
+    if (!isReading(earlier) || !isReading(later)) return null;
+    const gap = later.at - earlier.at;
+    if (!(gap >= 0 && gap <= clampStaleSeconds(staleSeconds) * 1000)) return null;
+    return Math.min(earlier.bpm, later.bpm);
+}
+
+// The sustained peak of a run of readings in the order they arrived: the
+// highest value held on two consecutive ones, or null when no two readings
+// are consecutive. An entry that is not a usable reading is skipped, as the
+// watchdog skips a 0 BPM "no contact" packet.
+export function sustainedPeakHr(readings, { staleSeconds } = {}) {
+    if (!Array.isArray(readings)) return null;
+    let previous = null;
+    let peak = null;
+    for (const reading of readings) {
+        if (!isReading(reading)) continue;
+        const held = heldOnTwoReadings(previous, reading, { staleSeconds });
+        if (held !== null && (peak === null || held > peak)) peak = held;
+        previous = reading;
+    }
+    return peak;
+}
+
+// Finished me's record of one Survival run, opened when Survival comes on in
+// a live session, or by START with Survival selected. It keeps no list: the
+// sustained peak so far, the last counted reading (to pair with the next
+// one), the highest single reading (so the dialog can say one did not hold),
+// how many readings counted, and how many came from the simulator while the
+// run was running (so a refusal can say why). `closedAt` is when the session
+// stopped; a closed record is read, never written.
+export function openCalibrationWindow(at) {
+    return {
+        openedAt: Number.isFinite(at) ? at : null,
+        closedAt: null,
+        last: null,
+        peakHr: null,
+        highestHr: null,
+        counted: 0,
+        simulated: 0
+    };
+}
+
+// One valid reading of the pulse source while the record is open. `running`:
+// the session was RUNNING when it arrived; `simulator`: it came from the
+// simulator's slider. A reading that does not count breaks the pair that
+// would have straddled it. Returns a new record; the one passed in is never
+// changed.
+export function noteCalibrationReading(win, { at, bpm, running = false, simulator = false, staleSeconds } = {}) {
+    if (!win || win.closedAt !== null) return win;
+    const reading = { at, bpm };
+    if (!isReading(reading)) return win;
+    if (!running || simulator) {
+        return { ...win, last: null, simulated: win.simulated + (running && simulator ? 1 : 0) };
+    }
+    const held = heldOnTwoReadings(win.last, reading, { staleSeconds });
+    return {
+        ...win,
+        last: reading,
+        counted: win.counted + 1,
+        highestHr: win.highestHr === null ? bpm : Math.max(win.highestHr, bpm),
+        peakHr: held === null ? win.peakHr : (win.peakHr === null ? held : Math.max(win.peakHr, held))
+    };
+}
+
+// The session stopped at `at`. A clock nobody can read closes it as long ago.
+export function closeCalibrationWindow(win, at) {
+    if (!win || win.closedAt !== null) return win;
+    return { ...win, closedAt: Number.isFinite(at) ? at : -Infinity, last: null };
+}
+
+// What Finished me may do with a record at `now`, given the Resting HR:
+//   'offer'             - the sustained peak, `peakHr`, may become the Climax HR
+//   'no-run'            - no Survival run was read in this session
+//   'too-late'          - the run stopped more than FINISHED_ME_AFTER_STOP_MS ago
+//   'simulator'         - nothing held, and the run's pulse was the simulator's
+//   'no-reading'        - the monitor never gave two consecutive readings
+//   'too-high' / 'too-low' - the peak lies outside the plausible window
+//   'not-above-resting' - the peak is at or below the Resting HR
+// The last matters as much as the glitch. A Climax HR at or below the Resting
+// HR is a pair the settings refuse, and a refused pair is stored as the
+// factory 70 / 140: a peak of 76 over a Resting HR of 80 was confirmed as 76
+// and saved as a Climax HR of 140, a raise nobody was told about. A Resting HR
+// that is not a number leaves nothing to compare with, and nothing is saved.
+export function judgeFinishedMe({ window: win, now, restingHr } = {}) {
+    if (!win) return { verdict: 'no-run' };
+    if (win.closedAt !== null && !(now - win.closedAt <= FINISHED_ME_AFTER_STOP_MS)) {
+        return { verdict: 'too-late' };
+    }
+    const peakHr = win.peakHr;
+    if (peakHr === null) return { verdict: win.simulated > 0 ? 'simulator' : 'no-reading' };
+    if (peakHr > MAX_CALIBRATION_HR) return { verdict: 'too-high', peakHr };
+    if (peakHr < MIN_CALIBRATION_HR) return { verdict: 'too-low', peakHr };
+    if (!Number.isFinite(restingHr) || peakHr <= restingHr) return { verdict: 'not-above-resting', peakHr };
+    return { verdict: 'offer', peakHr, highestHr: win.highestHr };
+}
+
+// Where the next session pulls back once `peakHr` is the Climax HR. `next` is
+// the ceiling a session starts at with that Climax HR and everything else as
+// it is now (learnedOffsetCeilings(...).start): the learned offset is kept -
+// it is the wearer's record of climaxing early and nothing here clears it -
+// and dual-stim dampening applies with the toys connected now. 1.1.2 said
+// "the next session uses 152" while a learned offset of 3 had it pulling back
+// at 149.
+function describeNextPullback({ peakHr, next, holdPercent }) {
+    const learned = next.requestedLearned;
+    const appliedLearned = next.appliedLearned;
+    const dual = next.appliedDual;
+    const working = next.maxHr;
+    const mark = resolveEdgeTriggerHr(working, holdPercent, next.minHr);
+    const reasons = [];
+    if (learned > 0) {
+        if (appliedLearned >= learned) reasons.push(`Your learned offset of ${learned} BPM is kept`);
+        else if (appliedLearned > 0) reasons.push(`Your learned offset of ${learned} BPM is kept, but only ${appliedLearned} BPM of it applies, because ${describeGapFloor(next.minHr)}`);
+        else reasons.push(`Your learned offset of ${learned} BPM is kept, but none of it applies, because ${describeGapFloor(next.minHr)}`);
+    }
+    if (dual > 0) {
+        const more = appliedLearned > 0 ? ' more' : '';
+        reasons.push(`${reasons.length > 0 ? 'with' : 'With'} your toys connected as they are now, dual-stimulation dampening takes ${dual} BPM${more} off`);
+    }
+    const fromPercent = Math.min(working, Math.max(1, Math.round(working * (holdPercent / 100))));
+    let where;
+    if (mark === working) {
+        where = `the next session pulls back at ${mark} BPM${mark !== peakHr ? `, not ${peakHr}` : ''}`;
+    } else if (mark === fromPercent) {
+        where = `the next session's working ceiling is ${working} BPM, and it pulls back at ${mark} BPM, the ${holdPercent}% you set`;
+    } else {
+        where = `the next session's working ceiling is ${working} BPM, and it pulls back at ${mark} BPM: ${holdPercent}% of that is ${fromPercent}, lifted to clear your Resting HR (${next.minHr})`;
+    }
+    const sentence = reasons.length > 0
+        ? `${reasons.join(', and ')}, so ${where}.`
+        : `${where.charAt(0).toUpperCase()}${where.slice(1)}.`;
+    return learned > 0
+        ? `${sentence} Wipe Memory in Session Setup (Backup) clears the learned offset.`
+        : sentence;
+}
+
+// The Finished me confirmation, for a run that held `peakHr`. `highestHr` is
+// the run's highest single reading: when it went higher than the peak, the
+// dialog says it was not held, so a wearer who saw 180 on the cockpit knows
+// why 150 is offered. `typedMaxHr` is the Climax HR now. `paused`: the run
+// is paused behind the question, and OK ends it. `handyAtRest` is false when
+// it is asked over a Handy that has not confirmed its stop
+// (describeToysBehindQuestion).
+export function describeFinishedMeConfirm({ peakHr, highestHr, typedMaxHr, next, holdPercent, paused = false, handyAtRest = true } = {}) {
+    let held = `${peakHr} BPM is the highest heart rate your monitor held on two readings in a row while this Survival run was running.`;
+    if (Number.isFinite(highestHr) && highestHr > peakHr) {
+        held += ` One reading went up to ${highestHr} BPM, but no reading next to it did - a sensor glitch can do that - so it is not used.`;
+    }
+    held += peakHr === typedMaxHr
+        ? ` Your Climax HR is ${typedMaxHr} BPM already.`
+        : ` Your Climax HR is ${typedMaxHr} BPM now.`;
+    const toys = describeToysBehindQuestion({ paused, handyAtRest, what: 'run' });
+    return [
+        `Set your Climax HR to ${peakHr} BPM?`,
+        held,
+        describeNextPullback({ peakHr, next, holdPercent }),
+        paused
+            ? `${toys} OK saves it and ends the run; Cancel keeps your Climax HR at ${typedMaxHr} BPM and leaves the run paused, so RESUME carries on.`
+            : `${toys} Cancel keeps your Climax HR at ${typedMaxHr} BPM.`
+    ].join('\n\n');
+}
+
+// What Finished me says when it saves nothing: `text` for the dialog, and
+// `line` for the cockpit's prompt line, spoken with voice guidance on (a
+// line is at most 140 characters, as every cue is).
+function describeFinishedMeRefusal({ verdict, peakHr }, { typedMaxHr, restingHr }) {
+    const stays = `Your Climax HR stays ${typedMaxHr} BPM.`;
+    switch (verdict) {
+    case 'no-run':
+        return {
+            text: `Nothing was saved. Start Survival first: once it is running, Finished me stops the toys and offers the heart rate the run held as your Climax HR. ${stays}`,
+            line: `Not saved: no Survival run to read. ${stays}`
+        };
+    case 'too-late':
+        return {
+            text: `Nothing was saved. The Survival run stopped more than ${FINISHED_ME_AFTER_STOP_MS / 1000} seconds ago, and Finished me reads a run only in the minute after it stops. ${stays}`,
+            line: `Not saved: the run stopped over a minute ago. ${stays}`
+        };
+    case 'simulator':
+        return {
+            text: `Nothing was saved. The heart rate in this run came from the simulator, and Finished me only saves a heart rate your monitor measured. ${stays}`,
+            line: `Not saved: a simulated heart rate is never saved. ${stays}`
+        };
+    case 'no-reading':
+        return {
+            text: `Nothing was saved. Your heart-rate monitor never gave two readings in a row while this Survival run was running, so there is no heart rate the run held. ${stays}`,
+            line: `Not saved: no heart rate held on two readings in a row. ${stays}`
+        };
+    case 'too-high':
+        return {
+            text: `Nothing was saved. The highest heart rate the run held was ${peakHr} BPM, above ${MAX_CALIBRATION_HR}: that is a sensor fault, not a climax. ${stays} Type it in yourself if you know it.`,
+            line: `Not saved: ${peakHr} BPM is above ${MAX_CALIBRATION_HR}, a sensor fault. ${stays}`
+        };
+    case 'too-low':
+        return {
+            text: `Nothing was saved. The highest heart rate the run held was ${peakHr} BPM, below ${MIN_CALIBRATION_HR}, which is no climax. ${stays}`,
+            line: `Not saved: ${peakHr} BPM is below ${MIN_CALIBRATION_HR}. ${stays}`
+        };
+    default:
+        if (!Number.isFinite(restingHr)) {
+            return {
+                text: `Nothing was saved. The highest heart rate the run held was ${peakHr} BPM, but there is no Resting HR to check it against. ${stays}`,
+                line: `Not saved: no Resting HR to check ${peakHr} BPM against. ${stays}`
+            };
+        }
+        return {
+            text: `Nothing was saved. The highest heart rate the run held was ${peakHr} BPM, which is not above your Resting HR of ${restingHr} BPM, so it cannot be your Climax HR. ${stays}`,
+            line: `Not saved: ${peakHr} BPM is not above your Resting HR of ${restingHr}. ${stays}`
+        };
+    }
+}
+
+// Everything one Finished me press does once the toys are stopped, worked
+// out when the question is asked, from the run as it stood at the press and
+// the settings as they stand then, so the numbers the wearer agrees to are
+// the numbers that are stored. `window` is the record as it stood at the
+// press and `now` the moment of the press. `paused`: a run is paused behind
+// the question - the press pauses one that is driving the toys - and only
+// OK ends it. Cancel and a refusal leave it paused, with nothing in History
+// until the wearer ends it: the press used to end the run before it asked,
+// so a cancelled or a refused calibration went into History as "Survival
+// calibration". `inputs`: workingCeilingInputs as the engine has them (the
+// Resting HR and the Climax HR among them). `handyAtRest` is false when the
+// question is asked over a Handy that has not confirmed its stop, and every
+// dialog then says so instead of "the toys are stopped". Returns what to
+// `ask` ('confirm' or 'alert'), its `text`, the prompt `line` to paint and
+// speak, the `saveHr` OK stores, the `outcome` History records when OK ends
+// the run, and the `cancelLine` for a No.
+export function planFinishedMe({ calibrating = false, paused = false, window: win = null, now, inputs = {}, holdPercent, handyAtRest = true } = {}) {
+    const typedMaxHr = inputs.maxHr;
+    const restingHr = inputs.minHr;
+    const stays = `Your Climax HR stays ${typedMaxHr} BPM.`;
+    const none = { saveHr: null, outcome: null, cancelLine: null };
+    const toys = describeToysBehindQuestion({ paused, handyAtRest, what: 'run' });
+    // An alert over toys at rest with no run behind it says nothing about
+    // them; a Handy in doubt is said every time.
+    const alertToys = paused || !handyAtRest ? `\n\n${toys}` : '';
+    if (!calibrating) {
+        // Without Calibration the button only ends the run, once the wearer
+        // says so. Pressed with no run to end, it says what the check on the
+        // card is for.
+        if (paused) {
+            return {
+                ...none,
+                ask: 'confirm',
+                verdict: 'end-run',
+                text: [
+                    'End the run?',
+                    `Calibration is off on the Survival card, so your Climax HR stays ${typedMaxHr} BPM. Check it before a run if Finished me should save the heart rate the run held.`,
+                    `${toys} Cancel leaves it paused, so RESUME carries on.`
+                ].join('\n\n'),
+                line: `Run ended. Calibration is off, so your Climax HR stays ${typedMaxHr} BPM.`,
+                outcome: 'Survival'
+            };
+        }
+        return {
+            ...none,
+            ask: 'alert',
+            verdict: 'not-calibrating',
+            text: `Nothing was saved: Calibration is off on the Survival card. Check it before a run if Finished me should save the heart rate the run held as your Climax HR. ${stays}${alertToys}`,
+            line: `Not saved: Calibration is off. ${stays}`
+        };
+    }
+    const judged = judgeFinishedMe({ window: win, now, restingHr });
+    if (judged.verdict !== 'offer') {
+        const refusal = describeFinishedMeRefusal(judged, { typedMaxHr, restingHr });
+        let text = refusal.text;
+        if (paused && handyAtRest) text += '\n\nThe toys are stopped and the run is paused: RESUME carries on, STOP ends it.';
+        else if (paused) text += `${alertToys} RESUME carries on, STOP ends it.`;
+        else text += alertToys;
+        return {
+            ...none,
+            ask: 'alert',
+            verdict: judged.verdict,
+            text,
+            line: refusal.line
+        };
+    }
+    const next = learnedOffsetCeilings({ ...inputs, maxHr: judged.peakHr }).start;
+    return {
+        ask: 'confirm',
+        verdict: 'offer',
+        text: describeFinishedMeConfirm({
+            peakHr: judged.peakHr,
+            highestHr: judged.highestHr,
+            typedMaxHr,
+            next,
+            holdPercent: clampEdgeHoldPercent(holdPercent),
+            paused,
+            handyAtRest
+        }),
+        line: `Saved. Your Climax HR is ${judged.peakHr} BPM.`,
+        cancelLine: `Not saved. ${stays}`,
+        saveHr: judged.peakHr,
+        outcome: 'Survival calibration'
+    };
+}
+
+// ---- Came Early and Finished me: the toys stop before the question ---------
+//
+// Both buttons mean the wearer has come, so both stop every toy first, as
+// STOP stops them, and only then ask. The question is a native dialog, and a
+// native dialog stops the page it is opened from: no timer fires and no
+// promise settles until it is answered. 1.1.2 asked first, so the question
+// stood over toys still running on a body that had just climaxed, with no
+// watchdog, guard or clock watching them until it was answered. Stopping
+// first is not enough on its own either. The Handy's stop is verified - PUT
+// /hamp/stop, tried again 250, 500 and 1000 ms later until the API confirms
+// it - and those waits are timers. Opened one frame after the stop, the
+// question stood over a first PUT that had failed: the retry went out only
+// once it was answered, five seconds later in the measured case, while the
+// dialog told the wearer the toys were stopped and the Handy kept moving. So
+// the question waits, with the page running, while any start or verified
+// stop is still on its way to a Handy - the live one, or one whose key
+// Disconnect, a reconnect or the offline verdict has just dropped, whose stop
+// is retried all the same (handy.js handyRestState) - and then one frame
+// more, so the cockpit behind it shows the stopped session and every stop
+// the other drivers queue from a promise job has gone out. A session that is
+// driving the toys again meanwhile is stopped again first: the page takes no
+// START or RESUME while a press runs (app.js startOrResumeWhenReady), and
+// this does not rely on that.
+//
+// A Handy that has not confirmed its stop once nothing is on its way any
+// more may still be moving: every attempt failed, or it went offline before
+// one was confirmed and is being sent a stop in the background every few
+// seconds, which is not waited for (handy.js beginOfflineStop). The press
+// asks nothing then. The prompt line tells the wearer, and the next press of
+// the button is their answer: that press asks once nothing is on its way,
+// and its question says the Handy may still be moving instead of "the toys
+// are stopped" (`acknowledged`). Refusing every press until the Handy
+// answered would leave no way out: an offline Handy is sent that background
+// stop for about seven minutes when every attempt fails at once and half an
+// hour when each times out, Disconnect is not offered for it, and a wearer
+// who had come could neither log it nor save a Survival run while the
+// minute after STOP ran out. The refusal holds the button for REFUSAL_HOLD_MS, so
+// the second tap of a double tap is not taken for that answer: the line has
+// to have been there to be answered.
+//
+// A stop asked for a Handy already at rest - one that has confirmed a stop
+// since anything that may have moved it - can go unanswered on every attempt:
+// a Handy switched off after STOP, say. Such a device is not in doubt (handy.js
+// noteStopFailed: that stop is an API error, not "may still be moving"), so
+// the press asks. It must not say the Handy confirmed its stop, though, and
+// handyRestState cannot tell it: that stop leaves it 'stopped'. So the press
+// reads what became of the verified stops while it waited (`stopTally`,
+// handy.js handyStopTally), and the question is told when one went
+// unanswered and none was confirmed (`unanswered`). One that gave up before
+// a stop sent after it was confirmed - the stop that follows a start which
+// landed late - leaves the Handy at rest on that confirmation: it has
+// confirmed its stop.
+//
+// A stop the API answers at once is confirmed in a few hundred milliseconds.
+// One that is retried can take much longer - four attempts, 26 s when each
+// times out, and a Handy whose stops keep failing is sent another on the next
+// tick until it is called offline - and all that time the press showed
+// nothing but a paused session. After STOP_WAIT_NOTICE_MS of waiting, the
+// wearer is told what the press is waiting for (`waiting`), once, and the
+// question is told they were (`waited`).
+//
+// `halt` stops every toy, pausing a session that is driving them; `driving`
+// says whether one is; `handyRest` is handyRestState; `stopTally` is
+// handyStopTally; `wait` and `nextFrame` are the page's clock.
+// `ask({ handyAtRest, waited, unanswered })` runs the question and stores the
+// answer, in one go; `handyAtRest` is false when it is asked over a Handy in
+// doubt. `refuse` says why nothing was asked. Resolves once one of the two
+// has run and, after a refusal, the hold is over.
+export const STOP_POLL_MS = 50;
+export const STOP_WAIT_NOTICE_MS = 1000;
+
+// A double tap lands a few hundred milliseconds after the first tap (40 to
+// 300 ms measured on a phone); a line takes longer than that to read.
+export const REFUSAL_HOLD_MS = 1000;
+
+// A page with no Handy driver to ask: nothing confirmed, nothing unanswered.
+const NO_STOPS = Object.freeze({ confirmed: 0, unanswered: 0 });
+
+export async function stopThenAsk({ halt, driving, handyRest, stopTally = () => NO_STOPS, wait, nextFrame, ask, refuse, waiting = () => {}, acknowledged = false } = {}) {
+    const before = stopTally();
+    halt();
+    let waitedForHandy = 0;
+    let told = false;
+    for (;;) {
+        const rest = handyRest();
+        if (driving() || rest === 'pending') {
+            if (rest === 'pending') {
+                if (!told && waitedForHandy >= STOP_WAIT_NOTICE_MS) {
+                    told = true;
+                    waiting();
+                }
+                waitedForHandy += STOP_POLL_MS;
+            }
+            await wait(STOP_POLL_MS);
+        } else if (rest === 'unconfirmed' && !acknowledged) {
+            refuse();
+            await wait(REFUSAL_HOLD_MS);
+            return undefined;
+        } else {
+            await nextFrame();
+            const settled = handyRest();
+            if (!driving() && settled !== 'pending' && (settled !== 'unconfirmed' || acknowledged)) {
+                const after = stopTally();
+                const unanswered = after.unanswered !== before.unanswered && after.confirmed === before.confirmed;
+                return ask({ handyAtRest: settled !== 'unconfirmed', waited: told, unanswered });
+            }
+        }
+        if (driving()) halt();
+    }
+}
+
+// One question at a time. The plan behind a question is made when it is
+// asked, from the learning profile and the Climax HR as they stand, and a
+// press that comes while an earlier one is still stopping the toys or asking
+// is dropped. With the question deferred past the stop, a second tap - 160-
+// 240 ms later on a phone-speed CPU with a full History - reached the
+// button, made a second plan from the offset the first had not stored yet,
+// and its OK logged a second event that added nothing while its dialog and
+// its cue said the limit had dropped again. A tap is judged by when it was
+// made, `pressedAt` (the click's timeStamp, on the `now` clock): the browser
+// holds back a tap that lands while the page is busy - ending the session
+// after OK, writing History - and hands it over afterwards, and a tap made
+// before the last question was over belongs to that question, not to a new
+// one. `run` resolves true when it ran the press, false when it dropped it.
+// `claims(pressedAt)` is that same rule for any other tap: true while a press
+// is stopping the toys or asking, and for a tap made before the last one was
+// over. The page asks it of START and RESUME (app.js startOrResumeWhenReady):
+// a press keeps the toys stopped until its question is answered, and a START
+// or RESUME tapped while it waited was still waiting for The Handy's answer
+// when the question opened, so it started the toys once the question was
+// answered - after Cancel, whose dialog says the session stays paused, and
+// after OK in the minute after STOP.
+export function createQuestionGate({ now = () => Date.now() } = {}) {
+    let busy = false;
+    let settledAt = -Infinity;
+    const claims = (pressedAt) => busy || (Number.isFinite(pressedAt) ? pressedAt : now()) < settledAt;
+    return {
+        get busy() {
+            return busy;
+        },
+        claims,
+        async run(steps, { pressedAt } = {}) {
+            if (claims(pressedAt)) return false;
+            busy = true;
+            try {
+                await stopThenAsk(steps);
+                return true;
+            } finally {
+                busy = false;
+                settledAt = now();
+            }
+        }
+    };
+}
+
+// The prompt line for a press that asked nothing because the Handy has not
+// confirmed its stop (at most 140 characters, as every cue is). It names
+// what the wearer can do whatever became of the link - the device's own
+// button works when the API does not, and Disconnect is not offered for a
+// Handy that went offline - and the press that answers it (stopThenAsk).
+export function describeStopNotConfirmed({ finishedMe = false } = {}) {
+    return finishedMe
+        ? 'Nothing saved yet: the Handy has not confirmed its stop and may still be moving. Switch it off if it is, then press Finished me again.'
+        : 'Nothing logged yet: the Handy has not confirmed its stop and may still be moving. Switch it off if it is, then press Came Early again.';
+}
+
+// The prompt line for a press still waiting for the Handy to confirm its
+// stop (stopThenAsk's `waiting`), as short as a cue.
+export function describeWaitingForStop() {
+    return 'Waiting for the Handy to confirm its stop before asking.';
+}
+
+// The line that says how that wait ended, when the question is asked
+// (stopThenAsk passes `waited` and `unanswered`): it replaces the notice -
+// nothing else repaints the prompt line when the answer is Cancel, and the
+// notice stood on after the question as if the press were still waiting -
+// and it is said as well for a stop that went unanswered before the notice
+// was due. `handyAtRest` and `unanswered` are the question's own. A Handy at
+// rest whose stop went unanswered had confirmed an earlier one and has not
+// been started since; "The Handy has confirmed its stop" was said over it,
+// after every attempt of the stop the press sent had been refused.
+export function describeStopWaitOver({ handyAtRest = true, unanswered = false } = {}) {
+    if (!handyAtRest) return 'The Handy has not confirmed its stop: if it is still moving, switch it off.';
+    return unanswered
+        ? 'The Handy did not confirm the stop, but it had confirmed an earlier one and nothing has started it since.'
+        : 'The Handy has confirmed its stop.';
+}
+
+// What a press of `kind` - 'cameEarly' or 'finishedMe' - is about, made at
+// `now`. `held` is the press the Handy last turned away, if any (stopThenAsk
+// refused it). A press of the same kind answers it (`acknowledged`) and is
+// about that press, not about now: seeing to a Handy that went offline can
+// take minutes, and meanwhile the pulse falls from the climax and the minute
+// after STOP runs out. Judged at the second press, Came Early took the larger
+// step on that fall and stored it as the event's pulse, and Finished me
+// refused a run the first press was in time for. Otherwise a Came Early
+// press carries the peak of the minute before `now` in `readings`
+// (recentPeakHr), and a Finished me press the calibration `window` as it
+// stands, stamped `now` (judgeFinishedMe reads it at that moment). Returns
+// { press, acknowledged }; `press` is what to keep if this press is refused.
+export function pressAbout({ kind, held = null, now, readings = [], window: win = null } = {}) {
+    if (held && held.kind === kind) return { press: held, acknowledged: true };
+    const press = kind === 'finishedMe'
+        ? { kind, pressedAt: now, win }
+        : { kind, peakHr: recentPeakHr(readings, now) };
+    return { press, acknowledged: false };
 }
 
 // Edge Training: climb to the pullback mark, hold there for holdGoal

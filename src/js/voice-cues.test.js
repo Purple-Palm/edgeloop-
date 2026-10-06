@@ -9,6 +9,8 @@ import {
     sanitizeCueList,
     mergeVoiceCues,
     interpolateCue,
+    cueLineIsComplete,
+    sayableCueLines,
     resolveVoiceCue,
     isVoiceCueId,
     pickCueLine,
@@ -46,6 +48,169 @@ describe('voice cue templates', () => {
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'cameEarly')?.group, 'Premature');
         assert.ok(DEFAULT_VOICE_CUES.trainFinish.length >= 2);
         assert.equal(VOICE_CUE_CATALOG.find((c) => c.id === 'trainHold')?.group, 'Training');
+    });
+
+    it('keeps the two Came Early banks apart: the ceiling lowered, and held', () => {
+        const lowered = VOICE_CUE_CATALOG.find((c) => c.id === 'cameEarly');
+        const held = VOICE_CUE_CATALOG.find((c) => c.id === 'cameEarlyHeld');
+        assert.equal(held?.group, 'Premature');
+        assert.ok(held.lines.length >= 4);
+        assert.match(lowered.label, /lowered/);
+        assert.match(held.label, /stays where it is/);
+        assert.equal(isVoiceCueId('cameEarlyHeld'), true);
+        // The held bank is spoken over a ceiling the press left where it was:
+        // the Resting HR floor holds it, or the learned offset is at its cap -
+        // and at the cap the ceiling can sit far above the floor. So no line,
+        // and not the label the editor shows over them, may promise a drop or
+        // say the ceiling is as low as it goes; each says it stays.
+        const claimsDrop = /tighten|tighter|drop|goes down|lower|meaner/i;
+        const claimsFloor = /as low as|no lower|nothing left|lowest|minimum|bottom|floor/i;
+        for (const text of [held.label, ...held.lines]) {
+            assert.doesNotMatch(text, claimsDrop, text);
+            assert.doesNotMatch(text, claimsFloor, text);
+        }
+        for (const line of held.lines) assert.match(line, /stays|holds|unchanged|the same/i, line);
+        // Its lines are picked and filled like any other bank's.
+        assert.equal(resolveVoiceCue({}, 'cameEarlyHeld', { hr: 118 }, { random: () => 2.5 / 5 }).text,
+            'Accidental release. 118 BPM. Logged. The ceiling stays where it is.');
+        assert.deepEqual(mergeVoiceCues({ cameEarly: ['Mine.'] }).cameEarlyHeld, held.lines, 'a saved profile without the bank gets the factory lines');
+        assert.deepEqual(mergeVoiceCues({ cameEarlyHeld: [] }).cameEarlyHeld, [], 'and it can be muted like any other');
+    });
+
+    it('keeps a Came Early mute saved before the held bank existed', () => {
+        // A set saved by 1.1.0: every bank it knew, Came Early emptied.
+        const saved = { ...DEFAULT_VOICE_CUES, cameEarly: [] };
+        delete saved.cameEarlyHeld;
+        const merged = mergeVoiceCues(saved);
+        assert.deepEqual(merged.cameEarly, []);
+        assert.deepEqual(merged.cameEarlyHeld, [], 'the new bank starts as silent as the one it was split from');
+        // Only the mute carries over: lines of the older bank are never
+        // copied into the one that must not promise a drop.
+        const custom = mergeVoiceCues({ cameEarly: ['Limit down, loser.'] });
+        assert.deepEqual(custom.cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld);
+        // A box emptied as text is a mute too; an unusable value is not one.
+        assert.deepEqual(mergeVoiceCues({ cameEarly: '' }).cameEarlyHeld, []);
+        assert.deepEqual(mergeVoiceCues({ cameEarly: null }).cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld);
+        assert.deepEqual(mergeVoiceCues({}).cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld, 'Reset defaults speaks both');
+        // Once saved with an entry of its own, the held bank is on its own.
+        assert.deepEqual(mergeVoiceCues({ cameEarly: [], cameEarlyHeld: ['Logged.'] }).cameEarlyHeld, ['Logged.']);
+        assert.deepEqual(mergeVoiceCues({ cameEarly: ['Oops.'], cameEarlyHeld: [] }).cameEarlyHeld, []);
+        // And merging again changes nothing.
+        assert.deepEqual(mergeVoiceCues(merged), merged);
+    });
+
+    it('imports a phrase list written before the held bank existed with its Came Early mute', () => {
+        // Export phrases in 1.1.0 wrote every bank it knew - Came Early
+        // emptied, and no cameEarlyHeld. Import phrases writes only the banks
+        // a file names, so that mute used to leave the held bank on its
+        // factory lines: every press the Resting HR floor swallowed was
+        // spoken and painted, while the alert said "(1 muted)".
+        const listed = { ...DEFAULT_VOICE_CUES, cameEarly: [] };
+        delete listed.cameEarlyHeld;
+        const parsed = parseVoiceCuesText(JSON.stringify({ voiceCues: listed, voiceEncourageSeconds: 45 }, null, 2));
+        assert.equal(parsed.error, null);
+        assert.equal(Object.prototype.hasOwnProperty.call(parsed.cues, 'cameEarlyHeld'), false);
+        // Into the factory editor, and into one whose held bank has lines of
+        // its own: both halves of Came Early fall silent either way.
+        for (const editor of [mergeVoiceCues({}), mergeVoiceCues({ cameEarlyHeld: ['Mine, held.'] })]) {
+            const after = applyImportedCues(editor, parsed.cues);
+            assert.deepEqual(after.cameEarly, []);
+            assert.deepEqual(after.cameEarlyHeld, []);
+            for (const key of ['cameEarly', 'cameEarlyHeld']) {
+                for (const hr of [118, null]) assert.equal(resolveVoiceCue(after, key, { hr, maxHr: 120 }).text, '', `${key} with hr ${hr}`);
+            }
+        }
+        // The same data restored as a whole set (the settings store, a
+        // Backup) reads the same way.
+        assert.deepEqual(applyImportedCues(mergeVoiceCues({}), parsed.cues), mergeVoiceCues(parsed.cues));
+        // The alert counts what was written, the held bank's mute included,
+        // so it agrees with the editor, which then shows both banks muted.
+        const summary = describeImport(parsed.cues);
+        assert.equal(summary.applied.length, VOICE_CUE_CATALOG.length);
+        assert.deepEqual(summary.muted, ['cameEarly', 'cameEarlyHeld']);
+        assert.deepEqual(summary.skipped, []);
+        assert.equal(voiceImportAlert(summary), `Imported and saved ${VOICE_CUE_CATALOG.length} phrase lists (2 muted).`);
+    });
+
+    it('carries only the Came Early mute into the held bank, and never over an answer of its own', () => {
+        const factory = mergeVoiceCues({});
+        const heldMuted = mergeVoiceCues({ cameEarlyHeld: [] });
+        // A 1.1.0 list with Came Early lines of its own: those lines promise
+        // a drop, so they never reach the held bank, which stays as the
+        // editor has it - factory lines, or the wearer's own mute.
+        const custom = { cameEarly: ['Lower next time.'] };
+        assert.deepEqual(applyImportedCues(factory, custom).cameEarly, ['Lower next time.']);
+        assert.deepEqual(applyImportedCues(factory, custom).cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld);
+        assert.deepEqual(applyImportedCues(heldMuted, custom).cameEarlyHeld, []);
+        assert.deepEqual(describeImport(custom), { applied: ['cameEarly'], muted: [], skipped: [] });
+        // A list written after the split answers for each bank itself.
+        const both = { cameEarly: [], cameEarlyHeld: ['Logged. Ceiling unchanged.'] };
+        assert.deepEqual(applyImportedCues(factory, both).cameEarlyHeld, ['Logged. Ceiling unchanged.']);
+        assert.deepEqual(describeImport(both), { applied: ['cameEarly', 'cameEarlyHeld'], muted: ['cameEarly'], skipped: [] });
+        const heldUnusable = { cameEarly: [], cameEarlyHeld: 7 };
+        assert.deepEqual(applyImportedCues(factory, heldUnusable).cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld);
+        assert.deepEqual(describeImport(heldUnusable), { applied: ['cameEarly'], muted: ['cameEarly'], skipped: ['cameEarlyHeld'] });
+        // A box emptied as text is a mute; a value that is not lines of text
+        // is no answer at all, so it silences nothing.
+        assert.deepEqual(applyImportedCues(factory, { cameEarly: '' }).cameEarlyHeld, []);
+        assert.deepEqual(applyImportedCues(factory, { cameEarly: null }).cameEarlyHeld, DEFAULT_VOICE_CUES.cameEarlyHeld);
+        assert.deepEqual(describeImport({ cameEarly: null }), { applied: [], muted: [], skipped: ['cameEarly'] });
+        // The file's own object is read, never written.
+        const file = { cameEarly: [] };
+        applyImportedCues(factory, file);
+        describeImport(file);
+        mergeVoiceCues(file);
+        assert.deepEqual(file, { cameEarly: [] });
+    });
+
+    it('reads a split bank the same way on every restore path, and counts exactly what it wrote', () => {
+        // Every shape a file can give the two Came Early banks, absent included.
+        const values = [undefined, null, 7, [], '', ['  '], ['A line.'], 'A line.\nB line.'];
+        const current = { cameEarly: ['Existing.'], cameEarlyHeld: ['Existing, held.'] };
+        for (const older of values) {
+            for (const newer of values) {
+                const incoming = {};
+                if (older !== undefined) incoming.cameEarly = older;
+                if (newer !== undefined) incoming.cameEarlyHeld = newer;
+                const label = JSON.stringify({ older, newer });
+                const after = applyImportedCues(current, incoming);
+                const summary = describeImport(incoming);
+                for (const id of ['cameEarly', 'cameEarlyHeld']) {
+                    const written = JSON.stringify(after[id]) !== JSON.stringify(current[id]);
+                    assert.equal(summary.applied.includes(id), written, `${id} applied, ${label}`);
+                    assert.equal(summary.muted.includes(id), after[id].length === 0, `${id} muted, ${label}`);
+                }
+                // The held bank goes silent through the file and only then:
+                // its own mute, or Came Early's when it names no held bank.
+                const olderMutes = typeof older === 'string' || Array.isArray(older) ? sanitizeCueList(older, []).length === 0 : false;
+                const newerMutes = typeof newer === 'string' || Array.isArray(newer) ? sanitizeCueList(newer, []).length === 0 : false;
+                assert.equal(after.cameEarlyHeld.length === 0, newerMutes || (newer === undefined && olderMutes), `held silent, ${label}`);
+                // Into the factory editor, Import phrases gives what a Backup
+                // restore of the same banks gives.
+                assert.deepEqual(applyImportedCues(mergeVoiceCues({}), incoming), mergeVoiceCues(incoming), label);
+            }
+        }
+    });
+
+    it('does not pick a line whose token has no value while another line can be said in full', () => {
+        assert.equal(cueLineIsComplete('Accidental release. {hr} BPM.', { hr: null }), false);
+        assert.equal(cueLineIsComplete('Accidental release. {hr} BPM.', { hr: undefined }), false);
+        assert.equal(cueLineIsComplete('Accidental release. {hr} BPM.', { hr: 0 }), true);
+        assert.equal(cueLineIsComplete('Hold {nope}.', {}), true, 'an unknown brace is not a token');
+        assert.equal(cueLineIsComplete('Hold it.', {}), true);
+        const cues = { cameEarly: ['Accidental release. {hr} BPM. Limits tighter.', 'Came early. Limit tightened.', 'Edge {edges}. {hr}.'] };
+        assert.deepEqual(sayableCueLines(cues.cameEarly, { hr: null, edges: 2 }), ['Came early. Limit tightened.']);
+        for (let roll = 0; roll < 1; roll += 1 / 32) {
+            assert.equal(resolveVoiceCue(cues, 'cameEarly', { hr: null, edges: 2 }, { random: () => roll }).text, 'Came early. Limit tightened.');
+        }
+        // With a pulse to quote, the whole bank is in play again.
+        assert.equal(resolveVoiceCue(cues, 'cameEarly', { hr: 131, edges: 2 }, { random: () => 0.1 }).text, 'Accidental release. 131 BPM. Limits tighter.');
+        // A bank with no line that can be said in full still says something,
+        // the token dropped, rather than falling silent like a mute.
+        assert.deepEqual(sayableCueLines(['{hr} BPM.'], { hr: null }), ['{hr} BPM.']);
+        assert.equal(resolveVoiceCue({ edge: ['{hr} BPM.'] }, 'edge', { hr: null }).text, 'BPM.');
+        // A literal sentence is not a bank and is filled as written.
+        assert.equal(resolveVoiceCue({}, 'Stopped at {hr}.', { hr: null }).text, 'Stopped at .');
     });
 
     it('interpolates known tokens and leaves unknown braces alone', () => {
@@ -214,17 +379,19 @@ describe('voice cue templates', () => {
     it('never calls a bank muted that the import left alone', () => {
         // A hand-edited JSON with a cue set to null or a number: the import
         // keeps the lines the user already had (correct), so the summary must
-        // not send them hunting for a bank that has gone silent.
-        const current = { edge: ['Mine.'], forceOrgasm: ['Now.'], cameEarly: ['Oh.'] };
-        const incoming = { edge: null, forceOrgasm: 7, cameEarly: [] };
+        // not send them hunting for a bank that has gone silent. (The real
+        // mute here is not Came Early's: emptying that one also silences the
+        // bank split off it, which the tests above cover.)
+        const current = { edge: ['Mine.'], forceOrgasm: ['Now.'], paused: ['Oh.'] };
+        const incoming = { edge: null, forceOrgasm: 7, paused: [] };
         const after = applyImportedCues(current, incoming);
         assert.deepEqual(after.edge, ['Mine.'], 'an unusable value leaves the bank untouched');
         assert.deepEqual(after.forceOrgasm, ['Now.']);
-        assert.deepEqual(after.cameEarly, [], 'an empty list is a real mute');
+        assert.deepEqual(after.paused, [], 'an empty list is a real mute');
 
         const summary = describeImport(incoming);
-        assert.deepEqual(summary.applied, ['cameEarly'], 'only the bank that was really written');
-        assert.deepEqual(summary.muted, ['cameEarly'], 'and only the bank that really went silent');
+        assert.deepEqual(summary.applied, ['paused'], 'only the bank that was really written');
+        assert.deepEqual(summary.muted, ['paused'], 'and only the bank that really went silent');
         assert.deepEqual(summary.skipped, ['edge', 'forceOrgasm'], 'the banks the file could not write');
 
         const text = voiceImportAlert(summary);

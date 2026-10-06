@@ -156,7 +156,13 @@ function readCommand(raw, role) {
     switch (raw.type) {
         case 'SESSION_STATE': {
             const status = oneOf(raw.status, COMMAND_STATUSES);
-            return status ? { type: 'SESSION_STATE', status } : null;
+            if (!status) return null;
+            const command = { type: 'SESSION_STATE', status };
+            // Present only when the sender said so: the host state its button
+            // was showing when it was pressed (hostTransportAction).
+            const from = oneOf(raw.from, REMOTE_STATUSES);
+            if (from) command.from = from;
+            return command;
         }
         case 'SESSION_RESET':
             return { type: 'SESSION_RESET' };
@@ -170,6 +176,42 @@ function readCommand(raw, role) {
             // whether that game should be on, so the host does not toggle twice.
             if (typeof raw.enabled === 'boolean') command.enabled = raw.enabled;
             return command;
+        }
+        default:
+            return null;
+    }
+}
+
+// What the host does with a controller's SESSION_STATE command, given the
+// state it is in now: 'start', 'resume', 'pause', 'stop' or null (nothing).
+// The controller has one transport button, and it sends RUNNING both as
+// START, over a host it shows IDLE, and as RESUME, over one it shows PAUSED.
+// The host used to take any RUNNING as "start or resume, whichever fits", and
+// a command can reach it long after it was pressed: a native dialog on the
+// host holds back every message until it is answered. Came Early and
+// Finished me pause the session behind their question, so the partner's
+// button reads RESUME for as long as it is open; pressed then, the RESUME
+// waited behind the dialog, the wearer's OK ended the session, and the RESUME
+// arrived at an idle host as a START - a brand-new session driving the toys a
+// second after the wearer had confirmed a climax. So a controller now sends
+// `from`, the host state its button showed, and RUNNING acts only on the
+// state it was pressed for: a RESUME never starts a session the wearer has
+// ended since, and a START never resumes one the wearer has paused since.
+// A command without `from` - a controller page from before it was sent - is
+// taken as it always was. PAUSED and IDLE only ever stop the toys, and are
+// taken as they always were.
+export function hostTransportAction(command, hostStatus) {
+    if (!command || command.type !== 'SESSION_STATE') return null;
+    const active = hostStatus === 'RUNNING' || hostStatus === 'RAMPDOWN';
+    switch (command.status) {
+        case 'IDLE':
+            return 'stop';
+        case 'PAUSED':
+            return active ? 'pause' : null;
+        case 'RUNNING': {
+            if (hostStatus !== 'IDLE' && hostStatus !== 'PAUSED') return null;
+            if (command.from !== undefined && command.from !== hostStatus) return null;
+            return hostStatus === 'IDLE' ? 'start' : 'resume';
         }
         default:
             return null;

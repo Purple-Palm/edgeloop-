@@ -78,11 +78,47 @@ import {
     cooldownEligible,
     tickCooldown,
     cooldownSecondsFor,
-    describeCooldownBadge
+    describeCooldownBadge,
+    workingCeilingInputs,
+    MAX_LEARNED_OFFSET_BPM,
+    CAME_EARLY_STEP_BPM,
+    CAME_EARLY_BONUS_BPM,
+    CAME_EARLY_BONUS_MARGIN_BPM,
+    CAME_EARLY_PEAK_WINDOW_MS,
+    rememberReading,
+    recentPeakHr,
+    cameEarlyStep,
+    learnedOffsetCeilings,
+    describeCameEarlyConfirm,
+    cameEarlyCue,
+    describeWipeLearningConfirm,
+    describeLearningStatus,
+    FINISHED_ME_AFTER_STOP_MS,
+    MIN_CALIBRATION_HR,
+    MAX_CALIBRATION_HR,
+    heldOnTwoReadings,
+    sustainedPeakHr,
+    openCalibrationWindow,
+    noteCalibrationReading,
+    closeCalibrationWindow,
+    judgeFinishedMe,
+    describeFinishedMeConfirm,
+    planFinishedMe,
+    STOP_POLL_MS,
+    STOP_WAIT_NOTICE_MS,
+    REFUSAL_HOLD_MS,
+    stopThenAsk,
+    createQuestionGate,
+    describeStopNotConfirmed,
+    describeWaitingForStop,
+    describeStopWaitOver,
+    pressAbout
 } from './session-rules.js';
-import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM, COOLDOWN_MODES, ENGINE_MODES } from './engine.js';
+import { calculateEngineOutputs, TEASE_MODES, GAME_MODES, EDGE_RELEASE_BPM, COOLDOWN_MODES, ENGINE_MODES, resolveEdgeTriggerHr } from './engine.js';
 import { RUIN_RIDE_SECONDS, RUIN_LOCK_SECONDS, RUIN_LOCK_SECONDARY } from './patterns.js';
 import { rememberEdgeReading } from './edge-confirm.js';
+import { isVoiceCueId, resolveVoiceCue, DEFAULT_VOICE_CUES, MAX_CUE_LENGTH } from './voice-cues.js';
+import { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM as SCHEMA_MAX_LEARNED_OFFSET_BPM } from './settings-schema.js';
 
 describe('sanitizeHrLimits', () => {
     it('parses typed strings', () => {
@@ -133,9 +169,11 @@ describe('computeEffectiveCeiling', () => {
             decayBpm: 2,
             decayFloor: 100
         });
-        assert.equal(out.learnedOffset, 5);
-        assert.equal(out.dualOffset, 15);
-        assert.equal(out.totalDecay, 4);
+        assert.equal(out.requestedLearned, 5);
+        assert.equal(out.appliedLearned, 5);
+        assert.equal(out.requestedDual, 15);
+        assert.equal(out.appliedDual, 15);
+        assert.equal(out.requestedDecay, 4);
         assert.equal(out.appliedDecay, 4);
         assert.equal(out.maxHr, 140 - 5 - 15 - 4);
     });
@@ -195,6 +233,852 @@ describe('computeEffectiveCeiling', () => {
         assert.equal(computeEffectiveCeiling({ ...base, survivalOverdrive: 500 }).maxHr, 140 + SURVIVAL_OVERDRIVE_CAP);
         assert.equal(computeEffectiveCeiling({ ...base, survivalOverdrive: -4 }).maxHr, 140);
         assert.equal(computeEffectiveCeiling({ ...base, orgasmBoost: 5, survivalOverdrive: 3 }).maxHr, 148);
+    });
+});
+
+describe('computeEffectiveCeiling reports what it applied, not what was asked', () => {
+    // The numbers measured in the page: Climax HR 120 and one Came Early
+    // press (3 BPM) on file, with the Resting HR moved up under it.
+    const pressed = (minHr) => computeEffectiveCeiling({ minHr, maxHr: 120, learnedOffset: 3 });
+
+    it('applies the whole learned offset while the floor is out of the way', () => {
+        const out = pressed(102);
+        assert.equal(out.maxHr, 117);
+        assert.equal(out.requestedLearned, 3);
+        assert.equal(out.appliedLearned, 3);
+    });
+
+    it('applies only what the Resting HR floor lets through', () => {
+        const out = pressed(103);
+        assert.equal(out.offsetFloorHr, 118);
+        assert.equal(out.maxHr, 118);
+        assert.equal(out.requestedLearned, 3);
+        assert.equal(out.appliedLearned, 2);
+    });
+
+    it('applies nothing once the floor reaches the typed Climax HR', () => {
+        for (const minHr of [105, 108, 115]) {
+            const out = pressed(minHr);
+            assert.equal(out.maxHr, 120, `Resting ${minHr}`);
+            assert.equal(out.requestedLearned, 3, `Resting ${minHr}`);
+            assert.equal(out.appliedLearned, 0, `Resting ${minHr}`);
+            // What the panel used to print: the typed ceiling less the
+            // REQUESTED offset, 3 BPM under the ceiling the engine runs on.
+            assert.ok(out.typedMaxHr - out.requestedLearned < out.maxHr);
+            assert.equal(out.typedMaxHr - out.appliedLearned, out.maxHr);
+        }
+    });
+
+    it('reports dual-stim dampening the same way', () => {
+        const dual = { dualStimActive: true, dualDampening: true, dualDampeningBpm: 15 };
+        const open = computeEffectiveCeiling({ minHr: 70, maxHr: 120, ...dual });
+        assert.equal(open.requestedDual, 15);
+        assert.equal(open.appliedDual, 15);
+        assert.equal(open.maxHr, 105);
+        // Resting 90 puts the floor at 105. The learned 3 BPM come off first,
+        // so only 12 of the 15 dual-stim BPM can follow them.
+        const tight = computeEffectiveCeiling({ minHr: 90, maxHr: 120, learnedOffset: 3, ...dual });
+        assert.equal(tight.maxHr, 105);
+        assert.equal(tight.appliedLearned, 3);
+        assert.equal(tight.requestedDual, 15);
+        assert.equal(tight.appliedDual, 12);
+        // Resting 105: none of it.
+        const shut = computeEffectiveCeiling({ minHr: 105, maxHr: 120, ...dual });
+        assert.equal(shut.maxHr, 120);
+        assert.equal(shut.requestedDual, 15);
+        assert.equal(shut.appliedDual, 0);
+    });
+
+    it('asks for no dual-stim dampening when it is off or only one toy is live', () => {
+        assert.equal(computeEffectiveCeiling({ minHr: 70, maxHr: 140, dualStimActive: true, dualDampening: false }).requestedDual, 0);
+        assert.equal(computeEffectiveCeiling({ minHr: 70, maxHr: 140, dualStimActive: false, dualDampening: true }).requestedDual, 0);
+    });
+
+    it('reports the two raises as asked for and as applied, after their caps', () => {
+        const base = { minHr: 70, maxHr: 140 };
+        const raised = (extra) => computeEffectiveCeiling({ ...base, ...extra });
+        assert.equal(raised({ orgasmBoost: 12 }).orgasmBoost, 12);
+        assert.equal(raised({ orgasmBoost: 12 }).requestedOrgasmBoost, 12);
+        assert.equal(raised({ orgasmBoost: 500 }).orgasmBoost, ORGASM_BOOST_CAP);
+        assert.equal(raised({ orgasmBoost: 500 }).requestedOrgasmBoost, 500);
+        assert.equal(raised({ orgasmBoost: -3 }).orgasmBoost, 0);
+        assert.equal(raised({ orgasmBoost: -3 }).requestedOrgasmBoost, 0);
+        assert.equal(raised({ survivalOverdrive: 8 }).survivalOverdrive, 8);
+        assert.equal(raised({ survivalOverdrive: 8 }).requestedSurvivalOverdrive, 8);
+        assert.equal(raised({ survivalOverdrive: 500 }).survivalOverdrive, SURVIVAL_OVERDRIVE_CAP);
+        assert.equal(raised({ survivalOverdrive: 500 }).requestedSurvivalOverdrive, 500);
+        assert.equal(raised({ survivalOverdrive: NaN }).survivalOverdrive, 0);
+        assert.equal(raised({ survivalOverdrive: NaN }).requestedSurvivalOverdrive, 0);
+        assert.equal(raised({}).requestedOrgasmBoost, 0);
+        assert.equal(raised({}).requestedSurvivalOverdrive, 0);
+        // A raise climbs from the lowered ceiling: Survival past a learned
+        // offset, with the floor holding part of it.
+        const out = computeEffectiveCeiling({ minHr: 103, maxHr: 120, learnedOffset: 3, survivalOverdrive: 5 });
+        assert.equal(out.appliedLearned, 2);
+        assert.equal(out.survivalOverdrive, 5);
+        assert.equal(out.maxHr, 123);
+    });
+
+    it('adds the applied amounts and the raises up to exactly the ceiling the engine gets', () => {
+        // The cockpit prints each offset badge next to the CEILING badge and
+        // Survival's +N BPM, so they must add up: typed - learned - dual -
+        // decay + boost + overdrive = ceiling.
+        let cases = 0;
+        const raises = [[0, 0], [9, 0], [0, 7], [75, 55], [-3, NaN], [60, 40]];
+        for (const minHr of [40, 70, 95, 103, 105, 118, 130]) {
+            for (const maxHr of [75, 100, 110, 120, 140, 180]) {
+                for (const learnedOffset of [0, 2, 3, 5, 12, 30]) {
+                    for (const dualStimActive of [false, true]) {
+                        for (const dualDampeningBpm of [5, 15, 30]) {
+                            for (const edges of [0, 3, 10, 60]) {
+                                for (const decayFloor of [80, 105, 130]) {
+                                    for (const [orgasmBoost, survivalOverdrive] of raises) {
+                                        const out = computeEffectiveCeiling({
+                                            minHr, maxHr, learnedOffset,
+                                            dualStimActive, dualDampening: true, dualDampeningBpm,
+                                            adaptiveDecay: true, edges, decayEdgeCount: 2, decayBpm: 3, decayFloor,
+                                            orgasmBoost, survivalOverdrive
+                                        });
+                                        const label = JSON.stringify({ minHr, maxHr, learnedOffset, dualStimActive, dualDampeningBpm, edges, decayFloor, orgasmBoost, survivalOverdrive });
+                                        for (const [asked, applied] of [['requestedLearned', 'appliedLearned'], ['requestedDual', 'appliedDual'], ['requestedDecay', 'appliedDecay']]) {
+                                            assert.ok(out[applied] >= 0 && out[applied] <= out[asked], `${applied} ${out[applied]} of ${out[asked]} for ${label}`);
+                                        }
+                                        assert.equal(out.orgasmBoost, Math.min(out.requestedOrgasmBoost, ORGASM_BOOST_CAP), label);
+                                        assert.equal(out.survivalOverdrive, Math.min(out.requestedSurvivalOverdrive, SURVIVAL_OVERDRIVE_CAP), label);
+                                        assert.ok(out.orgasmBoost >= 0 && out.survivalOverdrive >= 0, label);
+                                        assert.equal(
+                                            out.typedMaxHr - out.appliedLearned - out.appliedDual - out.appliedDecay + out.orgasmBoost + out.survivalOverdrive,
+                                            out.maxHr,
+                                            label
+                                        );
+                                        const beforeRaises = out.maxHr - out.orgasmBoost - out.survivalOverdrive;
+                                        assert.ok(beforeRaises <= out.typedMaxHr, label);
+                                        assert.ok(beforeRaises >= out.offsetFloorHr, label);
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(cases > 80000, `only ${cases} cases`);
+    });
+});
+
+describe('the inputs the working ceiling is computed from', () => {
+    const settings = {
+        learningProfile: { breakthroughEvents: 2, suggestedMaxHrOffset: 6, lastBreakthroughHr: 131 },
+        dualDampening: true,
+        dualDampeningBpm: 15,
+        adaptiveDecay: true,
+        decayEdgeCount: 2,
+        decayBpm: 2,
+        decayFloor: 105
+    };
+    const session = { minHr: 70, maxHr: 140, settings, edges: 10, orgasmMode: false, orgasmBoost: 0, survivalOverdrive: 7 };
+
+    it('switches decay off and the overdrive on while Survival is the active mode', () => {
+        const inputs = workingCeilingInputs({ ...session, activeMode: 'survival' });
+        assert.equal(inputs.adaptiveDecay, false);
+        assert.equal(inputs.survivalOverdrive, 7);
+        const ceiling = computeEffectiveCeiling(inputs);
+        // Ten edges would have taken 10 BPM off; the climb adds its 7.
+        assert.equal(ceiling.requestedDecay, 0);
+        assert.equal(ceiling.appliedLearned, 6);
+        assert.equal(ceiling.survivalOverdrive, 7);
+        assert.equal(ceiling.maxHr, 140 - 6 + 7);
+    });
+
+    it('decays, and carries no overdrive, in every other mode', () => {
+        for (const activeMode of ENGINE_MODES.filter((mode) => mode !== 'survival')) {
+            const inputs = workingCeilingInputs({ ...session, activeMode });
+            assert.equal(inputs.adaptiveDecay, true, activeMode);
+            assert.equal(inputs.survivalOverdrive, 0, activeMode);
+            const ceiling = computeEffectiveCeiling(inputs);
+            assert.equal(ceiling.appliedDecay, 10, activeMode);
+            assert.equal(ceiling.maxHr, 140 - 6 - 10, activeMode);
+        }
+        assert.equal(workingCeilingInputs({ ...session, settings: { ...settings, adaptiveDecay: false }, activeMode: 'classic' }).adaptiveDecay, false);
+    });
+
+    it('carries the Force Orgasm boost only while Force Orgasm is on', () => {
+        assert.equal(workingCeilingInputs({ ...session, activeMode: 'classic', orgasmBoost: 12 }).orgasmBoost, 0);
+        const on = workingCeilingInputs({ ...session, activeMode: 'classic', orgasmMode: true, orgasmBoost: 12 });
+        assert.equal(on.orgasmBoost, 12);
+        assert.equal(computeEffectiveCeiling(on).maxHr, 140 - 6 - 10 + 12);
+        // In Survival both raises stack on the lowered ceiling.
+        const both = workingCeilingInputs({ ...session, activeMode: 'survival', orgasmMode: true, orgasmBoost: 12 });
+        assert.equal(computeEffectiveCeiling(both).maxHr, 140 - 6 + 12 + 7);
+    });
+
+    it('passes the learned offset and dual-stim dampening as set', () => {
+        const inputs = workingCeilingInputs({ ...session, activeMode: 'classic', dualStimActive: true });
+        assert.equal(inputs.learnedOffset, 6);
+        assert.equal(inputs.dualStimActive, true);
+        assert.equal(inputs.dualDampening, true);
+        assert.equal(inputs.dualDampeningBpm, 15);
+        assert.equal(computeEffectiveCeiling(inputs).appliedDual, 15);
+        // No profile, no settings: nothing is asked for.
+        const bare = workingCeilingInputs({ minHr: 70, maxHr: 140, activeMode: 'classic' });
+        assert.equal(bare.learnedOffset, 0);
+        assert.equal(bare.dualDampening, false);
+        assert.equal(bare.adaptiveDecay, false);
+        assert.equal(computeEffectiveCeiling(bare).maxHr, 140);
+    });
+});
+
+describe('Came Early: the recent readings and their peak', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+
+    it('finds no peak where nothing was read', () => {
+        assert.equal(recentPeakHr([], at(100)), null);
+        assert.equal(recentPeakHr(undefined, at(100)), null);
+        assert.equal(recentPeakHr([{ at: at(99), bpm: 120 }], NaN), null);
+    });
+
+    it('takes the peak of the window, not the pulse at the press', () => {
+        // The climax at 134, then the fall while the wearer reaches the button.
+        const readings = [];
+        for (const [s, bpm] of [[40, 118], [55, 131], [58, 134], [62, 126], [75, 117], [88, 109], [99, 104]]) {
+            rememberReading(readings, at(s), bpm);
+        }
+        assert.equal(recentPeakHr(readings, at(100)), 134);
+    });
+
+    it('looks back exactly one window and no further', () => {
+        assert.equal(CAME_EARLY_PEAK_WINDOW_MS, 60 * 1000);
+        const readings = [{ at: at(40), bpm: 150 }, { at: at(41), bpm: 120 }];
+        assert.equal(recentPeakHr(readings, at(100)), 150);
+        assert.equal(recentPeakHr(readings, at(100) + 1), 120);
+        assert.equal(recentPeakHr(readings, at(102)), null);
+    });
+
+    it('never counts an unusable value or a reading from the future', () => {
+        const readings = [
+            { at: at(95), bpm: 0 }, { at: at(96), bpm: 20 }, { at: at(97), bpm: 400 },
+            { at: at(98), bpm: NaN }, { at: at(98), bpm: '130' }, null,
+            { at: NaN, bpm: 130 }, { at: at(101), bpm: 140 }
+        ];
+        assert.equal(recentPeakHr(readings, at(100)), null);
+        readings.push({ at: at(99), bpm: 90 });
+        assert.equal(recentPeakHr(readings, at(100)), 90);
+    });
+
+    it('keeps about one window of readings, and never an unusable one', () => {
+        const readings = [];
+        for (let s = 0; s < 600; s += 1) rememberReading(readings, at(s), 100 + (s % 7));
+        assert.ok(readings.length <= 61, `kept ${readings.length}`);
+        assert.equal(readings[0].at, at(599 - 60));
+        rememberReading(readings, at(600), 0);
+        rememberReading(readings, at(600), 300);
+        rememberReading(readings, NaN, 120);
+        assert.ok(readings.every((r) => r.bpm >= 35 && r.bpm <= 250 && Number.isFinite(r.at)));
+        assert.deepEqual(rememberReading(null, at(1), 120), []);
+    });
+
+    it('stays bounded when the clock steps backwards', () => {
+        const readings = [];
+        rememberReading(readings, at(10_000), 120);
+        for (let s = 0; s < 5000; s += 1) rememberReading(readings, at(s), 110);
+        assert.ok(readings.length <= 1000, `kept ${readings.length}`);
+    });
+});
+
+describe('Came Early: the step', () => {
+    it('takes the ordinary step when there is no reading at all', () => {
+        // No monitor: the page's pulse sits at the 70 it starts with, 50
+        // under a 120 Climax HR, and the old rule took the larger step on
+        // that. No reading is not a low reading.
+        for (const peakHr of [null, undefined, NaN]) {
+            const out = cameEarlyStep({ offset: 0, typedMaxHr: 120, peakHr });
+            assert.equal(out.step, CAME_EARLY_STEP_BPM);
+            assert.equal(out.bonus, false);
+            assert.equal(out.offset, 3);
+            assert.equal(out.peakHr, null);
+        }
+    });
+
+    it('takes the larger step only for a peak more than the margin under the typed ceiling', () => {
+        assert.equal(CAME_EARLY_BONUS_MARGIN_BPM, 8);
+        const step = (peakHr) => cameEarlyStep({ offset: 6, typedMaxHr: 140, peakHr });
+        assert.deepEqual(step(131), { previous: 6, offset: 11, step: 5, added: 5, bonus: true, peakHr: 131 });
+        assert.equal(step(60).step, CAME_EARLY_STEP_BPM + CAME_EARLY_BONUS_BPM);
+        assert.deepEqual(step(132), { previous: 6, offset: 9, step: 3, added: 3, bonus: false, peakHr: 132 });
+        assert.equal(step(139).step, 3);
+        assert.equal(step(150).step, 3);
+    });
+
+    it('never takes the larger step on a value that is not a pulse', () => {
+        for (const peakHr of [0, 20, 34, 251, 400, '100', Infinity]) {
+            const out = cameEarlyStep({ offset: 0, typedMaxHr: 140, peakHr });
+            assert.equal(out.bonus, false, String(peakHr));
+            assert.equal(out.peakHr, null, String(peakHr));
+        }
+        assert.equal(cameEarlyStep({ offset: 0, typedMaxHr: NaN, peakHr: 90 }).bonus, false);
+    });
+
+    it('stops at the cap and never lowers the offset', () => {
+        assert.equal(MAX_LEARNED_OFFSET_BPM, 30);
+        assert.deepEqual(cameEarlyStep({ offset: 28, typedMaxHr: 140, peakHr: 138 }),
+            { previous: 28, offset: 30, step: 3, added: 2, bonus: false, peakHr: 138 });
+        assert.equal(cameEarlyStep({ offset: 29, typedMaxHr: 140, peakHr: 100 }).added, 1);
+        assert.equal(cameEarlyStep({ offset: 30, typedMaxHr: 140, peakHr: 100 }).added, 0);
+        // Only a store this build did not write can hold more than the cap;
+        // a press leaves it alone rather than lowering it.
+        assert.equal(cameEarlyStep({ offset: 35, typedMaxHr: 140 }).offset, 35);
+        for (const offset of [undefined, null, NaN, -4, '9']) {
+            assert.equal(cameEarlyStep({ offset, typedMaxHr: 140 }).previous, 0, String(offset));
+        }
+    });
+
+    it('agrees with the stored profile about the cap, press after press', () => {
+        assert.equal(SCHEMA_MAX_LEARNED_OFFSET_BPM, MAX_LEARNED_OFFSET_BPM);
+        let offset = 0;
+        for (let press = 1; press <= 20; press += 1) {
+            offset = cameEarlyStep({ offset, typedMaxHr: 140, peakHr: press % 2 ? 100 : 139 }).offset;
+            const stored = sanitizeLearningProfile({ breakthroughEvents: press, suggestedMaxHrOffset: offset, lastBreakthroughHr: 120 });
+            assert.equal(stored.suggestedMaxHrOffset, offset, `press ${press}`);
+        }
+        assert.equal(offset, MAX_LEARNED_OFFSET_BPM);
+    });
+});
+
+describe('Came Early: the ceilings a learned offset gives', () => {
+    const inputs = {
+        minHr: 70, maxHr: 140, learnedOffset: 6,
+        dualStimActive: true, dualDampening: true, dualDampeningBpm: 15,
+        adaptiveDecay: true, edges: 10, decayEdgeCount: 2, decayBpm: 2, decayFloor: 105,
+        orgasmBoost: 12
+    };
+
+    it('takes the learned ceiling from the typed limits and the offset alone', () => {
+        const { learned } = learnedOffsetCeilings(inputs);
+        assert.deepEqual(learned, computeEffectiveCeiling({ minHr: 70, maxHr: 140, learnedOffset: 6 }));
+        assert.equal(learned.maxHr, 134);
+        assert.equal(learnedOffsetCeilings(inputs, 9).learned.maxHr, 131);
+    });
+
+    it('starts a session with the connected toys, and with no decay, boost or overdrive', () => {
+        const { start } = learnedOffsetCeilings(inputs);
+        assert.deepEqual(start, computeEffectiveCeiling({ ...inputs, edges: 0, orgasmBoost: 0 }));
+        assert.equal(start.maxHr, 140 - 6 - 15);
+        assert.equal(start.appliedDecay, 0);
+        assert.equal(start.orgasmBoost, 0);
+        // The engine on this tick has decay and the boost as well; neither
+        // follows the wearer into the next session.
+        assert.equal(computeEffectiveCeiling(inputs).maxHr, 140 - 6 - 15 - 10 + 12);
+        // Nor does a Survival climb: Wipe Memory can be pressed during one.
+        const climbing = { ...inputs, adaptiveDecay: false, survivalOverdrive: 9 };
+        assert.equal(computeEffectiveCeiling(climbing).maxHr, 140 - 6 - 15 + 12 + 9);
+        assert.equal(learnedOffsetCeilings(climbing).start.maxHr, 140 - 6 - 15);
+        assert.equal(learnedOffsetCeilings(climbing).start.survivalOverdrive, 0);
+    });
+});
+
+describe('Came Early: the confirmation', () => {
+    const confirmFor = (inputs, { peakHr = null, paused = true, handyAtRest } = {}) => {
+        const step = cameEarlyStep({ offset: inputs.learnedOffset, typedMaxHr: inputs.maxHr, peakHr });
+        const text = describeCameEarlyConfirm({
+            before: learnedOffsetCeilings(inputs, step.previous),
+            after: learnedOffsetCeilings(inputs, step.offset),
+            step,
+            paused,
+            handyAtRest
+        });
+        return { step, text };
+    };
+    const dual = { dualStimActive: true, dualDampening: true, dualDampeningBpm: 15 };
+
+    it('states the working ceiling before and after the press', () => {
+        const { text } = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { peakHr: 116 });
+        assert.match(text, /^Log an accidental release\?/);
+        assert.match(text, /Your working climax ceiling goes from 120 to 117 BPM on every session from now on\. Your typed Climax HR stays 120\./);
+        assert.match(text, /This press adds 3 BPM to the learned offset\./);
+        assert.match(text, /yours peaked at 116 BPM in the last minute/);
+        assert.match(text, /The toys are stopped and the session is paused\. OK logs the release and ends the session; Cancel logs nothing and leaves it paused, so RESUME carries on\./);
+        assert.match(text, /Wipe Memory in Session Setup \(Backup\) clears the learned offset\.$/);
+    });
+
+    it('says when there was no reading to judge by, and takes the ordinary step', () => {
+        const { text, step } = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 });
+        assert.equal(step.added, 3);
+        assert.match(text, /goes from 120 to 117 BPM/);
+        assert.match(text, /There is no heart-rate reading from the last minute \(no monitor, or the signal was lost\), so the larger 5 BPM step for a climax well under your Climax HR does not apply\./);
+    });
+
+    it('explains the larger step when the pulse peaked well under the Climax HR', () => {
+        const { text } = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { peakHr: 100 });
+        assert.match(text, /goes from 120 to 115 BPM/);
+        assert.match(text, /This press adds 5 BPM to the learned offset\. That is the larger step: your pulse peaked at only 100 BPM in the last minute, more than 8 BPM under your Climax HR\./);
+    });
+
+    it('never promises a drop the Resting HR floor will not allow', () => {
+        const none = confirmFor({ minHr: 105, maxHr: 120, learnedOffset: 0 }, { peakHr: 118 }).text;
+        assert.match(none, /Your working climax ceiling stays at your typed Climax HR, 120 BPM\./);
+        assert.match(none, /None of it lowers the ceiling: no offset may take the ceiling closer than 15 BPM to your Resting HR \(105\)\./);
+        assert.doesNotMatch(none, /117|goes from/);
+
+        const partial = confirmFor({ minHr: 103, maxHr: 120, learnedOffset: 0 }, { peakHr: 118 }).text;
+        assert.match(partial, /goes from 120 to 118 BPM/);
+        assert.match(partial, /Only 2 BPM of it lowers the ceiling: no offset may take the ceiling closer than 15 BPM to your Resting HR \(103\)\./);
+
+        const alreadyDown = confirmFor({ minHr: 100, maxHr: 120, learnedOffset: 5 }, { peakHr: 118 }).text;
+        assert.match(alreadyDown, /Your working climax ceiling stays at 115 BPM \(your typed Climax HR is 120\)\./);
+        assert.match(alreadyDown, /None of it lowers the ceiling/);
+    });
+
+    it('says so when the learned offset is already at its maximum', () => {
+        const full = confirmFor({ minHr: 70, maxHr: 140, learnedOffset: 30 }, { peakHr: 100 }).text;
+        assert.match(full, /stays at 110 BPM \(your typed Climax HR is 140\)/);
+        assert.match(full, /Your learned offset is already at its 30 BPM maximum, so this press adds nothing to it; the event is still logged\./);
+        const nearly = confirmFor({ minHr: 70, maxHr: 140, learnedOffset: 28 }, { peakHr: 139 }).text;
+        assert.match(nearly, /goes from 112 to 110 BPM/);
+        assert.match(nearly, /This press adds 2 BPM to the learned offset, which takes it to its 30 BPM maximum\./);
+    });
+
+    it('adds the start of a session when dual-stim dampening changes it', () => {
+        const both = confirmFor({ minHr: 70, maxHr: 140, learnedOffset: 0, ...dual }, { peakHr: 139 }).text;
+        assert.match(both, /goes from 140 to 137 BPM/);
+        assert.match(both, /dual-stimulation dampening takes it lower still: a session starts at 122 BPM instead of 125\./);
+        const floored = confirmFor({ minHr: 90, maxHr: 120, learnedOffset: 0, ...dual }, { peakHr: 118 }).text;
+        assert.match(floored, /goes from 120 to 117 BPM/);
+        assert.match(floored, /dual-stimulation dampening holds a session at 105 BPM either way\./);
+        const single = confirmFor({ minHr: 70, maxHr: 140, learnedOffset: 0 }, { peakHr: 139 }).text;
+        assert.doesNotMatch(single, /dual-stimulation/);
+    });
+
+    it('says what OK and Cancel do to a paused session, and nothing of one when none is paused', () => {
+        // The press pauses a session that is driving the toys and asks; only
+        // OK ends it. It used to end it first and then say "Cancel logs
+        // nothing" over a History that already held "Premature Release".
+        const paused = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { paused: true }).text;
+        assert.match(paused, /OK logs the release and ends the session; Cancel logs nothing and leaves it paused, so RESUME carries on\./);
+        assert.doesNotMatch(paused, /has ended/);
+        const idle = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { paused: false }).text;
+        assert.doesNotMatch(idle, /toys are stopped|paused|ends the session|RESUME/);
+        assert.match(idle, /Cancel logs nothing\. Wipe Memory in Session Setup \(Backup\) clears the learned offset\.$/);
+    });
+
+    it('asked over a Handy that has not confirmed its stop, says so instead of "the toys are stopped"', () => {
+        // The press that answers a refusal asks although the Handy never
+        // confirmed its stop (stopThenAsk): that dialog must not tell a
+        // wearer whose Handy may still be moving that the toys are stopped.
+        const paused = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { paused: true, handyAtRest: false }).text;
+        assert.doesNotMatch(paused, /toys are stopped/);
+        assert.match(paused, /\n\nThe session is paused, but the Handy has not confirmed its stop: if it is still moving, switch it off\. OK logs the release and ends the session; Cancel logs nothing and leaves it paused, so RESUME carries on\./);
+        const idle = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { paused: false, handyAtRest: false }).text;
+        assert.doesNotMatch(idle, /toys are stopped|paused|RESUME/);
+        assert.match(idle, /\n\nThe Handy has not confirmed its stop: if it is still moving, switch it off\. Cancel logs nothing\./);
+        // The ceiling it quotes is the same either way.
+        const atRest = confirmFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, { paused: true, handyAtRest: true }).text;
+        assert.equal(atRest.split('\n\n').slice(0, 3).join('\n\n'), paused.split('\n\n').slice(0, 3).join('\n\n'));
+    });
+
+    it('names the minute before the first press when the step was judged there', () => {
+        // The press answers one the Handy turned away (pressAbout): the peak
+        // is from the minute before that first press, not the last minute.
+        const inputs = { minHr: 70, maxHr: 140, learnedOffset: 0 };
+        const texts = (peakFromFirstPress) => [null, 126, 135].map((peakHr) => {
+            const step = cameEarlyStep({ offset: 0, typedMaxHr: 140, peakHr });
+            return describeCameEarlyConfirm({
+                before: learnedOffsetCeilings(inputs, step.previous),
+                after: learnedOffsetCeilings(inputs, step.offset),
+                step,
+                paused: true,
+                peakFromFirstPress
+            });
+        });
+        const [none, larger, ordinary] = texts(true);
+        assert.match(none, /There is no heart-rate reading from the minute before your first press \(no monitor/);
+        assert.match(larger, /your pulse peaked at only 126 BPM in the minute before your first press, more than 8 BPM/);
+        assert.match(ordinary, /yours peaked at 135 BPM in the minute before your first press\./);
+        for (const text of texts(true)) assert.doesNotMatch(text, /the last minute/);
+        for (const text of texts(false)) {
+            assert.match(text, /the last minute/);
+            assert.doesNotMatch(text, /first press/);
+        }
+    });
+
+    it('quotes exactly the ceilings the engine runs on before and after, for any limits', () => {
+        let cases = 0;
+        for (const minHr of [50, 70, 90, 100, 103, 105, 110]) {
+            for (const maxHr of [110, 118, 120, 140]) {
+                for (const learnedOffset of [0, 3, 10, 28, 30]) {
+                    for (const peakHr of [null, 95, 112, 125, 150]) {
+                        for (const dualStimActive of [false, true]) {
+                            const inputs = { minHr, maxHr, learnedOffset, dualStimActive, dualDampening: true, dualDampeningBpm: 15 };
+                            const { step, text } = confirmFor(inputs, { peakHr });
+                            const label = JSON.stringify({ ...inputs, peakHr });
+                            const engineBefore = computeEffectiveCeiling({ minHr, maxHr, learnedOffset });
+                            const engineAfter = computeEffectiveCeiling({ minHr, maxHr, learnedOffset: step.offset });
+                            const moved = text.match(/goes from (\d+) to (\d+) BPM on every session/);
+                            const held = text.match(/stays at (?:your typed Climax HR, )?(\d+) BPM/);
+                            if (engineAfter.maxHr < engineBefore.maxHr) {
+                                assert.ok(moved, `no before/after in ${label}: ${text}`);
+                                assert.equal(Number(moved[1]), engineBefore.maxHr, label);
+                                assert.equal(Number(moved[2]), engineAfter.maxHr, label);
+                            } else {
+                                assert.ok(!moved && held, `a drop promised in ${label}: ${text}`);
+                                assert.equal(Number(held[1]), engineBefore.maxHr, label);
+                            }
+                            const start = text.match(/a session starts at (\d+) BPM instead of (\d+)/);
+                            if (start) {
+                                assert.equal(Number(start[1]), computeEffectiveCeiling({ ...inputs, learnedOffset: step.offset }).maxHr, label);
+                                assert.equal(Number(start[2]), computeEffectiveCeiling(inputs).maxHr, label);
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(cases > 1000, `only ${cases} cases`);
+    });
+});
+
+describe('Came Early: the cue the cockpit speaks', () => {
+    const cueFor = (inputs, peakHr = null) => {
+        const step = cameEarlyStep({ offset: inputs.learnedOffset, typedMaxHr: inputs.maxHr, peakHr });
+        const before = learnedOffsetCeilings(inputs, step.previous);
+        const after = learnedOffsetCeilings(inputs, step.offset);
+        return { step, before, after, cue: cameEarlyCue({ before, after, step }), text: describeCameEarlyConfirm({ before, after, step }) };
+    };
+    const dual = { dualStimActive: true, dualDampening: true, dualDampeningBpm: 15 };
+    // Every line the cockpit can say for a cue, picked and filled the way the
+    // page does it. Twenty rolls reach every line of a bank of up to twenty.
+    const sayable = (cue, cues = {}) => {
+        const texts = new Set();
+        for (let k = 0; k < 20; k += 1) texts.add(resolveVoiceCue(cues, cue.cue, cue.vars, { random: () => (k + 0.5) / 20 }).text);
+        return [...texts];
+    };
+    // The same bank and the same values always give the same lines, so a
+    // sweep asks once for each: resolving every line of every case kept a
+    // CPU busy for two seconds, long enough to starve the wall-clock bounds
+    // of the hardware tests the runner has going at the same time.
+    const sayableByCue = new Map();
+    const sayableOnce = (cue) => {
+        const key = JSON.stringify([cue.cue, cue.vars]);
+        if (!sayableByCue.has(key)) sayableByCue.set(key, sayable(cue));
+        return sayableByCue.get(key);
+    };
+    const claimsDrop = /tighten|tighter|drop|goes down|lower|meaner/i;
+    const claimsFloor = /as low as|no lower|nothing left|lowest|minimum|bottom|floor/i;
+
+    it('names two real phrase banks', () => {
+        assert.equal(isVoiceCueId('cameEarly'), true);
+        assert.equal(isVoiceCueId('cameEarlyHeld'), true);
+    });
+
+    it('speaks the tightened bank only when the next session starts lower', () => {
+        assert.equal(cueFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }, 116).cue.cue, 'cameEarly');
+        // Two of the three BPM come off: the ceiling moved, so it did tighten.
+        assert.equal(cueFor({ minHr: 103, maxHr: 120, learnedOffset: 0 }, 116).cue.cue, 'cameEarly');
+        // The Resting HR floor swallows the whole press.
+        assert.equal(cueFor({ minHr: 105, maxHr: 120, learnedOffset: 0 }, 116).cue.cue, 'cameEarlyHeld');
+        // An earlier press already took the ceiling down to the floor.
+        assert.equal(cueFor({ minHr: 100, maxHr: 120, learnedOffset: 5 }, 116).cue.cue, 'cameEarlyHeld');
+        // The learned offset is at its cap.
+        assert.equal(cueFor({ minHr: 70, maxHr: 140, learnedOffset: 30 }, 100).cue.cue, 'cameEarlyHeld');
+        // Both toys live, and dual-stim dampening takes the session lower too.
+        assert.equal(cueFor({ minHr: 70, maxHr: 140, learnedOffset: 0, ...dual }, 139).cue.cue, 'cameEarly');
+    });
+
+    it('does not promise a meaner next session that dual-stim dampening holds at the floor either way', () => {
+        // Resting 100 puts the floor at 115. The learned ceiling goes 120 ->
+        // 117, but with both toys a session starts at 115 before the press
+        // and after it - which the dialog says in as many words.
+        const { cue, before, after, text } = cueFor({ minHr: 100, maxHr: 120, learnedOffset: 0, ...dual }, 118);
+        assert.equal(after.learned.maxHr, 117);
+        assert.equal(before.start.maxHr, 115);
+        assert.equal(after.start.maxHr, 115);
+        assert.match(text, /goes from 120 to 117 BPM/);
+        assert.match(text, /dual-stimulation dampening holds a session at 115 BPM either way\./);
+        assert.equal(cue.cue, 'cameEarlyHeld');
+        assert.equal(cue.vars.maxHr, 115);
+    });
+
+    it('never tells a wearer whose offset is at its cap that the ceiling is as low as it goes', () => {
+        // Resting 60, Climax 160, the learned offset at its 30 BPM cap: the
+        // press adds nothing, so it is announced from the held bank - over a
+        // ceiling of 130, with the Resting HR floor down at 75.
+        const capped = { minHr: 60, maxHr: 160, learnedOffset: MAX_LEARNED_OFFSET_BPM };
+        const { cue, step, after, text } = cueFor(capped, 118);
+        assert.equal(step.added, 0);
+        assert.equal(cue.cue, 'cameEarlyHeld');
+        assert.equal(after.start.maxHr, 130);
+        assert.equal(after.start.offsetFloorHr, 75);
+        assert.match(text, /already at its 30 BPM maximum/);
+        // It is not as low as it goes: both toys live, or a lower typed
+        // Climax HR, take it lower at once.
+        assert.equal(computeEffectiveCeiling({ ...capped, ...dual }).maxHr, 115);
+        assert.equal(computeEffectiveCeiling({ ...capped, maxHr: 140 }).maxHr, 110);
+        // So nothing the cockpit can say for this press claims it is, or
+        // claims a drop; every line says the ceiling stays where it was.
+        const lines = sayable(cue);
+        assert.equal(lines.length, DEFAULT_VOICE_CUES.cameEarlyHeld.length);
+        for (const said of lines) {
+            assert.doesNotMatch(said, claimsFloor, said);
+            assert.doesNotMatch(said, claimsDrop, said);
+            assert.match(said, /stays|holds|unchanged|the same/i, said);
+        }
+        // With no reading the line built on {hr} is left out, and the rest
+        // say the same.
+        const blind = cueFor(capped).cue;
+        assert.equal(blind.cue, 'cameEarlyHeld');
+        const blindLines = sayable(blind);
+        assert.equal(blindLines.length, DEFAULT_VOICE_CUES.cameEarlyHeld.filter((line) => !line.includes('{hr}')).length);
+        for (const said of blindLines) assert.doesNotMatch(said, new RegExp(`${claimsFloor.source}|BPM`, 'i'), said);
+    });
+
+    it('fills {hr} with the peak the step was judged on, or nothing', () => {
+        assert.equal(cueFor({ minHr: 70, maxHr: 140, learnedOffset: 0 }, 135).cue.vars.hr, 135);
+        assert.equal(cueFor({ minHr: 70, maxHr: 140, learnedOffset: 0 }).cue.vars.hr, null);
+        // With no reading, the factory line built on {hr} is never the one
+        // said: it used to come out as "Accidental release. 70 BPM." from the
+        // pulse the app starts with.
+        const { cue } = cueFor({ minHr: 70, maxHr: 120, learnedOffset: 0 });
+        assert.equal(cue.cue, 'cameEarly');
+        for (let roll = 0; roll < 1; roll += 1 / 64) {
+            const { text } = resolveVoiceCue({}, cue.cue, cue.vars, { random: () => roll });
+            assert.doesNotMatch(text, /BPM/, text);
+            assert.ok(DEFAULT_VOICE_CUES.cameEarly.includes(text), text);
+        }
+        // With a reading, it quotes exactly that.
+        const live = cueFor({ minHr: 70, maxHr: 140, learnedOffset: 0 }, 135).cue;
+        assert.equal(resolveVoiceCue({}, live.cue, live.vars, { random: () => 3.5 / 8 }).text, 'Accidental release. 135 BPM. Limits tighter.');
+    });
+
+    it('fills {maxHr} with the ceiling the cockpit shows once the session has stopped', () => {
+        const { cue, after } = cueFor({ minHr: 70, maxHr: 140, learnedOffset: 0, ...dual }, 139);
+        assert.equal(cue.vars.maxHr, 122);
+        assert.equal(cue.vars.maxHr, after.start.maxHr);
+        // Exactly the engine with the new offset, both toys, no edges, no boost.
+        assert.equal(cue.vars.maxHr, computeEffectiveCeiling({ minHr: 70, maxHr: 140, learnedOffset: 3, ...dual, edges: 0, orgasmBoost: 0 }).maxHr);
+    });
+
+    it('agrees with the dialog for any limits: tightened if and only if the next session starts lower', () => {
+        let cases = 0;
+        for (const minHr of [50, 70, 90, 100, 103, 105, 110]) {
+            for (const maxHr of [110, 118, 120, 140]) {
+                for (const learnedOffset of [0, 3, 10, 28, 30]) {
+                    for (const peakHr of [null, 95, 125]) {
+                        for (const dualStimActive of [false, true]) {
+                            // The running session's decay, Force Orgasm boost
+                            // and Survival climb end with the press: they must
+                            // not decide what is said about the next one.
+                            for (const running of [{}, { adaptiveDecay: true, edges: 12, decayEdgeCount: 2, decayBpm: 3, decayFloor: 80, orgasmBoost: 9, survivalOverdrive: 6 }]) {
+                                const inputs = { minHr, maxHr, learnedOffset, dualStimActive, dualDampening: true, dualDampeningBpm: 15, ...running };
+                                const { cue, text, step } = cueFor(inputs, peakHr);
+                                const label = JSON.stringify({ ...inputs, peakHr });
+                                const next = { ...inputs, edges: 0, orgasmBoost: 0, survivalOverdrive: 0 };
+                                const startBefore = computeEffectiveCeiling(next).maxHr;
+                                const startAfter = computeEffectiveCeiling({ ...next, learnedOffset: step.offset }).maxHr;
+                                assert.equal(cue.cue === 'cameEarly', startAfter < startBefore, `${label}: ${cue.cue}, ${startBefore} -> ${startAfter}`);
+                                // The dialog's own words: a drop on every
+                                // session, and not one dual-stim dampening
+                                // holds at the same number either way.
+                                const promised = /goes from \d+ to \d+ BPM on every session/.test(text)
+                                    && !/holds a session at \d+ BPM either way/.test(text);
+                                assert.equal(cue.cue === 'cameEarly', promised, `${label}: ${cue.cue} over "${text}"`);
+                                // Never a tighter limit over a learned ceiling
+                                // that held.
+                                const learnedBefore = computeEffectiveCeiling({ minHr, maxHr, learnedOffset });
+                                const learnedAfter = computeEffectiveCeiling({ minHr, maxHr, learnedOffset: step.offset });
+                                if (cue.cue === 'cameEarly') assert.ok(learnedAfter.maxHr < learnedBefore.maxHr, label);
+                                assert.equal(cue.vars.hr, step.peakHr, label);
+                                assert.equal(cue.vars.maxHr, startAfter, label);
+                                // And a press that moved nothing never hears
+                                // a drop, or that the ceiling is as low as it
+                                // goes - here at the cap that is often untrue.
+                                if (cue.cue === 'cameEarlyHeld') {
+                                    for (const said of sayableOnce(cue)) {
+                                        assert.doesNotMatch(said, claimsDrop, `${label}: ${said}`);
+                                        assert.doesNotMatch(said, claimsFloor, `${label}: ${said}`);
+                                    }
+                                }
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(cases > 1000, `only ${cases} cases`);
+    });
+});
+
+describe('Wipe Memory: the confirmation', () => {
+    const wipeFor = (inputs) => describeWipeLearningConfirm({
+        before: learnedOffsetCeilings(inputs),
+        after: learnedOffsetCeilings(inputs, 0)
+    });
+
+    it('states the ceiling it gives back', () => {
+        assert.equal(wipeFor({ minHr: 70, maxHr: 120, learnedOffset: 3 }),
+            'Reset local bio-learning memory? Your working climax ceiling goes back up from 117 to 120 BPM, your typed Climax HR, on every session from now on.');
+    });
+
+    it('says when the offset is not lowering anything, or there is none', () => {
+        assert.equal(wipeFor({ minHr: 105, maxHr: 120, learnedOffset: 3 }),
+            'Reset local bio-learning memory? Your working climax ceiling stays at 120 BPM: the learned offset is not lowering it right now, because no offset may take the ceiling closer than 15 BPM to your Resting HR (105).');
+        assert.equal(wipeFor({ minHr: 70, maxHr: 120, learnedOffset: 0 }),
+            'Reset local bio-learning memory? There is no learned offset, so your working climax ceiling stays at 120 BPM, your typed Climax HR.');
+    });
+
+    it('does not claim the typed Climax HR comes back while dual-stim dampening holds it lower', () => {
+        const text = wipeFor({ minHr: 70, maxHr: 140, learnedOffset: 6, dualStimActive: true, dualDampening: true, dualDampeningBpm: 15 });
+        assert.match(text, /goes back up from 134 to 140 BPM/);
+        assert.match(text, /dual-stimulation dampening takes it lower still: a session starts at 125 BPM instead of 119\./);
+    });
+
+    it('quotes the next session, not a Survival climb in progress', () => {
+        const text = wipeFor({ minHr: 70, maxHr: 140, learnedOffset: 6, survivalOverdrive: 11, orgasmBoost: 4, edges: 9 });
+        assert.equal(text, 'Reset local bio-learning memory? Your working climax ceiling goes back up from 134 to 140 BPM, your typed Climax HR, on every session from now on.');
+    });
+});
+
+describe('the Session Setup learning line', () => {
+    const lineFor = (minHr, maxHr, profile, extra = {}) => describeLearningStatus({
+        profile,
+        ceiling: computeEffectiveCeiling({ minHr, maxHr, learnedOffset: profile.suggestedMaxHrOffset, ...extra })
+    });
+    const oneEvent = { breakthroughEvents: 1, suggestedMaxHrOffset: 3, lastBreakthroughHr: 118 };
+
+    it('says nothing is learned on a fresh profile', () => {
+        assert.deepEqual(lineFor(70, 140, { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null }),
+            { active: false, text: 'Zero breakthrough events recorded. No learned offset is taken off your typed Climax HR.' });
+    });
+
+    it('quotes the whole offset when all of it applies', () => {
+        assert.deepEqual(lineFor(102, 120, oneEvent), {
+            active: true,
+            text: 'Active: 1 premature event(s). The learned offset takes 3 BPM off your typed Climax HR on every session: 117 instead of 120 BPM. Last event at 118 BPM.'
+        });
+    });
+
+    it('quotes only what the Resting HR floor lets through', () => {
+        const partial = lineFor(103, 120, oneEvent);
+        assert.equal(partial.text, 'Active: 1 premature event(s). Learned offset 3 BPM, but it takes only 2 BPM off your typed Climax HR, because no offset may take the ceiling closer than 15 BPM to your Resting HR (103): 118 instead of 120 BPM. Last event at 118 BPM.');
+        const none = lineFor(105, 120, oneEvent);
+        assert.equal(none.text, 'Learned offset 3 BPM from 1 premature event(s), but it takes nothing off your typed Climax HR of 120 BPM, because no offset may take the ceiling closer than 15 BPM to your Resting HR (105). Last event at 118 BPM.');
+        assert.equal(none.active, true);
+        assert.doesNotMatch(none.text, /117/);
+    });
+
+    it('describes an offset restored without events, and events without an offset', () => {
+        assert.match(lineFor(70, 140, { breakthroughEvents: 0, suggestedMaxHrOffset: 6, lastBreakthroughHr: null }).text,
+            /^Active: 0 premature event\(s\)\. The learned offset takes 6 BPM off your typed Climax HR on every session: 134 instead of 140 BPM\.$/);
+        assert.equal(lineFor(70, 140, { breakthroughEvents: 2, suggestedMaxHrOffset: 0, lastBreakthroughHr: null }).text,
+            '2 premature event(s) recorded, but no learned offset is taken off your typed Climax HR.');
+    });
+
+    it('is the same whatever dual-stim, decay, Force Orgasm or Survival do on top', () => {
+        const plain = lineFor(70, 140, oneEvent);
+        const busy = lineFor(70, 140, oneEvent, {
+            dualStimActive: true, dualDampening: true, dualDampeningBpm: 15,
+            adaptiveDecay: true, edges: 12, orgasmBoost: 20, survivalOverdrive: 9
+        });
+        assert.deepEqual(busy, plain);
+    });
+
+    it('never names a ceiling below the one the engine runs on', () => {
+        for (const minHr of [50, 70, 95, 100, 103, 104, 105, 110, 125]) {
+            for (const maxHr of [100, 118, 120, 140]) {
+                for (const offset of [0, 1, 3, 5, 15, 30]) {
+                    const profile = { breakthroughEvents: 2, suggestedMaxHrOffset: offset, lastBreakthroughHr: null };
+                    const ceiling = computeEffectiveCeiling({ minHr, maxHr, learnedOffset: offset });
+                    const { text } = describeLearningStatus({ profile, ceiling });
+                    const label = `${minHr}/${maxHr} offset ${offset}: ${text}`;
+                    const instead = text.match(/(\d+) instead of (\d+) BPM/);
+                    if (ceiling.appliedLearned > 0) {
+                        assert.ok(instead, label);
+                        assert.equal(Number(instead[1]), ceiling.maxHr, label);
+                        assert.equal(Number(instead[2]), maxHr, label);
+                        const takes = text.match(/takes (?:only )?(\d+) BPM off your typed Climax HR/);
+                        assert.ok(takes, label);
+                        assert.equal(Number(takes[1]), ceiling.appliedLearned, label);
+                    } else {
+                        assert.ok(!instead, label);
+                        assert.match(text, /takes nothing off|no learned offset is taken off/i, label);
+                    }
+                }
+            }
+        }
+    });
+});
+
+describe('Came Early, from the press to the stored profile', () => {
+    // The page's handler in order: the peak of the monitor's readings, the
+    // step, the dialog, and then exactly that step stored.
+    const press = (readings, now, inputs) => {
+        const step = cameEarlyStep({ offset: inputs.learnedOffset, typedMaxHr: inputs.maxHr, peakHr: recentPeakHr(readings, now) });
+        const text = describeCameEarlyConfirm({
+            before: learnedOffsetCeilings(inputs, step.previous),
+            after: learnedOffsetCeilings(inputs, step.offset),
+            step,
+            paused: true
+        });
+        const profile = sanitizeLearningProfile({ breakthroughEvents: 1, suggestedMaxHrOffset: step.offset, lastBreakthroughHr: step.peakHr });
+        return { text, profile };
+    };
+
+    it('with no monitor: the ordinary step, and no pulse invented for the event', () => {
+        const { text, profile } = press([], 1_700_000_000_000, { minHr: 70, maxHr: 120, learnedOffset: 0 });
+        assert.deepEqual(profile, { breakthroughEvents: 1, suggestedMaxHrOffset: 3, lastBreakthroughHr: null });
+        assert.match(text, /goes from 120 to 117 BPM/);
+    });
+
+    it('with a climax near the ceiling and the pulse falling at the press: the ordinary step', () => {
+        const now = 1_700_000_100_000;
+        const readings = [];
+        // Peak 135 against a 140 Climax HR, then down to 120 by the press:
+        // judged at the press it would have been the larger step.
+        for (const [back, bpm] of [[40, 128], [30, 135], [20, 131], [10, 125], [1, 120]]) rememberReading(readings, now - back * 1000, bpm);
+        const { text, profile } = press(readings, now, { minHr: 70, maxHr: 140, learnedOffset: 0 });
+        assert.deepEqual(profile, { breakthroughEvents: 1, suggestedMaxHrOffset: 3, lastBreakthroughHr: 135 });
+        assert.match(text, /goes from 140 to 137 BPM/);
+        // The engine then runs on the number the dialog promised.
+        assert.equal(computeEffectiveCeiling({ minHr: 70, maxHr: 140, learnedOffset: profile.suggestedMaxHrOffset }).maxHr, 137);
+    });
+
+    it('after STOP at the point of no return: the climax after STOP is the peak', () => {
+        // The wearer stops the toys as they tip over, climaxes with nothing
+        // running, and presses. The readings after STOP are the climax; the
+        // readings up to STOP alone would quote 126 as the peak, take the
+        // larger step on it and store it as the event.
+        const stop = 1_700_000_300_000;
+        const readings = [];
+        for (const [back, bpm] of [[6, 110], [5, 115], [4, 120], [3, 124], [2, 126], [1, 126]]) rememberReading(readings, stop - back * 1000, bpm);
+        for (const [ahead, bpm] of [[1, 130], [2, 134], [3, 138], [4, 138], [5, 137], [6, 135], [7, 131], [8, 128]]) rememberReading(readings, stop + ahead * 1000, bpm);
+        const { text, profile } = press(readings, stop + 9000, { minHr: 70, maxHr: 140, learnedOffset: 0 });
+        assert.deepEqual(profile, { breakthroughEvents: 1, suggestedMaxHrOffset: 3, lastBreakthroughHr: 138 });
+        assert.match(text, /This press adds 3 BPM to the learned offset\./);
+        assert.match(text, /yours peaked at 138 BPM in the last minute/);
+    });
+
+    it('with a climax well under the ceiling: the larger step', () => {
+        const now = 1_700_000_200_000;
+        const readings = [];
+        for (const [back, bpm] of [[50, 118], [35, 126], [25, 121], [5, 112]]) rememberReading(readings, now - back * 1000, bpm);
+        const { profile } = press(readings, now, { minHr: 70, maxHr: 140, learnedOffset: 0 });
+        assert.deepEqual(profile, { breakthroughEvents: 1, suggestedMaxHrOffset: 5, lastBreakthroughHr: 126 });
+    });
+
+    it('is described in Session Setup with the numbers the code uses', () => {
+        // The paragraph under the learning line is what a wearer reads before
+        // pressing; a step or a window changed here without it would make it
+        // the next thing on screen that is wrong about the ceiling.
+        const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
+        const para = html.match(/Tap <strong>Came Early<\/strong> after an accidental climax\.[\s\S]*?<\/p>/);
+        assert.ok(para, 'the Came Early paragraph is gone from Session Setup');
+        const text = para[0];
+        assert.ok(text.includes(`${CAME_EARLY_STEP_BPM} BPM a press, or ${CAME_EARLY_STEP_BPM + CAME_EARLY_BONUS_BPM} when your pulse peaked more than ${CAME_EARLY_BONUS_MARGIN_BPM} BPM under your Climax HR`), text);
+        assert.ok(text.includes(`in the minute before you pressed`) && CAME_EARLY_PEAK_WINDOW_MS === 60 * 1000, text);
+        assert.ok(text.includes(`up to ${MAX_LEARNED_OFFSET_BPM} BPM in all`), text);
+        assert.ok(text.includes(`closer than ${MIN_CEILING_GAP} BPM to your Resting HR`), text);
     });
 });
 
@@ -615,7 +1499,11 @@ describe('survival climb', () => {
         assert.equal(src.includes('isSurvivalDefeated'), false);
     });
 
-    it('saves the run peak from the Came Early button only after the wearer confirms', () => {
+    it('wires both buttons through the one stop-then-ask gate, and only OK saves or ends anything', () => {
+        // The page wiring. When the question may be asked is stopThenAsk's
+        // and createQuestionGate's, what is offered, refused and stored is
+        // planFinishedMe's and the Came Early helpers', all tested below; the
+        // page proof presses the button.
         const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
         const html = readFileSync(new URL('../../index.html', import.meta.url), 'utf8');
         assert.equal(html.includes('survivalCameBtn'), false);
@@ -624,12 +1512,39 @@ describe('survival climb', () => {
         assert.match(html, /id="wizardCalibrateBtn"/);
         assert.match(src, /Finished me/);
         assert.match(src, /survivalCalibrating/);
-        const handler = src.match(/cameEarlyBtn\?\.addEventListener\([\s\S]*?stopSession\('Survival calibration'/);
-        assert.ok(handler, 'Finished me has no handler on the Came Early button');
-        assert.match(handler[0], /activeMode === 'survival'/);
-        assert.match(handler[0], /confirm\(/);
-        assert.equal(handler[0].includes('suggestedMaxHrOffset'), false);
-        assert.match(handler[0], /isRemotePage/);
+        const click = src.match(/cameEarlyBtn\?\.addEventListener\('click', \(event\) => \{[\s\S]*?\n\}\);/);
+        assert.ok(click, 'the Came Early button has no click handler');
+        assert.match(click[0], /isRemotePage/);
+        assert.match(click[0], /event\?\.timeStamp/);
+        assert.match(click[0], /activeMode === 'survival'\) finishedMe\(tappedAt\)/);
+        assert.match(click[0], /else cameEarly\(tappedAt\)/);
+        const gate = src.match(/function stopThenAskOnce\([\s\S]*?\n\}/);
+        assert.ok(gate, 'no stop-then-ask gate');
+        assert.match(gate[0], /pressQuestion\.run\(/);
+        assert.match(gate[0], /handyRest: handyRestState/);
+        // The line that ends the wait is said whenever a stop the press
+        // waited for went unanswered, so it can never claim a confirmation.
+        assert.match(gate[0], /stopTally: handyStopTally/);
+        assert.match(gate[0], /if \(answer\.waited \|\| answer\.unanswered\) cueVoice\(describeStopWaitOver\(answer\)\);/);
+        assert.match(gate[0], /\{ pressedAt: tappedAt \}/);
+        assert.match(src, /const pressQuestion = createQuestionGate\(\{ now: \(\) => performance\.now\(\) \}\);/);
+        for (const name of ['finishedMe', 'cameEarly']) {
+            const handler = src.match(new RegExp(`function ${name}\\(tappedAt\\) \\{[\\s\\S]*?\\n\\}`));
+            assert.ok(handler, `${name} has no handler`);
+            const body = handler[0];
+            const gated = body.indexOf('stopThenAskOnce(');
+            assert.ok(gated >= 0, `${name} does not stop before it asks`);
+            // Nothing is asked, planned from the profile, stored or ended
+            // outside the question.
+            for (const late of ['confirm(', 'readHrLimits()', 'stopSession(', 'persistSettings()', "getElementById('maxHr')"]) {
+                const at = body.indexOf(late);
+                assert.ok(at < 0 || at > gated, `${name}: ${late} comes before the stop`);
+            }
+            assert.ok(body.indexOf('stopSession(') > body.indexOf('confirm('), `${name}: the session is ended before OK`);
+        }
+        const finished = src.match(/function finishedMe\(tappedAt\) \{[\s\S]*?\n\}/)[0];
+        assert.ok(finished.indexOf("getElementById('maxHr')") > finished.indexOf('confirm(plan.text)'), 'the Climax HR is written before the Yes');
+        assert.equal(finished.includes('suggestedMaxHrOffset'), false);
         assert.match(src, /suggestedMaxHrOffset/);
     });
 });
@@ -666,6 +1581,1129 @@ describe('survival breach counter', () => {
         assert.equal(ticks, 1, 'a held value is not a new reading below the ceiling either');
         ticks = countSurvivalBreach(ticks, 139, 140, true);
         assert.equal(ticks, 0);
+    });
+});
+
+describe('Finished me: the heart rate a run held', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    // One reading a second, as a chest strap sends them.
+    const strap = (bpms, from = 0) => bpms.map((bpm, i) => ({ at: at(from + i), bpm }));
+
+    it('holds a value on two consecutive readings, the lower of the two', () => {
+        assert.equal(heldOnTwoReadings({ at: at(0), bpm: 150 }, { at: at(1), bpm: 180 }), 150);
+        assert.equal(heldOnTwoReadings({ at: at(0), bpm: 180 }, { at: at(1), bpm: 150 }), 150);
+        assert.equal(heldOnTwoReadings({ at: at(0), bpm: 151 }, { at: at(1), bpm: 151 }), 151);
+        assert.equal(heldOnTwoReadings(null, { at: at(1), bpm: 150 }), null);
+        assert.equal(heldOnTwoReadings({ at: at(1), bpm: 150 }, undefined), null);
+    });
+
+    it('calls two readings consecutive only within the signal-loss timeout', () => {
+        const a = { at: at(0), bpm: 150 };
+        // 8 s unless the wearer changed it.
+        assert.equal(heldOnTwoReadings(a, { at: at(8), bpm: 152 }), 150);
+        assert.equal(heldOnTwoReadings(a, { at: at(8) + 1, bpm: 152 }), null);
+        assert.equal(heldOnTwoReadings(a, { at: at(12), bpm: 152 }, { staleSeconds: 12 }), 150);
+        assert.equal(heldOnTwoReadings(a, { at: at(4), bpm: 152 }, { staleSeconds: 3 }), null);
+        // Held to the 3-20 s the app allows, whatever a caller passes.
+        assert.equal(heldOnTwoReadings(a, { at: at(21), bpm: 152 }, { staleSeconds: 600 }), null);
+        assert.equal(heldOnTwoReadings(a, { at: at(20), bpm: 152 }, { staleSeconds: 600 }), 150);
+        assert.equal(heldOnTwoReadings(a, { at: at(3), bpm: 152 }, { staleSeconds: 0 }), 150);
+        // A reading stamped before the one it follows says nothing about how
+        // long the pulse stayed: a wall clock set back is a gap.
+        assert.equal(heldOnTwoReadings({ at: at(5), bpm: 150 }, { at: at(4), bpm: 150 }), null);
+    });
+
+    it('holds nothing on a value that is not a pulse', () => {
+        for (const bpm of [0, 20, 34, 251, NaN, '150', null]) {
+            assert.equal(heldOnTwoReadings({ at: at(0), bpm }, { at: at(1), bpm: 150 }), null, String(bpm));
+            assert.equal(heldOnTwoReadings({ at: at(0), bpm: 150 }, { at: at(1), bpm }), null, String(bpm));
+        }
+        assert.equal(heldOnTwoReadings({ at: NaN, bpm: 150 }, { at: at(1), bpm: 150 }), null);
+    });
+
+    it('never takes one glitch reading as the peak', () => {
+        // The measured case: one packet of 180 during a 120-150 run. 1.1.2
+        // offered 180 and saved it.
+        const run = strap([120, 128, 135, 141, 146, 150, 180, 149, 147, 150, 144]);
+        assert.equal(sustainedPeakHr(run), 150);
+        // A glitch with only one neighbour cannot hold either.
+        assert.equal(sustainedPeakHr(strap([190, 120, 121])), 120);
+        assert.equal(sustainedPeakHr(strap([120, 121, 190])), 121);
+        // One reading alone is no peak at all.
+        assert.equal(sustainedPeakHr(strap([150])), null);
+        assert.equal(sustainedPeakHr([]), null);
+        assert.equal(sustainedPeakHr(undefined), null);
+    });
+
+    it('takes a value two readings in a row reached', () => {
+        assert.equal(sustainedPeakHr(strap([150, 180, 180, 150])), 180);
+        assert.equal(sustainedPeakHr(strap([150, 170, 176, 150])), 170);
+        // A relay app that sends every 5 s is still read, pair by pair.
+        assert.equal(sustainedPeakHr([150, 160, 158].map((bpm, i) => ({ at: at(i * 5), bpm }))), 158);
+        // Across a drop-out longer than the timeout it is not.
+        assert.equal(sustainedPeakHr([{ at: at(0), bpm: 160 }, { at: at(30), bpm: 160 }]), null);
+    });
+
+    it('skips what is not a reading, as the watchdog does', () => {
+        // A 0 BPM "no contact" packet between two readings is not a reading,
+        // and the two either side of it are still consecutive.
+        const readings = [{ at: at(0), bpm: 150 }, { at: at(1), bpm: 0 }, { at: at(2), bpm: 152 }, null, { at: at(3), bpm: 400 }];
+        assert.equal(sustainedPeakHr(readings), 150);
+    });
+});
+
+describe('Finished me: the readings that belong to the run', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    // Feed one reading a second through the record, each with how the page
+    // saw it arrive.
+    const feed = (win, rows, from = 0) => rows.reduce(
+        (w, [bpm, how = {}], i) => noteCalibrationReading(w, { at: at(from + i), bpm, running: true, ...how }),
+        win
+    );
+    const paused = { running: false };
+    const sim = { simulator: true };
+
+    it('counts the monitor\'s readings while the run is running', () => {
+        const win = feed(openCalibrationWindow(at(0)), [[120], [131], [142], [150], [180], [148], [151]]);
+        assert.equal(win.peakHr, 150);
+        assert.equal(win.highestHr, 180);
+        assert.equal(win.counted, 7);
+        assert.equal(win.simulated, 0);
+    });
+
+    it('never counts a reading taken while paused, and does not pair across it', () => {
+        // The pause readings went higher than anything the run held.
+        const win = feed(openCalibrationWindow(at(0)), [[140], [141], [170, paused], [171, paused], [150], [142]]);
+        assert.equal(win.peakHr, 142);
+        assert.equal(win.highestHr, 150);
+        // 150 has no counted neighbour before it: the reading before it was
+        // taken while paused.
+        const straddle = feed(openCalibrationWindow(at(0)), [[140], [160, paused], [158]]);
+        assert.equal(straddle.peakHr, null);
+    });
+
+    it('never counts the simulator, and says so', () => {
+        const win = feed(openCalibrationWindow(at(0)), [[180, sim], [182, sim], [181, sim]]);
+        assert.equal(win.peakHr, null);
+        assert.equal(win.counted, 0);
+        assert.equal(win.simulated, 3);
+        // The simulator between two strap readings breaks their pair too.
+        const mixed = feed(openCalibrationWindow(at(0)), [[140], [141], [190, sim], [150], [139]]);
+        assert.equal(mixed.peakHr, 140);
+        // A slider moved while nothing runs is not the run's either.
+        assert.equal(feed(openCalibrationWindow(at(0)), [[150, { simulator: true, running: false }]]).simulated, 0);
+    });
+
+    it('stops counting at the stop, and keeps what it had', () => {
+        let win = feed(openCalibrationWindow(at(0)), [[140], [145], [146]]);
+        win = closeCalibrationWindow(win, at(3));
+        assert.equal(win.closedAt, at(3));
+        // The pulse after STOP - the wearer tipping over anyway - is not the run.
+        const after = feed(win, [[170], [172], [171]], 4);
+        assert.equal(after, win);
+        assert.equal(after.peakHr, 145);
+        // Closing twice keeps the first stop.
+        assert.equal(closeCalibrationWindow(win, at(50)).closedAt, at(3));
+        // A clock nobody can read closes it as long ago.
+        assert.equal(closeCalibrationWindow(openCalibrationWindow(at(0)), NaN).closedAt, -Infinity);
+    });
+
+    it('never changes the record it was given', () => {
+        const win = openCalibrationWindow(at(0));
+        const copy = JSON.parse(JSON.stringify(win));
+        const next = noteCalibrationReading(win, { at: at(1), bpm: 150, running: true });
+        noteCalibrationReading(next, { at: at(2), bpm: 151, running: true });
+        closeCalibrationWindow(next, at(3));
+        assert.deepEqual(win, copy);
+        assert.equal(next.counted, 1);
+        // No record, nothing to write to.
+        assert.equal(noteCalibrationReading(null, { at: at(1), bpm: 150, running: true }), null);
+        assert.equal(closeCalibrationWindow(null, at(1)), null);
+    });
+
+    it('ignores a packet that is not a pulse, without breaking the pair', () => {
+        const win = feed(openCalibrationWindow(at(0)), [[150], [0], [152], [20]]);
+        assert.equal(win.peakHr, 150);
+        assert.equal(win.counted, 2);
+    });
+});
+
+describe('Finished me: what a press may do', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const heldAt = (bpm) => {
+        let win = openCalibrationWindow(at(0));
+        for (let s = 1; s <= 3; s += 1) win = noteCalibrationReading(win, { at: at(s), bpm, running: true });
+        return win;
+    };
+
+    it('offers the sustained peak of a run that is going', () => {
+        assert.deepEqual(judgeFinishedMe({ window: heldAt(152), now: at(4), restingHr: 70 }), { verdict: 'offer', peakHr: 152, highestHr: 152 });
+    });
+
+    it('reads a run for a minute after it stopped, and no longer', () => {
+        assert.equal(FINISHED_ME_AFTER_STOP_MS, 60 * 1000);
+        const stopped = closeCalibrationWindow(heldAt(152), at(10));
+        assert.equal(judgeFinishedMe({ window: stopped, now: at(10), restingHr: 70 }).verdict, 'offer');
+        assert.equal(judgeFinishedMe({ window: stopped, now: at(70), restingHr: 70 }).verdict, 'offer');
+        assert.equal(judgeFinishedMe({ window: stopped, now: at(70) + 1, restingHr: 70 }).verdict, 'too-late');
+        assert.equal(judgeFinishedMe({ window: stopped, now: NaN, restingHr: 70 }).verdict, 'too-late');
+        assert.equal(judgeFinishedMe({ window: closeCalibrationWindow(heldAt(152), NaN), now: at(10), restingHr: 70 }).verdict, 'too-late');
+        // A run that is still going has no such limit.
+        assert.equal(judgeFinishedMe({ window: heldAt(152), now: at(4000), restingHr: 70 }).verdict, 'offer');
+    });
+
+    it('has nothing to offer without a run, or without a held reading', () => {
+        assert.deepEqual(judgeFinishedMe({ window: null, now: at(1), restingHr: 70 }), { verdict: 'no-run' });
+        assert.deepEqual(judgeFinishedMe({ window: openCalibrationWindow(at(0)), now: at(1), restingHr: 70 }), { verdict: 'no-reading' });
+        const single = noteCalibrationReading(openCalibrationWindow(at(0)), { at: at(1), bpm: 150, running: true });
+        assert.equal(judgeFinishedMe({ window: single, now: at(2), restingHr: 70 }).verdict, 'no-reading');
+        const simulated = noteCalibrationReading(openCalibrationWindow(at(0)), { at: at(1), bpm: 150, running: true, simulator: true });
+        assert.equal(judgeFinishedMe({ window: simulated, now: at(2), restingHr: 70 }).verdict, 'simulator');
+    });
+
+    it('refuses a peak no climax reaches, and takes one at the bounds', () => {
+        assert.equal(MAX_CALIBRATION_HR, 220);
+        assert.equal(MIN_CALIBRATION_HR, 40);
+        assert.deepEqual(judgeFinishedMe({ window: heldAt(221), now: at(4), restingHr: 70 }), { verdict: 'too-high', peakHr: 221 });
+        assert.equal(judgeFinishedMe({ window: heldAt(250), now: at(4), restingHr: 70 }).verdict, 'too-high');
+        assert.equal(judgeFinishedMe({ window: heldAt(220), now: at(4), restingHr: 70 }).verdict, 'offer');
+        assert.deepEqual(judgeFinishedMe({ window: heldAt(39), now: at(4), restingHr: 30 }), { verdict: 'too-low', peakHr: 39 });
+        assert.equal(judgeFinishedMe({ window: heldAt(40), now: at(4), restingHr: 30 }).verdict, 'offer');
+    });
+
+    it('refuses a peak at or below the Resting HR', () => {
+        assert.deepEqual(judgeFinishedMe({ window: heldAt(76), now: at(4), restingHr: 80 }), { verdict: 'not-above-resting', peakHr: 76 });
+        assert.equal(judgeFinishedMe({ window: heldAt(80), now: at(4), restingHr: 80 }).verdict, 'not-above-resting');
+        assert.equal(judgeFinishedMe({ window: heldAt(81), now: at(4), restingHr: 80 }).verdict, 'offer');
+        assert.equal(judgeFinishedMe({ window: heldAt(150), now: at(4), restingHr: NaN }).verdict, 'not-above-resting');
+    });
+});
+
+describe('Finished me: never a raise nobody was told about', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const heldAt = (bpm) => {
+        let win = openCalibrationWindow(at(0));
+        for (let s = 1; s <= 3; s += 1) win = noteCalibrationReading(win, { at: at(s), bpm, running: true });
+        return win;
+    };
+    const planFor = (restingHr, typedMaxHr, peakHr) => planFinishedMe({
+        calibrating: true,
+        paused: true,
+        window: heldAt(peakHr),
+        now: at(4),
+        inputs: { minHr: restingHr, maxHr: typedMaxHr, learnedOffset: 0 },
+        holdPercent: 100
+    });
+
+    it('refuses the measured case instead of storing the factory pair', () => {
+        // Resting 80, a run that held 76: 1.1.2 confirmed "Set Climax HR to
+        // 76?" and the settings, refusing 80 / 76, stored 70 / 140.
+        const plan = planFor(80, 120, 76);
+        assert.equal(plan.ask, 'alert');
+        assert.equal(plan.saveHr, null);
+        assert.match(plan.text, /76 BPM, which is not above your Resting HR of 80 BPM/);
+        assert.match(plan.text, /Your Climax HR stays 120 BPM\./);
+        assert.equal(sanitizeSessionLimits({ minHr: 80, maxHr: 76 }).maxHr, 140, 'the pair it would have stored');
+    });
+
+    it('stores exactly the number it offered, beside the Resting HR it was judged against', () => {
+        let offers = 0;
+        for (let restingHr = 30; restingHr <= 130; restingHr += 5) {
+            for (let peakHr = 35; peakHr <= 250; peakHr += 1) {
+                const plan = planFor(restingHr, 140, peakHr);
+                const label = `Resting ${restingHr}, peak ${peakHr}`;
+                if (plan.saveHr === null) {
+                    assert.equal(plan.ask, 'alert', label);
+                    assert.ok(peakHr <= restingHr || peakHr > MAX_CALIBRATION_HR || peakHr < MIN_CALIBRATION_HR, label);
+                    continue;
+                }
+                offers += 1;
+                assert.equal(plan.ask, 'confirm', label);
+                assert.equal(plan.saveHr, peakHr, label);
+                assert.match(plan.text, new RegExp(`^Set your Climax HR to ${peakHr} BPM\\?`), label);
+                // What the settings keep of that pair is that pair: never
+                // the factory 70 / 140 a refused pair falls back to.
+                const stored = sanitizeSessionLimits({ minHr: restingHr, maxHr: plan.saveHr });
+                assert.equal(stored.minHr, restingHr, label);
+                assert.equal(stored.maxHr, peakHr, label);
+            }
+        }
+        assert.ok(offers > 2000, `only ${offers} offers`);
+    });
+});
+
+describe('Finished me: the confirmation', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const run = (bpms) => bpms.reduce(
+        (w, bpm, i) => noteCalibrationReading(w, { at: at(i + 1), bpm, running: true }),
+        openCalibrationWindow(at(0))
+    );
+    const planFor = (inputs, bpms, holdPercent = 100, paused = true) => planFinishedMe({
+        calibrating: true,
+        paused,
+        window: run(bpms),
+        now: at(bpms.length + 1),
+        inputs,
+        holdPercent
+    });
+    const typed = { minHr: 70, maxHr: 140 };
+    const dual = { dualStimActive: true, dualDampening: true, dualDampeningBpm: 15 };
+
+    it('offers the held peak and says what the Climax HR is now', () => {
+        const plan = planFor({ ...typed, learnedOffset: 0 }, [140, 148, 152, 152, 150]);
+        assert.equal(plan.saveHr, 152);
+        assert.equal(plan.text, [
+            'Set your Climax HR to 152 BPM?',
+            '152 BPM is the highest heart rate your monitor held on two readings in a row while this Survival run was running. Your Climax HR is 140 BPM now.',
+            'The next session pulls back at 152 BPM.',
+            'The toys are stopped and the run is paused. OK saves it and ends the run; Cancel keeps your Climax HR at 140 BPM and leaves the run paused, so RESUME carries on.'
+        ].join('\n\n'));
+        assert.equal(plan.line, 'Saved. Your Climax HR is 152 BPM.');
+        assert.equal(plan.cancelLine, 'Not saved. Your Climax HR stays 140 BPM.');
+        // OK ends the run it paused, and only then is it in History.
+        assert.equal(plan.outcome, 'Survival calibration');
+    });
+
+    it('pressed after STOP, says nothing of a run to end', () => {
+        const plan = planFor({ ...typed, learnedOffset: 0 }, [150, 152, 152], 100, false);
+        assert.equal(plan.saveHr, 152);
+        assert.match(plan.text, /\n\nThe toys are stopped\. Cancel keeps your Climax HR at 140 BPM\.$/);
+        assert.doesNotMatch(plan.text, /paused|ends the run|RESUME/);
+    });
+
+    it('asked over a Handy that has not confirmed its stop, never says the toys are stopped', () => {
+        // Every dialog Finished me can open - the offer, each refusal, the
+        // end of a run without Calibration - with and without a run paused
+        // behind it.
+        const inputs = { ...typed, learnedOffset: 0 };
+        const cases = [];
+        for (const paused of [true, false]) {
+            cases.push(['offer', planFinishedMe({ calibrating: true, paused, window: run([150, 152, 152]), now: at(4), inputs, holdPercent: 100, handyAtRest: false })]);
+            cases.push(['too-high', planFinishedMe({ calibrating: true, paused, window: run([231, 232, 233]), now: at(4), inputs, holdPercent: 100, handyAtRest: false })]);
+            cases.push(['no-run', planFinishedMe({ calibrating: true, paused, window: null, now: at(4), inputs, holdPercent: 100, handyAtRest: false })]);
+            cases.push([paused ? 'end-run' : 'not-calibrating', planFinishedMe({ calibrating: false, paused, window: run([150, 152]), now: at(3), inputs, holdPercent: 100, handyAtRest: false })]);
+        }
+        for (const [verdict, plan] of cases) {
+            assert.equal(plan.verdict, verdict);
+            assert.doesNotMatch(plan.text, /toys are stopped/, verdict);
+            assert.match(plan.text, /the Handy has not confirmed its stop: if it is still moving, switch it off\./i, verdict);
+        }
+        const [, offer] = cases[0];
+        assert.equal(offer.saveHr, 152, 'the number is the run\'s, whatever the Handy did');
+        assert.match(offer.text, /\n\nThe run is paused, but the Handy has not confirmed its stop: if it is still moving, switch it off\. OK saves it and ends the run; Cancel keeps your Climax HR at 140 BPM and leaves the run paused, so RESUME carries on\.$/);
+        const [, refusedPaused] = cases[1];
+        assert.match(refusedPaused.text, /\n\nThe run is paused, but the Handy has not confirmed its stop: if it is still moving, switch it off\. RESUME carries on, STOP ends it\.$/);
+        const [, refusedIdle] = cases[5];
+        assert.match(refusedIdle.text, /\n\nThe Handy has not confirmed its stop: if it is still moving, switch it off\.$/);
+    });
+
+    it('says a higher single reading was not held, so the offered number is explained', () => {
+        const plan = planFor({ ...typed, learnedOffset: 0 }, [140, 148, 150, 180, 149, 150]);
+        assert.equal(plan.saveHr, 150);
+        assert.match(plan.text, /One reading went up to 180 BPM, but no reading next to it did - a sensor glitch can do that - so it is not used\./);
+    });
+
+    it('keeps a learned offset, and says the next session pulls back that much lower', () => {
+        // 1.1.2 said "the next session uses 152" over a learned offset of 3,
+        // which has it pulling back at 149.
+        const plan = planFor({ ...typed, learnedOffset: 3 }, [150, 152, 152]);
+        assert.equal(plan.saveHr, 152);
+        assert.match(plan.text, /Your learned offset of 3 BPM is kept, so the next session pulls back at 149 BPM, not 152\. Wipe Memory in Session Setup \(Backup\) clears the learned offset\./);
+        assert.doesNotMatch(plan.text, /uses 152/);
+    });
+
+    it('says when the Resting HR floor holds part or all of the offset back', () => {
+        const partial = planFor({ minHr: 95, maxHr: 140, learnedOffset: 5 }, [112, 112]);
+        assert.match(partial.text, /Your learned offset of 5 BPM is kept, but only 2 BPM of it applies, because no offset may take the ceiling closer than 15 BPM to your Resting HR \(95\), so the next session pulls back at 110 BPM, not 112\./);
+        const none = planFor({ minHr: 97, maxHr: 140, learnedOffset: 5 }, [112, 112]);
+        assert.match(none.text, /Your learned offset of 5 BPM is kept, but none of it applies, because no offset may take the ceiling closer than 15 BPM to your Resting HR \(97\), so the next session pulls back at 112 BPM\./);
+    });
+
+    it('takes dual-stim dampening off with the toys connected now', () => {
+        const both = planFor({ ...typed, learnedOffset: 3, ...dual }, [152, 152]);
+        assert.match(both.text, /Your learned offset of 3 BPM is kept, and with your toys connected as they are now, dual-stimulation dampening takes 15 BPM more off, so the next session pulls back at 134 BPM, not 152\./);
+        const dualOnly = planFor({ ...typed, learnedOffset: 0, ...dual }, [152, 152]);
+        assert.match(dualOnly.text, /With your toys connected as they are now, dual-stimulation dampening takes 15 BPM off, so the next session pulls back at 137 BPM, not 152\./);
+    });
+
+    it('names the pullback percent when it is below 100', () => {
+        const plan = planFor({ ...typed, learnedOffset: 3 }, [152, 152], 95);
+        assert.match(plan.text, /Your learned offset of 3 BPM is kept, so the next session's working ceiling is 149 BPM, and it pulls back at 142 BPM, the 95% you set\./);
+        const lifted = planFor({ minHr: 80, maxHr: 140, learnedOffset: 0 }, [90, 90], 90);
+        assert.match(lifted.text, /The next session's working ceiling is 90 BPM, and it pulls back at 86 BPM: 90% of that is 81, lifted to clear your Resting HR \(80\)\./);
+    });
+
+    it('never quotes the running session\'s climb or boost for the next one', () => {
+        // Pressed in the middle of a Survival climb with Force Orgasm on: the
+        // next session starts from none of it.
+        const inputs = { ...typed, learnedOffset: 3, survivalOverdrive: 12, orgasmBoost: 9, edges: 14, adaptiveDecay: true };
+        const plan = planFor(inputs, [150, 152, 152]);
+        assert.match(plan.text, /the next session pulls back at 149 BPM, not 152/);
+    });
+
+    it('quotes exactly where the engine will pull back, for any limits', () => {
+        let cases = 0;
+        for (const minHr of [50, 70, 90, 100, 110, 125]) {
+            for (const learnedOffset of [0, 3, 12, 30]) {
+                for (const peakHr of [96, 118, 130, 152, 176, 205]) {
+                    for (const dualStimActive of [false, true]) {
+                        for (const holdPercent of [90, 95, 100]) {
+                            if (peakHr <= minHr) continue;
+                            const inputs = { minHr, maxHr: 140, learnedOffset, dualStimActive, dualDampening: true, dualDampeningBpm: 15, adaptiveDecay: true, edges: 9, survivalOverdrive: 8 };
+                            const plan = planFor(inputs, [peakHr, peakHr], holdPercent);
+                            const label = JSON.stringify({ ...inputs, peakHr, holdPercent });
+                            assert.equal(plan.saveHr, peakHr, label);
+                            // The engine at the start of the next session:
+                            // the new Climax HR, the kept offset, the toys as
+                            // they are, and nothing of this session.
+                            const engine = computeEffectiveCeiling({ ...inputs, maxHr: peakHr, edges: 0, orgasmBoost: 0, survivalOverdrive: 0 });
+                            const mark = resolveEdgeTriggerHr(engine.maxHr, holdPercent, minHr);
+                            const quoted = plan.text.match(/pulls back at (\d+) BPM/);
+                            assert.ok(quoted, `${label}: ${plan.text}`);
+                            assert.equal(Number(quoted[1]), mark, label);
+                            const working = plan.text.match(/working ceiling is (\d+) BPM/);
+                            if (working) assert.equal(Number(working[1]), engine.maxHr, label);
+                            else assert.equal(mark, engine.maxHr, label);
+                            assert.equal(/learned offset of \d+ BPM is kept/.test(plan.text), learnedOffset > 0, label);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert.ok(cases > 500, `only ${cases} cases`);
+    });
+});
+
+describe('Finished me: refused out loud', () => {
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const inputs = { minHr: 70, maxHr: 140, learnedOffset: 0 };
+    const run = (rows) => rows.reduce(
+        (w, [bpm, how = {}], i) => noteCalibrationReading(w, { at: at(i + 1), bpm, running: true, ...how }),
+        openCalibrationWindow(at(0))
+    );
+    const refusals = {
+        'no-run': { window: null, now: at(5) },
+        'too-late': { window: closeCalibrationWindow(run([[150], [151]]), at(3)), now: at(3) + 61_000 },
+        simulator: { window: run([[150, { simulator: true }], [151, { simulator: true }]]), now: at(3) },
+        'no-reading': { window: run([[150]]), now: at(3) },
+        'too-high': { window: run([[231], [233], [232]]), now: at(4) },
+        'too-low': { window: run([[38], [38]]), now: at(3), inputs: { minHr: 30, maxHr: 140 } },
+        'not-above-resting': { window: run([[68], [69]]), now: at(3) }
+    };
+
+    it('stops nothing it has not already stopped, saves nothing, and says why in a line and a dialog', () => {
+        for (const [verdict, { window, now, inputs: own }] of Object.entries(refusals)) {
+            const plan = planFinishedMe({ calibrating: true, paused: true, window, now, inputs: own || inputs, holdPercent: 100 });
+            assert.equal(plan.verdict, verdict);
+            assert.equal(plan.ask, 'alert', verdict);
+            assert.equal(plan.saveHr, null, verdict);
+            assert.match(plan.text, /^Nothing was saved\./, verdict);
+            assert.match(plan.text, /Your Climax HR stays 140 BPM\./, verdict);
+            // The prompt line carries the same news and fits a cue.
+            assert.match(plan.line, /^Not saved: /, verdict);
+            assert.match(plan.line, /Your Climax HR stays 140 BPM\.$/, verdict);
+            assert.ok(plan.line.length <= MAX_CUE_LENGTH, `${verdict}: ${plan.line.length} characters`);
+            assert.equal(resolveVoiceCue({}, plan.line, {}).text, plan.line, `${verdict} is said as written`);
+            // Nothing ends the run it paused: it stays paused, and says so.
+            assert.equal(plan.outcome, null, verdict);
+            assert.match(plan.text, /\n\nThe toys are stopped and the run is paused: RESUME carries on, STOP ends it\.$/, verdict);
+            const idle = planFinishedMe({ calibrating: true, paused: false, window, now, inputs: own || inputs, holdPercent: 100 });
+            assert.equal(idle.verdict, verdict);
+            assert.doesNotMatch(idle.text, /paused/, verdict);
+        }
+    });
+
+    it('names the number above 220 and the Resting HR it did not clear', () => {
+        const high = planFinishedMe({ calibrating: true, paused: true, ...refusals['too-high'], inputs, holdPercent: 100 });
+        assert.match(high.text, /The highest heart rate the run held was 232 BPM, above 220: that is a sensor fault, not a climax\./);
+        assert.equal(high.line, 'Not saved: 232 BPM is above 220, a sensor fault. Your Climax HR stays 140 BPM.');
+        const low = planFinishedMe({ calibrating: true, paused: true, ...refusals['not-above-resting'], inputs, holdPercent: 100 });
+        assert.equal(low.line, 'Not saved: 68 BPM is not above your Resting HR of 70. Your Climax HR stays 140 BPM.');
+        const late = planFinishedMe({ calibrating: true, paused: false, ...refusals['too-late'], inputs, holdPercent: 100 });
+        assert.match(late.text, /stopped more than 60 seconds ago/);
+        const simulated = planFinishedMe({ calibrating: true, paused: true, ...refusals.simulator, inputs, holdPercent: 100 });
+        assert.match(simulated.text, /came from the simulator/);
+    });
+
+    it('without Calibration only asks to end the run, and says what the check is for', () => {
+        const ended = planFinishedMe({ calibrating: false, paused: true, window: run([[150], [152]]), now: at(3), inputs, holdPercent: 100 });
+        assert.equal(ended.ask, 'confirm');
+        assert.equal(ended.verdict, 'end-run');
+        assert.equal(ended.saveHr, null);
+        assert.equal(ended.outcome, 'Survival');
+        assert.match(ended.text, /^End the run\?\n\nCalibration is off on the Survival card, so your Climax HR stays 140 BPM\./);
+        assert.match(ended.text, /The toys are stopped and the run is paused\. Cancel leaves it paused, so RESUME carries on\.$/);
+        assert.equal(ended.line, 'Run ended. Calibration is off, so your Climax HR stays 140 BPM.');
+        const idle = planFinishedMe({ calibrating: false, paused: false, window: null, now: at(3), inputs, holdPercent: 100 });
+        assert.equal(idle.ask, 'alert');
+        assert.equal(idle.saveHr, null);
+        assert.match(idle.text, /Calibration is off on the Survival card/);
+        assert.equal(idle.outcome, null);
+        assert.ok(idle.line.length <= MAX_CUE_LENGTH);
+    });
+});
+
+describe('Finished me, from the run to the stored Climax HR', () => {
+    // The page's order of events, second by second: each reading goes into
+    // the record as the page saw it arrive (RUNNING or not, strap or
+    // simulator), the stop closes it, and the press plans from what is there.
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const inputs = { minHr: 70, maxHr: 140, learnedOffset: 0 };
+
+    it('a 120-150 run with one packet of 180: 150 is offered, and the simulator and the pause count for nothing', () => {
+        let win = openCalibrationWindow(at(0));
+        let s = 0;
+        const read = (bpm, how = {}) => { s += 1; win = noteCalibrationReading(win, { at: at(s), bpm, running: true, ...how }); };
+        [120, 126, 133, 139, 144, 148, 150, 180, 149, 150, 147].forEach((bpm) => read(bpm));
+        [175, 178, 176].forEach((bpm) => read(bpm, { running: false })); // paused
+        [140, 146].forEach((bpm) => read(bpm));
+        [168, 170, 169].forEach((bpm) => read(bpm, { simulator: true }));
+        [141, 143].forEach((bpm) => read(bpm));
+        // The press pauses the run and plans from the record as it stands;
+        // what the strap reads behind the question counts for nothing.
+        const atPress = win;
+        [171, 172].forEach((bpm) => read(bpm, { running: false }));
+        assert.equal(win.peakHr, atPress.peakHr);
+        const plan = planFinishedMe({ calibrating: true, paused: true, window: atPress, now: at(s), inputs, holdPercent: 100 });
+        assert.equal(plan.saveHr, 150);
+        assert.match(plan.text, /One reading went up to 180 BPM/);
+        assert.equal(plan.outcome, 'Survival calibration');
+    });
+
+    it('STOP, then Finished me within the minute: the run is still offered', () => {
+        let win = openCalibrationWindow(at(0));
+        [128, 136, 142, 146, 146, 143].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(i + 1), bpm, running: true }); });
+        win = closeCalibrationWindow(win, at(7));
+        // The climax after STOP reaches the page, but not the record.
+        [150, 158, 160].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(8 + i), bpm, running: false }); });
+        const soon = planFinishedMe({ calibrating: true, paused: false, window: win, now: at(40), inputs, holdPercent: 100 });
+        assert.equal(soon.ask, 'confirm');
+        assert.equal(soon.saveHr, 146);
+        const late = planFinishedMe({ calibrating: true, paused: false, window: win, now: at(68), inputs, holdPercent: 100 });
+        assert.equal(late.verdict, 'too-late');
+    });
+
+    it('during a Soft Landing: the run up to the landing is offered', () => {
+        let win = openCalibrationWindow(at(0));
+        [140, 150, 155, 154].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(i + 1), bpm, running: true }); });
+        // The landing is not RUNNING: its readings do not count.
+        [162, 164, 163].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(5 + i), bpm, running: false }); });
+        // The press pauses the landing and plans from the record as it
+        // stands; OK then ends the run.
+        const plan = planFinishedMe({ calibrating: true, paused: true, window: win, now: at(8), inputs, holdPercent: 100 });
+        assert.equal(plan.saveHr, 154);
+        assert.equal(plan.outcome, 'Survival calibration');
+    });
+
+    it('a strap stuck above 220: refused, with the toys already stopped by the press', () => {
+        let win = openCalibrationWindow(at(0));
+        [150, 229, 231, 230, 232].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(i + 1), bpm, running: true }); });
+        const plan = planFinishedMe({ calibrating: true, paused: true, window: win, now: at(6), inputs, holdPercent: 100 });
+        assert.equal(plan.verdict, 'too-high');
+        assert.equal(plan.saveHr, null);
+        assert.match(plan.line, /^Not saved: 230 BPM is above 220/);
+    });
+});
+
+describe('Came Early and Finished me: nothing is asked before the toys are at rest', () => {
+    // A page with a clock that moves only when the sequencer waits: a Handy
+    // whose state follows a timeline (handy.js handyRestState), a session
+    // that may be driving the toys, and a RESUME that may start it again at
+    // set moments. halt() is the press's stop: it
+    // pauses the session and sends the Handy a stop that the API answers
+    // `stopTakesMs` later with `stopResult`; `afterStop` is what the driver
+    // does next, [ms after the halt, state] - the stop the next tick sends a
+    // Handy whose stops keep failing, say. `unansweredAt` and `confirmedAt`:
+    // the moments a verified stop gives up unanswered and is confirmed
+    // (handy.js handyStopTally), a negative one before the press.
+    // `acknowledged`: the press answers a refusal. Every `waiting` notice is
+    // kept in page.waited, [when, rest].
+    function fakePage({ driving = true, handy = 'unconfirmed', stopTakesMs = 120, stopResult = 'stopped', afterStop = [], resumeAt = [], haltWorksFrom = 0, acknowledged = false, unansweredAt = [], confirmedAt = [] } = {}) {
+        const page = { now: 0, driving, log: [], timeline: [[0, handy]], waits: 0, waited: [], pendingWaited: 0 };
+        const set = (at, value) => {
+            page.timeline.push([at, value]);
+            page.timeline.sort((a, b) => a[0] - b[0]);
+        };
+        page.rest = () => {
+            let value = page.timeline[0][1];
+            for (const [at, state] of page.timeline) if (at <= page.now) value = state;
+            return value;
+        };
+        const advance = (ms) => {
+            const until = page.now + ms;
+            for (const at of resumeAt) {
+                if (at > page.now && at <= until) {
+                    page.driving = true;
+                    page.log.push(['resumed', at]);
+                    // The session drives the Handy again: it is running.
+                    if (handy !== 'none') {
+                        page.timeline = page.timeline.filter(([when]) => when < at);
+                        set(at, 'unconfirmed');
+                    }
+                }
+            }
+            page.now = until;
+            page.waits += 1;
+            if (page.waits > 10000) throw new Error('the sequencer never finished');
+        };
+        page.steps = {
+            halt: () => {
+                page.log.push(['halt', page.now]);
+                if (page.now >= haltWorksFrom) page.driving = false;
+                if (handy !== 'none') {
+                    page.timeline = page.timeline.filter(([when]) => when <= page.now);
+                    set(page.now, 'pending');
+                    set(page.now + stopTakesMs, stopResult);
+                    for (const [after, value] of afterStop) set(page.now + after, value);
+                }
+            },
+            driving: () => page.driving,
+            handyRest: () => page.rest(),
+            stopTally: () => ({
+                confirmed: confirmedAt.filter((at) => at <= page.now).length,
+                unanswered: unansweredAt.filter((at) => at <= page.now).length
+            }),
+            wait: async (ms) => {
+                if (page.rest() === 'pending') page.pendingWaited += ms;
+                advance(ms);
+            },
+            nextFrame: async () => advance(16),
+            acknowledged,
+            ask: (arg) => { page.log.push(['ask', page.now, page.rest(), page.driving, arg]); },
+            refuse: () => { page.log.push(['refuse', page.now, page.rest(), page.driving]); },
+            waiting: () => { page.waited.push([page.now, page.rest()]); }
+        };
+        return page;
+    }
+    const kinds = (page) => page.log.map(([kind]) => kind);
+
+    it('asks only once the Handy has confirmed its stop, and a frame after it', async () => {
+        // The measured failure: the first PUT /hamp/stop got a 502 and the
+        // retry, 250 ms later, was confirmed. The question used to open one
+        // frame after the press, over the failed first attempt.
+        const page = fakePage({ stopTakesMs: 320 });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(kinds(page), ['halt', 'ask']);
+        const [, askedAt, rest, driving, arg] = page.log[1];
+        assert.equal(rest, 'stopped');
+        assert.equal(driving, false);
+        assert.deepEqual(arg, { handyAtRest: true, waited: false, unanswered: false });
+        assert.ok(askedAt >= 320 + 16, `asked at ${askedAt} ms`);
+        assert.ok(askedAt <= 320 + STOP_POLL_MS + 16, `asked late, at ${askedAt} ms`);
+    });
+
+    it('asks nothing over a stop the Handy never confirmed, says why instead, and holds the button a moment', async () => {
+        // Four attempts, all failed: the toy may still be moving, and a
+        // native dialog would hold back every stop the page still sends.
+        const page = fakePage({ stopTakesMs: 1750, stopResult: 'unconfirmed' });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(kinds(page), ['halt', 'refuse']);
+        const refusedAt = page.log[1][1];
+        assert.ok(refusedAt >= 1750);
+        // The press is over only once the refusal has stood for a moment:
+        // the second tap of a double tap is not taken for its answer.
+        assert.equal(page.now, refusedAt + REFUSAL_HOLD_MS);
+        assert.ok(REFUSAL_HOLD_MS >= 300, 'longer than the gap of a double tap');
+        // A Handy that went offline with its stop still owed is refused at
+        // once: the press sends it nothing, and its background stop is not
+        // waited for (handy.js beginOfflineStop).
+        const offline = fakePage({ stopTakesMs: 0, stopResult: 'unconfirmed' });
+        await stopThenAsk(offline.steps);
+        assert.deepEqual(kinds(offline), ['halt', 'refuse']);
+        assert.equal(offline.log[1][1], 0);
+        assert.deepEqual(offline.waited, [], 'nothing to wait for, and nothing said about waiting');
+    });
+
+    it('the press that answers a refusal asks once nothing is on its way, and says the Handy may still be moving', async () => {
+        // The wearer was told the Handy has not confirmed its stop and
+        // pressed again. Refusing that press too left an offline Handy -
+        // sent a stop every few seconds for as long as the page runs -
+        // blocking the question for minutes: no event logged, and no Survival
+        // run saved once the minute after STOP was over.
+        const failed = fakePage({ stopTakesMs: 1750, stopResult: 'unconfirmed', acknowledged: true });
+        await stopThenAsk(failed.steps);
+        assert.deepEqual(kinds(failed), ['halt', 'ask']);
+        const [, askedAt, rest, driving, arg] = failed.log[1];
+        assert.ok(askedAt >= 1750 + 16, `asked at ${askedAt}, while the stop was still being tried`);
+        assert.equal(rest, 'unconfirmed');
+        assert.equal(driving, false);
+        assert.deepEqual(arg, { handyAtRest: false, waited: true, unanswered: false });
+        // Pressed while a stop is still being retried - Disconnect's, whose
+        // attempts fail until the fourth: that stop is waited out, and the
+        // question comes once it has failed too, before the next is sent.
+        const retried = fakePage({ stopTakesMs: 0, stopResult: 'pending', afterStop: [[1750, 'unconfirmed'], [2600, 'pending'], [4350, 'unconfirmed']], acknowledged: true });
+        await stopThenAsk(retried.steps);
+        const asked = retried.log.find(([kind]) => kind === 'ask');
+        assert.ok(asked[1] >= 1750 + 16 && asked[1] < 2600, `asked at ${asked[1]}`);
+        assert.deepEqual(asked.slice(2), ['unconfirmed', false, { handyAtRest: false, waited: true, unanswered: false }]);
+        // A round that is confirmed meanwhile: an ordinary question.
+        const recovered = fakePage({ stopTakesMs: 900, stopResult: 'none', acknowledged: true });
+        await stopThenAsk(recovered.steps);
+        assert.deepEqual(recovered.log[1].slice(2), ['none', false, { handyAtRest: true, waited: false, unanswered: false }]);
+    });
+
+    it('says what the press is waiting for once the stop takes longer than a moment, once', async () => {
+        // Confirmed at once, or after a retry: nothing to say.
+        const quick = fakePage({ stopTakesMs: 600 });
+        await stopThenAsk(quick.steps);
+        assert.deepEqual(kinds(quick), ['halt', 'ask']);
+        assert.deepEqual(quick.waited, []);
+        // Every attempt timed out: 26 s of a paused cockpit and nothing else,
+        // then the refusal. The wearer is told after a second what the press
+        // is waiting for, and told once.
+        const slow = fakePage({ stopTakesMs: 25750, stopResult: 'unconfirmed' });
+        await stopThenAsk(slow.steps);
+        assert.deepEqual(kinds(slow), ['halt', 'refuse']);
+        assert.equal(slow.waited.length, 1);
+        const [toldAt, rest] = slow.waited[0];
+        assert.equal(rest, 'pending');
+        assert.ok(toldAt >= STOP_WAIT_NOTICE_MS && toldAt <= STOP_WAIT_NOTICE_MS + STOP_POLL_MS, `told at ${toldAt} ms`);
+        // A slow stop that is confirmed in the end, and the press that
+        // answers a refusal, are told the same, before the question.
+        for (const page of [fakePage({ stopTakesMs: 4000 }), fakePage({ stopTakesMs: 4000, stopResult: 'unconfirmed', acknowledged: true })]) {
+            await stopThenAsk(page.steps);
+            assert.deepEqual(kinds(page), ['halt', 'ask']);
+            assert.equal(page.waited.length, 1);
+            assert.ok(page.waited[0][0] < page.log[1][1], 'told before it asks');
+            // ...and the question knows, so it can say how the wait ended.
+            assert.equal(page.log[1][4].waited, true);
+        }
+        assert.equal(quick.log[1][4].waited, false);
+        // Waiting for a session to stop driving the toys is not waiting for
+        // the Handy.
+        const session = fakePage({ handy: 'none', haltWorksFrom: 3000 });
+        await stopThenAsk(session.steps);
+        assert.deepEqual(session.waited, []);
+    });
+
+    it('a stop that goes unanswered over a Handy already at rest is asked over, and the question is told it went unanswered', async () => {
+        // A Handy switched off after STOP: the press's own stop is refused on
+        // every attempt, but the device confirmed a stop after anything that
+        // may have moved it, so handyRestState says 'stopped' (handy.js
+        // noteStopFailed: no "may still be moving"). The press asks, and was
+        // saying "The Handy has confirmed its stop."
+        const page = fakePage({ stopTakesMs: 1750, unansweredAt: [1750] });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(kinds(page), ['halt', 'ask']);
+        assert.deepEqual(page.log[1].slice(2), ['stopped', false, { handyAtRest: true, waited: true, unanswered: true }]);
+        // Given up on before the notice was due - Disconnect's stop, its key
+        // already dropped: told all the same.
+        const early = fakePage({ stopTakesMs: 600, stopResult: 'none', unansweredAt: [600] });
+        await stopThenAsk(early.steps);
+        assert.deepEqual(early.log[1].slice(2), ['none', false, { handyAtRest: true, waited: false, unanswered: true }]);
+        // One that gave up before the press is not this press's.
+        const before = fakePage({ stopTakesMs: 300, unansweredAt: [-40] });
+        await stopThenAsk(before.steps);
+        assert.deepEqual(before.log[1][4], { handyAtRest: true, waited: false, unanswered: false });
+        // A start that was still out lands after the press's stop gave up:
+        // the stop sent after it is confirmed, and the Handy is at rest on
+        // that confirmation - it has confirmed its stop.
+        const restopped = fakePage({ stopTakesMs: 0, stopResult: 'pending', afterStop: [[2100, 'stopped']], unansweredAt: [1750], confirmedAt: [2100] });
+        await stopThenAsk(restopped.steps);
+        assert.deepEqual(restopped.log[1].slice(2), ['stopped', false, { handyAtRest: true, waited: true, unanswered: false }]);
+    });
+
+    it('with no Handy to wait for, asks one frame after the stop', async () => {
+        const page = fakePage({ handy: 'none' });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(page.log, [['halt', 0], ['ask', 16, 'none', false, { handyAtRest: true, waited: false, unanswered: false }]]);
+    });
+
+    it('stops a session that drives the toys again before the question, and waits for that stop too', async () => {
+        // The session runs again while the Handy is still confirming the
+        // first stop. The page takes no START or RESUME while a press runs
+        // (claims, below), and this does not rely on that.
+        const page = fakePage({ stopTakesMs: 300, resumeAt: [120] });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(kinds(page), ['halt', 'resumed', 'halt', 'ask']);
+        const secondHalt = page.log[2][1];
+        assert.ok(secondHalt >= 120 && secondHalt <= 120 + STOP_POLL_MS, `stopped again at ${secondHalt}`);
+        const [, askedAt, rest, driving] = page.log[3];
+        assert.ok(askedAt >= secondHalt + 300 + 16, `asked at ${askedAt}, before the second stop was confirmed`);
+        assert.equal(rest, 'stopped');
+        assert.equal(driving, false);
+    });
+
+    it('a session started in the frame before the question is stopped first', async () => {
+        const page = fakePage({ handy: 'none', resumeAt: [10] });
+        await stopThenAsk(page.steps);
+        assert.deepEqual(page.log, [['halt', 0], ['resumed', 10], ['halt', 16], ['ask', 32, 'none', false, { handyAtRest: true, waited: false, unanswered: false }]]);
+    });
+
+    it('never asks while a session is driving the toys, however long that lasts', async () => {
+        const page = fakePage({ handy: 'none', haltWorksFrom: 1000 });
+        await stopThenAsk(page.steps);
+        const asked = page.log.find(([kind]) => kind === 'ask');
+        assert.ok(asked && asked[1] >= 1000, JSON.stringify(page.log.slice(-3)));
+        assert.equal(asked[3], false);
+    });
+
+    it('whatever the Handy and the session do, asks or refuses once, never while a stop is on its way, and only over toys at rest unless answering a refusal', async () => {
+        // A seeded sweep over stop times, answers, background rounds,
+        // restarts and presses that answer a refusal.
+        let seed = 12345;
+        const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+        let seedTally = 777;
+        const randTally = () => { seedTally = (seedTally * 1103515245 + 12345) % 2147483648; return seedTally / 2147483648; };
+        for (let n = 0; n < 600; n += 1) {
+            const handy = rand() < 0.2 ? 'none' : 'unconfirmed';
+            const resumeAt = [];
+            for (let r = Math.floor(rand() * 3); r > 0; r -= 1) resumeAt.push(Math.floor(rand() * 2000));
+            const stopTakesMs = Math.floor(rand() * 2000);
+            const stopResult = rand() < 0.3 ? 'unconfirmed' : 'stopped';
+            const afterStop = [];
+            if (stopResult === 'unconfirmed' && rand() < 0.5) {
+                // A Handy whose stops keep failing is sent another on the
+                // next tick; the last one is maybe confirmed.
+                let t = stopTakesMs;
+                for (let r = 1 + Math.floor(rand() * 3); r > 0; r -= 1) {
+                    t += 1 + Math.floor(rand() * 600);
+                    afterStop.push([t, 'pending']);
+                    t += 1 + Math.floor(rand() * 600);
+                    afterStop.push([t, r === 1 && rand() < 0.5 ? 'none' : 'unconfirmed']);
+                }
+            }
+            const acknowledged = rand() < 0.5;
+            // Stops that give up unanswered and stops that are confirmed,
+            // before the press or during it, drawn from a generator of their
+            // own.
+            const unansweredAt = [];
+            const confirmedAt = [];
+            for (let u = Math.floor(randTally() * 3); u > 0; u -= 1) unansweredAt.push(Math.floor(randTally() * 3000) - 500);
+            for (let c = Math.floor(randTally() * 2); c > 0; c -= 1) confirmedAt.push(Math.floor(randTally() * 3000) - 500);
+            const page = fakePage({ handy, stopTakesMs, stopResult, afterStop, resumeAt, acknowledged, unansweredAt, confirmedAt });
+            await stopThenAsk(page.steps);
+            const label = JSON.stringify({ handy, stopTakesMs, stopResult, afterStop, resumeAt, acknowledged, unansweredAt, confirmedAt, log: page.log });
+            const ends = page.log.filter(([kind]) => kind === 'ask' || kind === 'refuse');
+            assert.equal(ends.length, 1, label);
+            const endAt = page.log.indexOf(ends[0]);
+            const [kind, , rest, driving, arg] = ends[0];
+            assert.equal(driving, false, label);
+            assert.notEqual(rest, 'pending', label);
+            if (kind === 'ask') {
+                assert.ok(rest === 'stopped' || rest === 'none' || (acknowledged && rest === 'unconfirmed'), label);
+                // Told of a stop that gave up unanswered while it waited,
+                // when none was confirmed meanwhile - and of no other.
+                const during = (at) => at > 0 && at <= ends[0][1];
+                const unanswered = unansweredAt.some(during) && !confirmedAt.some(during);
+                assert.deepEqual(arg, { handyAtRest: rest !== 'unconfirmed', waited: page.waited.length === 1, unanswered }, label);
+                // Nothing happens behind a question.
+                assert.equal(endAt, page.log.length - 1, label);
+            } else {
+                assert.equal(acknowledged, false, label);
+                assert.equal(rest, 'unconfirmed', label);
+            }
+            // Told what the press waits for once, and only when it waited
+            // for the Handy long enough to need telling.
+            const needed = page.pendingWaited >= STOP_WAIT_NOTICE_MS + STOP_POLL_MS;
+            assert.equal(page.waited.length, needed ? 1 : 0, label);
+            if (needed) {
+                assert.equal(page.waited[0][1], 'pending', label);
+                assert.ok(page.waited[0][0] >= STOP_WAIT_NOTICE_MS && page.waited[0][0] <= ends[0][1], label);
+            }
+            // Every restart before the end was stopped again before it.
+            for (const [k, at] of page.log.slice(0, endAt)) {
+                if (k !== 'resumed') continue;
+                assert.ok(page.log.slice(0, endAt).some(([h, when]) => h === 'halt' && when >= at), label);
+            }
+        }
+    });
+});
+
+describe('Came Early and Finished me: one question at a time', () => {
+    // The page's clock, which only moves when a test moves it.
+    const clock = () => {
+        const c = { t: 1000 };
+        c.now = () => c.t;
+        return c;
+    };
+    const quickSteps = (log, name, { ask = () => log.push(`${name} asked`) } = {}) => ({
+        halt: () => log.push(`${name} halted`),
+        driving: () => false,
+        handyRest: () => 'none',
+        wait: async () => {},
+        nextFrame: () => new Promise((resolve) => setTimeout(resolve, 5)),
+        ask,
+        refuse: () => log.push(`${name} refused`)
+    });
+
+    it('drops a press that comes while the first is still stopping the toys or asking', async () => {
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const log = [];
+        const first = gate.run(quickSteps(log, 'first'), { pressedAt: c.t });
+        assert.equal(gate.busy, true);
+        c.t += 150;
+        const second = gate.run(quickSteps(log, 'second'), { pressedAt: c.t });
+        assert.equal(await second, false);
+        assert.equal(await first, true);
+        assert.deepEqual(log, ['first halted', 'first asked']);
+        assert.equal(gate.busy, false);
+        // Once the first is answered, the next press is a press.
+        c.t += 2000;
+        assert.equal(await gate.run(quickSteps(log, 'third'), { pressedAt: c.t }), true);
+        assert.deepEqual(log, ['first halted', 'first asked', 'third halted', 'third asked']);
+    });
+
+    it('a tap made before the question was over belongs to it, even when the page gets it later', async () => {
+        // Measured on a phone-speed CPU: a second tap made 4 ms after OK
+        // reached the page 300 ms later, once ending the session and writing
+        // History had let go of it, and asked a second question.
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const log = [];
+        const tappedAt = c.t;
+        await gate.run(quickSteps(log, 'first', { ask: () => { c.t += 250; log.push('first asked'); c.t += 300; } }), { pressedAt: tappedAt });
+        const madeDuringIt = tappedAt + 254;
+        assert.equal(await gate.run(quickSteps(log, 'late'), { pressedAt: madeDuringIt }), false);
+        assert.deepEqual(log, ['first halted', 'first asked']);
+        c.t += 1;
+        assert.equal(await gate.run(quickSteps(log, 'next'), { pressedAt: c.t }), true);
+        assert.deepEqual(log, ['first halted', 'first asked', 'next halted', 'next asked']);
+        // A press with no usable time of its own is taken as made now.
+        c.t += 1;
+        assert.equal(await gate.run(quickSteps(log, 'untimed'), { pressedAt: NaN }), true);
+        assert.equal(await gate.run(quickSteps(log, 'bare')), true);
+    });
+
+    it('claims a START or RESUME tapped while a press runs, or before it was over, as it claims a second press', async () => {
+        // app.js asks it before it starts anything (startOrResumeWhenReady). A
+        // START or RESUME tapped while the press waited for the stop went to
+        // The Handy for its answer, was still waiting for it when the
+        // question opened, and started the toys once the question was
+        // answered: after Cancel, which leaves the session paused, and after
+        // OK in the minute after STOP.
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const log = [];
+        assert.equal(gate.claims(c.t), false, 'no press, nothing to claim');
+        let answer = null;
+        const press = gate.run({ ...quickSteps(log, 'press'), ask: () => new Promise((resolve) => { answer = resolve; }) }, { pressedAt: c.t });
+        c.t += 150;
+        const tappedWhileItRan = c.t;
+        assert.equal(gate.claims(tappedWhileItRan), true, 'tapped while the press stops the toys');
+        while (!answer) await new Promise((resolve) => setTimeout(resolve, 1));
+        assert.equal(gate.claims(), true, 'with no time of its own, while the question is open');
+        c.t += 600;
+        answer();
+        assert.equal(await press, true);
+        assert.equal(gate.busy, false);
+        assert.equal(gate.claims(tappedWhileItRan), true, 'made while it ran, handed to the page afterwards');
+        assert.equal(gate.claims(c.t - 1), true, 'made before the question was over');
+        assert.equal(gate.claims(c.t + 1), false, 'made after it');
+        assert.equal(gate.claims(), false, 'with no time of its own, after it');
+        assert.equal(gate.claims(NaN), false);
+        // The same rule the press itself is judged by.
+        assert.equal(await gate.run(quickSteps(log, 'late'), { pressedAt: tappedWhileItRan }), false);
+        assert.deepEqual(log, ['press halted']);
+    });
+
+    it('a question that fails does not leave the button dead', async () => {
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const log = [];
+        await assert.rejects(gate.run(quickSteps(log, 'broken', { ask: () => { throw new Error('boom'); } }), { pressedAt: c.t }), /boom/);
+        assert.equal(gate.busy, false);
+        c.t += 1;
+        assert.equal(await gate.run(quickSteps(log, 'next'), { pressedAt: c.t }), true);
+        assert.deepEqual(log, ['broken halted', 'next halted', 'next asked']);
+    });
+
+    it('a double tap on Came Early logs one event, with the numbers its dialog quoted', async () => {
+        // The page's ask: the plan is made when the question is asked, from
+        // the profile as it stands, and exactly that is stored on OK. Two
+        // taps 160 ms apart on a phone used to make two plans from one stored
+        // offset: two events, 3 BPM, and two dialogs promising 140 to 137.
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const inputsNow = (profile) => ({ minHr: 70, maxHr: 140, learnedOffset: profile.suggestedMaxHrOffset });
+        const profile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
+        const dialogs = [];
+        const press = () => gate.run({
+            ...quickSteps([], 'press'),
+            ask: () => {
+                const inputs = inputsNow(profile);
+                const step = cameEarlyStep({ offset: inputs.learnedOffset, typedMaxHr: inputs.maxHr, peakHr: 132 });
+                const before = learnedOffsetCeilings(inputs, step.previous);
+                const after = learnedOffsetCeilings(inputs, step.offset);
+                dialogs.push(describeCameEarlyConfirm({ before, after, step, paused: true }));
+                profile.breakthroughEvents += 1;
+                profile.suggestedMaxHrOffset = step.offset;
+                profile.lastBreakthroughHr = step.peakHr;
+            }
+        }, { pressedAt: c.t });
+        const taps = [press(), (c.t += 160, press())];
+        assert.deepEqual(await Promise.all(taps), [true, false]);
+        assert.equal(dialogs.length, 1);
+        assert.match(dialogs[0], /goes from 140 to 137 BPM/);
+        assert.deepEqual(profile, { breakthroughEvents: 1, suggestedMaxHrOffset: 3, lastBreakthroughHr: 132 });
+        assert.equal(computeEffectiveCeiling(inputsNow(profile)).maxHr, 137);
+        // A later press starts from what the first one stored.
+        c.t += 5000;
+        await press();
+        assert.match(dialogs[1], /goes from 137 to 134 BPM/);
+        assert.deepEqual(profile, { breakthroughEvents: 2, suggestedMaxHrOffset: 6, lastBreakthroughHr: 132 });
+    });
+
+    it('a refusal holds the button, so the second tap of a double tap is not taken for its answer', async () => {
+        // The Handy has not confirmed its stop: the first press asks nothing,
+        // and the next press is the wearer's answer to the line - it asks. A
+        // double tap's second tap, 40 to 300 ms after the first, has not read
+        // the line; it is dropped, as any tap is while a press is running.
+        const c = clock();
+        const gate = createQuestionGate({ now: c.now });
+        const log = [];
+        let endHold = null;
+        const inDoubt = (name, { acknowledged = false } = {}) => ({
+            ...quickSteps(log, name, { ask: (arg) => log.push(`${name} asked, the Handy ${arg.handyAtRest ? 'at rest' : 'in doubt'}`) }),
+            handyRest: () => 'unconfirmed',
+            acknowledged,
+            wait: (ms) => (ms === REFUSAL_HOLD_MS
+                ? new Promise((resolve) => { endHold = () => { c.t += ms; resolve(); }; })
+                : Promise.resolve())
+        });
+        const first = gate.run(inDoubt('first'), { pressedAt: c.t });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.deepEqual(log, ['first halted', 'first refused']);
+        assert.equal(gate.busy, true, 'the refusal holds the button');
+        c.t += 150;
+        assert.equal(await gate.run(inDoubt('bounce', { acknowledged: true }), { pressedAt: c.t }), false);
+        endHold();
+        assert.equal(await first, true);
+        assert.equal(gate.busy, false);
+        // A tap made during the hold that the page gets only now is dropped
+        // too: it was made before the refusal was over.
+        assert.equal(await gate.run(inDoubt('late', { acknowledged: true }), { pressedAt: c.t - 10 }), false);
+        c.t += 800;
+        assert.equal(await gate.run(inDoubt('second', { acknowledged: true }), { pressedAt: c.t }), true);
+        assert.deepEqual(log, ['first halted', 'first refused', 'second halted', 'second asked, the Handy in doubt']);
+    });
+
+    it('says out loud why nothing was asked and what to do, in a line a cue can carry', () => {
+        for (const [finishedMe, start, button] of [[false, 'Nothing logged yet', 'Came Early'], [true, 'Nothing saved yet', 'Finished me']]) {
+            const line = describeStopNotConfirmed({ finishedMe });
+            assert.ok(line.startsWith(`${start}: the Handy has not confirmed its stop and may still be moving.`), line);
+            // Something the wearer can do whatever became of the link - an
+            // offline Handy offers no Disconnect - and the press that answers.
+            assert.doesNotMatch(line, /disconnect/i);
+            assert.ok(line.endsWith(`Switch it off if it is, then press ${button} again.`), line);
+            assert.ok(line.length <= MAX_CUE_LENGTH, `${line.length} characters`);
+            assert.equal(resolveVoiceCue({}, line, {}).text, line, 'said as written');
+        }
+    });
+
+    it('says what a slow stop is waited for, and then how the wait ended, in lines a cue can carry', () => {
+        const waiting = describeWaitingForStop();
+        assert.equal(waiting, 'Waiting for the Handy to confirm its stop before asking.');
+        assert.doesNotMatch(waiting, /stopped|at rest|logged|saved/);
+        // The question replaces it: after a Cancel nothing else repaints the
+        // prompt line, and the notice stood there as if still waiting.
+        const confirmed = describeStopWaitOver({ handyAtRest: true });
+        const inDoubt = describeStopWaitOver({ handyAtRest: false });
+        assert.equal(confirmed, 'The Handy has confirmed its stop.');
+        assert.match(inDoubt, /^The Handy has not confirmed its stop: if it is still moving, switch it off\.$/);
+        // A stop that went unanswered over a Handy already at rest: it did
+        // not confirm the stop, and the line says so, and why the press asks.
+        const unanswered = describeStopWaitOver({ handyAtRest: true, unanswered: true });
+        assert.equal(unanswered, 'The Handy did not confirm the stop, but it had confirmed an earlier one and nothing has started it since.');
+        assert.equal(describeStopWaitOver({ handyAtRest: false, unanswered: true }), inDoubt, 'a Handy in doubt is in doubt');
+        for (const line of [waiting, confirmed, inDoubt, unanswered]) {
+            assert.ok(line.length <= MAX_CUE_LENGTH, `${line.length} characters`);
+            assert.equal(resolveVoiceCue({}, line, {}).text, line, 'said as written');
+        }
+    });
+});
+
+describe('Came Early and Finished me: the press a second press answers', () => {
+    // When the Handy has not confirmed its stop, the first press asks nothing
+    // and says so (stopThenAsk), and the next press of the same button is the
+    // wearer's answer. Seeing to the Handy can take minutes: an offline one
+    // offers no Disconnect and is sent its background stop for up to half an
+    // hour. The question is about the first press, not about the moment of
+    // the second.
+    const t0 = 1_700_000_000_000;
+    const at = (s) => t0 + s * 1000;
+    const inputs = { minHr: 70, maxHr: 140, learnedOffset: 0 };
+
+    it('a first press is about now: the peak of the last minute, or the run as it stands', () => {
+        const readings = [];
+        for (const [s, bpm] of [[10, 128], [20, 136], [30, 131]]) rememberReading(readings, at(s), bpm);
+        assert.deepEqual(pressAbout({ kind: 'cameEarly', now: at(31), readings }), {
+            press: { kind: 'cameEarly', peakHr: 136 },
+            acknowledged: false
+        });
+        const win = openCalibrationWindow(at(0));
+        assert.deepEqual(pressAbout({ kind: 'finishedMe', now: at(31), window: win }), {
+            press: { kind: 'finishedMe', pressedAt: at(31), win },
+            acknowledged: false
+        });
+    });
+
+    it('Came Early answering a turned-away press: the step and the event are the climax, not the fall after it', () => {
+        const readings = [];
+        // A climax at 135 against a 140 Climax HR, and the press at once.
+        for (const [s, bpm] of [[0, 126], [10, 131], [20, 135], [30, 132], [35, 128]]) rememberReading(readings, at(s), bpm);
+        const first = pressAbout({ kind: 'cameEarly', now: at(36), readings });
+        assert.equal(first.press.peakHr, 135);
+        // Refused. Two minutes later, the Handy seen to, the pulse is down.
+        for (const [s, bpm] of [[60, 110], [100, 98], [150, 92], [155, 91]]) rememberReading(readings, at(s), bpm);
+        const second = pressAbout({ kind: 'cameEarly', held: first.press, now: at(156), readings });
+        assert.equal(second.acknowledged, true);
+        assert.equal(second.press, first.press);
+        const step = cameEarlyStep({ offset: 0, typedMaxHr: 140, peakHr: second.press.peakHr });
+        assert.deepEqual([step.step, step.peakHr, step.bonus], [3, 135, false]);
+        const text = describeCameEarlyConfirm({
+            before: learnedOffsetCeilings(inputs, step.previous),
+            after: learnedOffsetCeilings(inputs, step.offset),
+            step,
+            paused: true,
+            handyAtRest: false,
+            peakFromFirstPress: second.acknowledged
+        });
+        assert.match(text, /goes from 140 to 137 BPM/);
+        assert.match(text, /yours peaked at 135 BPM in the minute before your first press\./);
+        // Judged at the second press, the fall was the larger step and the
+        // event's pulse.
+        const judgedLate = cameEarlyStep({ offset: 0, typedMaxHr: 140, peakHr: recentPeakHr(readings, at(156)) });
+        assert.deepEqual([judgedLate.step, judgedLate.peakHr], [5, 98]);
+    });
+
+    it('Finished me answering a turned-away press: the run it was in time for is offered, whenever the answer comes', () => {
+        let win = openCalibrationWindow(at(0));
+        [128, 136, 142, 146, 146, 143].forEach((bpm, i) => { win = noteCalibrationReading(win, { at: at(i + 1), bpm, running: true }); });
+        // Pressed during the run: refused, the run paused. STOP a few seconds
+        // later closes the record; the second press comes 70 s after that.
+        const first = pressAbout({ kind: 'finishedMe', now: at(7), window: win });
+        const closed = closeCalibrationWindow(win, at(10));
+        const second = pressAbout({ kind: 'finishedMe', held: first.press, now: at(80), window: closed });
+        assert.equal(second.acknowledged, true);
+        const plan = planFinishedMe({ calibrating: true, paused: false, window: second.press.win, now: second.press.pressedAt, inputs, holdPercent: 100, handyAtRest: false });
+        assert.equal(plan.ask, 'confirm');
+        assert.equal(plan.saveHr, 146);
+        // A press of its own at that moment is a minute too late.
+        const fresh = pressAbout({ kind: 'finishedMe', now: at(80), window: closed });
+        assert.equal(planFinishedMe({ calibrating: true, paused: false, window: fresh.press.win, now: fresh.press.pressedAt, inputs, holdPercent: 100 }).verdict, 'too-late');
+    });
+
+    it('a turned-away press of the other button is not answered', () => {
+        const readings = [];
+        rememberReading(readings, at(1), 120);
+        const heldCame = { kind: 'cameEarly', peakHr: 150 };
+        const finished = pressAbout({ kind: 'finishedMe', held: heldCame, now: at(2), window: null });
+        assert.equal(finished.acknowledged, false);
+        assert.deepEqual(finished.press, { kind: 'finishedMe', pressedAt: at(2), win: null });
+        const heldFinished = { kind: 'finishedMe', pressedAt: at(0), win: null };
+        const came = pressAbout({ kind: 'cameEarly', held: heldFinished, now: at(2), readings });
+        assert.equal(came.acknowledged, false);
+        assert.deepEqual(came.press, { kind: 'cameEarly', peakHr: 120 });
     });
 });
 

@@ -38,7 +38,24 @@ import {
     describeGameNotice,
     describeCutoffNotice,
     describeStallPauseNotice,
-    sanitizeSessionLimits
+    sanitizeSessionLimits,
+    workingCeilingInputs,
+    rememberReading,
+    cameEarlyStep,
+    learnedOffsetCeilings,
+    describeCameEarlyConfirm,
+    cameEarlyCue,
+    describeWipeLearningConfirm,
+    describeLearningStatus,
+    openCalibrationWindow,
+    noteCalibrationReading,
+    closeCalibrationWindow,
+    planFinishedMe,
+    createQuestionGate,
+    describeStopNotConfirmed,
+    describeWaitingForStop,
+    describeStopWaitOver,
+    pressAbout
 } from './session-rules.js';
 import { safeGet, safeParse, safeSet, safeRemove, saveHistoryTrimmed } from './storage.js';
 import { buildBackup, backupFilename, describeBackupExport, readBackup, describeBackupImport, mergeDeviceMaps, countDroppedOnMerge, pruneReservedKeys, pruneRetiredKeys } from './backup.js';
@@ -61,7 +78,7 @@ import {
 } from './supervision.js';
 import { createScreenWakeLock } from './screen-wake-lock.js';
 import { createTickDispatch, guardEngagedBy } from './tick-dispatch.js';
-import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected, getHandyKey } from './hardware/handy.js';
+import { connectHandy, disconnectHandy, dispatchHandy, stopHandyOnUnload, handyConnected, setHandyHandlers, pollHandyConnected, getHandyKey, handyRestState, handyStopTally } from './hardware/handy.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
@@ -119,7 +136,7 @@ import {
     getPeerCounts,
     peerLibraryAvailable
 } from './webrtc.js';
-import { describePeerVersionMismatch, peerProtocolRelation } from './peer-messages.js';
+import { describePeerVersionMismatch, peerProtocolRelation, hostTransportAction } from './peer-messages.js';
 import {
     speakPrompt,
     speakNow,
@@ -258,6 +275,38 @@ let edgeReadings = [];
 let funscriptSamples = [];
 let funscriptSessionStart = 0;
 
+// The valid readings of the last minute or so, from the strap or the engaged
+// simulator, { at, bpm } (session-rules.rememberReading). Came Early judges
+// its step on their peak: state.hrCurrent is not a reading - it starts at 70
+// before any monitor has spoken, and it is already falling by the time the
+// button is pressed. Every reading counts, session running or not, and START
+// does not empty them: the wearer who hits STOP at the point of no return and
+// tips over anyway climaxes with nothing running, and the pulse the cockpit
+// showed during that minute is the climax the press is about.
+let recentReadings = [];
+
+// Finished me's record of the Survival run (session-rules.openCalibrationWindow):
+// the sustained peak of the monitor's readings while the run was RUNNING,
+// since Survival came on in this session. Opened by START with Survival
+// selected or by Survival coming on in a live session, closed - and kept for
+// a minute - when the session stops, dropped when Survival goes off.
+let calibrationWindow = null;
+
+// A Came Early or Finished me press that asked nothing because the Handy had
+// not confirmed its stop, while the prompt line tells the wearer it may still
+// be moving (session-rules.stopThenAsk): { kind: 'cameEarly', peakHr } or
+// { kind: 'finishedMe', pressedAt, win }. The next press of the same button
+// answers that line, and asks about the press that was turned away, because
+// seeing to a Handy that went offline can take minutes. Finished me reads the
+// run as it stood then and counts its minute after STOP from that press.
+// Came Early judges its step on the peak of the minute before that press:
+// judged on the minute before the second one, a pulse falling from the
+// climax took the larger step and went into the profile as the event's
+// pulse, only because the Handy had held the question back. START and RESUME
+// drop it, and so does Survival going on or off: the wearer has carried on,
+// and a press after that is about something new.
+let heldPress = null;
+
 // Query string check for remote controller
 const urlParams = new URLSearchParams(window.location.search);
 const partnerRoom = urlParams.get('partner');
@@ -306,6 +355,10 @@ const orgasmBtnText = document.getElementById('orgasmBtnText');
 // (see startOrResumeWhenReady); STOP, Reset and the page going away
 // (handlePageAway) cancel the wait.
 const startGate = createStartGate();
+// Came Early and Finished me, one at a time (stopThenAskOnce); START and
+// RESUME ask it too (startOrResumeWhenReady). On the clock a click's
+// timeStamp is measured on.
+const pressQuestion = createQuestionGate({ now: () => performance.now() });
 
 // What the toys were last sent, exactly as dispatchHardware() handed it to
 // the drivers: Force Orgasm's ramp starts from it. A decision the master
@@ -883,13 +936,13 @@ function initHandyRoleUI() {
     applyRole(state.handyRole || 'primary');
 }
 
-// The working ceiling: typed Climax HR minus learned / dual-stim / decay
-// offsets (never raised by any of them), plus two explicit raises: Force
-// Orgasm, and Survival's per-edge overdrive. Decay is off while Survival is
-// on so it cannot fight that climb. One place only, so the engine, the
-// cockpit badges and the Session Setup preview can never quote different
-// BPM at the wearer.
-function workingCeiling(minHr, typedMaxHr) {
+// Everything the working ceiling is computed from, in one object: the engine
+// hands it to computeEffectiveCeiling, and the Came Early, Wipe Memory and
+// Finished me dialogs work from the same object, so a dialog can never work
+// its numbers out from different inputs than the motors run on. Survival's
+// two switches - no decay during the game, and its overdrive only while it
+// is on - are made by workingCeilingInputs, with Force Orgasm's boost.
+function ceilingInputs(minHr, typedMaxHr) {
     // Dual Stimulation Offset Check: a stroker (primary) AND an internal toy
     // (secondary) are both live. The Handy counts for whichever role it holds;
     // Intiface and TCode axes count for the role they are assigned.
@@ -897,23 +950,26 @@ function workingCeiling(minHr, typedMaxHr) {
     const serialHasRole = (role) => isTCodeConnected() && tcodeHasRole(role);
     const hasPrimary = (handyConnected && state.handyRole === 'primary') || intifaceHasRole('primary') || serialHasRole('primary');
     const hasSecondary = (handyConnected && state.handyRole === 'secondary') || intifaceHasRole('secondary') || serialHasRole('secondary');
-    return computeEffectiveCeiling({
+    return workingCeilingInputs({
         minHr,
         maxHr: typedMaxHr,
-        learnedOffset: advancedSettings.learningProfile?.suggestedMaxHrOffset || 0,
+        activeMode: state.activeMode,
+        settings: advancedSettings,
         dualStimActive: hasPrimary && hasSecondary,
-        dualDampening: Boolean(advancedSettings.dualDampening),
-        dualDampeningBpm: advancedSettings.dualDampeningBpm,
-        // Decay lowers the ceiling as edges pile up. Survival is climbing
-        // past the typed max, so that drop does not run during the game.
-        adaptiveDecay: state.activeMode === 'survival' ? false : Boolean(advancedSettings.adaptiveDecay),
         edges: state.edges,
-        decayEdgeCount: advancedSettings.decayEdgeCount,
-        decayBpm: advancedSettings.decayBpm,
-        decayFloor: advancedSettings.decayFloor,
-        orgasmBoost: state.orgasmMode ? state.orgasmBoost : 0,
-        survivalOverdrive: state.activeMode === 'survival' ? state.survivalOverdrive : 0
+        orgasmMode: state.orgasmMode,
+        orgasmBoost: state.orgasmBoost,
+        survivalOverdrive: state.survivalOverdrive
     });
+}
+
+// The working ceiling: typed Climax HR minus learned / dual-stim / decay
+// offsets (never raised by any of them), plus two explicit raises: Force
+// Orgasm, and Survival's per-edge overdrive. One place only, so the engine,
+// the cockpit badges and the Session Setup preview can never quote different
+// BPM at the wearer.
+function workingCeiling(minHr, typedMaxHr) {
+    return computeEffectiveCeiling(ceilingInputs(minHr, typedMaxHr));
 }
 
 // Engine Calculation Loop
@@ -986,29 +1042,38 @@ function updateEngine() {
     if (hrDisplay) hrDisplay.textContent = sensorHr;
     if (!Number.isFinite(state.peakHr) || sensorHr > state.peakHr) state.peakHr = sensorHr;
 
+    // Each offset badge is shown while its offset is asked for, and says how
+    // much of it the floor let through - the same amounts the ceiling below
+    // was built from, so the badges add up to it. They used to print the
+    // requested amounts: LEARNED -3 and DUAL STIM (-15 BPM) stayed lit over
+    // an engine the Resting HR floor was holding at the typed Climax HR. A
+    // floored offset now reads as the smaller number, or 0, instead of
+    // quietly vanishing, so a wearer can see that protection is not in force.
     const learnBadge = document.getElementById('learnBadge');
     const learnAmount = document.getElementById('learnAmountText');
-    if (learnAmount) learnAmount.textContent = ceiling.learnedOffset;
-    learnBadge?.classList.toggle('hidden', !(ceiling.learnedOffset > 0));
+    if (learnAmount) learnAmount.textContent = ceiling.appliedLearned;
+    learnBadge?.classList.toggle('hidden', !(ceiling.requestedLearned > 0));
 
     const dualBadge = document.getElementById('dualStimBadge');
     if (dualBadge) {
-        dualBadge.textContent = `DUAL STIM (-${ceiling.dualOffset} BPM)`;
-        dualBadge.classList.toggle('hidden', !(ceiling.dualOffset > 0));
+        dualBadge.textContent = `DUAL STIM (-${ceiling.appliedDual} BPM)`;
+        dualBadge.classList.toggle('hidden', !(ceiling.requestedDual > 0));
     }
 
     const decayBadge = document.getElementById('decayBadge');
     const decayText = document.getElementById('decayAmountText');
     if (decayText) decayText.textContent = ceiling.appliedDecay;
-    decayBadge?.classList.toggle('hidden', !(ceiling.totalDecay > 0));
+    decayBadge?.classList.toggle('hidden', !(ceiling.requestedDecay > 0));
+
+    paintLearningStatus(ceiling);
 
     // Shown whenever the working ceiling differs from the typed Climax HR.
+    // The two raises it can carry are the ones the ceiling applied.
     const ceilingBadge = document.getElementById('effectiveCeilingBadge');
     const ceilingLabel = document.getElementById('effectiveCeilingLabel');
     const ceilingText = document.getElementById('effectiveCeilingText');
     if (ceilingLabel) {
-        const raised = (state.orgasmMode && ceiling.orgasmBoost > 0)
-            || (state.activeMode === 'survival' && (state.survivalOverdrive || 0) > 0);
+        const raised = ceiling.orgasmBoost > 0 || ceiling.survivalOverdrive > 0;
         ceilingLabel.textContent = raised ? 'OVERDRIVE CEILING' : 'CEILING';
     }
     if (ceilingText) ceilingText.textContent = max;
@@ -1021,6 +1086,7 @@ function updateEngine() {
     if (holdText) holdText.textContent = `${triggerHr}`;
     holdBadge?.classList.toggle('hidden', holdPct === 100 || triggerHr === max);
     state.edgeTriggerHr = triggerHr;
+    updateEdgeHoldPreview(ceiling);
 
     const result = calculateEngineOutputs({
         hr,
@@ -1151,7 +1217,7 @@ function updateEngine() {
     }
 
     updateWarmupBadge();
-    updateGameNotice();
+    updateGameNotice(ceiling);
     renderForceOrgasmButton();
 
     dispatchHardware(result.primaryPercent, result.secondaryPercent, result.strokeMinPercent, result.strokeMaxPercent);
@@ -1260,12 +1326,18 @@ function paintIdlePrompt() {
 // dashboard keeps whatever the last unmuted cue wrote. Hiding the box there
 // wiped a live edge warning one second after it appeared, every
 // encouragement interval, all session.
-function cueVoice(key, urgent = false) {
+//
+// `vars` overrides the live values the cue's tokens are filled from, for a
+// cue that is not about this second's pulse: Came Early's {hr} is the peak
+// its step was judged on, and nothing when there was no reading, not the
+// cockpit's current value - which is the 70 the app starts with when no
+// monitor is on.
+function cueVoice(key, urgent = false, vars = null) {
     const lastTemplate = state.lastCueTemplateById?.[key] || '';
     const { text, template } = resolveVoiceCue(
         advancedSettings.voiceCues,
         key,
-        sessionVoiceVars(),
+        { ...sessionVoiceVars(), ...(vars || {}) },
         { lastTemplate }
     );
     const now = Date.now();
@@ -1302,7 +1374,10 @@ function updateWarmupBadge() {
     }
 }
 
-function updateGameNotice() {
+// `ceiling` is the one updateEngine has just handed the engine: Survival's
+// +N BPM is the overdrive it applied. The calibration toggle passes none, and
+// the game's own figure stands until the next tick.
+function updateGameNotice(ceiling = null) {
     const notice = document.getElementById('gameNotice');
     if (!notice) return;
     const text = describeGameNotice({
@@ -1316,7 +1391,7 @@ function updateGameNotice() {
         trainHoldGoal: advancedSettings.trainHoldSeconds,
         trainEdgesGoal: advancedSettings.trainEdges,
         survivalSpeedFloor: state.survivalSpeedFloor,
-        survivalOverdrive: state.survivalOverdrive,
+        survivalOverdrive: ceiling ? ceiling.survivalOverdrive : state.survivalOverdrive,
         survivalCalibrating: Boolean(advancedSettings.survivalCalibrating),
         sessionSeconds: state.sessionSeconds,
         minSeconds: state.durationMinSeconds,
@@ -1332,6 +1407,9 @@ function updateGameNotice() {
 // Came Early is an accidental release in every other mode. Survival is the
 // climb that is supposed to finish you, so that same button changes its
 // words while the game is selected and, during the run, saves the heart rate.
+// The Came Early tooltip is the one index.html ships with. It used to promise
+// that every press "tightens limits next time"; the Resting HR floor and the
+// offset cap can each leave the ceiling where it was.
 function renderCameEarlyButton() {
     const kicker = document.getElementById('cameEarlyKicker');
     const label = document.getElementById('cameEarlyLabel');
@@ -1341,10 +1419,10 @@ function renderCameEarlyButton() {
     kicker.textContent = survival ? 'The app' : 'Accidental';
     label.textContent = survival ? 'Finished me' : 'Came Early';
     cameEarlyBtn.title = calibrating
-        ? 'This calibration run sets your Climax HR to the heart rate Survival pushed you to.'
+        ? 'Stops the toys and pauses the run at once, then offers the highest heart rate this Survival run held on two readings in a row as your Climax HR. OK saves it and ends the run. It still works for a minute after STOP.'
         : survival
-            ? 'Survival finished you. Check Calibration on the card if this heart rate should become your max.'
-            : 'Log accidental release so local learning engine tightens limits next time.';
+            ? 'Stops the toys and pauses the run, then asks to end it. Check Calibration on the Survival card if the run should set your Climax HR.'
+            : 'Stops the toys and pauses the session, then asks to log an accidental climax. Logged, it adds to the learned offset, which lowers your working climax ceiling on later sessions unless the Resting HR floor or the offset cap holds it. The confirmation states the ceiling before and after.';
     kicker.classList.toggle('text-rose-300', survival);
     kicker.classList.toggle('text-amber-400', !survival);
     cameEarlyBtn.classList.toggle('bg-rose-950/60', survival);
@@ -1727,6 +1805,17 @@ function recordHrReading(bpm, sensorContact = null, now = Date.now()) {
     // Remembered before the engine runs on it, so the reading the engine
     // judges is always the last one in the list.
     edgeReadings = rememberEdgeReading(edgeReadings, now, bpm);
+    rememberReading(recentReadings, now, bpm);
+    // Judged as it arrives: a reading that brings a paused session back was
+    // still taken while it was paused, and one the simulator's slider made is
+    // never the wearer's heart rate.
+    calibrationWindow = noteCalibrationReading(calibrationWindow, {
+        at: now,
+        bpm,
+        running: state.sessionStatus === 'RUNNING',
+        simulator: state.simEngaged,
+        staleSeconds: advancedSettings.hrStaleSeconds
+    });
     // The watchdog's report says no valid reading is arriving, and one just
     // did, so it goes now, whatever the session does next: an auto-resume
     // that cannot run (no toy left to drive, or The Handy not answering that
@@ -1946,11 +2035,16 @@ function masterClockTick() {
     // value left on it is a value held: every second it stays there is one
     // more reading. Otherwise an edge set on the slider in one step - a click
     // on the track, one arrow key - would pull back and then wait for the
-    // slider to move again before it counted. Not once a sensor is linked:
-    // while a new strap connects, the simulator is still flagged engaged but
-    // the pulse is the strap's, and repeating its reading here would hold
-    // one reading twice.
-    if (state.simEngaged && !isBleConnected()) edgeReadings = rememberEdgeReading(edgeReadings, now, state.hrCurrent);
+    // slider to move again before it counted. Came Early's recent readings
+    // take it the same way, or a slider left alone for a minute would read to
+    // them as no reading at all. (Finished me never counts the simulator.)
+    // Not once a sensor is linked: while a new strap connects, the simulator
+    // is still flagged engaged but the pulse is the strap's, and repeating
+    // its reading here would hold one reading twice.
+    if (state.simEngaged && !isBleConnected()) {
+        edgeReadings = rememberEdgeReading(edgeReadings, now, state.hrCurrent);
+        rememberReading(recentReadings, now, state.hrCurrent);
+    }
 
     if (state.sessionStatus === 'RUNNING') {
         state.sessionSeconds += 1;
@@ -2151,6 +2245,10 @@ function startOrResumeSession() {
         setOrgasmMode(false);
         funscriptSessionStart = Date.now();
         resetGameState();
+        // A new session is a new run: the last one's record is gone even
+        // inside its minute, and Survival selected now is Survival switched
+        // on for this session.
+        calibrationWindow = state.activeMode === 'survival' ? openCalibrationWindow(Date.now()) : null;
         state.chosenTargetSeconds = pickSessionTargetSeconds();
         updateTimerDisplay();
         // A voice that fails is told about once per session, so a fresh
@@ -2161,6 +2259,9 @@ function startOrResumeSession() {
         // Resume into the rampdown where it left off, not back to RUNNING.
         resumingRampdown = state.resumeStatus === 'RAMPDOWN' && state.rampdownSecondsLeft > 0;
     }
+    // The wearer carries on: a Came Early or Finished me press the Handy
+    // turned away is not what the next press is about any more.
+    heldPress = null;
     state.sessionStatus = resumingRampdown ? 'RAMPDOWN' : 'RUNNING';
     state.resumeStatus = null;
     // A Force Orgasm run that a pause interrupted ramps up again from the
@@ -2205,7 +2306,19 @@ function withdrawStartRefusal() {
 // refused before the question is asked, and the answer is checked against
 // the whole readiness gate again, since the pulse or a toy can go in the
 // meantime. Resolves whether the session started.
-function startOrResumeWhenReady() {
+//
+// Nothing is started while Came Early or Finished me is stopping the toys
+// and asking, nor by a tap made before its question was over that the page
+// gets only afterwards (`tappedAt`, the click's timeStamp: the press's own
+// rule, createQuestionGate). The press keeps the toys stopped until the
+// wearer has answered, and a START or RESUME tapped while it waited for the
+// stop was still waiting for The Handy's answer when the question opened:
+// the answer started the toys once the question was answered - after
+// Cancel, whose dialog says the session stays paused, and after OK in the
+// minute after STOP. A partner's is dropped while a press runs before it
+// reaches the button (onCommandReceived).
+function startOrResumeWhenReady(tappedAt) {
+    if (pressQuestion.claims(tappedAt)) return Promise.resolve(false);
     if (state.sessionStatus !== 'IDLE' && state.sessionStatus !== 'PAUSED') return Promise.resolve(false);
     if (transportWaitingReason()) {
         checkReadiness();
@@ -2243,16 +2356,20 @@ function startOrResumeWhenReady() {
 }
 
 // Session Controls Handlers
-playPauseBtn?.addEventListener('click', () => {
+playPauseBtn?.addEventListener('click', (event) => {
     if (isRemoteViewer) return;
     if (isRemoteController) {
         // Ask the host; the button re-renders from the telemetry it sends back.
+        // `from` is the host state the button is showing, so a RESUME the host
+        // gets late never starts a session the wearer has ended meanwhile
+        // (peer-messages.hostTransportAction).
         const wants = (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') ? 'RUNNING' : 'PAUSED';
-        sendPeerCommand({ type: 'SESSION_STATE', status: wants });
+        sendPeerCommand({ type: 'SESSION_STATE', status: wants, from: state.sessionStatus });
         return;
     }
     if (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') {
-        startOrResumeWhenReady();
+        // When the tap was made, which is not always when the page gets it.
+        startOrResumeWhenReady(Number.isFinite(event?.timeStamp) && event.timeStamp > 0 ? event.timeStamp : performance.now());
     } else if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         pauseSession('Paused.');
     }
@@ -2277,8 +2394,9 @@ function showIdleTransport() {
 }
 
 // `voiceText` overrides the spoken outcome when a game or guard wants to say
-// more than the history label (one cue, never two back-to-back).
-function stopSession(outcome = "Stopped", voiceText = null) {
+// more than the history label (one cue, never two back-to-back), and
+// `voiceVars` fills its tokens when they are not this second's values.
+function stopSession(outcome = "Stopped", voiceText = null, voiceVars = null) {
     const wasActive = state.sessionStatus !== 'IDLE';
     // Status and motors FIRST: nothing below (history, storage, voice) may
     // leave the session running if it throws. A START still waiting for The
@@ -2298,6 +2416,10 @@ function stopSession(outcome = "Stopped", voiceText = null) {
     // or a pulse that is still not read, is reported on in its own words.
     hideAlertBanner('supervision');
     retractMotorsPaused();
+    // The run is over, but Finished me may still read it for a minute: the
+    // wearer who stops the toys at the point of no return, or whose run ends
+    // in a Soft Landing, comes after this.
+    calibrationWindow = closeCalibrationWindow(calibrationWindow, Date.now());
     try {
         if (wasActive && state.sessionSeconds >= 10 && !isRemotePage) saveSessionToHistory(outcome);
     } catch (e) {
@@ -2310,7 +2432,7 @@ function stopSession(outcome = "Stopped", voiceText = null) {
         withdrawStartRefusal();
         // STOP silences every queued cue; the outcome is the one thing said.
         cancelSpeech();
-        cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'sessionStop'), true);
+        cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'sessionStop'), true, voiceVars);
         syncTelemetry();
         checkReadiness();
         if (!isRemotePage) updateEngine();
@@ -2333,6 +2455,8 @@ resetBtn?.addEventListener('click', () => {
     // As after STOP: no paused session is left to resume, or to report.
     hideAlertBanner('supervision');
     retractMotorsPaused();
+    // Reset ends a run as STOP does, and Finished me may read it for a minute.
+    calibrationWindow = closeCalibrationWindow(calibrationWindow, Date.now());
     resetSessionCounters();
     resetGameState();
     updateWarmupBadge();
@@ -2389,77 +2513,218 @@ function persistSessionLimits(immediate = false) {
     return immediate ? sessionLimitsWriter.flush() : true;
 }
 
-function renderLearningStatus() {
+// The learning line in Session Setup. updateEngine paints it from the
+// ceiling it has just handed the engine, on every tick, so the line can never
+// describe an offset the engine is not applying.
+function paintLearningStatus(ceiling) {
     const text = document.getElementById('learningStatusText');
-    const p = advancedSettings.learningProfile || { breakthroughEvents: 0, suggestedMaxHrOffset: 0 };
-    if (text) {
-        if (p.breakthroughEvents > 0) {
-            const last = p.lastBreakthroughHr ? ` Last event at ${p.lastBreakthroughHr} BPM.` : '';
-            text.textContent = `Active: ${p.breakthroughEvents} premature event(s). Working climax ceiling is ${p.suggestedMaxHrOffset} BPM below your typed Climax HR on every session.${last}`;
-            text.className = "p-2 bg-amber-950/40 border border-amber-800 rounded-lg text-[10px] font-mono text-amber-300";
-        } else {
-            text.textContent = "Zero breakthrough events recorded. Typed Climax HR is used as-is.";
-            text.className = "p-2 bg-slate-900 rounded-lg text-[10px] font-mono text-purple-300";
-        }
-    }
+    if (!text) return;
+    const status = describeLearningStatus({ profile: advancedSettings.learningProfile, ceiling });
+    const className = status.active
+        ? "p-2 bg-amber-950/40 border border-amber-800 rounded-lg text-[10px] font-mono text-amber-300"
+        : "p-2 bg-slate-900 rounded-lg text-[10px] font-mono text-purple-300";
+    if (text.textContent !== status.text) text.textContent = status.text;
+    if (text.className !== className) text.className = className;
+}
+
+// Anything that changes the learning profile repaints through the engine
+// tick, which computes the ceiling once and paints every surface from it.
+function renderLearningStatus() {
     updateEngine();
 }
 
-cameEarlyBtn?.addEventListener('click', () => {
-    // The learning profile and the typed max belong to the host.
-    if (isRemotePage || isRemoteViewer) return;
-    if (state.activeMode === 'survival') {
-        // A run is live until it has ended, its soft landing included: Force
-        // Orgasm's time limit hands a run that has just finished the wearer
-        // to that landing, and Finished me must still save the heart rate
-        // there rather than tell them to start the run they are in.
-        if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'PAUSED' && state.sessionStatus !== 'RAMPDOWN') {
-            confirm(advancedSettings.survivalCalibrating
-                ? 'Start Survival first. Once it is running, Finished me saves the heart rate the climb pushed you to.'
-                : 'Start Survival first. Check Calibration on the card if Finished me should save your heart rate.');
+function sessionIsLive() {
+    return state.sessionStatus === 'RUNNING' || state.sessionStatus === 'PAUSED' || state.sessionStatus === 'RAMPDOWN';
+}
+
+// A session that is driving the toys: RUNNING, or in its Soft Landing.
+function sessionDriving() {
+    return state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
+}
+
+// Came Early and Finished me stop every toy the moment they are pressed,
+// with the forced zero dispatch STOP sends, and ask only once the toys are
+// at rest (session-rules.stopThenAsk says why the question waits for the
+// Handy to confirm its stop, and what a press does when it does not). A
+// session that is driving the toys is paused, not ended: nothing is decided
+// before the answer, OK ends it, and Cancel leaves it paused for RESUME. The
+// press used to end it first, so a mis-tap cost the session, and History
+// kept an outcome Cancel could not take back. A pause the watchdog made
+// would end by itself when the pulse came back, starting the toys under the
+// question or after Cancel, so the press makes it one only RESUME ends. The
+// pause is counted as any other pause is. A partner's RESUME that reaches the
+// page only once OK has ended the session is not taken for a START
+// (peer-messages.hostTransportAction). A START or RESUME still waiting for
+// The Handy's answer (startOrResumeWhenReady) is dropped as STOP drops it -
+// the wearer's, a partner's taken just before the press, and the watchdog's
+// auto-resume, which no longer reads as a watchdog pause while it waits:
+// its answer would start the toys while the press waits for their stop, or
+// once the question is answered, Cancel included. One pressed while the
+// press stops the toys and asks is not taken at all (startOrResumeWhenReady);
+// pressed again once the question is answered, it asks again.
+function haltForTheQuestion() {
+    startGate.cancel();
+    if (state.hrSignalPaused) clearHrSignalPause();
+    if (!pauseSession('Paused.')) dispatchHardware(0, 0, 0, 100, true);
+    checkReadiness();
+    syncTelemetry();
+    updateEngine();
+}
+
+function waitMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The frame after the next paint, so a question opened then stands over the
+// cockpit as it is, not as it was a moment earlier.
+function nextFrame() {
+    return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+}
+
+// Stop the toys, then `ask` once they are at rest - or, for the press that
+// answers a refusal (`acknowledged`), once nothing is on its way to the Handy
+// any more. A press made while an earlier one is still stopping or asking is
+// dropped (createQuestionGate). `press` is what this press is about
+// (session-rules.pressAbout), kept when it is refused.
+function stopThenAskOnce(tappedAt, { press, acknowledged, notStoppedLine }, ask) {
+    pressQuestion.run({
+        halt: haltForTheQuestion,
+        driving: sessionDriving,
+        handyRest: handyRestState,
+        stopTally: handyStopTally,
+        wait: waitMs,
+        nextFrame,
+        acknowledged,
+        ask: (answer) => {
+            heldPress = null;
+            // The prompt line said the press was waiting for the Handy: it
+            // now says how that wait ended - and says it, notice or not,
+            // when a stop it waited for went unanswered over a Handy
+            // already at rest, which asks all the same.
+            if (answer.waited || answer.unanswered) cueVoice(describeStopWaitOver(answer));
+            return ask(answer);
+        },
+        // Said on the prompt line and spoken, never in a dialog: a dialog
+        // would hold back the very stops the page is still sending.
+        refuse: () => {
+            heldPress = press;
+            cueVoice(notStoppedLine, true);
+        },
+        waiting: () => cueVoice(describeWaitingForStop())
+    }, { pressedAt: tappedAt }).catch((e) => console.warn('Came Early could not finish', e));
+}
+
+// Finished me: the Came Early button while Survival is the game.
+function finishedMe(tappedAt) {
+    // The run as it stood at the press, or at the press this one answers.
+    // The record is never changed in place, so this is the run the question
+    // is about, whatever happens before the question is asked.
+    const { press, acknowledged } = pressAbout({ kind: 'finishedMe', held: heldPress, now: Date.now(), window: calibrationWindow });
+    const calibrating = Boolean(advancedSettings.survivalCalibrating);
+    stopThenAskOnce(tappedAt, { press, acknowledged, notStoppedLine: describeStopNotConfirmed({ finishedMe: true }) }, ({ handyAtRest }) => {
+        // Worked out as the question is asked and stored exactly as asked.
+        const limits = readHrLimits();
+        const paused = state.sessionStatus === 'PAUSED';
+        const plan = planFinishedMe({
+            calibrating,
+            paused,
+            window: press.win,
+            now: press.pressedAt,
+            inputs: ceilingInputs(limits.minHr, limits.maxHr),
+            holdPercent: advancedSettings.edgeHoldPercent,
+            handyAtRest
+        });
+        if (plan.ask === 'alert') {
+            // A press that saves nothing says so out loud and on the
+            // cockpit's prompt line, which stays up behind the dialog and
+            // after it. 1.1.2 returned in silence on a reading above 220,
+            // with the toys still running.
+            cueVoice(plan.line);
+            alert(plan.text);
             return;
         }
-        const typed = readHrLimits().maxHr;
-        if (!advancedSettings.survivalCalibrating) {
-            if (confirm(`End the run? Your Climax HR stays ${typed}. Check Calibration on the Survival card first if you want this heart rate saved.`)) {
-                stopSession('Survival');
+        if (!confirm(plan.text)) {
+            if (plan.cancelLine) cueVoice(plan.cancelLine);
+            return;
+        }
+        if (plan.saveHr !== null) {
+            const input = document.getElementById('maxHr');
+            if (input) {
+                input.value = String(plan.saveHr);
+                input.dispatchEvent(new Event('change', { bubbles: true }));
             }
-            return;
         }
-        const now = Number.isFinite(state.sensorHr) ? state.sensorHr : state.hrCurrent;
-        const peak = Number.isFinite(state.peakHr) ? state.peakHr : now;
-        const hr = Math.round(Math.max(Number(now) || 0, Number(peak) || 0));
-        if (!Number.isFinite(hr) || hr < 40 || hr > 220) return;
-        const ok = confirm(`Set Climax HR to ${hr}? Survival pushed you there. Your typed max is ${typed}. The toys stop, and the next session uses ${hr}.`);
-        if (!ok) return;
-        const input = document.getElementById('maxHr');
-        if (input) {
-            input.value = String(hr);
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        stopSession('Survival calibration', 'Saved. That heart rate is your max.');
-        return;
-    }
-    if (confirm("Log an accidental release? EdgeLoop will lower your working climax ceiling on this and future sessions.")) {
+        if (paused) stopSession(plan.outcome, plan.line);
+        else cueVoice(plan.line);
+    });
+}
+
+// Came Early in every other mode: log an accidental release.
+function cameEarly(tappedAt) {
+    // The step is judged on the pulse of the minute before the press, or
+    // before the press this one answers.
+    const { press, acknowledged } = pressAbout({ kind: 'cameEarly', held: heldPress, now: Date.now(), readings: recentReadings });
+    stopThenAskOnce(tappedAt, { press, acknowledged, notStoppedLine: describeStopNotConfirmed() }, ({ handyAtRest }) => {
+        // Everything else is worked out as the question is asked, from the
+        // profile as it stands, and exactly that is stored after it: the
+        // numbers the wearer agrees to are the numbers they get.
+        const limits = readHrLimits();
+        const inputs = ceilingInputs(limits.minHr, limits.maxHr);
+        const step = cameEarlyStep({ offset: inputs.learnedOffset, typedMaxHr: limits.maxHr, peakHr: press.peakHr });
+        const before = learnedOffsetCeilings(inputs, step.previous);
+        const after = learnedOffsetCeilings(inputs, step.offset);
+        const paused = state.sessionStatus === 'PAUSED';
+        if (!confirm(describeCameEarlyConfirm({ before, after, step, paused, handyAtRest, peakFromFirstPress: acknowledged }))) return;
         if (!advancedSettings.learningProfile) {
             advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
         }
         const profile = advancedSettings.learningProfile;
-        const userMax = readHrLimits().maxHr;
-        profile.breakthroughEvents += 1;
-        profile.lastBreakthroughHr = state.hrCurrent;
-        profile.suggestedMaxHrOffset = Math.min(30, (profile.suggestedMaxHrOffset || 0) + 3);
-        if (state.hrCurrent && state.hrCurrent < userMax - 8) {
-            profile.suggestedMaxHrOffset = Math.min(30, profile.suggestedMaxHrOffset + 2);
-        }
+        profile.breakthroughEvents = (profile.breakthroughEvents || 0) + 1;
+        // The peak the step was judged on, or nothing: with no monitor this
+        // used to record the 70 BPM the app starts with as the pulse of the
+        // event.
+        profile.lastBreakthroughHr = step.peakHr;
+        profile.suggestedMaxHrOffset = step.offset;
         persistSettings();
-        renderLearningStatus();
-        stopSession("Premature Release", "cameEarly");
-    }
+        // No tick of the session runs on the offset stored here: it is
+        // paused, which keeps the toys silent and counts no edge, and OK ends
+        // it in the same breath. Stored under a running session, as 1.1.2
+        // did, it lowered the ceiling for one more tick: a pulse between the
+        // old and the new pullback mark - where a climax under the Climax HR
+        // sits - counted as a brand-new edge, queued the edge cue ahead of
+        // this one, reversed an Intiface rotator and went into the session
+        // history as one edge more. The stop, or the tick below, repaints the
+        // learning line and the badges with the offset just stored. The cue
+        // says what the dialog said: a tighter limit only when the ceiling the
+        // next session starts at really went down, and the peak the step was
+        // judged on for {hr}.
+        const cue = cameEarlyCue({ before, after, step });
+        if (paused) {
+            stopSession('Premature Release', cue.cue, cue.vars);
+        } else {
+            renderLearningStatus();
+            cueVoice(cue.cue, false, cue.vars);
+        }
+    });
+}
+
+cameEarlyBtn?.addEventListener('click', (event) => {
+    // The learning profile and the typed max belong to the host.
+    if (isRemotePage || isRemoteViewer) return;
+    // When the tap was made, which is not always when the page gets it.
+    const tappedAt = Number.isFinite(event?.timeStamp) && event.timeStamp > 0 ? event.timeStamp : performance.now();
+    if (state.activeMode === 'survival') finishedMe(tappedAt);
+    else cameEarly(tappedAt);
 });
 
 document.getElementById('wipeLearningBtn')?.addEventListener('click', () => {
-    if (confirm("Reset local bio-learning memory? Your typed Climax HR will be used with no offset.")) {
+    const limits = readHrLimits();
+    const inputs = ceilingInputs(limits.minHr, limits.maxHr);
+    const message = describeWipeLearningConfirm({
+        before: learnedOffsetCeilings(inputs),
+        after: learnedOffsetCeilings(inputs, 0)
+    });
+    if (confirm(message)) {
         advancedSettings.learningProfile = { breakthroughEvents: 0, suggestedMaxHrOffset: 0, lastBreakthroughHr: null };
         persistSettings();
         renderLearningStatus();
@@ -2693,7 +2958,7 @@ const MODE_DETAILS = {
     ultimate: 'The pattern changes with your pulse: long and steady, then long-slow against short-fast. Stops and short bursts wait until your pulse is close to the heart rate you set. The internal toy follows the same chapters.',
     ruin: 'The stroker keeps moving through the edge, once. After about 12 seconds on the mark it stops dead and the other toy drops low, so it can leak without a full orgasm. The stop lasts at least 18 seconds, and until the edge releases 5 BPM below the mark; only the next edge rides again. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
-    survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. Check Calibration when this run should set your Climax HR, then tap Finished me when you come. The stroke range is the tease mode you selected.',
+    survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. Check Calibration when this run should set your Climax HR, then tap Finished me when you come: it stops the toys, then offers the highest heart rate your monitor held on two readings in a row. The stroke range is the tease mode you selected.',
     edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
 };
 
@@ -2726,6 +2991,7 @@ function highlightModeCard() {
 }
 
 function applyModeSelection(mode, enabled) {
+    const wasSurvival = state.activeMode === 'survival';
     if (GAME_CARD_MODES.includes(mode)) {
         const turnOn = enabled !== undefined ? enabled : state.gameMode !== mode;
         if (!turnOn) {
@@ -2743,6 +3009,15 @@ function applyModeSelection(mode, enabled) {
         state.teaseMode = mode;
     }
     state.activeMode = state.gameMode || state.teaseMode;
+    // Finished me reads the run from the moment Survival came on in this
+    // session, as the game's own edges do: readings from before belong to
+    // another game. Going off ends its record; a tease-mode card under the
+    // game leaves it alone.
+    if (state.activeMode !== 'survival') calibrationWindow = null;
+    else if (!wasSurvival) calibrationWindow = sessionIsLive() ? openCalibrationWindow(Date.now()) : null;
+    // The button now means the other thing, and a press it turned away as
+    // Came Early is no Finished me - nor a Finished me of a record just gone.
+    if (wasSurvival !== (state.activeMode === 'survival')) heldPress = null;
     highlightModeCard();
     renderModeDetail();
     updateEngine();
@@ -3654,26 +3929,36 @@ function startMicMeterLoop() {
     tick();
 }
 
-function updateEdgeHoldPreview() {
+// `ceiling` is the one updateEngine has just handed the engine; the input
+// handlers pass none and have it worked out here by the same function. The
+// engine tick repaints this line too: painted only when Session Setup opened
+// or the field was edited, it went on quoting the ceiling of that moment
+// while the modal stayed open over a running session - a toy dropping out
+// ends dual-stim dampening and raises the real mark by 15 BPM, and the line
+// kept promising the lower one.
+function updateEdgeHoldPreview(ceiling = null) {
     const preview = document.getElementById('edgeHoldPreview');
     if (!preview) return;
-    const limits = readHrLimits();
-    const typedMax = limits.maxHr;
+    let working = ceiling;
+    if (!working) {
+        const limits = readHrLimits();
+        working = workingCeiling(limits.minHr, limits.maxHr);
+    }
     // The percentage applies to the WORKING ceiling, which is what the
     // engine, the HOLD TO badge and the guards use. Previewing it against
     // the typed Climax HR promised a mark the session never pulls back at
     // (dual-stim dampening and decay are on by default).
-    const max = workingCeiling(limits.minHr, typedMax).maxHr;
     const pct = clampEdgeHoldPercent(document.getElementById('edgeHoldPercentInput')?.value);
-    preview.textContent = describeEdgeHoldPreview({
-        typedMaxHr: typedMax,
-        workingMaxHr: max,
-        minHr: limits.minHr,
+    const text = describeEdgeHoldPreview({
+        typedMaxHr: working.typedMaxHr,
+        workingMaxHr: working.maxHr,
+        minHr: working.minHr,
         holdPercent: pct
     });
+    if (preview.textContent !== text) preview.textContent = text;
 }
 
-document.getElementById('edgeHoldPercentInput')?.addEventListener('input', updateEdgeHoldPreview);
+document.getElementById('edgeHoldPercentInput')?.addEventListener('input', () => updateEdgeHoldPreview());
 
 document.getElementById('paramMicTestBtn')?.addEventListener('click', async () => {
     try {
@@ -5063,10 +5348,17 @@ function setupPartnerHost() {
         },
         onCommandReceived: (cmd) => {
             if (cmd.type === 'SESSION_STATE') {
-                const hostActive = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN';
-                if (cmd.status === 'RUNNING' && !hostActive) playPauseBtn?.click();
-                else if (cmd.status === 'PAUSED' && hostActive) playPauseBtn?.click();
-                else if (cmd.status === 'IDLE') stopBtn?.click();
+                // Start, resume and pause are the one button, which does
+                // whichever the host's state calls for; the command has just
+                // been checked against that state.
+                const action = hostTransportAction(cmd, state.sessionStatus);
+                // While Came Early or Finished me is stopping the toys and
+                // asking, a partner's START or RESUME is not taken: the
+                // wearer has just come. Taken, it drove the toys until the
+                // press stopped them again.
+                if ((action === 'start' || action === 'resume') && pressQuestion.busy) return;
+                if (action === 'stop') stopBtn?.click();
+                else if (action) playPauseBtn?.click();
             } else if (cmd.type === 'SESSION_RESET') resetBtn?.click();
             else if (cmd.type === 'ORGASM_TOGGLE') orgasmBtn?.click();
             else if (cmd.type === 'MODE_CHANGE') {

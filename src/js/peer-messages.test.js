@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
     sanitizeCommand,
     sanitizeTelemetry,
+    hostTransportAction,
     HISTORY_LENGTH,
     PEER_PROTOCOL_VERSION,
     VERSIONED_COMMANDS,
@@ -50,6 +51,75 @@ describe('sanitizeCommand', () => {
         assert.equal(sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING' }, 'viewer'), null);
         assert.equal(sanitizeCommand({ type: 'ORGASM_TOGGLE' }, 'viewer'), null);
         assert.equal(sanitizeCommand({ type: 'SESSION_RESET' }, 'viewer'), null);
+    });
+
+    it('carries the host state a transport command was pressed for, and nothing that is not one', () => {
+        assert.deepEqual(
+            sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING', from: 'PAUSED' }),
+            { type: 'SESSION_STATE', status: 'RUNNING', from: 'PAUSED' }
+        );
+        assert.deepEqual(
+            sanitizeCommand({ type: 'SESSION_STATE', status: 'PAUSED', from: 'RAMPDOWN' }),
+            { type: 'SESSION_STATE', status: 'PAUSED', from: 'RAMPDOWN' }
+        );
+        for (const from of ['paused', 'STOPPED', 3, null, {}, '']) {
+            assert.deepEqual(sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING', from }), { type: 'SESSION_STATE', status: 'RUNNING' });
+        }
+        assert.equal(sanitizeCommand({ type: 'SESSION_STATE', from: 'PAUSED' }), null);
+    });
+});
+
+describe('hostTransportAction', () => {
+    const command = (status, from) => sanitizeCommand(from === undefined
+        ? { type: 'SESSION_STATE', status }
+        : { type: 'SESSION_STATE', status, from });
+
+    it('a RESUME that reaches the host after the session ended starts nothing', () => {
+        // Came Early and Finished me pause the session behind their question,
+        // so the partner's button reads RESUME while it is open. Pressed then,
+        // the command waited behind the host's dialog, OK ended the session,
+        // and the RESUME arrived at an idle host - which took it for START and
+        // drove the toys a second after the wearer confirmed a climax.
+        assert.equal(hostTransportAction(command('RUNNING', 'PAUSED'), 'IDLE'), null);
+        // Cancel leaves the session paused: then the partner's RESUME resumes it.
+        assert.equal(hostTransportAction(command('RUNNING', 'PAUSED'), 'PAUSED'), 'resume');
+    });
+
+    it('a START starts only an idle host, and never resumes a session paused since', () => {
+        assert.equal(hostTransportAction(command('RUNNING', 'IDLE'), 'IDLE'), 'start');
+        assert.equal(hostTransportAction(command('RUNNING', 'IDLE'), 'PAUSED'), null);
+        for (const busy of ['RUNNING', 'RAMPDOWN']) {
+            assert.equal(hostTransportAction(command('RUNNING', 'IDLE'), busy), null);
+            assert.equal(hostTransportAction(command('RUNNING', 'PAUSED'), busy), null);
+        }
+        // A RUNNING no controller button sends is never acted on.
+        assert.equal(hostTransportAction(command('RUNNING', 'RUNNING'), 'IDLE'), null);
+        assert.equal(hostTransportAction(command('RUNNING', 'RAMPDOWN'), 'PAUSED'), null);
+    });
+
+    it('PAUSE and STOP act as they always did, whatever the controller showed', () => {
+        for (const from of [undefined, 'IDLE', 'RUNNING', 'PAUSED', 'RAMPDOWN']) {
+            assert.equal(hostTransportAction(command('PAUSED', from), 'RUNNING'), 'pause');
+            assert.equal(hostTransportAction(command('PAUSED', from), 'RAMPDOWN'), 'pause');
+            assert.equal(hostTransportAction(command('PAUSED', from), 'PAUSED'), null);
+            assert.equal(hostTransportAction(command('PAUSED', from), 'IDLE'), null);
+            for (const host of ['IDLE', 'RUNNING', 'PAUSED', 'RAMPDOWN']) {
+                assert.equal(hostTransportAction(command('IDLE', from), host), 'stop');
+            }
+        }
+    });
+
+    it('a command from a controller that does not say what it showed is taken as before', () => {
+        assert.equal(hostTransportAction(command('RUNNING'), 'IDLE'), 'start');
+        assert.equal(hostTransportAction(command('RUNNING'), 'PAUSED'), 'resume');
+        assert.equal(hostTransportAction(command('RUNNING'), 'RUNNING'), null);
+        assert.equal(hostTransportAction(command('RUNNING'), 'RAMPDOWN'), null);
+    });
+
+    it('anything that is not a transport command does nothing', () => {
+        assert.equal(hostTransportAction(null, 'IDLE'), null);
+        assert.equal(hostTransportAction({ type: 'ORGASM_TOGGLE' }, 'RUNNING'), null);
+        assert.equal(hostTransportAction({ type: 'SESSION_STATE', status: 'RAMPDOWN' }, 'RUNNING'), null);
     });
 });
 
