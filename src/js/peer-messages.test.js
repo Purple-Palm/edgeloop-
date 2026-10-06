@@ -4,8 +4,10 @@ import { readFileSync } from 'node:fs';
 import {
     sanitizeCommand,
     sanitizeTelemetry,
+    transportCommand,
     hostTransportAction,
     HISTORY_LENGTH,
+    REMOTE_STATUSES,
     PEER_PROTOCOL_VERSION,
     VERSIONED_COMMANDS,
     readPeerProtocol,
@@ -385,10 +387,16 @@ describe('the two pages say which version they speak', () => {
         const typeOf = (arg) => {
             const literal = /^\{\s*type:\s*'([A-Z_]+)'/.exec(arg);
             if (literal) return literal[1];
+            // The transport's command is built in peer-messages.js, for every
+            // status the controller can be showing.
+            if (/^transportCommand\(/.test(arg)) {
+                const built = new Set([...REMOTE_STATUSES, undefined].map((shown) => transportCommand(shown).type));
+                return built.size === 1 ? [...built][0] : null;
+            }
             const named = new RegExp(`const ${arg} = \\{\\s*type:\\s*'([A-Z_]+)'`).exec(app);
             return named ? named[1] : null;
         };
-        const sends = [...app.matchAll(/sendPeerCommand\(([^)]*)\)/g)].map((m) => m[1].trim());
+        const sends = [...app.matchAll(/sendPeerCommand\(((?:[^()]|\([^()]*\))*)\)/g)].map((m) => m[1].trim());
         assert.ok(sends.length >= 5, `only ${sends.length} commands found`);
         const types = sends.map((arg) => {
             const type = typeOf(arg);
@@ -451,5 +459,88 @@ describe('the two pages say which version they speak', () => {
         const viewerTexts = texts['viewer/older'] + texts['viewer/newer'];
         assert.ok(!/mode and game changes/i.test(viewerTexts), viewerTexts);
         assert.ok(!/STOP/.test(viewerTexts), viewerTexts);
+    });
+});
+
+describe('a controller RESUME never becomes a START', () => {
+    it('the controller asks for a resume, a start or a pause from the status it shows, and says which it showed', () => {
+        assert.deepEqual(transportCommand('IDLE'), { type: 'SESSION_STATE', status: 'RUNNING', from: 'IDLE' });
+        assert.deepEqual(transportCommand('PAUSED'), { type: 'SESSION_STATE', status: 'RUNNING', from: 'PAUSED' });
+        assert.deepEqual(transportCommand('RUNNING'), { type: 'SESSION_STATE', status: 'PAUSED', from: 'RUNNING' });
+        assert.deepEqual(transportCommand('RAMPDOWN'), { type: 'SESSION_STATE', status: 'PAUSED', from: 'RAMPDOWN' });
+        // A status the page cannot read asks for the direction that stops
+        // the motors, as it always did, and claims no state it was pressed in.
+        for (const unread of [undefined, null, 'STARTING', '']) {
+            assert.deepEqual(transportCommand(unread), { type: 'SESSION_STATE', status: 'PAUSED' }, String(unread));
+        }
+    });
+
+    it('what the controller sends crosses the wire as it was sent, and never from a viewer', () => {
+        for (const shown of [...REMOTE_STATUSES, undefined]) {
+            const sent = transportCommand(shown);
+            assert.deepEqual(sanitizeCommand(sent), sent, String(shown));
+            assert.equal(sanitizeCommand(sent, 'viewer'), null, String(shown));
+        }
+        // What a marker the host cannot read leaves: the bare command.
+        for (const junk of ['true', true, 1, {}, [], null, false]) {
+            assert.deepEqual(
+                sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING', from: junk }),
+                { type: 'SESSION_STATE', status: 'RUNNING' },
+                `from: ${JSON.stringify(junk)} says nothing`
+            );
+        }
+    });
+
+    it('a host that stopped meanwhile does not start a session on a late resume', () => {
+        // The race: the wearer pressed STOP on a paused session while the
+        // partner pressed RESUME. The partner's page still showed PAUSED.
+        const late = sanitizeCommand(transportCommand('PAUSED'));
+        assert.equal(hostTransportAction(late, 'IDLE'), null);
+        // A resume that finds the session paused does resume it.
+        assert.equal(hostTransportAction(late, 'PAUSED'), 'resume');
+        // Already running again (the wearer resumed first): nothing to do.
+        assert.equal(hostTransportAction(late, 'RUNNING'), null);
+        assert.equal(hostTransportAction(late, 'RAMPDOWN'), null);
+    });
+
+    it('a START still starts, a pause only pauses, and IDLE is STOP', () => {
+        const start = sanitizeCommand(transportCommand('IDLE'));
+        assert.equal(hostTransportAction(start, 'IDLE'), 'start');
+        assert.equal(hostTransportAction(start, 'RUNNING'), null);
+        // A START that finds the session paused leaves the wearer's pause
+        // alone; one from a page that does not say what it showed resumes it,
+        // as it always did.
+        assert.equal(hostTransportAction(start, 'PAUSED'), null);
+        assert.equal(hostTransportAction(sanitizeCommand({ type: 'SESSION_STATE', status: 'RUNNING' }), 'PAUSED'), 'resume');
+        const pause = sanitizeCommand(transportCommand('RUNNING'));
+        assert.equal(hostTransportAction(pause, 'RUNNING'), 'pause');
+        assert.equal(hostTransportAction(pause, 'RAMPDOWN'), 'pause');
+        assert.equal(hostTransportAction(pause, 'PAUSED'), null, 'pressing the transport of a paused host would resume it');
+        assert.equal(hostTransportAction(pause, 'IDLE'), null, 'pressing the transport of an idle host would start it');
+        const stop = sanitizeCommand({ type: 'SESSION_STATE', status: 'IDLE' });
+        for (const status of REMOTE_STATUSES) assert.equal(hostTransportAction(stop, status), 'stop');
+    });
+
+    it('nothing that is not a transport command reaches the transport', () => {
+        const junks = [null, undefined, 'SESSION_STATE', [], { type: 'SESSION_RESET' }, { type: 'SESSION_STATE', status: 'RAMPDOWN' },
+            { type: 'MODE_CHANGE', status: 'RUNNING' }];
+        for (const junk of junks) {
+            assert.equal(hostTransportAction(junk, 'PAUSED'), null, JSON.stringify(junk));
+            assert.equal(hostTransportAction(junk, 'IDLE'), null, JSON.stringify(junk));
+        }
+    });
+
+    it('an idle host is started only by a page that was showing START, and a paused one resumed only by one showing RESUME', () => {
+        // Every status the controller can be showing, against an idle host
+        // and a paused one.
+        for (const shown of [...REMOTE_STATUSES, undefined]) {
+            const command = sanitizeCommand(transportCommand(shown));
+            const onIdle = hostTransportAction(command, 'IDLE');
+            if (shown === 'IDLE') assert.equal(onIdle, 'start', 'a page showing START may start');
+            else assert.equal(onIdle, null, `a page showing ${String(shown)} must not start the host`);
+            const onPaused = hostTransportAction(command, 'PAUSED');
+            if (shown === 'PAUSED') assert.equal(onPaused, 'resume', 'a page showing RESUME may resume');
+            else assert.equal(onPaused, null, `a page showing ${String(shown)} must not resume the host`);
+        }
     });
 });

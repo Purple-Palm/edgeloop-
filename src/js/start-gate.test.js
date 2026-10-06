@@ -203,7 +203,8 @@ describe('a START or RESUME made while Came Early or Finished me runs starts not
 
     it('the button hands it the time of the tap', () => {
         const body = bodyFrom("playPauseBtn?.addEventListener('click'", '\n});');
-        assert.match(body, /startOrResumeWhenReady\(Number\.isFinite\(event\?\.timeStamp\) && event\.timeStamp > 0 \? event\.timeStamp : performance\.now\(\)\)/);
+        assert.match(body, /const tappedAt = Number\.isFinite\(event\?\.timeStamp\) && event\.timeStamp > 0 \? event\.timeStamp : performance\.now\(\);/);
+        assert.match(body, /startOrResumeWhenReady\(tappedAt\)/);
     });
 });
 

@@ -1,4 +1,5 @@
-// Validation of everything that arrives over the WebRTC data channel.
+// Validation of everything that arrives over the WebRTC data channel, and
+// the transport command both ends of it agree on.
 //
 // Both directions are untrusted: a controller page may only issue the
 // transport / orgasm / mode commands its UI exposes (never limits or raw
@@ -159,7 +160,8 @@ function readCommand(raw, role) {
             if (!status) return null;
             const command = { type: 'SESSION_STATE', status };
             // Present only when the sender said so: the host state its button
-            // was showing when it was pressed (hostTransportAction).
+            // was showing when it was pressed (transportCommand,
+            // hostTransportAction).
             const from = oneOf(raw.from, REMOTE_STATUSES);
             if (from) command.from = from;
             return command;
@@ -182,24 +184,39 @@ function readCommand(raw, role) {
     }
 }
 
+// The command a controller's play / pause button sends, for the host status
+// that page is showing: RUNNING over START or RESUME, PAUSED over PAUSE, and
+// `from`, the status the button showed, so the host takes it only for the
+// state it was pressed in (hostTransportAction). A status the page cannot
+// read asks for the direction that stops the motors, as it always did, and
+// claims no state it was pressed for.
+export function transportCommand(shownStatus) {
+    const status = shownStatus === 'IDLE' || shownStatus === 'PAUSED' ? 'RUNNING' : 'PAUSED';
+    const command = { type: 'SESSION_STATE', status };
+    if (REMOTE_STATUSES.includes(shownStatus)) command.from = shownStatus;
+    return command;
+}
+
 // What the host does with a controller's SESSION_STATE command, given the
 // state it is in now: 'start', 'resume', 'pause', 'stop' or null (nothing).
 // The controller has one transport button, and it sends RUNNING both as
 // START, over a host it shows IDLE, and as RESUME, over one it shows PAUSED.
 // The host used to take any RUNNING as "start or resume, whichever fits", and
-// a command can reach it long after it was pressed: a native dialog on the
-// host holds back every message until it is answered. Came Early and
-// Finished me pause the session behind their question, so the partner's
-// button reads RESUME for as long as it is open; pressed then, the RESUME
-// waited behind the dialog, the wearer's OK ended the session, and the RESUME
-// arrived at an idle host as a START - a brand-new session driving the toys a
-// second after the wearer had confirmed a climax. So a controller now sends
-// `from`, the host state its button showed, and RUNNING acts only on the
-// state it was pressed for: a RESUME never starts a session the wearer has
-// ended since, and a START never resumes one the wearer has paused since.
-// A command without `from` - a controller page from before it was sent - is
-// taken as it always was. PAUSED and IDLE only ever stop the toys, and are
-// taken as they always were.
+// a command can reach it after the state it was pressed for has gone. The
+// status a controller shows is the host's as of its last report, so the
+// wearer's STOP and the partner's RESUME can cross on the way. And a native
+// dialog on the host holds back every message until it is answered: Came
+// Early and Finished me pause the session behind their question, so the
+// partner's button reads RESUME for as long as it is open; pressed then, the
+// RESUME waited behind the dialog, the wearer's OK ended the session, and the
+// RESUME arrived at an idle host as a START - a brand-new session driving the
+// toys a second after the wearer had confirmed a climax. So a controller now
+// sends `from`, the host state its button showed (transportCommand), and
+// RUNNING acts only on the state it was pressed for: a RESUME never starts a
+// session the wearer has ended since, and a START never resumes one the
+// wearer has paused since. A command without `from` - a controller page from
+// before it was sent - is taken as it always was. PAUSED and IDLE only ever
+// stop the toys, and are taken as they always were.
 export function hostTransportAction(command, hostStatus) {
     if (!command || command.type !== 'SESSION_STATE') return null;
     const active = hostStatus === 'RUNNING' || hostStatus === 'RAMPDOWN';

@@ -136,7 +136,8 @@ import {
     getPeerCounts,
     peerLibraryAvailable
 } from './webrtc.js';
-import { describePeerVersionMismatch, peerProtocolRelation, hostTransportAction } from './peer-messages.js';
+import { describePeerVersionMismatch, peerProtocolRelation, hostTransportAction, transportCommand } from './peer-messages.js';
+import { createHotkeyLayer, classifyKeyTarget, transportKeyHint, createResumeHold, REACTION_MS } from './hotkeys.js';
 import {
     speakPrompt,
     speakNow,
@@ -561,11 +562,16 @@ function pauseSession(voiceText = 'Paused.') {
     return true;
 }
 
+// RESUME takes no press for a moment after it appears (see the transport's
+// click handler).
+const resumeHold = createResumeHold();
+
 // Put the transport button into the look for `status`. Shared by start,
 // pause, stop / reset and the remote controller's telemetry renderer.
 function renderTransport(status) {
     if (!playPauseBtn) return;
     playPauseBtn.disabled = false;
+    resumeHold.rendered(status, performance.now());
     if (status === 'RUNNING' || status === 'RAMPDOWN') {
         if (playPauseText) playPauseText.textContent = "PAUSE";
         if (playPauseIcon) playPauseIcon.innerHTML = `<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>`;
@@ -579,14 +585,38 @@ function renderTransport(status) {
         if (playPauseIcon) playPauseIcon.innerHTML = `<path d="M8 5v14l11-7z"/>`;
         playPauseBtn.className = "flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-3 rounded-xl text-xs sm:text-sm transition tracking-wide flex justify-center items-center gap-1.5 shadow-lg shadow-emerald-950/40 cursor-pointer";
     }
+    renderTransportKeyHint(status);
 }
 
 // Grey out the transport with a reason while the hardware is not ready.
 function renderTransportWaiting(reason) {
     if (!playPauseBtn) return;
     playPauseBtn.disabled = true;
+    resumeHold.rendered(null, performance.now());
     if (playPauseText) playPauseText.textContent = reason;
     playPauseBtn.className = "flex-1 bg-slate-800 text-slate-500 font-bold py-3 px-3 rounded-xl text-xs sm:text-sm transition tracking-wide flex justify-center items-center gap-1.5 border border-slate-700/50 cursor-not-allowed";
+    renderTransportKeyHint(null);
+}
+
+// The transport names its key, and only while that key works it: on PAUSE,
+// never on START or RESUME (Space never starts or resumes a session), never
+// while the button is greyed out, never on a viewer's locked page. The chip
+// is aria-hidden, so the button is still announced as PAUSE; a screen reader
+// gets the key from aria-keyshortcuts, and a pointer from the title.
+function renderTransportKeyHint(status) {
+    if (!playPauseBtn) return;
+    const hint = transportKeyHint({
+        sessionStatus: status,
+        transportEnabled: !isRemoteViewer && !playPauseBtn.disabled
+    });
+    document.getElementById('playPauseKeyHint')?.classList.toggle('hidden', !hint);
+    if (hint) {
+        playPauseBtn.title = hint.title;
+        playPauseBtn.setAttribute('aria-keyshortcuts', hint.shortcut);
+    } else {
+        playPauseBtn.removeAttribute('title');
+        playPauseBtn.removeAttribute('aria-keyshortcuts');
+    }
 }
 
 // Flag a numeric input as invalid (red border) or restore its normal border.
@@ -2358,18 +2388,25 @@ function startOrResumeWhenReady(tappedAt) {
 // Session Controls Handlers
 playPauseBtn?.addEventListener('click', (event) => {
     if (isRemoteViewer) return;
+    // When the tap was made, which is not always when the page gets it.
+    const tappedAt = Number.isFinite(event?.timeStamp) && event.timeStamp > 0 ? event.timeStamp : performance.now();
+    // A press that lands on RESUME moments after it appeared was aimed at
+    // what the button showed before: at PAUSE, for the second click of a
+    // double-click or a click already on its way when Space or the partner
+    // paused. Taken, it would start the motors the wearer had just stopped.
+    // It is judged by when it was made, so the page getting it late does not
+    // let it through.
+    if (state.sessionStatus === 'PAUSED' && resumeHold.held(tappedAt)) return;
     if (isRemoteController) {
         // Ask the host; the button re-renders from the telemetry it sends back.
-        // `from` is the host state the button is showing, so a RESUME the host
-        // gets late never starts a session the wearer has ended meanwhile
-        // (peer-messages.hostTransportAction).
-        const wants = (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') ? 'RUNNING' : 'PAUSED';
-        sendPeerCommand({ type: 'SESSION_STATE', status: wants, from: state.sessionStatus });
+        // The command says which host state the button is showing, so a
+        // RESUME the host gets late never starts a session the wearer has
+        // ended meanwhile (peer-messages.transportCommand, hostTransportAction).
+        sendPeerCommand(transportCommand(state.sessionStatus));
         return;
     }
     if (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') {
-        // When the tap was made, which is not always when the page gets it.
-        startOrResumeWhenReady(Number.isFinite(event?.timeStamp) && event.timeStamp > 0 ? event.timeStamp : performance.now());
+        startOrResumeWhenReady(tappedAt);
     } else if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') {
         pauseSession('Paused.');
     }
@@ -2602,7 +2639,17 @@ function stopThenAskOnce(tappedAt, { press, acknowledged, notStoppedLine }, ask)
             // when a stop it waited for went unanswered over a Handy
             // already at rest, which asks all the same.
             if (answer.waited || answer.unanswered) cueVoice(describeStopWaitOver(answer));
-            return ask(answer);
+            try {
+                return ask(answer);
+            } finally {
+                // The question is a native dialog. Escape closes it as Cancel
+                // without the page ever seeing the key, and a click on its
+                // way to the dialog's buttons lands a moment later on what the
+                // dialog covered: RESUME, or START once OK has ended the
+                // session. So the press sheet goes up as it closes, however
+                // it was answered (raisePressSheet).
+                raisePressSheet();
+            }
         },
         // Said on the prompt line and spoken, never in a dialog: a dialog
         // would hold back the very stops the page is still sending.
@@ -3233,6 +3280,88 @@ async function loadChangelog() {
 }
 document.getElementById('modalCloseBtn')?.addEventListener('click', closeModal);
 overlay?.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+
+// Keyboard (hotkeys.js decides, this only reads the page and presses). Space
+// pauses a running session and never resumes or starts one; Escape closes
+// the open modal. Each presses the very button a click would - the
+// transport, the modal's X - so a key obeys every lock and readiness check
+// that button obeys, on the host and on a controller page alike, and a
+// viewer's locked transport answers no key. The listeners run in the capture
+// phase because a pause must reach the transport before a handler on the
+// focused control acts on the same Space (the Import labels open a file
+// picker on it); a key the layer consumes goes no further.
+const hotkeys = createHotkeyLayer();
+
+function overlayUp(el) {
+    return Boolean(el) && !el.classList.contains('hidden');
+}
+
+// For REACTION_MS after Escape closes the dialog, a sheet lies over the whole
+// page. Escape closes the dialog on the way down, and a click on its X that
+// is already on its way lands a moment later on whatever the dialog covered:
+// on START or RESUME, which set the toys moving, or on a mode card or the
+// intensity slider. The sheet takes that click. The Came Early and Finished
+// me question raises it too, as it closes (stopThenAskOnce). It has no
+// content, is aria-hidden and cannot take the focus, so a keyboard and a
+// screen reader pass it by.
+// A press that begins on the sheet presses nothing else, even when the sheet
+// is gone before the press ends: a mouse's click goes to what both its press
+// and its release were on, and a tap's click, aimed again as the finger
+// lifts, is cancelled with the tap's touchend.
+const pressSheet = document.createElement('div');
+pressSheet.setAttribute('aria-hidden', 'true');
+pressSheet.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none';
+document.body.append(pressSheet);
+let pressSheetTimer = null;
+
+function raisePressSheet() {
+    pressSheet.style.display = 'block';
+    clearTimeout(pressSheetTimer);
+    pressSheetTimer = setTimeout(() => { pressSheet.style.display = 'none'; }, REACTION_MS);
+}
+
+pressSheet.addEventListener('touchend', (e) => e.preventDefault(), { passive: false });
+
+// Stopping the motors is always allowed: while the session runs, a press on
+// the sheet over PAUSE or STOP presses that button at once. Not Reset: it
+// throws the session away unsaved, and a press meant for the X that landed
+// on it would lose the wearer's whole session.
+pressSheet.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    if (state.sessionStatus !== 'RUNNING' && state.sessionStatus !== 'RAMPDOWN') return;
+    const under = document.elementsFromPoint(e.clientX, e.clientY).find((el) => el !== pressSheet);
+    const button = under?.closest('button');
+    if (button && (button === playPauseBtn || button === stopBtn)) button.click();
+});
+
+document.addEventListener('keydown', (e) => {
+    const plan = hotkeys.keyDown(e, {
+        target: classifyKeyTarget(e.target, playPauseBtn),
+        sessionStatus: state.sessionStatus,
+        transportEnabled: Boolean(playPauseBtn) && !playPauseBtn.disabled && !isRemoteViewer,
+        modalOpen: overlayUp(overlay),
+        // The age gate sits above the wizard, so it names the pair.
+        overlay: overlayUp(ageOverlay) ? 'ageGate' : (overlayUp(wizardOverlay) ? 'wizard' : null)
+    });
+    if (plan.consume) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+    if (plan.action === 'pause') {
+        // The plan only ever pauses a running session. Neither does this
+        // line press the transport in any other state, whatever a later
+        // change does to the plan: there the press would be START or RESUME.
+        if (state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN') playPauseBtn?.click();
+    } else if (plan.action === 'closeModal') {
+        document.getElementById('modalCloseBtn')?.click();
+        raisePressSheet();
+    }
+}, true);
+document.addEventListener('keyup', (e) => {
+    if (!hotkeys.keyUp(e, { target: classifyKeyTarget(e.target, playPauseBtn) }).consume) return;
+    e.preventDefault();
+    e.stopPropagation();
+}, true);
 
 // BLE Modal Tabs
 const bleTabRealBtn = document.getElementById('bleTabRealBtn');

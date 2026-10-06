@@ -50,6 +50,7 @@ const PRECACHE = [
     './src/js/webrtc.js',
     './src/js/peer-messages.js',
     './src/js/input-hygiene.js',
+    './src/js/hotkeys.js',
     './src/js/hardware/ble.js',
     './src/js/hardware/ble-protocol.js',
     './src/js/hardware/handy.js',

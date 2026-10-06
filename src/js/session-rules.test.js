@@ -1527,6 +1527,10 @@ describe('survival climb', () => {
         assert.match(gate[0], /stopTally: handyStopTally/);
         assert.match(gate[0], /if \(answer\.waited \|\| answer\.unanswered\) cueVoice\(describeStopWaitOver\(answer\)\);/);
         assert.match(gate[0], /\{ pressedAt: tappedAt \}/);
+        // The question is a native dialog, which Escape closes as Cancel
+        // without the page seeing the key: it raises the press sheet as it
+        // closes, however it was answered (app.js raisePressSheet).
+        assert.match(gate[0], /try \{\s*return ask\(answer\);\s*\} finally \{[^}]*raisePressSheet\(\);\s*\}/);
         assert.match(src, /const pressQuestion = createQuestionGate\(\{ now: \(\) => performance\.now\(\) \}\);/);
         for (const name of ['finishedMe', 'cameEarly']) {
             const handler = src.match(new RegExp(`function ${name}\\(tappedAt\\) \\{[\\s\\S]*?\\n\\}`));
