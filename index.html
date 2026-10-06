@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="max-lg:scroll-pb-24">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -33,7 +33,7 @@
     }
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen p-2.5 sm:p-5 font-sans antialiased select-none flex flex-col justify-between">
+<body class="bg-slate-950 text-slate-100 min-h-screen p-2.5 sm:p-5 pb-24 sm:pb-24 lg:pb-5 font-sans antialiased select-none flex flex-col justify-between">
   <div class="max-w-6xl mx-auto w-full space-y-3">
 
     <!-- Disconnect / Watchdog Warning Banner -->
@@ -46,7 +46,10 @@
     </div>
 
     <!-- Header -->
-    <header class="flex justify-between items-center border-b border-slate-800/80 pb-2.5">
+    <!-- On a phone the toolbar wraps under the name instead of running off
+         the right edge: with user-scalable=no the page cannot be zoomed out
+         to see it. Its buttons are icons there, named by aria-label. -->
+    <header class="flex flex-wrap justify-between items-center gap-x-3 gap-y-2 border-b border-slate-800/80 pb-2.5">
       <div class="flex items-center gap-2">
         <div class="p-1.5 rounded-xl bg-slate-900 border border-slate-800 text-rose-500 shadow-md">
           <svg class="w-5 h-5 stroke-current" viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -62,26 +65,26 @@
         </div>
       </div>
 
-      <div class="flex items-center gap-1.5 sm:gap-2">
-        <button id="guideBtn" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-slate-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
+      <div class="flex items-center gap-1.5 sm:gap-2 ml-auto">
+        <button id="guideBtn" aria-label="Guide" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-slate-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
           <svg class="w-3.5 h-3.5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
           <span class="hidden sm:inline">Guide</span>
         </button>
 
-        <button id="historyBtn" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-slate-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
+        <button id="historyBtn" aria-label="History" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-slate-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
           <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
           <span class="hidden sm:inline">History</span>
         </button>
 
         <!-- Session Setup Action -->
-        <button id="sessionParamsHeaderBtn" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-purple-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
+        <button id="sessionParamsHeaderBtn" aria-label="Session Setup" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-purple-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
           <svg class="w-3.5 h-3.5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-          <span>Session Setup</span>
+          <span class="hidden sm:inline">Session Setup</span>
         </button>
 
         <!-- Share Remote Control -->
         <div class="relative">
-          <button id="partnerShareBtn" class="bg-purple-950/60 hover:bg-purple-900 border border-purple-800 px-2.5 py-1.5 rounded-xl text-purple-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
+          <button id="partnerShareBtn" aria-label="Share Control" class="bg-purple-950/60 hover:bg-purple-900 border border-purple-800 px-2.5 py-1.5 rounded-xl text-purple-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
             <svg class="w-3.5 h-3.5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z"/></svg>
             <span class="hidden sm:inline">Share Control</span>
           </button>
@@ -238,7 +241,7 @@
             <span id="cameEarlyKicker" class="text-[8px] text-amber-400 font-semibold uppercase">Accidental</span>
             <span id="cameEarlyLabel" class="font-bold text-[10px] mt-0.5">Came Early</span>
           </button>
-          <button id="orgasmBtn" class="bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-amber-950/30">
+          <button id="orgasmBtn" title="Ramps the toys up over about half a minute from what they were doing, then keeps them near full speed until the time limit chosen on the Guards tab of Session Setup (60 s, 90 s by default, 2 min, 3 min or Off). Then the 45 s soft landing eases both channels down to a stop and ends the session. Tap again, or STOP, to end it sooner. Only during a session, running or paused; refused during a Soft Landing." class="bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl p-1.5 transition text-xs flex flex-col items-center justify-center cursor-pointer shadow-lg shadow-amber-950/30">
             <span id="orgasmBtnKicker" class="text-[8px] uppercase tracking-wider text-amber-200">Overdrive</span>
             <span id="orgasmBtnText" class="font-bold text-[10px] mt-0.5">Force Orgasm</span>
             <!-- Filled by app.js while a Force Orgasm run has a time limit: the
@@ -308,9 +311,15 @@
           </div>
         </div>
 
-        <!-- Primary Transport Controls -->
-        <div class="bg-slate-900/60 p-2 rounded-2xl border border-slate-800/80">
-          <div class="flex gap-2">
+        <!-- Primary Transport Controls. Below the two-column width the
+             cockpit is one column, and every notice, badge and banner that
+             comes and goes above this row used to push STOP down the screen
+             mid-session, out from under the wearer's thumb. There the row is
+             pinned to the bottom of the screen at a fixed height (two lines
+             of the PAUSE button's text), so nothing that appears or leaves
+             can move it; the body's bottom padding keeps it off the footer. -->
+        <div class="bg-slate-900/60 p-2 rounded-2xl border border-slate-800/80 max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:rounded-none max-lg:border-x-0 max-lg:border-b-0 max-lg:bg-slate-950/95 max-lg:backdrop-blur max-lg:pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+          <div class="flex gap-2 max-lg:h-[3.75rem] max-lg:max-w-6xl max-lg:mx-auto">
             <button id="sessionPlayPauseBtn" disabled class="flex-1 bg-slate-800 text-slate-500 font-bold py-3 px-3 rounded-xl text-xs sm:text-sm transition tracking-wide flex justify-center items-center gap-1.5 border border-slate-700/50 cursor-not-allowed">
               <svg id="playPauseIcon" class="w-4 h-4 fill-current shrink-0" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
               <span id="playPauseText">WAITING FOR HR SENSOR & TOY</span>
@@ -601,13 +610,17 @@
 
           <!-- Handy Physical Sleeve Travel Envelope (Moved from Motion tab) -->
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5 mt-2">
-            <div class="flex justify-between items-center">
+            <div class="flex justify-between items-center gap-2">
               <label class="text-xs font-bold text-slate-200">Hardware Travel Envelope</label>
               <span id="hwEnvelopeDisplay" class="font-mono text-[10px] font-bold text-teal-400">Bounds: 0% - 100%</span>
             </div>
             <p class="text-[9px] text-slate-400 leading-snug">
-              Protects against sleeve slip-out or base jamming. Strokes scale inside these physical bounds.
-              While you type, only a narrower envelope is sent; a wider one waits until you press Enter or leave the field.
+              Protects against sleeve slip-out or base jamming. Strokes scale inside these physical bounds; the
+              End-Stop Margin below can then slide a short stroke inward, off an end stop, but never out of them.
+              While you type, a number takes effect at once only when it is complete and narrows the envelope with the
+              other guard left where it is. Anything else - a single digit, a number that could still grow (10 on its
+              way to 100), a wider envelope, one that would move the other guard, or a number pasted or edited in the
+              middle - waits until you press Enter or leave the field.
             </p>
             <div class="grid grid-cols-2 gap-2 pt-1">
               <div class="space-y-0.5">
@@ -633,7 +646,8 @@
                 can go up to the margin further than with no margin, and only a stroke longer than the room
                 left is cut. Nothing leaves your Travel Envelope, the margin leaves one that already clears
                 it untouched, and <strong>0 sends the full range</strong>.
-                While you type, only a larger margin is sent; a smaller one waits until you press Enter or leave the field.
+                While you type, a larger margin takes effect as soon as the number is complete (a 1 waits: it could
+                still become 10); a smaller one waits until you press Enter or leave the field.
               </p>
               <span id="handySlideDisplay" class="font-mono text-[10px] font-bold text-teal-400 block">A full-length stroke reaches the device as 5% - 95%</span>
             </div>
@@ -808,13 +822,16 @@
 
         <!-- Hardware Travel Envelope: the SAME setting as in the Handy modal (bounds every linear axis) -->
         <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
-          <div class="flex justify-between items-center">
+          <div class="flex justify-between items-center gap-2">
             <label class="text-xs font-bold text-slate-200">Hardware Travel Envelope</label>
             <span id="tcodeHwEnvelopeDisplay" class="font-mono text-[10px] font-bold text-teal-400">Bounds: 0% - 100%</span>
           </div>
           <p class="text-[9px] text-slate-400 leading-snug">
-            Protects against sleeve slip-out or base jamming. Linear (L) axes scale inside these physical bounds; STOP rests at the lower guard. Shared with The Handy modal.
-            While you type, only a narrower envelope is sent; a wider one waits until you press Enter or leave the field.
+            Protects against sleeve slip-out or base jamming. Linear (L) axes scale inside these physical bounds; STOP rests at the lower guard. Shared with The Handy modal; the End-Stop Margin there is The Handy's only.
+            While you type, a number takes effect at once only when it is complete and narrows the envelope with the
+            other guard left where it is. Anything else - a single digit, a number that could still grow (10 on its
+            way to 100), a wider envelope, one that would move the other guard, or a number pasted or edited in the
+            middle - waits until you press Enter or leave the field.
           </p>
           <div class="grid grid-cols-2 gap-2 pt-1">
             <div class="space-y-0.5">
@@ -863,7 +880,10 @@
             </div>
             <input id="warmupInput" type="range" min="0" max="10" step="1" value="5" class="w-full accent-amber-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer">
             <p class="text-[9px] text-slate-400 leading-snug">
-              Restricts strokes to lower half (0%–55%) while soft, expanding as erection builds.
+              Each session starts with a short, slow stroke at the base of the mode's range - about a quarter of its
+              length, with both channels at about a sixth of their speed - and eases up to the full pattern over the
+              minutes set here. The WARM-UP badge on the cockpit counts it down. <strong>0 = instant</strong>: the full
+              pattern from the first second.
             </p>
           </div>
 
@@ -1289,7 +1309,7 @@
 
   <!-- Walkthrough Wizard Modal (3-step setup) -->
   <div id="wizardOverlay" class="fixed inset-0 bg-slate-950/85 backdrop-blur-md z-50 flex items-center justify-center p-4 hidden">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-5 space-y-4 shadow-2xl relative">
+    <div role="dialog" aria-modal="true" aria-label="Setup guide" tabindex="-1" class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md max-h-full overflow-y-auto p-5 space-y-4 shadow-2xl relative outline-none">
       <button type="button" id="wizardSkipBtn" class="absolute top-4 right-4 text-xs font-bold text-slate-400 hover:text-white uppercase cursor-pointer">Skip</button>
 
       <div class="flex items-center justify-center gap-1.5 pt-1">
@@ -1329,8 +1349,8 @@
 
   <!-- 18+ Age Verification Modal -->
   <div id="ageOverlay" class="fixed inset-0 bg-slate-950/95 backdrop-blur-xl z-50 flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-6 space-y-5 text-center shadow-2xl">
-      <h2 class="text-lg font-bold text-white">Age Verification</h2>
+    <div role="dialog" aria-modal="true" aria-labelledby="ageGateTitle" tabindex="-1" class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm max-h-full overflow-y-auto p-6 space-y-5 text-center shadow-2xl outline-none">
+      <h2 id="ageGateTitle" class="text-lg font-bold text-white">Age Verification</h2>
       <p class="text-xs text-slate-400">You must be at least <strong>18 years old</strong> to use EdgeLoop.</p>
       <div id="fileProtocolNotice" class="hidden p-2.5 rounded-xl bg-amber-950/70 border border-amber-700 text-left space-y-1.5">
         <p class="text-[11px] font-bold text-amber-200">Opened as a local file — the app cannot start</p>
@@ -1396,6 +1416,61 @@ python3 -m http.server 8787</pre>
           navigator.serviceWorker.register('./sw.js').catch(() => {});
         });
       }
+    })();
+  </script>
+
+  <!-- The age check and the setup wizard are modal. While either is up,
+       everything else in the body is inert - no Tab stop, no click, no key
+       on a control behind it - the focus moves into it, and when it closes
+       the focus goes back where it was (the Guide button, for the wizard).
+       It follows each overlay's `hidden` class, so it holds however the
+       overlay is shown or hidden: by the script above, by app.js, or by
+       dismissWizard. A classic script, like the one above, so the age check
+       is modal even where the modules never start. Space still pauses a
+       running session behind the wizard: that key is read on the document
+       (hotkeys.js), and stopping the motors is always allowed.
+       src/js/modal-overlays.test.js runs this script against a fake page. -->
+  <script id="overlayInertScript">
+    (function () {
+      // Topmost first: the age check sits above the wizard.
+      const layers = ['ageOverlay', 'wizardOverlay']
+        .map(function (id) { return document.getElementById(id); })
+        .filter(Boolean);
+      let shown = null;
+      let returnFocus = null;
+
+      function isUp(el) { return !el.classList.contains('hidden'); }
+
+      function sync() {
+        const top = layers.find(isUp) || null;
+        Array.from(document.body.children).forEach(function (el) {
+          if (el.tagName === 'SCRIPT') return;
+          const inert = top !== null && el !== top;
+          if (el.hasAttribute('inert') !== inert) el.toggleAttribute('inert', inert);
+        });
+        if (top === shown) return;
+        const active = document.activeElement;
+        if (top) {
+          // Remember where the focus was on the page, not in an overlay.
+          const onPage = active && active !== document.body && !layers.some(function (el) { return el.contains(active); });
+          if (!shown && onPage) returnFocus = active;
+          if (!top.contains(document.activeElement)) {
+            const panel = top.querySelector('[role="dialog"]') || top;
+            panel.focus({ preventScroll: true });
+          }
+        } else if (returnFocus) {
+          const back = returnFocus;
+          returnFocus = null;
+          if (back.isConnected) back.focus({ preventScroll: true });
+        }
+        shown = top;
+      }
+
+      const watch = new MutationObserver(sync);
+      layers.forEach(function (el) { watch.observe(el, { attributes: true, attributeFilter: ['class'] }); });
+      // Whatever is added to the body while an overlay is up is inert too.
+      watch.observe(document.body, { childList: true });
+      sync();
     })();
   </script>
 

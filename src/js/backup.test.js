@@ -641,6 +641,11 @@ describe('the documented backup is the backup that is written', () => {
         for (const phrase of [/Session Setup value/i, /Handy channel role and speed cap/i, /Intiface and T-Code device maps/i, /age \/ wizard flags/i, /connection key/i, /history is never in a backup/i]) {
             assert.match(section, phrase);
         }
+        // The VacuGlide's own values ride in the settings block, and its
+        // token rides the same opt-in as the Handy key.
+        assert.deepEqual([...VACUGLIDE_SETTING_NAMES], ['vacuglideRole', 'vacuglideMaxCap', 'vacuglideValvePulseMs']);
+        assert.match(section, /VacuGlide channel role, speed cap and valve pulse length/);
+        assert.match(section, /VacuGlide device token are left out unless you tick the box/);
     });
 
     it('every claim in it that this module decides is true of this module', () => {
@@ -651,8 +656,18 @@ describe('the documented backup is the backup that is written', () => {
                 () => /"note":/.test(JSON.stringify(file, null, 2).split('\n')[1])],
             ['downloads as `edgeloop_settings_with_key.json` instead of `edgeloop_settings.json`',
                 () => backupFilename(file) === FILENAME_WITH_KEY && backupFilename(buildBackup(STORES, { now: NOW })) === FILENAME_PLAIN],
-            ['a file carrying a **different** key does re-pair this browser, which the import says out loud',
-                () => /REPLACED/.test(describeBackupImport(readBackup({ minHr: 70, handyConnectionKey: 'X' }), { hadExistingKey: true, keyReplaced: true }))],
+            ['a file carrying a **different** key or token does re-pair this browser, which the import says out loud',
+                () => /REPLACED/.test(describeBackupImport(readBackup({ minHr: 70, handyConnectionKey: 'X' }), { hadExistingKey: true, keyReplaced: true }))
+                    && /token saved in this browser was REPLACED/.test(describeBackupImport(readBackup({ minHr: 70, vacuglideDeviceToken: 'a1b2c3d4e5f6' }), { hadExistingToken: true, tokenReplaced: true }))],
+            ['the one box covers both',
+                () => {
+                    const stores = { ...STORES, vacuglideDeviceToken: 'a1b2c3d4e5f6' };
+                    const ticked = buildBackup(stores, { includeKey: true, now: NOW });
+                    const plain = buildBackup(stores, { now: NOW });
+                    return ticked.handyConnectionKeyIncluded && ticked.vacuglideDeviceTokenIncluded
+                        && !plain.handyConnectionKeyIncluded && !plain.vacuglideDeviceTokenIncluded
+                        && backupFilename(buildBackup({ ...stores, handyConnectionKey: '' }, { includeKey: true, now: NOW })) === FILENAME_WITH_KEY;
+                }],
             ['comes back at the nearest value it accepts - a limit, or the factory setting - and is counted as refused',
                 () => /came back at the nearest value it does/.test(describeBackupImport(readBackup({ minHr: 5, maxHr: 9999 }), { settingsStored: 0 }))],
             ['the import says so first and in those words',
