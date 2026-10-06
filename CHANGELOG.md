@@ -9,6 +9,44 @@ credited by username.
 ### Site
 - **dev.edgeloop.app.** A separate copy for development. Pushes to the `dev` branch publish there. `main` still publishes edgeloop.app. The footer shows DEV on that host. Settings and pairings on the dev site are its own, not the live site's.
 
+### Safety
+- **A pause or a stop reaches every toy in the tick that decides it.** STOP, a pause, the watchdog and a guard's cut used to reach The Handy, Intiface and T-Code on different ticks, and a cut could wait behind The Handy's 400 ms throttle. All of them now go out together, and a cut is never held back by the throttle.
+- **The Handy is checked before START, and watched between sessions.** START and RESUME ask the device first and refuse with a clear line if it is offline. A Handy that drops off Wi-Fi while idle or paused is noticed too, and a stop it still owes is sent when it comes back.
+- **A page the browser freezes no longer carries the session on.** A frozen page used to stop The Handy alone, and on resume its queued ticks restarted it with nobody watching. A freeze now stops every toy and pauses the session, and the page says why when it is back. The screen stays on while a session runs, and a page held up for several seconds pauses instead of catching up.
+- **Typing a travel guard no longer collapses or widens the stroke.** Typing a new Upper or Lower Guard mid-session sent every keystroke to the device: the stroke collapsed to 0-10 on the first digit and the other guard was lost. A keystroke now only narrows the range, exactly as typed; anything else waits for Enter or for you to leave the field.
+- **The mouse wheel leaves a focused Resting HR or Climax HR alone.** One notch over the focused Climax HR raised it by a beat, without you seeing it. A committed number and a dragged slider also let go of the keyboard, so later key presses no longer change them.
+- **Short strokes move off the end stops instead of giving way.** The End-Stop Margin used to give way for short strokes, so Glans Protector, Head Play and the warm-up could send the carriage onto its mechanical ends. A short stroke now keeps its length and slides inside the margin (0-10 leaves as 5-15). The margin is no longer only a narrowing of the range: it can move a stroke.
+
+### Edges and endings
+- **An edge counts only when your pulse holds at the mark.** A single spike from the strap no longer counts as an edge, steps Survival's climb or starts a Ruin ride. The pullback itself is not delayed.
+- **Ruin & Leak rides once per edge.** It used to start a new ride every 30 s while your pulse sat on the mark. A new ride now needs a release first.
+- **A near-stop crawls instead of stopping.** A pattern's near-stop used to round down to a full stop on The Handy. It now crawls at 1%.
+- **Force Orgasm ramps from what the toys are doing, and lands after a set time.** It used to start from a recomputed value, which could send The Handy a stop and a restart on the mark, or jump in the warm-up. It now eases up from exactly what was last sent. A run lasts at most the time chosen on the Guards tab (60 s, 90 s by default, 2 min, 3 min or Off), counted from when it is switched on, then eases down to a stop. It is refused during a Soft Landing instead of reading Forcing..., and after a safety pause it ramps again from the start.
+- **Came Early and Finished me stop the toys first, then ask.** The toys kept running behind the question. They now stop, the question waits until The Handy confirms the stop, and Cancel undoes the press.
+- **Finished me saves the heart rate the run held.** It used to offer the session's highest single reading, so one glitch could become your Climax HR. It now takes the peak your pulse held during the Survival run, still works for a minute after STOP, and says so out loud when there is nothing usable to save.
+- **Soft Landing no longer turns back into Force Orgasm.** On every reload, Apply and import, a chosen Soft Landing endgame fell back to the forced-orgasm one.
+
+### Keyboard
+- **Space pauses a running session.** Not while you are typing in a field. It never resumes or starts one: press RESUME, or Tab to it and press Enter. On a partner's controller page Space pauses the same way.
+- **Escape closes the open dialog**, the same as its X.
+- **A click aimed just before a key cannot start anything.** RESUME takes a press only once it has been on the button for half a second, and for half a second after Escape closes a dialog the page ignores clicks, except PAUSE and STOP.
+
+### Banner and messages
+- **A report on the banner lasts exactly as long as what it reports.** Reports used to replace each other or outlive their cause: "The Handy disconnected." over a Handy connected again, "may still be moving" after the stop was confirmed. Each report now leaves when its own cause ends, a newer one is read first, and an older one stays under it. "Motors paused for safety." shows only while the session is paused.
+- **The voice switch works the moment you flip it.** It used to take effect only after Apply, at the bottom of the tab. A voice that fails now says why, without erasing the microphone's notice.
+- **Closing the Bluetooth chooser says why it was empty.** It lists the usual reasons (connected elsewhere, a phone app that must stay open, Bluetooth off), and each browser error gets its own line.
+
+### Remote control
+- **The two pages check that they run the same version.** A 1.0.0 controller's mode click could turn the running game off on a 1.1.0 wearer's page. Mode and game changes are now refused between different versions, and both people are told which page needs a reload. START, PAUSE, STOP, Reset and Force Orgasm always go through.
+- **A partner's RESUME never starts a new session.** If the wearer stopped in the meantime, or a Came Early question is open, the partner's button does nothing instead of starting the toys.
+
+### Offline
+- **The cockpit opens offline after one visit again.** Five modules were missing from the offline copy, and one missing module stopped the whole page. Every module and the two CDN scripts are now stored.
+
+### Settings and export
+- **Two retired switches are gone.** Cadence breathing and the milking wave, replaced by 1.1.0's patterns, are dropped from settings and from imported backups.
+- **Funscript export keeps to the speed the toy can be driven at.** Narrow zones at speed were written up to 6.7 times faster than any toy was ever sent.
+
 ## 1.1.2
 
 Survival, shipped as a patch so it can be tested. The next feature release still bumps the middle number.
