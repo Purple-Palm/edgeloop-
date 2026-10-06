@@ -361,10 +361,11 @@ export function formatPulseSeconds(ms) {
 //   - a read of the device's state that the watch for a command that may
 //     land late makes ("watch") is a safety read: a read that cannot be
 //     made raises the alarm, and the alarm pauses the session. Routine
-//     traffic stops WATCH_RESERVE short of where these may go, so a busy
-//     session can never leave the watch without a slot - and they stop
-//     RESERVE short of the ceiling, like routine traffic, so they never
-//     take a slot a stop is kept.
+//     traffic of its own - leaving out these reads, and the stops and valve
+//     closes, which have the ceiling - stops WATCH_RESERVE short of where
+//     these may go, so routine traffic can never leave the watch without a
+//     slot; and they stop RESERVE short of the ceiling, like all routine
+//     traffic, so they never take a slot a stop is kept.
 // A counted window guarantees what a counter that resets on a guessed
 // boundary cannot: whatever the server's window boundaries are, no 60-second
 // stretch of it holds more requests than this window allowed.
@@ -386,8 +387,15 @@ export function formatPulseSeconds(ms) {
 // a cluster the device has left is made again through the link that reaches
 // it: 34. Routine traffic keeps the 96 under that: a speed a second, a
 // valve open for every one the cap allows, and 10 for link checks, the
-// router and /info. A watch read does not count against the routine share,
-// so the reads a watch makes during a session never hold a speed back.
+// router and /info. Neither a watch read nor a stop or valve close counts
+// against that share, so neither the reads a watch makes during a session
+// nor the closes of the wearer's presses hold a speed back: a session with
+// a press every few seconds sent 68 of 80 speeds, with a 13 s gap, when the
+// presses' closes were counted in it. All of it together still stops at
+// the line RESERVE short of the ceiling, and only a stop or a close goes
+// past that; with the watch reading, a speed a second and every press the
+// cap allows, that line is what can still refuse a watch read, and the
+// alarm then goes up (vacuglide.js).
 //
 // The server's window does not end when this page does. A page that is
 // reloaded, or the same token opened again in a new tab, would start
@@ -451,7 +459,7 @@ export function decodeRateLog(raw, { now, windowMs = RATE_WINDOW_MS, page = '' }
         const who = typeof from === 'string' ? from.slice(0, MAX_PAGE_ID_LENGTH) : '';
         if (page && who === page) continue;
         if (t <= now - windowMs) continue;
-        out.entries.push({ t: Math.min(t, now), page: who, open: open === 1, watch: open === 2 });
+        out.entries.push({ t: Math.min(t, now), page: who, open: open === 1, watch: open === 2, critical: open === 3 });
     }
     out.entries.sort((a, b) => a.t - b.t);
     if (out.entries.length > MAX_RATE_LOG_ENTRIES) out.entries = out.entries.slice(-MAX_RATE_LOG_ENTRIES);
@@ -464,9 +472,10 @@ export function decodeRateLog(raw, { now, windowMs = RATE_WINDOW_MS, page = '' }
 // The string to store for a log, or null when nothing in it still counts
 // (the caller then removes the entry rather than keep an empty one).
 // The third field says what a request was: 1 a valve open, 2 a watch read,
-// 0 anything else. A page from before watch reads were told apart reads a 2
-// as routine traffic, which can only make it count more.
-const entryClass = (e) => (e.open ? 1 : e.watch ? 2 : 0);
+// 3 a stop or a valve close, 0 anything else. A page from before these were
+// told apart reads a 2 or a 3 as routine traffic, which can only make it
+// count more.
+const entryClass = (e) => (e.open ? 1 : e.watch ? 2 : e.critical ? 3 : 0);
 
 export function encodeRateLog({ own = [], others = [], page = '', blockedUntil = 0, now, windowMs = RATE_WINDOW_MS } = {}) {
     const entries = [];
@@ -496,7 +505,7 @@ export function createRateBudget({
     store = null,
     page = ''
 } = {}) {
-    // This page's own requests, oldest first: { t, open, watch }.
+    // This page's own requests, oldest first: { t, open, watch, critical }.
     let own = [];
     // What other pages recorded for the same token, as last read.
     let others = [];
@@ -553,7 +562,7 @@ export function createRateBudget({
             // Nothing but a stop or a valve close goes past this.
             let wait = waitBelow(sent, ceiling - reserve, now);
             // Routine traffic leaves the watch its share as well.
-            if (kind !== 'watch') wait = Math.max(wait, waitBelow(times((e) => !e.watch), ceiling - reserve - watchReserve, now));
+            if (kind !== 'watch') wait = Math.max(wait, waitBelow(times((e) => !e.watch && !e.critical), ceiling - reserve - watchReserve, now));
             const blockedUntil = Math.max(serverBlockedUntil, othersBlockedUntil);
             if (blockedUntil > now) wait = Math.max(wait, blockedUntil - now);
             if (kind === 'open') wait = Math.max(wait, waitBelow(times((e) => e.open), maxOpens, now));
@@ -561,7 +570,7 @@ export function createRateBudget({
         },
         record(kind, now) {
             prune(now);
-            own.push({ t: now, open: kind === 'open', watch: kind === 'watch' });
+            own.push({ t: now, open: kind === 'open', watch: kind === 'watch', critical: kind === 'critical' });
             write(now);
         },
         // The server refused a request for rate. Routine traffic waits; a

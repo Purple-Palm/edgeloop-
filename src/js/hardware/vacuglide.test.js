@@ -65,6 +65,9 @@ let valveNotes = [];
 // What onLateStop said: a device EdgeLoop had let go of was found moving
 // on a command that landed late, and stopped again.
 let lateStops = [];
+// What onStoppedElsewhere said: the connected device was found stopped
+// under the session by something other than this page.
+let stoppedElsewhere = [];
 // Speeds a test is holding back in the cloud (holdNextSpeed). The cleanup
 // fails any still held, so no watch outlives its test.
 let heldSpeeds = [];
@@ -320,7 +323,7 @@ function valveTimeline(valve) {
 // stand-in for the page - the badge, the status line and the banner's
 // reports by source. app.js itself cannot be loaded here (it needs the page),
 // so the stretch of it that holds them is run as it stands.
-function appVacuglidePanel({ badge = 'VacuGlide', status = 'Connected (fw 1.01)' } = {}) {
+function appVacuglidePanel({ badge = 'VacuGlide', status = 'Connected (fw 1.01)', onAlert = null } = {}) {
     const src = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
     const from = src.indexOf('const vacuglideStopsOwed = new Map();');
     const call = src.indexOf('setVacuglideHandlers({', from);
@@ -342,7 +345,10 @@ function appVacuglidePanel({ badge = 'VacuGlide', status = 'Connected (fw 1.01)'
         paintVacuglideButtons: () => {},
         renderVacuglideValves: () => {},
         setVacuglideValveMessage: () => {},
-        triggerDisconnectAlert: (text, source) => { banner.set(source, text); },
+        triggerDisconnectAlert: (text, source) => {
+            banner.set(source, text);
+            if (typeof onAlert === 'function') onAlert(source);
+        },
         reviseAlertBanner: (text, { source }) => { if (banner.has(source)) banner.set(source, text); },
         hideAlertBanner: (source) => { banner.delete(source); },
         setVacuglideHandlers: (h) => { handlers = h; }
@@ -374,6 +380,7 @@ describe('vacuglide driver', () => {
         pulses = [];
         valveNotes = [];
         lateStops = [];
+        stoppedElsewhere = [];
         heldSpeeds = [];
         sessionActive = false;
         serverLimit = null;
@@ -384,6 +391,8 @@ describe('vacuglide driver', () => {
         VACUGLIDE_TIMINGS.offlineStopRetryMs = 60;
         VACUGLIDE_TIMINGS.pollActiveMs = 100000;
         VACUGLIDE_TIMINGS.pollIdleMs = 100000;
+        VACUGLIDE_TIMINGS.steadyReadMs = 100000;
+        VACUGLIDE_TIMINGS.readBeforeSpeedWaitMs = 1000;
         VACUGLIDE_TIMINGS.speedGapMs = 40;
         VACUGLIDE_TIMINGS.staleOpenGuardMs = 60;
         VACUGLIDE_TIMINGS.pendingOpenBeatMs = 1000;
@@ -409,6 +418,7 @@ describe('vacuglide driver', () => {
             onPulse: (p) => pulses.push(p),
             onValves: (m) => valveNotes.push(m),
             onLateStop: (m) => lateStops.push(m),
+            onStoppedElsewhere: (m) => stoppedElsewhere.push(m),
             isSessionActive: () => sessionActive
         });
     });
@@ -1888,6 +1898,125 @@ describe('vacuglide driver', () => {
         assert.equal(app.badge(), 'Watching');
     });
 
+    // ---- stopped by something else under a running session ----------------------------
+    //
+    // Autoblow documents TARGET_SPEED_PAUSED as the answer to its stop, so
+    // Autoblow's own app, or any other app using the device token, can stop
+    // the device while EdgeLoop's session drives it - and so can a stop of
+    // an earlier link that Autoblow delivered late. The session's next speed
+    // must not start it again behind whoever stopped it: the session pauses
+    // on the wearer's page, and RESUME starts it. An earlier version started
+    // it again 9 s later; the released build at the session's next new speed.
+
+    // The page as app.js runs it on the driver: its handlers, and its pause -
+    // the session no longer runs, and every toy gets a forced zero.
+    function appSession() {
+        let pauses = 0;
+        const app = appVacuglidePanel({
+            onAlert: () => {
+                if (!sessionActive) return;
+                sessionActive = false;
+                pauses += 1;
+                dispatchVacuglide(0, true);
+            }
+        });
+        setVacuglideHandlers({ ...app.handlers, isSessionActive: () => sessionActive });
+        return { app, pauses: () => pauses };
+    }
+
+    // Another app on the token stops it: the cloud's state, as its stop leaves it.
+    function stoppedByAnotherApp() {
+        device.operationalMode = 'TARGET_SPEED_PAUSED';
+        device.events.push({ at: Date.now(), what: 'stop', by: 'another app' });
+        return device.events[device.events.length - 1];
+    }
+
+    // The engine's ticks: the session's speed while it runs, 0 once paused.
+    async function engineTicks(speed, ms, every = 50) {
+        for (const end = Date.now() + ms; Date.now() < end;) {
+            dispatchVacuglide(sessionActive ? (typeof speed === 'function' ? speed() : speed) : 0);
+            await tick(every);
+        }
+    }
+
+    for (const [what, steadyReadMs, run] of [
+        ['the session holds its speed: the read after a quiet stretch finds it', 250, async () => {
+            await engineTicks(60, 600);
+        }],
+        ['the speed changes after a quiet stretch: the speed waits for a read, which finds it', 250, async () => {
+            dispatchVacuglide(70);
+            await engineTicks(70, 400);
+        }],
+        // No read after a quiet stretch here: the open's own answer is all.
+        ['the wearer presses a valve: its answer finds it', 100000, async () => {
+            const press = pulseValve('minus', 300);
+            await engineTicks(60, 600);
+            await press;
+        }]
+    ]) {
+        it(`something else stops the VacuGlide under a running session - ${what}: the session pauses, and nothing starts it again until RESUME (app.js)`, async () => {
+            const { app, pauses } = appSession();
+            VACUGLIDE_TIMINGS.steadyReadMs = steadyReadMs;
+            await connectOk();
+            sessionActive = true;
+            dispatchVacuglide(60);
+            await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 60, 1000, 'the session');
+            // A quiet stretch: nothing sent, nothing read.
+            await tick(300);
+            const stopped = stoppedByAnotherApp();
+            await run();
+            assert.equal(pauses(), 1, 'the session paused');
+            assert.match(app.banner.get('vacuglidePaused'), /^The VacuGlide stopped while the session was driving it - Autoblow's app, another app using its device token, or a stop Autoblow's server delivered late\. EdgeLoop paused the session and sends it no speed until you press RESUME\.$/);
+            assert.deepEqual(eventsAfter(stopped).filter((e) => e.what === 'speed'), [], 'nothing started it again');
+            assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
+            assert.equal(isVacuglideMoving(), false);
+            // RESUME: the session runs again, and its speed starts it.
+            sessionActive = true;
+            dispatchVacuglide(60);
+            await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING', 1000, 'RESUME to start it');
+            assert.deepEqual(unconfirmed, []);
+        });
+    }
+
+    it('found stopped under the session, the device gets no speed from the session\'s ticks - unchanged or new - until the session has paused and runs again', async () => {
+        await connectOk();
+        sessionActive = true;
+        dispatchVacuglide(60);
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 60, 1000, 'the session');
+        await tick(60);
+        const stopped = stoppedByAnotherApp();
+        await pollVacuglideConnected();
+        assert.equal(stoppedElsewhere.length, 1, 'the page is told, once');
+        // This page has not paused yet: its ticks go on, and change.
+        let n = 0;
+        await engineTicks(() => 60 + (n++ % 2) * 5, 400);
+        assert.deepEqual(eventsAfter(stopped).filter((e) => e.what === 'speed'), []);
+        assert.equal(stoppedElsewhere.length, 1);
+        sessionActive = false;
+        dispatchVacuglide(0, true);
+        sessionActive = true;
+        dispatchVacuglide(65);
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 65, 1000, 'RESUME to start it');
+    });
+
+    it('a stop of this page\'s own, or a session that is not running, is not something else stopping it', async () => {
+        VACUGLIDE_TIMINGS.steadyReadMs = 150;
+        await connectOk();
+        sessionActive = true;
+        dispatchVacuglide(60);
+        await waitFor(() => device.targetSpeed === 60, 1000, 'the session');
+        dispatchVacuglide(0, true);
+        await waitFor(() => !isVacuglideMoving(), 1000, 'STOP');
+        await pollVacuglideConnected();
+        assert.deepEqual(stoppedElsewhere, []);
+        dispatchVacuglide(50);
+        await waitFor(() => device.targetSpeed === 50 && device.operationalMode === 'TARGET_SPEED_PLAYING', 1000, 'the session again');
+        sessionActive = false;
+        stoppedByAnotherApp();
+        await pollVacuglideConnected();
+        assert.deepEqual(stoppedElsewhere, [], 'no session runs');
+    });
+
     it('a lost device that was at rest is not chased and raises no alarm', async () => {
         await connectOk();
         device.online = false;
@@ -2912,12 +3041,13 @@ describe('vacuglide driver', () => {
         const held = holdNextSpeed();
         dispatchVacuglide(55);
         await waitFor(() => held.sentAt !== null, 1000, 'the speed to go out');
-        // The rest of the routine share is spent: with connect's five
-        // requests and the two speeds, 96 of the 150.
+        // The rest of the routine share is spent: with connect's /info and
+        // the two speeds, 96 - connect's router call and its whole stop are
+        // a stop's, and count only against the ceiling.
         const key = rateLogStorageKey(TOKEN);
         const log = JSON.parse(globalThis.localStorage.getItem(key));
         const at = Date.now();
-        for (let i = 0; i < RATE_CEILING - RATE_RESERVE - RATE_WATCH_RESERVE - 7; i += 1) log.e.push([at, 'another page', 0]);
+        for (let i = 0; i < RATE_CEILING - RATE_RESERVE - RATE_WATCH_RESERVE - 3; i += 1) log.e.push([at, 'another page', 0]);
         globalThis.localStorage.setItem(key, JSON.stringify(log));
         assert.equal((await pulseValve('plus', 300)).reason, 'rate', 'routine traffic has nothing left');
         calls = [];
@@ -3234,10 +3364,10 @@ describe('vacuglide driver', () => {
     });
 
     // A stop of the last link already on its way lands in the new session
-    // all the same. The device is read when its answer comes back, and the
-    // session's speed goes out again at its next tick - the same speed, which
-    // the driver would otherwise skip as one the device already has.
-    it('a stop of the last link that lands in the new session is noticed: the device is read, and the session\'s speed goes out again', async () => {
+    // all the same. The device is read when its answer comes back, found
+    // stopped under the session, and the session pauses: nothing here starts
+    // it again behind that stop - RESUME does.
+    it('a stop of the last link that lands in the new session is noticed: the device is read, the session pauses, and only RESUME starts it again', async () => {
         await connectOk();
         VACUGLIDE_TIMINGS.requestTimeoutMs = 20000;
         // The new link watches for that stop too, but on a beat too long to
@@ -3255,10 +3385,20 @@ describe('vacuglide driver', () => {
         land();
         await waitFor(() => device.operationalMode === 'TARGET_SPEED_PAUSED', 1000, 'the old stop to land');
         await waitFor(() => calls.slice(before).some((c) => c.path === '/vacuglide/state'), 1000, 'the device to be read, at once');
-        await tick(20);
-        assert.ok(notices.some((m) => /had stopped while the session was driving it/.test(m)), JSON.stringify(notices));
+        await waitFor(() => stoppedElsewhere.length === 1, 1000, 'the page told to pause the session');
+        assert.match(stoppedElsewhere[0], /stopped while the session was driving it/);
+        // Until the page has paused it, the session's ticks start nothing.
         dispatchVacuglide(60);
-        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 60, 1000, "the session's speed to go out again");
+        dispatchVacuglide(65);
+        await tick(100);
+        assert.equal(device.operationalMode, 'TARGET_SPEED_PAUSED');
+        // The pause, and RESUME.
+        sessionActive = false;
+        dispatchVacuglide(0, true);
+        await waitFor(() => !isVacuglideMoving(), 1000, "the pause's stop");
+        sessionActive = true;
+        dispatchVacuglide(65);
+        await waitFor(() => device.operationalMode === 'TARGET_SPEED_PLAYING' && device.targetSpeed === 65, 1000, 'RESUME to start it');
         await disconnected;
         assert.deepEqual(unconfirmed, []);
     });

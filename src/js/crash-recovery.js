@@ -991,11 +991,13 @@ export const OWNER_QUERY_TIMEOUT_MS = 2000;
 // localhost has none), or without an answer from it in time, nothing can
 // tell, and every one of them is treated as gone, driving nothing: stopping
 // a Handy that turns out to be in use in another tab is the safe way to be
-// wrong.
-export async function openPages(owners, locks, timeoutMs = OWNER_QUERY_TIMEOUT_MS) {
+// wrong. With no owners to ask about, the lock manager is asked only for
+// the VacuGlides other pages have connected (`linked`): a VacuGlide stop
+// still owed is sent with no marker anywhere.
+export async function openPages(owners, locks, timeoutMs = OWNER_QUERY_TIMEOUT_MS, { linked = false } = {}) {
     const none = { alive: new Set(), driving: new Map(), vacuglideLinked: new Map() };
     const asked = (Array.isArray(owners) ? owners : []).filter((owner) => cleanOwner(owner));
-    if (asked.length === 0 || !locks || typeof locks.query !== 'function') return none;
+    if ((asked.length === 0 && !linked) || !locks || typeof locks.query !== 'function') return none;
     let timer = null;
     try {
         const late = new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
@@ -1674,7 +1676,11 @@ export async function runCrashRecovery({
         await tidied();
         return { recovered: false, alive: 0 };
     }
-    const { alive, driving, vacuglideLinked } = await openPages(found.concat(stale, unwritten).map((marker) => marker.owner), locks, ownerQueryTimeoutMs);
+    // A VacuGlide stop still owed asks which VacuGlides other pages have
+    // connected even when no marker is left to ask about: one of them is
+    // that page's to answer for, whether or not a session runs there.
+    const vacuglideOwed = earlier && readPendingVacuglideStops(storage).length > 0;
+    const { alive, driving, vacuglideLinked } = await openPages(found.concat(stale, unwritten).map((marker) => marker.owner), locks, ownerQueryTimeoutMs, { linked: vacuglideOwed });
     // A copy of a marker that the other store records as ended is no crash,
     // and once its page is gone the store that is behind is given the end:
     // a later pass that cannot read the durable store must not take a stale

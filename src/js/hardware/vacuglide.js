@@ -90,6 +90,7 @@ import {
     classifyVacuglideResponse,
     parseVacuglideState,
     describeUnusableMode,
+    isPlayingMode,
     stopConfirmedBy,
     valveClosedBy,
     valvesOpenIn,
@@ -137,6 +138,20 @@ export const VACUGLIDE_TIMINGS = {
     // minute and a half - the cost of never dropping a link on one blip.
     pollActiveMs: 10000,
     pollIdleMs: 30000,
+    // Autoblow's own app, or any other app using the device token, can stop
+    // the device while a session drives it, and the next speed EdgeLoop
+    // sends would start it again before anything here had read that it was
+    // stopped. So while a session holds its speed, the device is read once
+    // it has gone this long without a request whose answer shows its state,
+    // and a new speed after such a stretch waits for that read first - up
+    // to readBeforeSpeedWaitMs - and is not sent when it finds the device
+    // stopped (stoppedUnderSession). Such a read comes only after that long
+    // a silence, so with the speeds it never comes to more than a request a
+    // second: the share of the budget a speed a second has. A speed sent
+    // less than this long after the last request still finds nothing
+    // read: that is the stop EdgeLoop does not see.
+    steadyReadMs: 2000,
+    readBeforeSpeedWaitMs: 1000,
     // "At most once a second" for the speed. The engine ticks once a second
     // and a heart-rate packet can tick it again in between.
     speedGapMs: 1000,
@@ -354,6 +369,7 @@ const handlers = {
     onValves: null,
     onLateStop: null,
     onTakeover: null,
+    onStoppedElsewhere: null,
     isSessionActive: null
 };
 
@@ -376,8 +392,12 @@ const handlers = {
 //   onTakeover(message, active) -> this page took over a device a page that went away could not
 //                                  vouch for (active: true), or has finished with it (active: false);
 //                                  message says what it is doing, or how it ended
+//   onStoppedElsewhere(message) -> the connected device was found stopped under a running session by
+//                                  something other than this page; the page pauses the session, and
+//                                  the driver sends it no speed until the session has been paused and
+//                                  runs again
 //   isSessionActive()           -> true while a session is RUNNING or RAMPDOWN
-export function setVacuglideHandlers({ onError, onOffline, onStopUnconfirmed, onStopConfirmed, onNotice, onPulse, onValves, onLateStop, onTakeover, isSessionActive } = {}) {
+export function setVacuglideHandlers({ onError, onOffline, onStopUnconfirmed, onStopConfirmed, onNotice, onPulse, onValves, onLateStop, onTakeover, onStoppedElsewhere, isSessionActive } = {}) {
     if (onError !== undefined) handlers.onError = onError;
     if (onOffline !== undefined) handlers.onOffline = onOffline;
     if (onStopUnconfirmed !== undefined) handlers.onStopUnconfirmed = onStopUnconfirmed;
@@ -387,6 +407,7 @@ export function setVacuglideHandlers({ onError, onOffline, onStopUnconfirmed, on
     if (onValves !== undefined) handlers.onValves = onValves;
     if (onLateStop !== undefined) handlers.onLateStop = onLateStop;
     if (onTakeover !== undefined) handlers.onTakeover = onTakeover;
+    if (onStoppedElsewhere !== undefined) handlers.onStoppedElsewhere = onStoppedElsewhere;
     if (isSessionActive !== undefined) handlers.isSessionActive = isSessionActive;
 }
 
@@ -495,7 +516,17 @@ function makeLink(token, cluster, info) {
         urgentSpeed: false,
         speedTimer: null,
         // The router check a DeviceNotConnectedError started, while it is out.
-        checking: null
+        checking: null,
+        // When the latest request whose answer shows the device's state went
+        // out through this link, and the read a steady session, or a speed
+        // after such a stretch, is waiting on (steadyReadMs).
+        lastSentAt: 0,
+        steadyRead: null,
+        // The device was found stopped under the session by something else
+        // (stoppedUnderSession): 'held' until the session has been paused,
+        // 'resumable' once it has, and null again when it runs once more. No
+        // speed goes out while it is set.
+        stoppedElsewhere: null
     };
 }
 
@@ -639,6 +670,7 @@ async function vgRequest(base, path, { method = 'GET', body = undefined, token, 
     const sentAt = Date.now();
     budget.record(kind, sentAt);
     const seq = ++requestSequence;
+    if (link) link.lastSentAt = sentAt;
     if (typeof onSent === 'function') onSent(seq, sentAt);
 
     const headers = { 'x-device-token': token };
@@ -849,10 +881,9 @@ function observeReply(link, data, seq, sentAt) {
 // motor at a target speed other than the one EdgeLoop last had confirmed is
 // that older speed - sent before a Disconnect and a reconnect, maybe under a
 // higher cap - and the session's own speed goes out again at once rather
-// than at its next change. A motor found stopped by a stop - paused - while
-// a session drives it at a speed the device confirmed is no longer taken to
-// run at that speed: a stop an earlier link sent landed after that speed, or
-// another app stopped it, and the session's next tick sends its speed again.
+// than at its next change. A motor found stopped under the session by
+// something else is never started again from here: the session pauses
+// (stoppedUnderSession).
 function observeDriven(link, state, seq, sentAt) {
     const moving = motionAfterStop(link, state, seq);
     if (moving && !drivenSinceStop(link)) {
@@ -861,11 +892,7 @@ function observeDriven(link, state, seq, sentAt) {
     }
     for (const valve of strayValvesIn(link, state, seq)) closeStrayValve(link, valve);
     if (!motorRunningIn(state)) {
-        if (state.operationalMode === 'TARGET_SPEED_PAUSED' && drivenSinceStop(link) && link.lastSpeedSent > 0 && !link.speedInFlight && seq > link.speedSettledSeq) {
-            link.lastSpeedSent = -1;
-            link.lastSpeedReported = null;
-            callHandler('onNotice', "The VacuGlide had stopped while the session was driving it - a stop Autoblow's server delivered late, or another app using this device token. EdgeLoop sends the session's speed again.");
-        }
+        if (stoppedUnderSession(link, state, seq)) noteStoppedElsewhere(link);
         return;
     }
     if (watchCoversSpeed(link.token) && link.lastSpeedSent > 0 && !link.speedInFlight
@@ -877,6 +904,68 @@ function observeDriven(link, state, seq, sentAt) {
         link.forceSpeed = true;
         pumpSpeed(link);
     }
+}
+
+// The device a running session drives at a speed it confirmed, found by a
+// request sent after that confirmation in a mode that runs nothing - paused,
+// as Autoblow documents the answer to a stop - with no stop of this page's
+// since: something else stopped it. Autoblow's own app, any other app using
+// the device token, or a stop an earlier link of this page's sent that
+// Autoblow's server delivered late. The session's next speed would start the
+// motor again behind whoever stopped it: an earlier version of this driver
+// did, 9 s after Autoblow's app had stopped it. A speed sent before anything
+// has read the stop still does, unseen (steadyReadMs). A mode the device
+// cannot be driven in is a fault, and ends the link (noteDeviceState).
+function stoppedUnderSession(link, state, seq) {
+    const mode = state.operationalMode;
+    return Boolean(mode) && !isPlayingMode(mode) && !describeUnusableMode(mode)
+        && sessionActive() && drivenSinceStop(link) && link.lastSpeedSent > 0 && seq > link.speedSettledSeq;
+}
+
+// What this page believed the device was doing is over: no speed of the
+// session's is taken to be running on it, none is sent until the session
+// has been paused and runs again (dispatchVacuglide), and the page pauses the
+// session where the wearer is. The pause sends the whole stop, which a device
+// already stopped takes as such; RESUME's speed is what starts it again.
+function noteStoppedElsewhere(link) {
+    if (link.stoppedElsewhere) return;
+    link.stoppedElsewhere = 'held';
+    cancelSpeed(link);
+    link.lastSpeedSent = -1;
+    link.lastSpeedReported = null;
+    // A speed still out may yet land on it, and run it.
+    if (!link.speedInFlight) link.motorMayRun = false;
+    callHandler('onStoppedElsewhere', "The VacuGlide stopped while the session was driving it - Autoblow's app, another app using its device token, or a stop Autoblow's server delivered late. EdgeLoop paused the session and sends it no speed until you press RESUME.");
+}
+
+// A read of the driven device after a stretch with no request whose answer
+// shows its state (steadyReadMs), while the session holds its speed, and
+// before a new speed after such a stretch. Its answer is read like any other
+// (observeDriven); a speed waits for it for up to readBeforeSpeedWaitMs,
+// and then goes - unless that answer found the device stopped under the
+// session. One that fails says nothing more than the link check that comes
+// after it will. Never throws.
+function readSteady(link) {
+    if (link.steadyRead) return;
+    const read = { at: Date.now() };
+    link.steadyRead = read;
+    const answered = vgRequest(link.cluster, VACUGLIDE_PATHS.state, { token: link.token, kind: 'normal', link, quiet: true }).catch(() => {});
+    pauseUnless(VACUGLIDE_TIMINGS.readBeforeSpeedWaitMs, answered).then(() => {
+        if (link.steadyRead !== read) return;
+        link.steadyRead = null;
+        // Read or not, the next one waits for the next stretch.
+        link.lastSentAt = Math.max(link.lastSentAt, read.at);
+        pumpSpeed(link);
+    });
+}
+
+// Whether the session holds its speed on a device nothing has read for
+// steadyReadMs: then it is read now.
+function readWhileSteady(link) {
+    if (link.speedInFlight || link.stopsInFlight > 0 || link.stoppedElsewhere) return;
+    if (!(link.lastSpeedSent > 0) || !drivenSinceStop(link) || !sessionActive()) return;
+    if (Date.now() - link.lastSentAt < VACUGLIDE_TIMINGS.steadyReadMs) return;
+    readSteady(link);
 }
 
 // A device EdgeLoop no longer drives - disconnected, lost, left for another
@@ -1346,6 +1435,12 @@ function pumpSpeed(link) {
     if (live !== link) return;
     if (link.speedInFlight) return;
     if (link.stopsInFlight > 0) return;
+    // Stopped under the session by something else: nothing starts it again
+    // but the session running again after its pause.
+    if (link.stoppedElsewhere) return;
+    // A read of the device is out: the speed waits for its answer - an
+    // urgent one does not.
+    if (link.steadyRead && !link.urgentSpeed) return;
     const speed = link.pendingSpeed;
     if (speed === null || speed <= 0) return;
     if (speed === link.lastSpeedSent && !link.forceSpeed && !link.motionUnknown) {
@@ -1373,6 +1468,12 @@ function pumpSpeed(link) {
     }
     // Held back by the budget: the engine asks again on its next tick.
     if (budgetFor(link.token).waitMs('normal', now) > 0) return;
+    // After a stretch nothing has read the device in, it is read first. A
+    // speed a tick sent urgent - a guard, a landing - does not wait for it.
+    if (link.lastSpeedSent > 0 && !link.urgentSpeed && now - link.lastSentAt >= VACUGLIDE_TIMINGS.steadyReadMs) {
+        readSteady(link);
+        return;
+    }
     link.pendingSpeed = null;
     link.forceSpeed = false;
     link.urgentSpeed = false;
@@ -1451,6 +1552,14 @@ export function dispatchVacuglide(speed, force = false, { urgent = false } = {})
     if (!link) return;
     quickenPollForSession();
     dispatchSequence += 1;
+    // Stopped under the session by something else: held until the session
+    // has been paused - the pause the wearer was told of - and runs again.
+    // RESUME, or a new START, starts the motor again; no tick of the session
+    // it was stopped under does.
+    if (link.stoppedElsewhere) {
+        if (!sessionActive()) link.stoppedElsewhere = 'resumable';
+        else if (link.stoppedElsewhere === 'resumable') link.stoppedElsewhere = null;
+    }
     const target = clampTargetSpeed(speed);
     if (target === 0) {
         cancelSpeed(link);
@@ -1461,6 +1570,7 @@ export function dispatchVacuglide(speed, force = false, { urgent = false } = {})
     if (force) link.forceSpeed = true;
     if (urgent) link.urgentSpeed = true;
     pumpSpeed(link);
+    readWhileSteady(link);
 }
 
 // ---- valves ------------------------------------------------------------------------

@@ -2477,6 +2477,7 @@ function startOrResumeSession() {
     withdrawStartRefusal();
     hideAlertBanner('hrSignal');
     hideAlertBanner('supervision');
+    hideAlertBanner('vacuglidePaused');
     // And no report may go on saying "Motors paused for safety." over motors
     // that run. The rest of a report can still be true: an Intiface or
     // T-Code device that was lost, or a Handy lost while reconnecting, is
@@ -2700,6 +2701,8 @@ function stopSession(outcome = "Stopped", voiceText = null, voiceVars = null) {
         updateWarmupBadge();
         showIdleTransport();
         withdrawStartRefusal();
+        // Nor a VacuGlide that something else stopped: no RESUME is left.
+        hideAlertBanner('vacuglidePaused');
         // STOP silences every queued cue; the outcome is the one thing said.
         cancelSpeech();
         cueVoice(voiceText || ((outcome && outcome !== 'Stopped') ? outcome : 'sessionStop'), true, voiceVars);
@@ -2725,6 +2728,7 @@ resetBtn?.addEventListener('click', () => {
     clearHrSignalPause();
     // As after STOP: no paused session is left to resume, or to report.
     hideAlertBanner('supervision');
+    hideAlertBanner('vacuglidePaused');
     retractMotorsPaused();
     // Reset ends a run as STOP does, and Finished me may read it for a minute.
     calibrationWindow = closeCalibrationWindow(calibrationWindow, Date.now());
@@ -5294,6 +5298,16 @@ setVacuglideHandlers({
         if (isVacuglideConnected() || !message) return;
         setVacuglideStatus(message, active ? 'busy' : 'idle');
         setBadgeState('Vacuglide', active ? 'warning' : 'disconnected', active ? 'Watching' : 'Disconnected');
+    },
+    // The VacuGlide was found stopped under the running session by
+    // something other than this page - Autoblow's app, another app on its
+    // token, a stop Autoblow delivered late. The session pauses where the
+    // wearer is, which sends it the whole stop and no speed, and the driver
+    // sends it none until the session runs again: RESUME starts it, not the
+    // session's next tick behind whoever stopped it.
+    onStoppedElsewhere: (message) => {
+        if (!isVacuglideConnected() || !message) return;
+        triggerDisconnectAlert(message, 'vacuglidePaused');
     },
     // Not gated on the link: Disconnect and a lost link drop it before their
     // stop resolves, and an unconfirmed stop or valve close there is the

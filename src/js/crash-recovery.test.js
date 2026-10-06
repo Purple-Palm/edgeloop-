@@ -4175,6 +4175,30 @@ describe('a VacuGlide in the crash marker', () => {
         assert.deepEqual(third.asked, []);
     });
 
+    // No session marker is left anywhere - the crash was handed over, and the
+    // tab that has the device connected runs no session - and the lock
+    // manager was asked about nothing: the owed stop went into that tab's
+    // device. Asked whenever a VacuGlide is owed, it is left to that tab.
+    it('an owed whole stop is not sent to a VacuGlide another open tab has connected, with no session marker anywhere, and goes once that tab has let go of it', async () => {
+        const { storage, locks } = crashedPage(VG);
+        await runCrashRecovery({ storage, locks, stopVacuglide: vgStop({ [TOKEN]: { outcome: 'offline', detail: 'not online' } }), onReport: () => {} });
+        assert.deepEqual(readPendingVacuglideStops(storage), [{ token: TOKEN, cluster: CLUSTER }]);
+        assert.equal(onlyMarker(storage), null, 'no marker anywhere');
+        const other = createLiveSessionTracker({ owner: 'page-b', storage: fakeStorage(), locks });
+        other.holdVacuglideLink(TOKEN);
+        await tick();
+        const stop = vgStop();
+        const result = await runCrashRecovery({ storage, locks, owner: 'page-c', stopVacuglide: stop, onReport: () => {} });
+        assert.deepEqual(stop.asked, [], 'nothing is sent into what that tab runs');
+        assert.equal(result.recovered, false);
+        assert.deepEqual(readPendingVacuglideStops(storage), [{ token: TOKEN, cluster: CLUSTER }], 'still owed');
+        other.holdVacuglideLink('');
+        await tick();
+        const later = vgStop();
+        await runCrashRecovery({ storage, locks, owner: 'page-c', stopVacuglide: later, onReport: () => {} });
+        assert.deepEqual(later.asked, [{ token: TOKEN, cluster: CLUSTER }]);
+    });
+
     it('a Connect of that VacuGlide settles what is owed, and one of another does not; a Handy owed beside it keeps its own', async () => {
         const { storage, locks } = crashedPage({ ...VG, handyKey: 'KEY-ONE-1234' });
         const gaveUp = { outcome: 'offline', detail: 'not online', final: true };

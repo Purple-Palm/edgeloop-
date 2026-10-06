@@ -418,20 +418,39 @@ describe('the request budget', () => {
             budget.record('critical', 1000);
         }
         assert.ok(budget.waitMs('critical', 1000) > 0);
-        // Watch reads do not count against routine traffic: a watch that
-        // reads while a session runs holds none of its speeds back.
-        const session = createRateBudget({ windowMs: 60000, ceiling: 12, reserve: 3, watchReserve: 4, maxOpens: 5 });
+        // Neither watch reads nor stops and valve closes count against
+        // routine traffic's share: a watch that reads while a session runs,
+        // or the closes of the wearer's presses, hold none of its speeds
+        // back. The line all routine traffic stops at still counts them.
+        const session = createRateBudget({ windowMs: 60000, ceiling: 14, reserve: 3, watchReserve: 4, maxOpens: 5 });
         for (let i = 0; i < 4; i += 1) session.record('watch', 1000);
+        for (let i = 0; i < 2; i += 1) session.record('critical', 1000);
         for (let i = 0; i < 5; i += 1) {
-            assert.equal(session.waitMs('normal', 1000), 0, `speed ${i + 1} beside the watch`);
+            assert.equal(session.waitMs('normal', 1000), 0, `speed ${i + 1} beside the watch and two closes`);
             session.record('normal', 1000);
         }
-        assert.ok(session.waitMs('normal', 1000) > 0);
+        assert.ok(session.waitMs('normal', 1000) > 0, 'the routine share is spent');
+        // Three presses' closes leave the routine share whole: all 13 of it.
+        const presses = createRateBudget({ windowMs: 60000, ceiling: 20, reserve: 3, watchReserve: 4, maxOpens: 5 });
+        for (let i = 0; i < 3; i += 1) presses.record('critical', 1000);
+        for (let i = 0; i < 13; i += 1) {
+            assert.equal(presses.waitMs('normal', 1000), 0, `speed ${i + 1} beside three closes`);
+            presses.record('normal', 1000);
+        }
+        assert.ok(presses.waitMs('normal', 1000) > 0);
+        const closes = createRateBudget({ windowMs: 60000, ceiling: 14, reserve: 3, watchReserve: 0, maxOpens: 5 });
+        for (let i = 0; i < 8; i += 1) closes.record('critical', 1000);
+        for (let i = 0; i < 3; i += 1) closes.record('normal', 1000);
+        assert.ok(closes.waitMs('normal', 1000) > 0, 'closes still count against the line routine traffic stops at');
+        assert.equal(closes.waitMs('critical', 1000), 0);
         // And a watch read stays one across a reload; a page that cannot tell
         // counts it as routine traffic, which only holds more back.
-        const text = encodeRateLog({ own: [{ t: 1000, open: false, watch: true }], page: 'me', now: 1000, windowMs: 60000 });
-        assert.deepEqual(JSON.parse(text).e, [[1000, 'me', 2]]);
-        assert.deepEqual(decodeRateLog(text, { now: 1000, windowMs: 60000 }).entries, [{ t: 1000, page: 'me', open: false, watch: true }]);
+        const text = encodeRateLog({ own: [{ t: 1000, open: false, watch: true }, { t: 1001, open: false, critical: true }], page: 'me', now: 1001, windowMs: 60000 });
+        assert.deepEqual(JSON.parse(text).e, [[1000, 'me', 2], [1001, 'me', 3]]);
+        assert.deepEqual(decodeRateLog(text, { now: 1001, windowMs: 60000 }).entries, [
+            { t: 1000, page: 'me', open: false, watch: true, critical: false },
+            { t: 1001, page: 'me', open: false, watch: false, critical: true }
+        ]);
     });
 
     it('says how long until the oldest request leaves the window', () => {
@@ -484,10 +503,13 @@ describe('the request budget', () => {
         assert.ok(RATE_CEILING < 160);
         assert.ok(RATE_WINDOW_MS > 60000);
         assert.ok(RATE_RESERVE >= 12, 'at least one full stop with every retry: 3 requests x 4 attempts');
-        // A session sends one speed a second at most, and every valve open
-        // the cap allows, with room for the link checks. A press's closes are
-        // a stop's (critical), or skipped when routine traffic is spent.
+        // A session sends one speed a second at most, with room to spare:
+        // every valve open the cap allows and its close fit under the line
+        // all routine traffic stops at, and the routine share - which counts
+        // neither the closes nor the watch's reads - holds the speeds, the
+        // opens and the link checks.
         const perWindow = Math.ceil(RATE_WINDOW_MS / 1000);
+        assert.ok(perWindow + MAX_VALVE_OPENS_PER_WINDOW * 2 + 10 <= RATE_CEILING - RATE_RESERVE);
         assert.ok(perWindow + MAX_VALVE_OPENS_PER_WINDOW + 10 <= RATE_CEILING - RATE_RESERVE - RATE_WATCH_RESERVE);
         // The watch reads once per 2 s beat for a whole window, and once more
         // through the link a device was connected again through.
@@ -612,9 +634,9 @@ describe('the request log outlives the page', () => {
         }
         const log = read(JSON.stringify({ e: [[now - 70000, 'old', 0], [now - 1000, 'other', 1], [now - 500, 'me', 0], [now + 3600000, 'fast clock', 0], [now - 10, 42, 0]] }));
         assert.deepEqual(log.entries, [
-            { t: now - 1000, page: 'other', open: true, watch: false },
-            { t: now - 10, page: '', open: false, watch: false },
-            { t: now, page: 'fast clock', open: false, watch: false }
+            { t: now - 1000, page: 'other', open: true, watch: false, critical: false },
+            { t: now - 10, page: '', open: false, watch: false, critical: false },
+            { t: now, page: 'fast clock', open: false, watch: false, critical: false }
         ], 'the expired one is gone, this page\'s own is skipped, and one from the future counts as now');
     });
 
