@@ -9,6 +9,7 @@ import {
     setAxisRole,
     setAxisMaxCap,
     setAxisInvert,
+    setAxisVibeMode,
     setDeviceRotation,
     reverseIntifaceRotation,
     testSingleAxis,
@@ -26,6 +27,7 @@ import {
     HANDSHAKE_TIMEOUT_TEXT
 } from './intiface.js';
 import { REST_MOVE_MS, legDurationMs } from './stroke-planner.js';
+import { OSCILLATE_TEST_LEVEL } from './intiface.js';
 
 const sockets = [];
 
@@ -95,6 +97,31 @@ const SR6 = {
             { StepCount: 1000, FeatureDescriptor: 'L0', ActuatorType: 'Position' },
             { StepCount: 1000, FeatureDescriptor: 'L1', ActuatorType: 'Position' }
         ],
+        StopDeviceCmd: {}
+    }
+};
+
+// What current Intiface Central lists for an OSSM over Bluetooth
+// (buttplugio/buttplug protocols/ossm.yml through the v3 view,
+// message/v3/server_device_message_attributes.rs): ONE motor, two entries.
+const OSSM = {
+    DeviceIndex: 4,
+    DeviceName: 'Kinky Makers OSSM',
+    DeviceMessageTimingGap: 0,
+    DeviceMessages: {
+        ScalarCmd: [{ FeatureDescriptor: '', StepCount: 100, ActuatorType: 'Oscillate' }],
+        LinearCmd: [{ FeatureDescriptor: '', StepCount: 100, ActuatorType: 'Position' }],
+        StopDeviceCmd: {}
+    }
+};
+// And a T-Code stroker (OSR2, or an OSSM on T-Code firmware) through
+// current Intiface: protocols/tcode-v03.yml, position + hw_position_with_duration.
+const TCODE_V03 = {
+    DeviceIndex: 5,
+    DeviceName: 'TCode v0.3 (Single Linear Axis)',
+    DeviceMessages: {
+        ScalarCmd: [{ FeatureDescriptor: '', StepCount: 999, ActuatorType: 'Position' }],
+        LinearCmd: [{ FeatureDescriptor: '', StepCount: 999, ActuatorType: 'Position' }],
         StopDeviceCmd: {}
     }
 };
@@ -782,5 +809,276 @@ describe('persistence', () => {
         connectWith([OSR2]);
         assert.equal(intifaceDevices.get(1).axes[0].role, 'primary');
         assert.equal(saveIntifaceConfig(), true);
+    });
+});
+
+// Buttplug's OSSM handler (protocol_impl/ossm.rs) answers a command for the
+// mode the machine is not in with "go:menu", which the OSSM firmware runs as
+// an emergency stop (src/ossm/state/machine.h): every switch between a
+// LinearCmd and a non-zero Oscillate is one. This counts them in what the
+// driver sent, the way the server would see it.
+function ossmModeSwitches(ws, devIndex = OSSM.DeviceIndex) {
+    let mode = 'none';
+    let switches = 0;
+    for (const frame of ws.sent) {
+        for (const m of frame) {
+            const [type, body] = Object.entries(m)[0];
+            if (!body || body.DeviceIndex !== devIndex) continue;
+            if (type === 'LinearCmd') {
+                if (mode !== 'pos') { if (mode !== 'none') switches += 1; mode = 'pos'; }
+            } else if (type === 'ScalarCmd' && body.Scalars.some((x) => x.Scalar > 0)) {
+                if (mode !== 'osc') { if (mode !== 'none') switches += 1; mode = 'osc'; }
+            }
+        }
+    }
+    return switches;
+}
+
+const ossmMessages = (ws, type) => ws.messages(type).filter((m) => m.DeviceIndex === OSSM.DeviceIndex);
+
+describe('an OSSM through Intiface: one motor, one mode', () => {
+    it('drives the Position axis alone by default and never touches Oscillate', async () => {
+        const ws = connectWith([OSSM]);
+        const dev = intifaceDevices.get(4);
+        assert.deepEqual(dev.axes.map((a) => [a.type, a.role]), [['Oscillate', 'off'], ['Position', 'primary']]);
+        for (let i = 0; i < 6; i++) {
+            dispatchIntiface(60 + i * 5, 40 + (i % 3) * 20, 30, 70, 20, 80);
+            await sleep(120);
+        }
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        assert.equal(ossmMessages(ws, 'ScalarCmd').length, 0, 'the secondary channel never reaches the Oscillate twin');
+        const legs = ossmMessages(ws, 'LinearCmd');
+        assert.ok(legs.length >= 2);
+        assert.equal(ossmModeSwitches(ws), 0);
+        assert.ok(legs.every((m) => m.Vectors[0].Position >= 0.2 && m.Vectors[0].Position <= 0.8));
+    });
+
+    it('drove both before: the old default flipped the machine on every secondary change', () => {
+        // The roles a saved map from before this build (or the old
+        // defaults) held: Position primary, Oscillate secondary. The driver
+        // takes the Position axis and leaves Oscillate OFF.
+        memory.set(INTIFACE_STORAGE_KEY, JSON.stringify({
+            'Kinky Makers OSSM|S:Oscillate|L:Position|R:': { axes: { 'scalar:0': { role: 'secondary' }, 'linear:0': { role: 'primary' } } }
+        }));
+        const ws = connectWith([OSSM]);
+        assert.deepEqual(intifaceDevices.get(4).axes.map((a) => a.role), ['off', 'primary']);
+        dispatchIntiface(50, 60, 30, 70);
+        dispatchIntiface(50, 80, 30, 70);
+        assert.equal(ossmMessages(ws, 'ScalarCmd').length, 0);
+        assert.equal(ossmModeSwitches(ws), 0);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('putting Oscillate in use takes Position out without a command to it, and drives a speed', async () => {
+        const ws = connectWith([OSSM]);
+        assert.equal(setAxisRole(4, 0, 'primary'), true);
+        const dev = intifaceDevices.get(4);
+        assert.deepEqual(dev.axes.map((a) => a.role), ['primary', 'off']);
+        assert.equal(ossmMessages(ws, 'LinearCmd').length, 0, 'no rest move for the axis going out: it would flip the machine');
+        setAxisMaxCap(4, 0, 50);
+        for (const speed of [20, 40, 60]) {
+            dispatchIntiface(speed, 90, 30, 70, 20, 80);
+            await sleep(20);
+        }
+        const levels = ossmMessages(ws, 'ScalarCmd').map((m) => m.Scalars[0]);
+        assert.ok(levels.every((x) => x.ActuatorType === 'Oscillate' && x.Index === 0));
+        // The primary speed under the cap - a speed, never a position, and
+        // the secondary's 90 nowhere. (The 0 the role change sent at rest
+        // Buttplug drops outside oscillate mode: no mode change.)
+        assert.deepEqual(levels.filter((x) => x.Scalar > 0).map((x) => Math.ceil(100 * x.Scalar)), [10, 20, 30]);
+        // STOP: the server-side stop, a zero, and still no LinearCmd.
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        const stopAt = ws.sent.findIndex((f) => f.some((m) => m.StopAllDevices));
+        assert.ok(stopAt >= 0);
+        assert.equal(ossmMessages(ws, 'ScalarCmd').at(-1).Scalars[0].Scalar, 0);
+        await sleep(REST_MOVE_MS + 50);
+        assert.equal(ossmMessages(ws, 'LinearCmd').length, 0);
+        assert.equal(ossmModeSwitches(ws), 0);
+    });
+
+    it('refuses a Test of the mode not in use and runs the Oscillate Test slowly', async () => {
+        const ws = connectWith([OSSM]);
+        assert.equal(testSingleAxis(4, 0), false, 'Position is in use: an Oscillate Test would flip the machine');
+        assert.equal(ossmMessages(ws, 'ScalarCmd').length, 0);
+        setAxisRole(4, 1, 'off');
+        assert.equal(testSingleAxis(4, 0), true);
+        const [test] = ossmMessages(ws, 'ScalarCmd');
+        assert.equal(test.Scalars[0].Scalar, OSCILLATE_TEST_LEVEL);
+        assert.equal(testSingleAxis(4, 1), true, 'with both OFF either can be tested');
+        disconnectIntiface();
+    });
+
+    it('setting Position OFF before anything moved it sends nothing, not a move to full extension', () => {
+        const ws = connectWith([OSSM, OSR2]);
+        setAxisRole(4, 1, 'off');
+        setAxisRole(1, 0, 'off');
+        assert.equal(ws.messages('LinearCmd').length, 0);
+    });
+
+    it('a Test takes the travel envelope with it, and an OFF after it rests inside the envelope', async () => {
+        const ws = connectWith([OSR2]);
+        assert.equal(testSingleAxis(1, 0, { min: 40, max: 90 }), true);
+        await sleep(INTIFACE_TIMINGS.testMoveMs + 100);
+        const legs = ws.messages('LinearCmd').map((m) => m.Vectors[0].Position);
+        assert.deepEqual(legs, [0.8, 0.4]);
+        setAxisRole(1, 0, 'off');
+        const rest = ws.messages('LinearCmd').slice(2).map((m) => m.Vectors[0].Position);
+        assert.ok(rest.every((p) => p >= 0.4 && p <= 0.9), `rest at ${rest}`);
+    });
+
+    it('sends every position on the device\'s own step, inside the envelope', async () => {
+        const ws = connectWith([OSSM]);
+        // A 29-71% envelope: 0.29 x 100 truncates to 28 on the server.
+        dispatchIntiface(100, 0, 29, 71, 29, 71);
+        await sleep(400);
+        dispatchIntiface(0, 0, 0, 100, 29, 71, true);
+        const steps = ossmMessages(ws, 'LinearCmd').map((m) => Math.trunc(100 * m.Vectors[0].Position));
+        assert.ok(steps.length >= 2);
+        assert.ok(steps.every((s) => s >= 29 && s <= 71), `steps ${steps}`);
+        assert.ok(steps.includes(29));
+    });
+
+    it('stops at once from either mode: STOP, page-away and disconnect', () => {
+        const ws = connectWith([OSSM]);
+        setAxisRole(4, 0, 'primary');
+        dispatchIntiface(60, 0, 30, 70);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        assert.equal(ws.messages('StopAllDevices').length, 1);
+        dispatchIntiface(60, 0, 30, 70);
+        assert.equal(stopAllIntiface(), true);
+        assert.equal(ws.messages('StopAllDevices').length, 2);
+        disconnectIntiface();
+        assert.equal(ws.messages('StopAllDevices').length, 3);
+        assert.equal(ossmModeSwitches(ws), 0);
+    });
+});
+
+describe('a ScalarCmd Position is a position, never a level', () => {
+    it('is OFF, cannot be put in use, is not tested and is sent nothing', async () => {
+        const ws = connectWith([TCODE_V03]);
+        const dev = intifaceDevices.get(5);
+        assert.deepEqual(dev.axes.map((a) => [a.kind, a.role, a.inert]), [['scalar', 'off', true], ['linear', 'primary', false]]);
+        assert.equal(setAxisRole(5, 0, 'secondary'), false);
+        assert.equal(testSingleAxis(5, 0), false);
+        dispatchIntiface(40, 90, 20, 80);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        assert.equal(ws.messages('ScalarCmd').length, 0, 'the secondary speed used to go out as where the stroker jumped to');
+        assert.ok(ws.messages('LinearCmd').length >= 1);
+    });
+
+    it('stays OFF whatever a saved map says', () => {
+        memory.set(INTIFACE_STORAGE_KEY, JSON.stringify({
+            'TCode v0.3 (Single Linear Axis)|S:Position|L:Position|R:': { axes: { 'scalar:0': { role: 'secondary' } } }
+        }));
+        connectWith([TCODE_V03]);
+        assert.equal(intifaceDevices.get(5).axes[0].role, 'off');
+    });
+});
+
+describe('pulsed vibration', () => {
+    const NORA = {
+        DeviceIndex: 6,
+        DeviceName: 'Lovense Nora',
+        DeviceMessages: { ScalarCmd: [{ StepCount: 20, ActuatorType: 'Vibrate' }], StopDeviceCmd: {} }
+    };
+    const levels = (ws) => ws.messages('ScalarCmd').filter((m) => m.DeviceIndex === 6).map((m) => m.Scalars[0].Scalar);
+
+    it('is Constant until chosen, and only on a vibrate axis', () => {
+        connectWith([NORA, OSSM]);
+        assert.equal(intifaceDevices.get(6).axes[0].vibeMode, 'constant');
+        assert.equal(setAxisVibeMode(4, 0, { mode: 'pulsed' }), false, 'Oscillate is not a vibrator');
+        assert.equal(setAxisVibeMode(4, 1, { mode: 'pulsed' }), false);
+        assert.equal(setAxisVibeMode(6, 0, { mode: 'strobe' }), false);
+        assert.equal(setAxisVibeMode(6, 0, { periodMs: 1000 }), false);
+        assert.equal(intifaceDevices.get(6).axes[0].vibeMode, 'constant');
+        assert.equal(intifaceDevices.get(6).axes[0].pulsePeriodMs, 1600);
+    });
+
+    it('alternates the engine\'s level and 0 on its period: two commands a period', async () => {
+        const ws = connectWith([NORA]);
+        assert.equal(setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 800 }), true);
+        const from = levels(ws).length;
+        dispatchIntiface(50, 0, 0, 100);
+        assert.deepEqual(levels(ws).slice(from), [0.5], 'on at once, at the peak');
+        // Engine ticks while it pulses add nothing when the level holds.
+        await sleep(200);
+        dispatchIntiface(50, 0, 0, 100);
+        await sleep(1450);
+        const seen = levels(ws).slice(from);
+        assert.deepEqual(seen.slice(0, 5), [0.5, 0, 0.5, 0, 0.5]);
+        assert.ok(seen.length <= 5, `${seen.length} commands in 1.65 s`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('takes a new engine level at once while on, and never goes above the cap', async () => {
+        const ws = connectWith([NORA]);
+        setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 1600 });
+        setAxisMaxCap(6, 0, 38);
+        const from = levels(ws).length;
+        dispatchIntiface(100, 0, 0, 100);
+        // 38% is not a step of a 20-step toy: the peak is the step under it.
+        assert.deepEqual(levels(ws).slice(from), [0.35]);
+        dispatchIntiface(60, 0, 0, 100);
+        assert.deepEqual(levels(ws).slice(from), [0.35, 0.25]);
+        assert.ok(levels(ws).every((x) => Math.ceil(20 * x) / 20 <= 0.38));
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('is cut at once by STOP, pause and the watchdog, page-away, OFF and disconnect, with no pulse after', async () => {
+        const cuts = {
+            stop: () => dispatchIntiface(0, 0, 0, 100, 0, 100, true),
+            pageAway: () => stopAllIntiface(),
+            off: () => setAxisRole(6, 0, 'off'),
+            disconnect: () => disconnectIntiface()
+        };
+        for (const [name, cut] of Object.entries(cuts)) {
+            resetIntifaceForTests();
+            memory.clear();
+            const ws = connectWith([NORA]);
+            setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 800 });
+            const axis = intifaceDevices.get(6).axes[0];
+            dispatchIntiface(80, 0, 0, 100);
+            await sleep(500); // into the off half, so the next pulse is due
+            cut();
+            assert.equal(axis.pulse, null, `${name}: the train is still running`);
+            const at = ws.sent.length;
+            await sleep(900);
+            const after = ws.sent.slice(at).flat().filter((m) => m.ScalarCmd && m.ScalarCmd.Scalars.some((x) => x.Scalar > 0));
+            assert.deepEqual(after, [], `${name}: a pulse went out after the cut`);
+        }
+    });
+
+    it('a cut in the on half leaves the vibrator at 0', async () => {
+        const ws = connectWith([NORA]);
+        setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 2400 });
+        dispatchIntiface(70, 0, 0, 100);
+        await sleep(100);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+        assert.equal(ws.messages('StopAllDevices').length, 1);
+        assert.equal(levels(ws).at(-1), 0);
+        await sleep(1400);
+        assert.equal(levels(ws).at(-1), 0);
+    });
+
+    it('starts again from the peak when the engine starts again after page-away', async () => {
+        const ws = connectWith([NORA]);
+        setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 800 });
+        dispatchIntiface(60, 0, 0, 100);
+        stopAllIntiface();
+        dispatchIntiface(60, 0, 0, 100);
+        assert.equal(levels(ws).at(-1), 0.6, 'the level the server stopped is not taken as still running');
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('is saved per device with its period and comes back on reconnect', () => {
+        connectWith([NORA]);
+        setAxisVibeMode(6, 0, { mode: 'pulsed', periodMs: 2400 });
+        const stored = JSON.parse(memory.get(INTIFACE_STORAGE_KEY));
+        assert.deepEqual(stored['Lovense Nora|S:Vibrate|L:|R:'].axes['scalar:0'], { role: 'primary', maxCap: 100, invert: false, vibeMode: 'pulsed', pulsePeriodMs: 2400 });
+        disconnectIntiface();
+        connectWith([{ ...NORA, DeviceIndex: 9 }]);
+        const axis = intifaceDevices.get(9).axes[0];
+        assert.equal(axis.vibeMode, 'pulsed');
+        assert.equal(axis.pulsePeriodMs, 2400);
     });
 });

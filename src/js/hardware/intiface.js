@@ -15,7 +15,13 @@
 //      re-times the leg in flight, to the position it was sent to and only
 //      inside the envelope.
 //      Vibrators and rotators get immediate updates, deduplicated so
-//      identical values are not re-sent.
+//      identical values are not re-sent, never above the axis's cap; a
+//      vibrator set to Pulsed runs a square wave of its own under the
+//      engine's level (vibe-pulse.js), cut by any 0.
+//   4. One motor, one mode: an Oscillate actuator and the linear axis of the
+//      same motor (an OSSM, oscillateTwins) are never both in use, and the
+//      one not in use is sent nothing (silenced). A ScalarCmd Position is a
+//      position, never a level, and is sent nothing (drivesAsLevel).
 //
 // Message construction and parsing live in buttplug-protocol.js (pure,
 // unit-tested). Roles, caps, linear invert and the rotation settings are
@@ -42,9 +48,13 @@ import {
     describeError,
     parseDevice,
     deviceSignature,
-    defaultRoleFor
+    defaultRoleFor,
+    drivesAsLevel,
+    oscillateTwins,
+    scalarLevel
 } from './buttplug-protocol.js';
 import { createStrokePlanner } from './stroke-planner.js';
+import { readVibeMode, readPulsePeriod, pulsePhase, pulseLevel, DEFAULT_VIBE_MODE, DEFAULT_PULSE_PERIOD_MS } from './vibe-pulse.js';
 
 export const INTIFACE_STORAGE_KEY = 'edgeloop_intiface_devices';
 export const DEFAULT_INTIFACE_URL = 'ws://localhost:12345';
@@ -58,6 +68,13 @@ export const INTIFACE_TIMINGS = {
     failuresBeforeFlag: 3,
     testMoveMs: 450
 };
+
+// The Test button's level. An Oscillate actuator is a reciprocating
+// machine's speed - on an OSSM its own stroke over the whole rail, which
+// Intiface sets to full depth and full stroke on entering that mode - so the
+// press that only has to show which motor it is runs it slowly.
+export const TEST_LEVEL = 0.6;
+export const OSCILLATE_TEST_LEVEL = 0.2;
 
 export const INVALID_URL_TEXT = 'Invalid WebSocket URL: it must start with ws:// (or wss:// for a remote server with TLS), e.g. ws://localhost:12345.';
 export const HANDSHAKE_TIMEOUT_TEXT = 'Handshake timed out. Make sure Intiface Central is running and its server is started; for localhost the URL must be ws://, not wss://.';
@@ -197,6 +214,7 @@ function clearAxisTimers(dev) {
     dev.axes.forEach((axis) => {
         if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
         if (axis.testTimer) { clearTimeout(axis.testTimer); axis.testTimer = null; }
+        cutPulse(axis);
     });
 }
 
@@ -320,8 +338,15 @@ export function disconnectIntiface() {
 }
 
 // Best-effort StopAllDevices (page unload, or any caller that wants the
-// server-side stop without touching the planners).
+// server-side stop without touching the planners). A pulse train is cut
+// with it: its next pulse would start the vibrator again after the stop, on
+// a page that has gone away or been frozen with the session still running.
 export function stopAllIntiface() {
+    intifaceDevices.forEach((dev) => dev.axes.forEach((axis) => {
+        if (!axis.pulse) return;
+        cutPulse(axis);
+        axis.lastSent = null;
+    }));
     if (!isIntifaceConnected()) return false;
     return send(buildStopAllDevices(nextId()));
 }
@@ -452,10 +477,14 @@ function loadSavedConfig() {
 function makeAxis(kind, attr, position, parsed, saved) {
     const key = `${kind}:${attr.index}`;
     const savedAxis = saved && saved.axes && saved.axes[key] && typeof saved.axes[key] === 'object' ? saved.axes[key] : null;
-    const role = savedAxis && ['primary', 'secondary', 'off'].includes(savedAxis.role)
+    // A scalar that takes a position (drivesAsLevel) is never driven: OFF
+    // whatever was saved, and sendScalar sends it nothing.
+    const inert = kind === 'scalar' && !drivesAsLevel(attr.actuatorType);
+    const role = !inert && savedAxis && ['primary', 'secondary', 'off'].includes(savedAxis.role)
         ? savedAxis.role
         : defaultRoleFor(parsed, kind, position);
     const cap = savedAxis ? Number(savedAxis.maxCap) : NaN;
+    const vibrates = kind === 'scalar' && attr.actuatorType === 'Vibrate';
     const axis = {
         key,
         kind,
@@ -463,9 +492,21 @@ function makeAxis(kind, attr, position, parsed, saved) {
         type: attr.actuatorType,
         descriptor: attr.descriptor || '',
         stepCount: attr.stepCount || null,
-        role,
+        role: inert ? 'off' : role,
+        inert,
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
         invert: Boolean(savedAxis && savedAxis.invert),
+        // Vibrate axes only: Constant (the engine's level as it is) or
+        // Pulsed (vibe-pulse.js), and the pulse period.
+        vibeMode: vibrates ? (readVibeMode(savedAxis && savedAxis.vibeMode) || DEFAULT_VIBE_MODE) : DEFAULT_VIBE_MODE,
+        pulsePeriodMs: (vibrates && readPulsePeriod(savedAxis && savedAxis.pulsePeriodMs)) || DEFAULT_PULSE_PERIOD_MS,
+        // The running pulse train of a Pulsed axis: { startedAt, timer }.
+        pulse: null,
+        // The other actuator of the same motor (oscillateTwins) and the
+        // record the two share of which of them last put the motor in its
+        // mode; null on every other axis.
+        twin: null,
+        pair: null,
         planner: kind === 'linear' ? createStrokePlanner() : null,
         // The physical positions the leg in flight was sent from and to (the
         // end of the leg before it, and its own), for a re-time (pumpLinear);
@@ -498,6 +539,18 @@ function addDiscoveredDevice(raw) {
     if (axes.length === 0) {
         axes.push(makeAxis('scalar', { index: 0, actuatorType: 'Vibrate', descriptor: '', stepCount: null }, 0, parsed, saved));
     }
+    // Two actuators of one motor: never both in use. A saved map (or a
+    // backup) from before this build may have both on; the linear axis keeps
+    // its role, the one that keeps the stroke inside the travel envelope.
+    oscillateTwins(parsed).forEach(({ scalar, linear }) => {
+        const osc = axes[scalar];
+        const lin = axes[parsed.scalars.length + linear];
+        if (!osc || !lin) return;
+        const pair = { owner: null };
+        osc.twin = lin; lin.twin = osc;
+        osc.pair = pair; lin.pair = pair;
+        if (osc.role !== 'off' && lin.role !== 'off') osc.role = 'off';
+    });
 
     const altSaved = saved ? Number(saved.alternateSeconds) : 0;
     const dev = {
@@ -547,6 +600,10 @@ export function saveIntifaceConfig() {
         const axes = {};
         dev.axes.forEach((axis) => {
             axes[axis.key] = { role: axis.role, maxCap: axis.maxCap, invert: Boolean(axis.invert) };
+            if (axis.kind === 'scalar' && axis.type === 'Vibrate') {
+                axes[axis.key].vibeMode = axis.vibeMode;
+                axes[axis.key].pulsePeriodMs = axis.pulsePeriodMs;
+            }
         });
         all[dev.signature] = {
             name: dev.name,
@@ -566,23 +623,100 @@ export function saveIntifaceConfig() {
 
 // ---- per-axis output ----------------------------------------------------------------
 
-function quantize(value, stepCount) {
-    let v = Math.max(0, Math.min(1, Number(value) || 0));
-    if (stepCount && stepCount > 0) v = Math.round(v * stepCount) / stepCount;
-    return Math.round(v * 1000) / 1000;
+// The axis's level for an engine speed (percent): the speed under the
+// axis's Max Power Cap, on the axis's step grid and never above the cap
+// (scalarLevel).
+function scalarFor(axis, speedPercent) {
+    if (axis.role === 'off' || axis.inert) return 0;
+    const cap = (axis.maxCap ?? 100) / 100;
+    const speed = Math.max(0, Math.min(100, Number(speedPercent) || 0)) / 100;
+    return scalarLevel(speed * cap, axis.stepCount, cap);
 }
 
-function scalarFor(axis, speedPercent) {
-    if (axis.role === 'off') return 0;
-    const capped = Math.max(0, Math.min(100, Number(speedPercent) || 0)) * ((axis.maxCap ?? 100) / 100);
-    return quantize(capped / 100, axis.stepCount);
+function speedForRole(role) {
+    if (role === 'primary') return lastSpeeds.primary;
+    if (role === 'secondary') return lastSpeeds.secondary;
+    return 0;
+}
+
+// Twins (oscillateTwins) are two modes of one motor. The motor is in the
+// mode of the twin that last sent it something it acts on: any LinearCmd,
+// an Oscillate level above 0 - Buttplug drops an Oscillate 0 outside
+// oscillate mode (protocol_impl/ossm.rs). Only that twin's stop or rest
+// move reaches the motor in the mode it is in.
+function noteDrove(axis, acting) {
+    if (axis.pair && acting) axis.pair.owner = axis.kind;
+}
+
+// Whether an axis must be sent nothing at all. A scalar that takes a
+// position (axis.inert) never is. Nor is an OFF twin whose twin holds the
+// motor: a rest move, a zero or a Test to it is a command for the other
+// mode, and Buttplug answers that by sending the OSSM to its menu, which its
+// firmware runs as an emergency stop, and then into the other mode - the
+// slam and the stop forum user X333 saw. The twin in use stops the motor
+// (STOP sends StopAllDevices, which reaches whichever mode it is in).
+function silenced(axis) {
+    if (axis.inert) return true;
+    return Boolean(axis.pair) && axis.role === 'off' && axis.pair.owner !== axis.kind;
 }
 
 function sendScalar(dev, axis, value) {
+    if (silenced(axis)) return false;
     if (axis.lastSent === value) return false;
     if (!sendDeviceCmd(dev, axis, buildScalarCmd(nextId(), dev.index, [{ index: axis.index, scalar: value, actuatorType: axis.type }]))) return false;
     axis.lastSent = value;
+    noteDrove(axis, value > 0);
     return true;
+}
+
+// ---- pulsed vibration (vibe-pulse.js) -------------------------------------
+
+function isPulsed(axis) {
+    return axis.kind === 'scalar' && axis.type === 'Vibrate' && axis.vibeMode === 'pulsed';
+}
+
+// Stop a pulse train where it is. Synchronous: once this returns, no pulse
+// of that train can go out - its timer is cleared, and the callback checks
+// that its train is still the axis's own all the same.
+function cutPulse(axis) {
+    if (!axis.pulse) return;
+    if (axis.pulse.timer) clearTimeout(axis.pulse.timer);
+    axis.pulse = null;
+}
+
+// Arm the timer for the train's next change of phase.
+function armPulse(dev, axis, now) {
+    const train = axis.pulse;
+    if (!train) return;
+    const { changeAt } = pulsePhase(train.startedAt, now, axis.pulsePeriodMs);
+    train.timer = setTimeout(() => {
+        if (axis.pulse !== train) return;
+        train.timer = null;
+        if (!isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) { axis.pulse = null; return; }
+        const t = Date.now();
+        applyScalar(dev, axis, speedForRole(axis.role), t);
+        if (axis.pulse === train) armPulse(dev, axis, t);
+    }, Math.max(1, changeAt - now));
+}
+
+// A scalar axis takes the engine's speed: as it is (Constant), or as the
+// peak of a pulse train (Pulsed), which starts on the first positive level
+// - at the peak at once - and is cut by the first 0: a stop, a pause, the
+// watchdog, OFF, a cap of 0.
+function applyScalar(dev, axis, speed, now) {
+    const level = scalarFor(axis, speed);
+    if (!isPulsed(axis) || level <= 0) {
+        cutPulse(axis);
+        sendScalar(dev, axis, level);
+        return;
+    }
+    let fresh = false;
+    if (!axis.pulse) {
+        axis.pulse = { startedAt: now, timer: null };
+        fresh = true;
+    }
+    sendScalar(dev, axis, pulseLevel(level, pulsePhase(axis.pulse.startedAt, now, axis.pulsePeriodMs).on));
+    if (fresh) armPulse(dev, axis, now);
 }
 
 function sendRotate(dev, axis, value) {
@@ -647,6 +781,10 @@ function travelCovered(axis) {
 // mapping changed just before it was planned.
 function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
     if (!axis.planner || !isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
+    if (silenced(axis)) {
+        if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
+        return;
+    }
     const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
     const leg = retimed || axis.planner.next(now);
     if (!leg) return;
@@ -654,13 +792,20 @@ function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
         axis.legFrom = axis.legTarget;
         axis.legTarget = physicalPosition(axis, leg.position);
     }
-    const position = axis.legTarget;
-    sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position, durationMs: leg.durationMs }]));
+    sendLinear(dev, axis, axis.legTarget, leg.durationMs);
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
         axis.timer = null;
         pumpLinear(dev, axis, Math.max(Date.now(), axis.planner.legEndsAt()));
     }, leg.durationMs);
+}
+
+// One LinearCmd, on the axis's step grid and inside the travel envelope
+// (linearWirePosition).
+function sendLinear(dev, axis, position, durationMs) {
+    const sent = sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position, durationMs, stepCount: axis.stepCount, bounds: lastEnvelope }]));
+    noteDrove(axis, sent);
+    return sent;
 }
 
 function flipDirection(dev, now) {
@@ -705,7 +850,7 @@ function applyAxis(dev, axis, primary, secondary, zone, now, urgent = false) {
         maybeAlternate(dev, now, value > 0);
         sendRotate(dev, axis, value);
     } else {
-        sendScalar(dev, axis, scalarFor(axis, speed));
+        applyScalar(dev, axis, speed, now);
     }
 }
 
@@ -756,22 +901,52 @@ export function dispatchIntiface(primarySpeed, secondarySpeed, strokeMin = 0, st
 
 // ---- user settings ----------------------------------------------------------------
 
+// An axis set OFF stops where it is: a linear axis with one rest move to
+// the bottom of the zone it was last given, inside the travel envelope; a
+// scalar (its pulse train cut) or a rotator with a 0. A linear axis nothing
+// has moved yet is sent nothing: its planner had never been given a zone,
+// and its rest move went to 0 whatever the travel envelope - setting an
+// OSSM's Position axis OFF before a session sent it to full extension.
 function restAxisNow(dev, axis) {
     if (axis.kind === 'linear') {
-        axis.planner.setInput({ enabled: false });
+        axis.planner.setInput({ enabled: false, zoneMin: lastZone.min, zoneMax: lastZone.max });
+        if (axis.legTarget === null) return;
         pumpLinear(dev, axis);
     } else if (axis.kind === 'rotate') {
         sendRotate(dev, axis, 0);
     } else {
+        cutPulse(axis);
         sendScalar(dev, axis, 0);
     }
+}
+
+// The twin of an axis the wearer has just put in use goes OFF and quiet:
+// timers, pulse and leg forgotten, and nothing sent (silenced()). The
+// twin taking over moves the motor into its own mode with its first
+// command; where the carriage is after that, nothing here knows.
+function yieldTwin(axis) {
+    axis.role = 'off';
+    if (axis.timer) { clearTimeout(axis.timer); axis.timer = null; }
+    if (axis.testTimer) { clearTimeout(axis.testTimer); axis.testTimer = null; }
+    cutPulse(axis);
+    if (axis.planner) {
+        axis.planner.reset();
+        axis.planner.setInput({ enabled: false });
+        axis.legFrom = null;
+        axis.legTarget = null;
+    }
+    axis.lastSent = null;
 }
 
 export function setAxisRole(devIdx, axisIdx, role) {
     const dev = intifaceDevices.get(devIdx);
     const axis = dev && dev.axes[axisIdx];
     if (!axis || !['primary', 'secondary', 'off'].includes(role)) return false;
+    // A scalar that takes a position is never driven (drivesAsLevel).
+    if (axis.inert && role !== 'off') return false;
     axis.role = role;
+    // One motor, one mode: putting one twin in use takes the other out.
+    if (role !== 'off' && axis.twin && axis.twin.role !== 'off') yieldTwin(axis.twin);
     saveIntifaceConfig();
     if (!isIntifaceConnected()) return true;
     if (role === 'off') {
@@ -819,14 +994,30 @@ export function setDeviceRotation(devIdx, { reverseOnEdge, alternateSeconds } = 
     return true;
 }
 
+// Take the travel envelope (percent) as the page has it now, for what can
+// move a linear axis before a session's first dispatch hands it over: until
+// then the driver knew only 0-100, and a Test press stroked 20-80% whatever
+// the wearer's bounds.
+function useEnvelope(envelope) {
+    if (!envelope || typeof envelope !== 'object') return;
+    const mapped = zoneFromPercent(lastZone.min * 100, lastZone.max * 100, envelope.min, envelope.max);
+    lastEnvelope = mapped.envelope;
+    lastZone = mapped.zone;
+}
+
 // Short manual test of one axis so the user can see which motor it is.
 // Skipped while the engine drives the axis (a session is running would
-// fight the planner).
-export function testSingleAxis(devIdx, axisIdx) {
+// fight the planner), for a scalar that takes a position, and for the twin
+// of a motor whose other mode is in use (silenced() says why). `envelope`:
+// the travel envelope in percent, { min, max }.
+export function testSingleAxis(devIdx, axisIdx, envelope = null) {
     const dev = intifaceDevices.get(devIdx);
     const axis = dev && dev.axes[axisIdx];
-    if (!axis || !isIntifaceConnected()) return false;
-    const level = quantize(0.6 * ((axis.maxCap ?? 100) / 100), axis.stepCount);
+    if (!axis || !isIntifaceConnected() || axis.inert) return false;
+    if (axis.twin && axis.twin.role !== 'off') return false;
+    useEnvelope(envelope);
+    const cap = (axis.maxCap ?? 100) / 100;
+    const level = scalarLevel((axis.type === 'Oscillate' ? OSCILLATE_TEST_LEVEL : TEST_LEVEL) * cap, axis.stepCount, cap);
     const holdMs = 1000;
 
     if (axis.kind === 'linear') {
@@ -834,13 +1025,13 @@ export function testSingleAxis(devIdx, axisIdx) {
         const up = physicalPosition(axis, lastZone.max);
         const down = physicalPosition(axis, lastZone.min);
         const moveMs = INTIFACE_TIMINGS.testMoveMs;
-        sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position: up, durationMs: moveMs }]));
+        sendLinear(dev, axis, up, moveMs);
         // Where the next leg starts from (travelCovered).
         axis.legTarget = up;
         axis.testTimer = setTimeout(() => {
             axis.testTimer = null;
             if (!isIntifaceConnected() || intifaceDevices.get(dev.index) !== dev) return;
-            sendDeviceCmd(dev, axis, buildLinearCmd(nextId(), dev.index, [{ index: axis.index, position: down, durationMs: moveMs }]));
+            sendLinear(dev, axis, down, moveMs);
             axis.legTarget = down;
             axis.planner.reset();
         }, moveMs + 50);
@@ -858,13 +1049,32 @@ export function testSingleAxis(devIdx, axisIdx) {
         return true;
     }
 
-    sendDeviceCmd(dev, axis, buildScalarCmd(nextId(), dev.index, [{ index: axis.index, scalar: level, actuatorType: axis.type }]));
+    if (sendDeviceCmd(dev, axis, buildScalarCmd(nextId(), dev.index, [{ index: axis.index, scalar: level, actuatorType: axis.type }]))) noteDrove(axis, level > 0);
     axis.lastSent = null;
     if (axis.testTimer) clearTimeout(axis.testTimer);
     axis.testTimer = setTimeout(() => {
         axis.testTimer = null;
         sendScalar(dev, axis, 0);
     }, holdMs);
+    return true;
+}
+
+// Vibrate axes: Constant or Pulsed, and the pulse period (vibe-pulse.js).
+// Either change starts a fresh train, at its peak, at once.
+export function setAxisVibeMode(devIdx, axisIdx, { mode, periodMs } = {}) {
+    const dev = intifaceDevices.get(devIdx);
+    const axis = dev && dev.axes[axisIdx];
+    if (!axis || axis.kind !== 'scalar' || axis.type !== 'Vibrate') return false;
+    const nextMode = mode === undefined ? axis.vibeMode : readVibeMode(mode);
+    const nextPeriod = periodMs === undefined ? axis.pulsePeriodMs : readPulsePeriod(periodMs);
+    if (!nextMode || !nextPeriod) return false;
+    axis.vibeMode = nextMode;
+    axis.pulsePeriodMs = nextPeriod;
+    saveIntifaceConfig();
+    cutPulse(axis);
+    if (isIntifaceConnected() && axis.role !== 'off') {
+        applyAxis(dev, axis, lastSpeeds.primary, lastSpeeds.secondary, lastZone, Date.now());
+    }
     return true;
 }
 

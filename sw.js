@@ -64,6 +64,7 @@ const PRECACHE = [
     './src/js/hardware/intiface.js',
     './src/js/hardware/buttplug-protocol.js',
     './src/js/hardware/stroke-planner.js',
+    './src/js/hardware/vibe-pulse.js',
     './src/js/hardware/tcode.js',
     './src/js/hardware/tcode-protocol.js'
 ];

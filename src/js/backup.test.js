@@ -202,6 +202,46 @@ describe('device maps survive the round trip and hostile ones are declawed', () 
     });
 });
 
+describe('a vibrator\'s Pulsed setting rides in the backup like the other per-axis settings', () => {
+    const PULSED = {
+        ...STORES,
+        intifaceDevices: {
+            'Lovense Nora|S:Vibrate|L:|R:': {
+                name: 'Lovense Nora',
+                axes: { 'scalar:0': { role: 'secondary', maxCap: 60, invert: false, vibeMode: 'pulsed', pulsePeriodMs: 800 } },
+                reverseOnEdge: true,
+                alternateSeconds: 0,
+                savedAt: 1700000000002
+            }
+        }
+    };
+
+    it('survives the round trip with its period', () => {
+        const read = readBackup(JSON.parse(JSON.stringify(buildBackup(PULSED, { now: NOW }))));
+        assert.deepEqual(read.devices.intiface['Lovense Nora|S:Vibrate|L:|R:'].axes['scalar:0'], {
+            invert: false, role: 'secondary', maxCap: 60, vibeMode: 'pulsed', pulsePeriodMs: 800
+        });
+    });
+
+    it('drops a mode or a period this build does not have, so the driver\'s Constant applies', () => {
+        const map = sanitizeDeviceMap({
+            d: { axes: {
+                'scalar:0': { role: 'primary', vibeMode: 'strobe', pulsePeriodMs: 50 },
+                'scalar:1': { role: 'primary', vibeMode: 'constant', pulsePeriodMs: '2400' },
+                'scalar:2': { role: 'primary', vibeMode: { evil: true }, pulsePeriodMs: 1600.5 }
+            } }
+        }, { extras: true });
+        assert.deepEqual(map.d.axes['scalar:0'], { invert: false, role: 'primary' });
+        assert.deepEqual(map.d.axes['scalar:1'], { invert: false, role: 'primary', vibeMode: 'constant', pulsePeriodMs: 2400 });
+        assert.deepEqual(map.d.axes['scalar:2'], { invert: false, role: 'primary' });
+    });
+
+    it('is an Intiface setting only: a T-Code axis map never carries it', () => {
+        const map = sanitizeDeviceMap({ osr: { axes: { V0: { role: 'secondary', vibeMode: 'pulsed', pulsePeriodMs: 800 } } } });
+        assert.deepEqual(map.osr.axes.V0, { invert: false, role: 'secondary' });
+    });
+});
+
 describe('the export file says what it is', () => {
     it('carries every store the audit found missing', () => {
         const file = buildBackup(STORES, { includeKey: false, now: NOW });

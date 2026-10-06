@@ -19,8 +19,49 @@ import {
     parseDevice,
     deviceSignature,
     defaultRoleFor,
-    isScalarActuator
+    isScalarActuator,
+    drivesAsLevel,
+    oscillateTwins,
+    scalarLevel,
+    linearWirePosition
 } from './buttplug-protocol.js';
+
+// How current Buttplug (buttplugio/buttplug, device-config v5) lists these
+// devices to a v3 client: message/v3/server_device_message_attributes.rs
+// puts every output of a feature but hw_position_with_duration in
+// ScalarCmd, that one in LinearCmd, both with the feature's description.
+// protocols/ossm.yml: one feature, oscillate 0..100 + hw_position_with_duration 0..100.
+const OSSM_RAW = {
+    DeviceName: 'Kinky Makers OSSM',
+    DeviceIndex: 0,
+    DeviceMessageTimingGap: 0,
+    DeviceMessages: {
+        ScalarCmd: [{ FeatureDescriptor: '', StepCount: 100, ActuatorType: 'Oscillate' }],
+        LinearCmd: [{ FeatureDescriptor: '', StepCount: 100, ActuatorType: 'Position' }],
+        StopDeviceCmd: {}
+    }
+};
+// protocols/lovense.yml, "Lovense Solace Pro": the same pair on one feature, with a description.
+const SOLACE_PRO_RAW = {
+    DeviceName: 'Lovense Solace Pro',
+    DeviceIndex: 4,
+    DeviceMessages: {
+        ScalarCmd: [{ FeatureDescriptor: 'Stroker position Based Movement', StepCount: 20, ActuatorType: 'Oscillate' }],
+        LinearCmd: [{ FeatureDescriptor: 'Stroker position Based Movement', StepCount: 100, ActuatorType: 'Position' }],
+        SensorReadCmd: [{ FeatureDescriptor: 'battery Level', SensorType: 'Battery', SensorRange: [[0, 100]] }],
+        StopDeviceCmd: {}
+    }
+};
+// protocols/tcode-v03.yml: hw_position_with_duration AND position on one feature.
+const TCODE_V03_RAW = {
+    DeviceName: 'TCode v0.3 (Single Linear Axis)',
+    DeviceIndex: 2,
+    DeviceMessages: {
+        ScalarCmd: [{ FeatureDescriptor: '', StepCount: 999, ActuatorType: 'Position' }],
+        LinearCmd: [{ FeatureDescriptor: '', StepCount: 999, ActuatorType: 'Position' }],
+        StopDeviceCmd: {}
+    }
+};
 
 describe('builders', () => {
     it('produces the v3 handshake', () => {
@@ -167,5 +208,119 @@ describe('parseDevice', () => {
         assert.equal(defaultRoleFor(vibe, 'scalar', 0), 'primary');
         assert.equal(isScalarActuator('Oscillate'), true);
         assert.equal(isScalarActuator('Rotate'), false);
+    });
+});
+
+describe('one motor listed twice: what current Intiface Central shows a v3 client', () => {
+    it('pairs the OSSM\'s Oscillate with its Position axis, and the Solace Pro\'s', () => {
+        assert.deepEqual(oscillateTwins(parseDevice(OSSM_RAW)), [{ scalar: 0, linear: 0 }]);
+        assert.deepEqual(oscillateTwins(parseDevice(SOLACE_PRO_RAW)), [{ scalar: 0, linear: 0 }]);
+    });
+
+    it('pairs nothing where the lists do not line up and no description is shared', () => {
+        const machine = parseDevice({
+            DeviceName: 'Two-motor rig',
+            DeviceIndex: 5,
+            DeviceMessages: {
+                ScalarCmd: [{ FeatureDescriptor: 'Thrust', ActuatorType: 'Oscillate' }, { FeatureDescriptor: 'Vibe', ActuatorType: 'Vibrate' }],
+                LinearCmd: [{ FeatureDescriptor: 'Rail A', ActuatorType: 'Position' }, { FeatureDescriptor: 'Rail B', ActuatorType: 'Position' }]
+            }
+        });
+        assert.deepEqual(oscillateTwins(machine), []);
+        assert.deepEqual(oscillateTwins(parseDevice(TCODE_V03_RAW)), [], 'a Position scalar is not an Oscillate twin');
+        assert.deepEqual(oscillateTwins(null), []);
+    });
+
+    it('defaults the Oscillate twin OFF and the Position axis Primary', () => {
+        const ossm = parseDevice(OSSM_RAW);
+        assert.equal(defaultRoleFor(ossm, 'scalar', 0), 'off');
+        assert.equal(defaultRoleFor(ossm, 'linear', 0), 'primary');
+    });
+
+    it('never drives a ScalarCmd Position: it is a position, not a level', () => {
+        assert.equal(drivesAsLevel('Position'), false);
+        for (const type of ['Vibrate', 'Oscillate', 'Rotate', 'Constrict', 'Inflate']) assert.equal(drivesAsLevel(type), true);
+        const osr = parseDevice(TCODE_V03_RAW);
+        assert.equal(defaultRoleFor(osr, 'scalar', 0), 'off');
+        assert.equal(defaultRoleFor(osr, 'linear', 0), 'primary');
+    });
+});
+
+// Buttplug turns a ScalarCmd level into a step with ceil(StepCount * level)
+// and a LinearCmd position with trunc(StepCount * position)
+// (server_device_feature.rs). These do the same in f64, as the server does.
+const serverStep = (level, n) => (level < 0.000001 ? 0 : Math.ceil(n * level));
+const serverPosition = (position, n) => Math.trunc(n * position);
+
+describe('scalarLevel: the step the server lands on, never above the cap', () => {
+    it('lands on the step it means for every step count and every level', () => {
+        for (const n of [3, 5, 6, 7, 9, 10, 12, 15, 19, 20, 25, 50, 99, 100, 255]) {
+            for (let k = 0; k <= n; k++) {
+                const level = scalarLevel(k / n, n);
+                assert.equal(serverStep(level, n), k, `step ${k} of ${n} sent as ${level}`);
+            }
+        }
+    });
+
+    it('never lets the server round a capped level above the cap', () => {
+        for (const n of [3, 6, 7, 10, 12, 20, 100]) {
+            for (let cap = 10; cap <= 100; cap += 5) {
+                for (let speed = 0; speed <= 100; speed += 1) {
+                    const level = scalarLevel((speed / 100) * (cap / 100), n, cap / 100);
+                    assert.ok(serverStep(level, n) / n <= cap / 100 + 1e-12, `n=${n} cap=${cap} speed=${speed}: server step ${serverStep(level, n)}`);
+                }
+            }
+        }
+    });
+
+    it('fixes the two ways the old 3-decimal level went over', () => {
+        // 2/3 on a 3-step toy went out as 0.667: ceil(2.001) = 3, full power under a 65% cap.
+        assert.equal(serverStep(Math.round((2 / 3) * 1000) / 1000, 3), 3);
+        assert.equal(serverStep(scalarLevel(0.65, 3, 0.65), 3), 1);
+        // 0.07 x 100 = 7.000000000000001: 7% went out as 8%.
+        assert.equal(serverStep(0.07, 100), 8);
+        assert.equal(serverStep(scalarLevel(0.07, 100), 100), 7);
+    });
+
+    it('keeps 1/1000 without a step count, still under the cap', () => {
+        assert.equal(scalarLevel(0.4567, null), 0.457);
+        assert.equal(scalarLevel(0.9, null, 0.35), 0.35);
+        assert.equal(scalarLevel(-1, 20), 0);
+        assert.equal(scalarLevel(2, 20), 1);
+    });
+});
+
+describe('linearWirePosition: the step the server lands on, inside the envelope', () => {
+    it('lands inside the envelope where the plain float fell one step outside it', () => {
+        // A 29% lower guard: 0.29 x 100 = 28.999999999999996, sent as 28.
+        assert.equal(serverPosition(0.29, 100), 28);
+        assert.equal(serverPosition(linearWirePosition(0.29, 100, { min: 0.29, max: 0.71 }), 100), 29);
+    });
+
+    it('never leaves the bounds, at any step count, for any position', () => {
+        for (const n of [100, 999, 1000, 632]) {
+            for (let lo = 0; lo <= 60; lo += 7) {
+                const bounds = { min: lo / 100, max: (lo + 33) / 100 };
+                for (let i = 0; i <= 200; i++) {
+                    const p = i / 200;
+                    const step = serverPosition(linearWirePosition(p, n, bounds), n);
+                    assert.ok(step >= Math.ceil(bounds.min * n - 1e-9) && step <= Math.floor(bounds.max * n + 1e-9), `n=${n} bounds=${lo}..${lo + 33} p=${p}: step ${step}`);
+                }
+            }
+        }
+    });
+
+    it('is the step the position is nearest to, and exact where the float already was', () => {
+        assert.equal(linearWirePosition(0.8, 1000), 0.8);
+        assert.equal(linearWirePosition(0.2 + 0.8 - 0.8, 1000), 0.2);
+        assert.equal(serverPosition(linearWirePosition(0.574, 100), 100), 57);
+        assert.equal(linearWirePosition(1, 100), 1);
+        assert.equal(linearWirePosition(0, 100), 0);
+        assert.equal(linearWirePosition(0.1234, null), 0.123, 'without a step count: 3 decimals, as before');
+    });
+
+    it('is what buildLinearCmd sends when the axis\'s step count and bounds come with it', () => {
+        const cmd = buildLinearCmd(9, 0, [{ index: 0, position: 0.29, durationMs: 400, stepCount: 100, bounds: { min: 0.29, max: 1 } }]);
+        assert.equal(serverPosition(cmd.LinearCmd.Vectors[0].Position, 100), 29);
     });
 });

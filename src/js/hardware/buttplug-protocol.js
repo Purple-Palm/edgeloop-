@@ -25,10 +25,79 @@ export function isScalarActuator(type) {
     return SCALAR_TYPES.includes(type);
 }
 
+// A ScalarCmd "Position" actuator takes a position, not a level. Current
+// Buttplug lists one beside the LinearCmd of the same feature on T-Code
+// strokers (OSR2, SR6, an OSSM on T-Code firmware), Umove and its simulated
+// stroker, so a level sent to it moved the stroke: the secondary channel's
+// intensity became where the axis jumped to between legs, and the 0 of a
+// stop a jump to the end of the travel. EdgeLoop drives that motor through
+// its LinearCmd axis alone and sends this one nothing.
+export function drivesAsLevel(type) {
+    return type !== 'Position';
+}
+
 function clamp01(v) {
     const n = Number(v);
     if (!Number.isFinite(n)) return 0;
     return Math.max(0, Math.min(1, n));
+}
+
+function stepsOf(stepCount) {
+    const n = Math.round(Number(stepCount));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// The next double up or down from x (x > 0), for the two encoders below.
+function nudge(x, up) {
+    const f = new Float64Array([x]);
+    const bits = new BigInt64Array(f.buffer);
+    bits[0] += up ? 1n : -1n;
+    return f[0];
+}
+
+// The ScalarCmd / RotateCmd level for `value` (0..1) on an actuator with
+// `stepCount` steps, never above `cap` (0..1): the nearest step at or under
+// the cap, as a float the server turns back into that very step. Buttplug
+// multiplies by StepCount and rounds UP (server_device_feature.rs,
+// calculate_scaled_float), so a float a hair above a step is the next step:
+// 0.07 x 100 is 7.000000000000001 and went out as 8, and the 3-decimal
+// rounding used before did it for every step count 1000 is not a multiple
+// of - 2/3 sent as 0.667 is ceil(2.001) = 3, full power on a 3-step toy
+// under a 65% cap. Without a step count the level is rounded to 1/1000,
+// still never above the cap.
+export function scalarLevel(value, stepCount, cap = 1) {
+    const v = clamp01(value);
+    const top = clamp01(cap);
+    const n = stepsOf(stepCount);
+    if (!n) return Math.min(Math.round(v * 1000), Math.floor(top * 1000 + 1e-9)) / 1000;
+    const step = Math.min(Math.round(v * n), Math.floor(top * n + 1e-9));
+    if (step <= 0) return 0;
+    if (step >= n) return 1;
+    let level = step / n;
+    for (let i = 0; i < 8 && Math.ceil(level * n) > step; i++) level = nudge(level, false);
+    return level;
+}
+
+// The LinearCmd Position for `position` (0..1) on an axis with `stepCount`
+// steps: the nearest step inside `bounds` (the travel envelope, 0..1), as a
+// float the server turns back into that very step. Buttplug multiplies by
+// StepCount and TRUNCATES for hw_position_with_duration
+// (server_device_feature.rs): 0.29 x 100 is 28.999999999999996, so a 29%
+// lower guard went out as 28% - on an OSSM, whose 0 is full extension, 1%
+// deeper than the wearer allowed. Without a step count: 1/1000, as before.
+export function linearWirePosition(position, stepCount, bounds = { min: 0, max: 1 }) {
+    const p = clamp01(position);
+    const n = stepsOf(stepCount);
+    if (!n) return Math.round(p * 1000) / 1000;
+    const lo = Math.ceil(clamp01(bounds && bounds.min) * n - 1e-9);
+    const hi = Math.floor(clamp01(bounds && bounds.max !== undefined ? bounds.max : 1) * n + 1e-9);
+    let step = Math.round(p * n);
+    if (lo <= hi) step = Math.max(lo, Math.min(hi, step));
+    if (step <= 0) return 0;
+    if (step >= n) return 1;
+    let wire = step / n;
+    for (let i = 0; i < 8 && wire * n < step; i++) wire = nudge(wire, true);
+    return wire;
 }
 
 // ---- builders -------------------------------------------------------------
@@ -79,9 +148,11 @@ export function buildLinearCmd(id, deviceIndex, vectors) {
             Vectors: vectors.map((v) => ({
                 Index: v.index,
                 Duration: Math.max(0, Math.round(Number(v.durationMs) || 0)),
-                // 3 decimals: a 0..999-step TCode axis cannot resolve more,
-                // and it keeps 1 - 0.8 from becoming 0.19999999999999996.
-                Position: Math.round(clamp01(v.position) * 1000) / 1000
+                // On the axis's own step grid inside its bounds when its
+                // StepCount is known (linearWirePosition); otherwise 3
+                // decimals, which keeps 1 - 0.8 from becoming
+                // 0.19999999999999996.
+                Position: linearWirePosition(v.position, v.stepCount, v.bounds)
             }))
         }
     };
@@ -235,12 +306,55 @@ export function deviceSignature(parsed) {
 
 // Default role for each actuator on a freshly discovered device: the first
 // stroke-capable axis is primary, the rest secondary; an internal toy
-// (prostate massager / Lovense Edge) defaults to secondary everywhere.
+// (prostate massager / Lovense Edge) defaults to secondary everywhere. A
+// scalar EdgeLoop does not drive (drivesAsLevel) is OFF, and so is the
+// Oscillate twin of a linear axis (oscillateTwins): the linear axis is the
+// one that keeps the stroke inside the travel envelope.
 export function defaultRoleFor(parsed, kind, position) {
+    if (kind === 'scalar' && parsed && Array.isArray(parsed.scalars)) {
+        const attr = parsed.scalars[position];
+        if (attr && !drivesAsLevel(attr.actuatorType)) return 'off';
+        if (oscillateTwins(parsed).some((t) => t.scalar === position)) return 'off';
+    }
     const lower = (parsed && parsed.name ? parsed.name : '').toLowerCase();
     const looksInternal = lower.includes('prostate') || lower.includes('edge') || lower.includes('hush');
     if (looksInternal) return 'secondary';
     if (kind === 'linear') return position === 0 ? 'primary' : 'secondary';
     if (kind === 'rotate') return (position === 0 && parsed.linears.length === 0) ? 'primary' : 'secondary';
     return (position === 0 && parsed.linears.length === 0 && parsed.rotations.length === 0) ? 'primary' : 'secondary';
+}
+
+// Which Oscillate scalar and which linear axis of a device are one motor.
+// Buttplug describes a device by features, and a feature with both an
+// `oscillate` and a `hw_position_with_duration` output - the OSSM ("Kinky
+// Makers OSSM", device-config/protocols/ossm.yml) and the Lovense Solace
+// Pro - reaches a v3 client twice: once in ScalarCmd (Oscillate), once in
+// LinearCmd, each list in feature order and both entries carrying the
+// feature's description as FeatureDescriptor
+// (message/v3/server_device_message_attributes.rs). Nothing else links them.
+// They are two modes of one motor, not two motors: on the OSSM, Buttplug
+// answers every command for the mode the machine is not in with "go:menu"
+// first (protocol_impl/ossm.rs), and the OSSM firmware runs its emergency
+// stop on that from either mode (src/ossm/state/machine.h) - driven both at
+// once, the machine flipped and stopped on nearly every command. Paired by
+// order when the two lists are as long and their descriptors agree, else by
+// a non-empty descriptor only the two share. Returns [{ scalar, linear }] as
+// positions in parsed.scalars / parsed.linears.
+export function oscillateTwins(parsed) {
+    if (!parsed || !Array.isArray(parsed.scalars) || !Array.isArray(parsed.linears)) return [];
+    const osc = parsed.scalars.map((a, pos) => ({ a, pos })).filter(({ a }) => a.actuatorType === 'Oscillate');
+    const lin = parsed.linears.map((a, pos) => ({ a, pos }));
+    if (osc.length === 0 || lin.length === 0) return [];
+    if (osc.length === lin.length && osc.every((o, i) => o.a.descriptor === lin[i].a.descriptor)) {
+        return osc.map((o, i) => ({ scalar: o.pos, linear: lin[i].pos }));
+    }
+    const pairs = [];
+    osc.forEach((o) => {
+        const d = o.a.descriptor;
+        if (!d) return;
+        const sameLin = lin.filter((l) => l.a.descriptor === d);
+        const sameOsc = osc.filter((x) => x.a.descriptor === d);
+        if (sameLin.length === 1 && sameOsc.length === 1) pairs.push({ scalar: o.pos, linear: sameLin[0].pos });
+    });
+    return pairs;
 }

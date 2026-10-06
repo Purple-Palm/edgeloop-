@@ -145,6 +145,7 @@ import {
     setAxisRole,
     setAxisMaxCap,
     setAxisInvert,
+    setAxisVibeMode,
     setDeviceRotation,
     reverseIntifaceRotation,
     saveIntifaceConfig,
@@ -159,6 +160,7 @@ import {
     ALTERNATE_SECONDS_MAX,
     INTIFACE_STORAGE_KEY
 } from './hardware/intiface.js';
+import { PULSE_PERIODS_MS } from './hardware/vibe-pulse.js';
 import {
     connectTCode,
     disconnectTCode,
@@ -5601,6 +5603,15 @@ window.setDeviceInvert = (devIdx, axisIdx, checked) => {
     setAxisInvert(devIdx, axisIdx, Boolean(checked));
 };
 
+window.setDeviceVibeMode = (devIdx, axisIdx, mode) => {
+    setAxisVibeMode(devIdx, axisIdx, { mode });
+    renderIntifaceDevices();
+};
+
+window.setDevicePulsePeriod = (devIdx, axisIdx, val) => {
+    setAxisVibeMode(devIdx, axisIdx, { periodMs: parseInt(val, 10) });
+};
+
 window.setDeviceReverseOnEdge = (devIdx, checked) => {
     setDeviceRotation(devIdx, { reverseOnEdge: Boolean(checked) });
 };
@@ -5609,7 +5620,9 @@ window.setDeviceAlternate = (devIdx, val) => {
     setDeviceRotation(devIdx, { alternateSeconds: parseInt(val, 10) || 0 });
 };
 
-window.testAxis = (devIdx, axisIdx) => testSingleAxis(devIdx, axisIdx);
+// The travel envelope goes with the press: before a session's first tick
+// the driver has no other way to know it.
+window.testAxis = (devIdx, axisIdx) => testSingleAxis(devIdx, axisIdx, normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax));
 
 function escapeHtml(text) {
     return String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -5638,6 +5651,17 @@ function renderIntifaceDevices() {
         let axisRows = '';
         dev.axes.forEach((axis, aIdx) => {
             const label = axis.descriptor ? `${escapeHtml(axis.type)} - ${escapeHtml(axis.descriptor)}` : escapeHtml(axis.type);
+            // A scalar that takes a position: the same motor as a Linear
+            // axis, driven through that one only (buttplug-protocol.js,
+            // drivesAsLevel). No role, no cap, no Test.
+            if (axis.inert) {
+                axisRows += `
+            <div class="bg-slate-900 p-2 rounded-lg border border-slate-800 space-y-1 text-[10px]">
+            <div class="font-bold text-slate-500 truncate">Axis ${axis.index} (${label}) - not used</div>
+            <p class="text-[9px] text-slate-500 leading-snug">A position without a duration: EdgeLoop strokes this motor through its Linear axis and sends this one nothing.</p>
+            </div>`;
+                return;
+            }
             const failing = axis.failing
                 ? `<span class="text-[9px] font-bold text-rose-400 bg-rose-950/60 border border-rose-800 px-1 rounded" title="Intiface rejected the last 3 commands to this axis">Not responding</span>`
                 : '';
@@ -5646,13 +5670,42 @@ function renderIntifaceDevices() {
             <span>Invert direction (sleeve mounted upside down)</span>
             <input type="checkbox" ${axis.invert ? 'checked' : ''} onchange="setDeviceInvert(${devIdx}, ${aIdx}, this.checked)" class="accent-amber-500 cursor-pointer">
             </label>` : '';
+            // Two actuators of one motor (an OSSM's Position and Oscillate):
+            // only one in use, and the Test of the other refused while it is.
+            const twinBusy = Boolean(axis.twin && axis.twin.role !== 'off');
+            const twinLabel = axis.twin ? `Axis ${axis.twin.index} (${escapeHtml(axis.twin.type)})` : '';
+            let twinNote = '';
+            if (axis.twin && axis.kind === 'linear') {
+                twinNote = `<p class="text-[9px] text-slate-500 leading-snug">Same motor as ${twinLabel}: only one of the two can be on. This one strokes inside your Travel Envelope.</p>`;
+            } else if (axis.twin) {
+                twinNote = `<p class="text-[9px] text-amber-300/80 leading-snug">Same motor as ${twinLabel}: only one of the two can be on, and switching makes the machine stop and change mode. Oscillate runs the machine's own stroke over its whole rail - Intiface sets full depth and stroke - at the engine's speed; your Travel Envelope cannot reach it. Use ${twinLabel} to keep the stroke inside your envelope.</p>`;
+            }
+            const testButton = twinBusy
+                ? `<button disabled title="${twinLabel} is in use; set it OFF to test this one" class="bg-slate-800 px-1.5 py-0.5 rounded text-[9px] opacity-40 cursor-not-allowed">Test</button>`
+                : `<button onclick="testAxis(${devIdx}, ${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer">Test</button>`;
+            let vibeRow = '';
+            if (axis.kind === 'scalar' && axis.type === 'Vibrate') {
+                const pulsed = axis.vibeMode === 'pulsed';
+                const periods = PULSE_PERIODS_MS.map((ms) => `<option value="${ms}" ${axis.pulsePeriodMs === ms ? 'selected' : ''}>${(ms / 1000).toFixed(1)} s</option>`).join('');
+                vibeRow = `
+            <div class="space-y-1 pt-1 border-t border-slate-800/60">
+            <div class="flex items-center gap-1 text-[9px] text-slate-400">
+            <span class="mr-1">Vibration:</span>
+            <button onclick="setDeviceVibeMode(${devIdx}, ${aIdx}, 'constant')" class="flex-1 py-0.5 rounded ${!pulsed ? 'bg-slate-700 text-amber-300 font-bold' : 'bg-slate-800 text-slate-400'} cursor-pointer">Constant</button>
+            <button onclick="setDeviceVibeMode(${devIdx}, ${aIdx}, 'pulsed')" class="flex-1 py-0.5 rounded ${pulsed ? 'bg-slate-700 text-amber-300 font-bold' : 'bg-slate-800 text-slate-400'} cursor-pointer">Pulsed</button>
+            <select aria-label="Pulse period" onchange="setDevicePulsePeriod(${devIdx}, ${aIdx}, this.value)" ${pulsed ? '' : 'disabled'} class="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 text-[9px] text-slate-200 ${pulsed ? 'cursor-pointer' : 'opacity-40'}">${periods}</select>
+            </div>
+            ${pulsed ? '<p class="text-[9px] text-slate-500 leading-snug">On for half of each period, off for the other half. The engine\'s intensity sets the peak, never above the cap.</p>' : ''}
+            </div>`;
+            }
             axisRows += `
             <div class="bg-slate-900 p-2 rounded-lg border ${axis.failing ? 'border-rose-800' : 'border-slate-800'} space-y-1.5 text-[10px]">
             <div class="flex justify-between items-center gap-1">
             <span class="font-bold text-slate-300 truncate">Axis ${axis.index} (${label})</span>
             <span class="flex items-center gap-1 shrink-0">${failing}
-            <button onclick="testAxis(${devIdx}, ${aIdx})" class="bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-[9px] cursor-pointer">Test</button></span>
+            ${testButton}</span>
             </div>
+            ${twinNote}
             <div class="flex gap-1">
             <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'primary')" class="flex-1 py-1 rounded ${axis.role === 'primary' ? 'bg-rose-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Primary</button>
             <button onclick="setDeviceRole(${devIdx}, ${aIdx}, 'secondary')" class="flex-1 py-1 rounded ${axis.role === 'secondary' ? 'bg-purple-600 text-white font-bold' : 'bg-slate-800 text-slate-400'} transition cursor-pointer">Secondary</button>
@@ -5665,6 +5718,7 @@ function renderIntifaceDevices() {
             </div>
             <input type="range" min="10" max="100" step="5" value="${axis.maxCap ?? 100}" oninput="setDeviceCap(${devIdx}, ${aIdx}, this.value)" class="w-full accent-amber-500 h-1 bg-slate-800 rounded cursor-pointer">
             </div>
+            ${vibeRow}
             ${invertRow}
             </div>
             `;
