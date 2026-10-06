@@ -17,6 +17,8 @@ credited by username.
 - **The mouse wheel leaves a focused Resting HR or Climax HR alone.** One notch over the focused Climax HR raised it by a beat, without you seeing it. A committed number and a dragged slider also let go of the keyboard, so later key presses no longer change them.
 - **Short strokes move off the end stops instead of giving way.** The End-Stop Margin used to give way for short strokes, so Glans Protector, Head Play and the warm-up could send the carriage onto its mechanical ends. A short stroke now keeps its length and slides inside the margin (0-10 leaves as 5-15). The margin is no longer only a narrowing of the range: it can move a stroke.
 
+- **A session a crashed page left running is stopped at the next open.** If the page dies mid-session (the tab crashes, the browser is killed, the phone kills it), the next time you open EdgeLoop it sends that session's Handy and VacuGlide a stop and the banner says the last session did not end cleanly and what the stop returned. A Handy another open tab is driving right now is left alone.
+
 ### Edges and endings
 - **An edge counts only when your pulse holds at the mark.** A single spike from the strap no longer counts as an edge, steps Survival's climb or starts a Ruin ride. The pullback itself is not delayed.
 - **Ruin & Leak rides once per edge.** It used to start a new ride every 30 s while your pulse sat on the mark. A new ride now needs a release first.
@@ -25,6 +27,9 @@ credited by username.
 - **Came Early and Finished me stop the toys first, then ask.** The toys kept running behind the question. They now stop, the question waits until The Handy confirms the stop, and Cancel undoes the press.
 - **Finished me saves the heart rate the run held.** It used to offer the session's highest single reading, so one glitch could become your Climax HR. It now takes the peak your pulse held during the Survival run, still works for a minute after STOP, and says so out loud when there is nothing usable to save.
 - **Soft Landing no longer turns back into Force Orgasm.** On every reload, Apply and import, a chosen Soft Landing endgame fell back to the forced-orgasm one.
+
+### Devices
+- **Autoblow VacuGlide 2 (experimental).** Connect it with its device token. EdgeLoop drives its speed only; the stroke range and a second channel do not exist on this device. Two buttons, Valve + and Valve -, open a valve for a short pulse and always close it again. Stop means the motor stops and both valves close, also when the page is closed. It has only been tested against Autoblow's API, not on a real device yet: keep the first sessions short, keep the device's power button in reach, and report what happened in the EdgeLoop thread. The token stays out of a backup unless you tick the box, like the Handy key.
 
 ### Keyboard
 - **Space pauses a running session.** Not while you are typing in a field. It never resumes or starts one: press RESUME, or Tab to it and press Enter. On a partner's controller page Space pauses the same way.
