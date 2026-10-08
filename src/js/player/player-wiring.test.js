@@ -161,6 +161,21 @@ describe('index.html: the player', () => {
         }
     });
 
+    it('with the player open, the transport is the fixed bottom bar at every width', () => {
+        // The bar holds PAUSE and STOP.
+        const at = INDEX.indexOf('id="transportBar"');
+        assert.ok(at >= 0);
+        const bar = INDEX.slice(at, INDEX.indexOf('id="sessionResetBtn"', at));
+        assert.ok(bar.includes('id="sessionPlayPauseBtn"') && bar.includes('id="sessionStopBtn"'));
+        // Below the two-column width it is fixed anyway; above it, while the
+        // player is open.
+        assert.match(INDEX.slice(at, INDEX.indexOf('>', at)), /max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0/);
+        const media = INDEX.slice(INDEX.indexOf('@media (min-width: 1024px) {'), INDEX.indexOf('</style>'));
+        assert.match(media, /html\[data-player-open="on"\] #transportBar \{\s*position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;/);
+        assert.match(media, /html\[data-player-open="on"\] body \{ padding-bottom: 6rem; \}/);
+        assert.match(body('function setPlayerOpen('), /document\.documentElement\.dataset\.playerOpen = open \? 'on' : 'off';/);
+    });
+
     it('says what stays on the device', () => {
         assert.match(INDEX, /Your video and script stay on this device\. EdgeLoop uploads neither\./);
     });

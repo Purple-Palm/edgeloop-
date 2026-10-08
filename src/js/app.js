@@ -1859,6 +1859,9 @@ function setPlayerOpen(open) {
     const body = document.getElementById('playerBody');
     if (!body) return;
     body.classList.toggle('hidden', !open);
+    // The transport becomes the fixed bottom bar at every width while the
+    // player is open (index.html), so STOP never ends up below the fold.
+    document.documentElement.dataset.playerOpen = open ? 'on' : 'off';
     document.getElementById('playerToggleBtn')?.setAttribute('aria-expanded', open ? 'true' : 'false');
     document.getElementById('playerHeaderBtn')?.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
