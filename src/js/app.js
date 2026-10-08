@@ -1037,6 +1037,7 @@ function putHandyEndMargin(margin, commit) {
     if (commit && el && String(el.value) !== String(margin)) el.value = margin;
     persistSettings();
     updateHandySlideDisplay();
+    syncHandyHspWindow();
     updateEngine();
 }
 
@@ -1077,6 +1078,7 @@ function putHwEnvelope(env, commit, edited = null) {
     });
     persistSettings();
     updateHwEnvelopeDisplay();
+    syncHandyHspWindow();
     updateEngine();
 }
 
@@ -1536,6 +1538,21 @@ function handyBeatSyncWanted() {
         && handyConnected
         && state.handyRole === 'primary'
         && handyHsp.beatSync();
+}
+
+// Beat sync's stroke window: the Travel Envelope with the end margin. It is
+// set at START and RESUME (prepare), and sent again at once when either
+// changes while beat sync owns The Handy - and checked with every dispatch
+// it takes - so the envelope stays the outermost bound mid-session too, as
+// it is for every other toy.
+function handyHspWindow() {
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    return { envMin: env.min, envMax: env.max, endMargin: advancedSettings.handyEndMargin };
+}
+
+function syncHandyHspWindow() {
+    if (!handyHsp || !handyHsp.owns()) return;
+    handyHsp.setWindow(handyHspWindow()).catch(() => {});
 }
 
 // The end of a session, or Script mode left while beat sync owned The
@@ -2275,6 +2292,7 @@ function routeTheHandy(primarySpeed, targetHandySpeed, range, force, urgent) {
     });
     if (route === 'hsp' && !(force && state.sessionStatus === 'IDLE')) {
         const allowance = state.handyRole === 'primary' ? primarySpeed : 0;
+        if (!force) syncHandyHspWindow();
         handyHsp.dispatch({ allowance, cap: state.handyMaxCap, force, urgent });
         return null;
     }
@@ -3377,8 +3395,7 @@ function startOrResumeWhenReady(tappedAt) {
             ? () => pollHandyConnected().then(async (answer) => {
                 if (answer.state !== 'online') return { ok: false, answer };
                 if (!handyBeatSyncWanted()) return { ok: true, answer };
-                const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
-                const ready = await handyHsp.prepare({ envMin: env.min, envMax: env.max, endMargin: advancedSettings.handyEndMargin });
+                const ready = await handyHsp.prepare(handyHspWindow());
                 return ready.ok ? { ok: true, answer } : { ok: false, answer, hsp: ready };
             })
             : null,

@@ -436,6 +436,77 @@ describe('the play and the rolling window', () => {
     });
 });
 
+describe('the stroke window during a session', () => {
+    it('sends a narrowed envelope at once and re-anchors the play on it', async () => {
+        const { api, sched, hsp } = await playing();
+        await sched.advance(1000);
+        const plays = api.of('PUT /hsp/play').length;
+        const done = hsp.setWindow({ envMin: 0, envMax: 50, endMargin: 5 });
+        await sched.advance(0);
+        assert.equal(await done, true);
+        const strokes = api.of('PUT /slider/stroke');
+        assert.deepEqual(strokes[strokes.length - 1].body, { min: 0.05, max: 0.5 });
+        assert.equal(api.of('PUT /hsp/play').length, plays + 1, 'the play is re-anchored on the new window');
+        assert.equal(hsp.isPlaying(), true);
+    });
+
+    it('sends a raised end margin, and nothing when the window is the same', async () => {
+        const { api, sched, hsp } = await playing();
+        const n = api.of('PUT /slider/stroke').length;
+        await hsp.setWindow({ envMin: 0, envMax: 100, endMargin: 5 });
+        assert.equal(api.of('PUT /slider/stroke').length, n, 'the same window is not sent again');
+        await hsp.setWindow({ envMin: 0, envMax: 100, endMargin: 10 });
+        await sched.advance(0);
+        assert.equal(api.of('PUT /slider/stroke').length, n + 1);
+        assert.deepEqual(api.of('PUT /slider/stroke')[n].body, { min: 0.1, max: 0.9 });
+    });
+
+    it('sends one window at a time, the latest last', async () => {
+        let slow = false;
+        const { api, sched, hsp } = await playing({
+            'PUT /slider/stroke': (c) => {
+                const answer = { status: 200, body: { result: { min: c.body.min, max: c.body.max } } };
+                return slow ? { delay: 300, then: answer } : answer;
+            }
+        });
+        slow = true;
+        const n = api.of('PUT /slider/stroke').length;
+        hsp.setWindow({ envMin: 0, envMax: 80, endMargin: 5 });
+        hsp.setWindow({ envMin: 0, envMax: 70, endMargin: 5 });
+        hsp.setWindow({ envMin: 0, envMax: 60, endMargin: 5 });
+        await sched.advance(1000);
+        const sent = api.of('PUT /slider/stroke').slice(n).map((c) => c.body.max);
+        assert.deepEqual(sent, [0.8, 0.6]);
+    });
+
+    it('pauses and stops when the device does not take a narrower window', async () => {
+        let refuse = false;
+        const { api, sched, hsp, events } = await playing({ 'PUT /slider/stroke': (c) => (refuse ? { status: 502, body: null } : { status: 200, body: { result: { min: c.body.min, max: c.body.max } } }) });
+        refuse = true;
+        await hsp.setWindow({ envMin: 0, envMax: 50, endMargin: 5 });
+        await sched.advance(0);
+        assert.equal(events.pauses.length, 1);
+        assert.match(events.pauses[0].reason, /did not take the new travel envelope/);
+        assert.ok(api.of('PUT /hsp/stop').length >= 1);
+        assert.equal(hsp.isPlaying(), false);
+    });
+
+    it('keeps playing inside the narrower window it has when a wider one is refused, and does not ask again until the envelope changes', async () => {
+        let refuse = false;
+        const { api, sched, hsp, events } = await playing({ 'PUT /slider/stroke': (c) => (refuse ? { status: 502, body: null } : { status: 200, body: { result: { min: c.body.min, max: c.body.max } } }) });
+        await hsp.setWindow({ envMin: 0, envMax: 50, endMargin: 5 });
+        await sched.advance(0);
+        refuse = true;
+        const n = api.of('PUT /slider/stroke').length;
+        assert.equal(await hsp.setWindow({ envMin: 0, envMax: 100, endMargin: 5 }), false);
+        await hsp.setWindow({ envMin: 0, envMax: 100, endMargin: 5 });
+        await sched.advance(0);
+        assert.equal(api.of('PUT /slider/stroke').length, n + 1);
+        assert.equal(events.pauses.length, 0);
+        assert.equal(hsp.isPlaying(), true);
+    });
+});
+
 describe('stops', () => {
     it('retries a stop and is satisfied by a confirmed one', async () => {
         let n = 0;

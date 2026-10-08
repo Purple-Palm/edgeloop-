@@ -204,6 +204,10 @@ export function createHandyHsp({
     let inFlight = null;
     let slowWarned = false;
     let unsubscribeFeed = null;
+    // The stroke window on its way to the device (setWindow), and whether a
+    // newer one was asked for meanwhile.
+    let strokeJob = null;
+    let strokeDirty = false;
 
     function call(name, ...args) {
         const fn = handlers && handlers[name];
@@ -416,15 +420,17 @@ export function createHandyHsp({
             if (finite(maxPoints) && maxPoints < HSP_MIN_BUFFER_POINTS) {
                 return refuse('buffer', `The Handy's point buffer holds only ${maxPoints} points (switching its Bluetooth off may help)`);
             }
-            session = { key, appId, streamId, maxPoints: finite(maxPoints) ? maxPoints : null, modeSessionId, window, ceiling };
+            session = { key, appId, streamId, maxPoints: finite(maxPoints) ? maxPoints : null, modeSessionId, window, deviceWindow: null, ceiling };
             failures = 0;
             offline = false;
             motion = 'stopped';
         }
         session.window = window;
+        session.refusedWindow = null;
         session.ceiling = ceiling;
         const stroke = await request('/slider/stroke', { method: 'PUT', body: strokeBody(window), kind: 'urgent', count: false });
         if (!stroke.verdict.ok) return refuse('stroke', `The Handy did not take the stroke window (${stroke.verdict.message})`);
+        session.deviceWindow = window;
         openSse();
         startResyncTimer();
         subscribeFeed();
@@ -806,6 +812,67 @@ export function createHandyHsp({
             anchor();
         };
         go();
+    }
+
+    // ---- the stroke window while prepared ------------------------------------------
+
+    // The Travel Envelope or the end margin changed while this driver owns
+    // the device (app.js calls this on every change, and with every
+    // dispatch): the new window goes out at once as PUT /slider/stroke, one
+    // at a time with the latest winning, and a play under way is re-anchored
+    // on it. The envelope stays the outermost bound: a window the device did
+    // not take while it may still stroke outside the new one pauses the
+    // session and stops it. Resolves whether the device has the window.
+    function setWindow({ envMin = 0, envMax = 100, endMargin = 5 } = {}) {
+        if (!session || offline) return Promise.resolve(false);
+        const window = strokeWindow(envMin, envMax, endMargin);
+        const same = (a, b) => Boolean(a && b) && a.min === b.min && a.max === b.max;
+        if (same(window, session.window)) return strokeJob || Promise.resolve(same(window, session.deviceWindow));
+        if (!strokeJob && same(window, session.refusedWindow)) return Promise.resolve(false);
+        session.refusedWindow = null;
+        session.window = window;
+        if (strokeJob) {
+            strokeDirty = true;
+            return strokeJob;
+        }
+        const job = sendStrokeWindow();
+        strokeJob = job;
+        job.catch(() => {}).finally(() => { if (strokeJob === job) strokeJob = null; });
+        return job;
+    }
+
+    async function sendStrokeWindow() {
+        const s = session;
+        let changed = false;
+        for (;;) {
+            strokeDirty = false;
+            const window = s.window;
+            const { verdict } = await request('/slider/stroke', { method: 'PUT', body: strokeBody(window), kind: 'urgent', key: s.key, appId: s.appId });
+            if (session !== s) return false;
+            if (verdict.ok) {
+                s.deviceWindow = window;
+                changed = true;
+            } else {
+                const dev = s.deviceWindow;
+                const outside = !dev || dev.min < s.window.min || dev.max > s.window.max;
+                if (strokeDirty) continue;
+                if (outside) {
+                    call('onPause', `The Handy did not take the new travel envelope (${verdict.message}).`, 'stroke');
+                    stop({ reason: 'stroke' });
+                    return false;
+                }
+                // A wider window it did not take: it still strokes inside
+                // the narrower one it has, and is shaped for that one until
+                // the envelope changes again.
+                s.refusedWindow = window;
+                s.window = dev;
+                if (changed && play) reanchor();
+                return false;
+            }
+            if (!strokeDirty) break;
+        }
+        if (changed && play) reanchor();
+        return true;
     }
 
     // ---- the feed --------------------------------------------------------------
@@ -1252,6 +1319,7 @@ export function createHandyHsp({
         },
         verify,
         prepare,
+        setWindow,
         dispatch,
         stop,
         // A page that died drove the Handy connected here over HSP (crash

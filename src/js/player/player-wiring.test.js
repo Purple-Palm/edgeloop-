@@ -53,6 +53,14 @@ describe('app.js: the video follows the session', () => {
         assert.match(body('function tickSessionGuardsAndGames('), /ceilingBehaviour: effectiveCeilingBehaviour\(\)/);
     });
 
+    it('a Travel Envelope or end margin changed mid-session reaches beat sync at once', () => {
+        assert.match(body('function putHwEnvelope('), /syncHandyHspWindow\(\);\s*updateEngine\(\);/);
+        assert.match(body('function putHandyEndMargin('), /syncHandyHspWindow\(\);\s*updateEngine\(\);/);
+        assert.match(body('function syncHandyHspWindow('), /handyHsp\.setWindow\(handyHspWindow\(\)\)/);
+        assert.match(body('function routeTheHandy('), /if \(!force\) syncHandyHspWindow\(\);\s*handyHsp\.dispatch\(/);
+        assert.match(body('function startOrResumeWhenReady('), /handyHsp\.prepare\(handyHspWindow\(\)\)/);
+    });
+
     it('the page-away stop includes beat sync', () => {
         assert.match(body('function stopEveryToyOnPageAway('), /handyHsp\?\.stopOnUnload\(\)/);
     });
