@@ -7,6 +7,9 @@ import {
     describeCappedShare,
     cappedShareFor,
     describeScriptSummary,
+    describeSpeedCaps,
+    describeMaxSpeedHint,
+    toySpeedLimit,
     describeMediaError,
     scriptWaitingReason,
     videoCoupled,
@@ -25,6 +28,7 @@ import {
 } from './player-rules.js';
 import { stats } from './script-track.js';
 import { clampScriptOffset } from './script-governor.js';
+import { DEVICE_CEILINGS, handySpeedCeiling, scriptSpeedCap } from './script-shaper.js';
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
@@ -96,6 +100,67 @@ describe('describeScriptSummary', () => {
         assert.ok(lines.some((l) => /range of 90/.test(l)));
         assert.ok(lines.some((l) => /Not played as written: 1 unusable action left out\./.test(l)));
         assert.deepEqual(describeScriptSummary({}), []);
+    });
+});
+
+describe('the speed limit per toy', () => {
+    // 0 <-> 100 every 180 ms: 556 %/s, every stroke.
+    const fast = () => {
+        const at = [];
+        const pos = [];
+        for (let i = 0; i < 40; i += 1) {
+            at.push(i * 180);
+            pos.push(i % 2 === 0 ? 0 : 100);
+        }
+        return stats(track(at, pos));
+    };
+
+    it('is the shaper\'s own: Max speed times the toy\'s cap, never above its ceiling, and says which', () => {
+        assert.deepEqual(toySpeedLimit({ maxSpeed: 600, cap: 100, ceiling: DEVICE_CEILINGS.intiface }), { limit: 500, why: 'ceiling' });
+        assert.deepEqual(toySpeedLimit({ maxSpeed: 300, cap: 50, ceiling: DEVICE_CEILINGS.intiface }), { limit: 150, why: 'cap' });
+        assert.deepEqual(toySpeedLimit({ maxSpeed: 300, cap: 100, ceiling: DEVICE_CEILINGS.tcode }), { limit: 300, why: 'max' });
+        for (const [maxSpeed, cap, ceiling] of [[600, 100, 500], [600, 70, 500], [450, 100, handySpeedCeiling({})], [80, 30, 600]]) {
+            assert.equal(toySpeedLimit({ maxSpeed, cap, ceiling }).limit, scriptSpeedCap({ maxSpeed, cap, approach: 'shorten', allowance: 100, ceiling }));
+        }
+    });
+
+    it('says every stroke is capped when the toy\'s ceiling caps every stroke, though Max speed would not', () => {
+        const lines = describeSpeedCaps({
+            stats: fast(),
+            maxSpeed: 600,
+            span: 100,
+            toys: [
+                { name: 'The Handy', ceiling: handySpeedCeiling({}), cap: 100, span: 90 },
+                { name: 'StandIn Stroker', ceiling: DEVICE_CEILINGS.intiface, cap: 100, span: 100 },
+                { name: 'T-Code L0', ceiling: DEVICE_CEILINGS.tcode, cap: 100, span: 100 }
+            ]
+        });
+        assert.deepEqual(lines, [
+            'The Handy: every stroke is faster than its 364 %/s limit (its top speed) and will be shortened.',
+            'StandIn Stroker: every stroke is faster than its 500 %/s limit (its top speed) and will be shortened.',
+            'T-Code L0: no stroke is faster than its 600 %/s limit (your Max speed).'
+        ]);
+    });
+
+    it('counts a toy\'s speed cap, over the stretch of travel the toy is given', () => {
+        const [capped] = describeSpeedCaps({ stats: fast(), maxSpeed: 600, toys: [{ name: 'T-Code L0', ceiling: 600, cap: 50, span: 100 }] });
+        assert.equal(capped, 'T-Code L0: every stroke is faster than its 300 %/s limit (your Max speed at its 50% cap) and will be shortened.');
+        // In a 50% envelope a 556 %/s script stroke moves 278 %/s of travel.
+        const [narrow] = describeSpeedCaps({ stats: fast(), maxSpeed: 600, toys: [{ name: 'T-Code L0', ceiling: 600, cap: 50, span: 50 }] });
+        assert.equal(narrow, 'T-Code L0: no stroke is faster than its 300 %/s limit (your Max speed at its 50% cap).');
+    });
+
+    it('with no toy that plays strokes, speaks of the Max speed alone', () => {
+        assert.deepEqual(describeSpeedCaps({ stats: fast(), maxSpeed: 600 }), ['No stroke is faster than your 600 %/s limit.']);
+        const lines = describeScriptSummary({ meta: { durationMs: 7020, actions: 40 }, stats: fast(), maxSpeed: 600, toys: [{ name: 'StandIn', ceiling: 500, cap: 100, span: 100 }] });
+        assert.equal(lines[2], 'StandIn: every stroke is faster than its 500 %/s limit (its top speed) and will be shortened.');
+    });
+
+    it('the Max speed hint never claims more than The Handy can do', () => {
+        assert.equal(describeMaxSpeedHint({ maxSpeed: 300 }), '≈ 330 mm/s on a 110 mm Handy · ≈ 1.5 full strokes/s');
+        assert.equal(describeMaxSpeedHint({ maxSpeed: 600 }), '≈ 3 full strokes/s · The Handy (110 mm) tops out at ≈ 400 mm/s, 364 %/s, and plays no faster');
+        assert.match(describeMaxSpeedHint({ maxSpeed: 300, travelMm: 110, maxSpeedMmS: 250 }), /tops out at ≈ 250 mm\/s, 227 %\/s/);
+        assert.ok(!/660 mm\/s/.test(describeMaxSpeedHint({ maxSpeed: 600 })));
     });
 });
 

@@ -107,10 +107,10 @@ import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, de
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
 import { createHandyHsp } from './hardware/handy-hsp.js';
-import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, sanitizeApplicationId, describeHspStartRefusal, describeHandyRoute, describeBeatSyncCheckFailed, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
+import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, sanitizeApplicationId, describeHspStartRefusal, describeHandyRoute, describeBeatSyncCheckFailed, handyScriptRoute, strokeWindow } from './hardware/handy-hsp-protocol.js';
 import { createScriptFeed } from './player/script-feed.js';
 import { rhythmAt, hampTarget } from './player/script-rhythm.js';
-import { effectiveInvert, percentToMmPerSecond, HANDY_DEFAULT_TRAVEL_MM } from './player/script-shaper.js';
+import { effectiveInvert, handySpeedCeiling, DEVICE_CEILINGS } from './player/script-shaper.js';
 import {
     DEFAULT_SCRIPT_SETTINGS,
     sanitizeScriptSettings,
@@ -129,6 +129,7 @@ import {
     GAMES_DISABLED_LINE,
     describePlayerStrip,
     describeScriptSummary,
+    describeMaxSpeedHint,
     scriptWaitingReason,
     videoCoupled,
     hiddenSilentPause,
@@ -1992,19 +1993,68 @@ function renderPlayerControls() {
         tcode: isTCodeConnected() && tcodeHasRole('primary'),
         vacuglide: isVacuglideConnected()
     });
-    const list = document.getElementById('playerToyNotes');
-    if (list) {
-        const text = notes.join('\n');
-        if (list.dataset.text !== text) {
-            list.dataset.text = text;
-            list.replaceChildren(...notes.map((line) => {
-                const li = document.createElement('li');
-                li.textContent = line;
-                return li;
-            }));
+    paintLines(document.getElementById('playerToyNotes'), notes);
+    renderScriptSummary();
+    renderScriptCard();
+}
+
+function paintLines(list, lines) {
+    if (!list) return;
+    const text = lines.join('\n');
+    if (list.dataset.text === text) return;
+    list.dataset.text = text;
+    list.replaceChildren(...lines.map((line) => {
+        const li = document.createElement('li');
+        li.textContent = line;
+        return li;
+    }));
+}
+
+// The toys that play each stroke of the script, each with the numbers the
+// shaper limits it by (script-shaper.js scriptSpeedCap): its ceiling, its
+// speed cap and the stretch of travel it is given. The Handy only over beat
+// sync (its rhythm mode plays no strokes); Intiface and T-Code linear axes
+// on the primary channel, over the Travel Envelope.
+function scriptStrokeToys() {
+    const toys = [];
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    if (handyHsp && handyConnected && state.handyRole === 'primary' && handyHsp.beatSync() && !handyHsp.unavailable()) {
+        const stroke = strokeWindow(env.min, env.max, advancedSettings.handyEndMargin);
+        toys.push({ name: 'The Handy', ceiling: handySpeedCeiling(handyHsp.deviceLimits()), cap: state.handyMaxCap ?? 100, span: stroke.max - stroke.min });
+    }
+    if (isIntifaceConnected()) {
+        for (const dev of intifaceDevices.values()) {
+            for (const axis of dev.axes || []) {
+                if (axis.kind !== 'linear' || axis.role !== 'primary') continue;
+                toys.push({ name: dev.name || 'Intiface', ceiling: DEVICE_CEILINGS[axis.holds ? 'ossm' : 'intiface'], cap: axis.maxCap ?? 100, span: env.max - env.min });
+            }
         }
     }
-    renderScriptCard();
+    const tcode = isTCodeConnected() ? getTCodeDevice() : null;
+    for (const axis of (tcode && tcode.axes) || []) {
+        if (axis.kind !== 'linear' || axis.centred || axis.role !== 'primary') continue;
+        toys.push({ name: `T-Code ${axis.id}`, ceiling: DEVICE_CEILINGS.tcode, cap: axis.maxCap ?? 100, span: env.max - env.min });
+    }
+    return toys;
+}
+
+// The script's lines in the panel: its length, the fastest segment, and
+// what the speed limit caps on each toy that plays the strokes, from the
+// toys, caps, envelope and Max speed in effect now.
+function renderScriptSummary() {
+    if (isRemotePage || !playerWired || !player) return;
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    const lines = loadedScript
+        ? describeScriptSummary({
+            meta: loadedScript.meta,
+            stats: loadedScript.stats,
+            maxSpeed: scriptSettingsNow().scriptMaxSpeed,
+            span: env.max - env.min,
+            toys: scriptStrokeToys(),
+            dropped: loadedScript.dropped
+        })
+        : [];
+    paintLines(document.getElementById('playerSummary'), lines);
 }
 
 // The script's own lines: the strip, the summary, what the speed limit caps.
@@ -2013,24 +2063,7 @@ function renderPlayerPanel() {
     const meta = loadedScript ? loadedScript.meta : null;
     const strip = document.getElementById('playerStrip');
     if (strip) strip.textContent = describePlayerStrip({ meta, hasVideo: player.hasVideo(), refused: Boolean(scriptRefusal) });
-    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
-    const lines = loadedScript
-        ? describeScriptSummary({
-            meta,
-            stats: loadedScript.stats,
-            maxSpeed: scriptSettingsNow().scriptMaxSpeed,
-            span: env.max - env.min,
-            dropped: loadedScript.dropped
-        })
-        : [];
-    const list = document.getElementById('playerSummary');
-    if (list) {
-        list.replaceChildren(...lines.map((line) => {
-            const li = document.createElement('li');
-            li.textContent = line;
-            return li;
-        }));
-    }
+    // The summary is painted with the controls: it follows the toys.
     renderPlayerControls();
 }
 
@@ -4713,17 +4746,14 @@ function readScriptTab() {
     return sanitizeScriptSettings(raw);
 }
 
-// "≈ 330 mm/s on a 110 mm Handy · ≈ 1.5 full strokes/s": a full stroke is
-// there and back, twice the travel.
+// "≈ 330 mm/s on a 110 mm Handy · ≈ 1.5 full strokes/s", never more than
+// The Handy's own top speed (player-rules.describeMaxSpeedHint).
 function paintMaxSpeedHint() {
     const el = document.getElementById('scriptMaxSpeedHint');
     if (!el) return;
     const value = sanitizeScriptSettings({ scriptMaxSpeed: document.getElementById('scriptMaxSpeedInput')?.value }).scriptMaxSpeed;
     const limits = handyHsp ? handyHsp.deviceLimits() : {};
-    const travel = Number.isFinite(limits.travelMm) && limits.travelMm > 0 ? limits.travelMm : HANDY_DEFAULT_TRAVEL_MM;
-    const mm = Math.round(percentToMmPerSecond(value, travel));
-    const strokes = Math.round((value / 200) * 10) / 10;
-    el.textContent = `≈ ${mm} mm/s on a ${Math.round(travel)} mm Handy · ≈ ${strokes} full strokes/s`;
+    el.textContent = describeMaxSpeedHint({ maxSpeed: value, travelMm: limits.travelMm, maxSpeedMmS: limits.maxSpeedMmS });
 }
 document.getElementById('scriptMaxSpeedInput')?.addEventListener('input', paintMaxSpeedHint);
 

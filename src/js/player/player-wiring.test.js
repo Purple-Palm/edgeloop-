@@ -69,6 +69,16 @@ describe('app.js: the video follows the session', () => {
         assert.match(line, /if \(beatSyncCheck\.state === 'refused'\) return describeBeatSyncCheckFailed\(/);
     });
 
+    it('the speed-limit lines use each toy\'s own limit, the numbers the shaper applies', () => {
+        assert.match(body('function renderScriptSummary('), /toys: scriptStrokeToys\(\),/);
+        assert.match(body('function renderPlayerControls('), /renderScriptSummary\(\);/);
+        const toys = body('function scriptStrokeToys(');
+        assert.match(toys, /ceiling: handySpeedCeiling\(handyHsp\.deviceLimits\(\)\), cap: state\.handyMaxCap \?\? 100, span: stroke\.max - stroke\.min/);
+        assert.match(toys, /ceiling: DEVICE_CEILINGS\[axis\.holds \? 'ossm' : 'intiface'\], cap: axis\.maxCap \?\? 100/);
+        assert.match(toys, /ceiling: DEVICE_CEILINGS\.tcode, cap: axis\.maxCap \?\? 100/);
+        assert.match(body('function paintMaxSpeedHint('), /describeMaxSpeedHint\(\{ maxSpeed: value, travelMm: limits\.travelMm, maxSpeedMmS: limits\.maxSpeedMmS \}\)/);
+    });
+
     it('the page-away stop includes beat sync', () => {
         assert.match(body('function stopEveryToyOnPageAway('), /handyHsp\?\.stopOnUnload\(\)/);
     });

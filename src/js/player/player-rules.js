@@ -8,6 +8,8 @@
 // pause from anywhere is always taken; a play is only ever a request, which
 // the START / RESUME gate may refuse.
 
+import { scriptSpeedCap, handySpeedCeiling, HANDY_DEFAULT_TRAVEL_MM } from './script-shaper.js';
+
 export const VIDEO_STALL_PAUSE_MS = 30000;
 export const HUD_HIDE_MS = 4000;
 export const OFFSET_NUDGE_MS = 50;
@@ -76,10 +78,62 @@ export function cappedShareFor(stats, maxSpeed, span = 100) {
     return stats.cappedShare((limit * 100) / width);
 }
 
+// The speed limit a toy plays the script under at a full allowance, % of
+// full travel per second: the shaper's own (script-shaper.js
+// scriptSpeedCap), the wearer's Max speed times the toy's speed cap, never
+// above the toy's ceiling. Returns { limit, why } where `why` names what
+// sets it: 'ceiling' (the toy's top speed), 'cap' (Max speed at the toy's
+// cap) or 'max' (Max speed).
+export function toySpeedLimit({ maxSpeed, cap = 100, ceiling } = {}) {
+    const args = { maxSpeed, cap, approach: 'shorten', allowance: 100 };
+    const limit = scriptSpeedCap({ ...args, ceiling });
+    const asked = scriptSpeedCap({ ...args, ceiling: Number.MAX_VALUE });
+    const why = limit < asked ? 'ceiling' : finite(cap) && cap < 100 ? 'cap' : 'max';
+    return { limit, why };
+}
+
+// What the speed limit caps, per toy that plays each stroke (spec 3.9):
+// `toys` is [{ name, ceiling, cap, span }] with the toy's ceiling (%/s),
+// its speed cap (%) and the stretch of travel it is given (% of full
+// travel: the envelope, or for The Handy over beat sync its stroke window).
+// With no such toy connected, the line is for the Max speed alone.
+export function describeSpeedCaps({ stats = null, maxSpeed = 300, span = 100, toys = [] } = {}) {
+    const list = Array.isArray(toys) ? toys.filter((t) => t && t.name) : [];
+    if (list.length === 0) return [describeCappedShare(cappedShareFor(stats, maxSpeed, span), maxSpeed)];
+    return list.map((toy) => {
+        const { limit, why } = toySpeedLimit({ maxSpeed, cap: toy.cap, ceiling: toy.ceiling });
+        const rounded = Math.round(limit);
+        const reason = why === 'ceiling'
+            ? 'its top speed'
+            : why === 'cap' ? `your Max speed at its ${Math.round(toy.cap)}% cap` : 'your Max speed';
+        const share = cappedShareFor(stats, limit, toy.span);
+        if (!finite(share) || share <= 0) return `${toy.name}: no stroke is faster than its ${rounded} %/s limit (${reason}).`;
+        const pct = share >= 1 ? 100 : Math.min(99, Math.max(1, Math.round(share * 100)));
+        return `${toy.name}: ${pct === 100 ? 'every stroke is' : `${pct}% of strokes are`} faster than its ${rounded} %/s limit (${reason}) and will be shortened.`;
+    });
+}
+
+// The Max speed field's hint: what the setting means on The Handy, which
+// tops out at its own speed (its x_max_speed over its travel, 400 mm/s on
+// 110 mm when it has not said), and in full strokes a second (a full
+// stroke is there and back, twice the travel).
+export function describeMaxSpeedHint({ maxSpeed, travelMm = null, maxSpeedMmS = null } = {}) {
+    const value = finite(maxSpeed) && maxSpeed > 0 ? maxSpeed : 0;
+    const travel = finite(travelMm) && travelMm > 0 ? travelMm : HANDY_DEFAULT_TRAVEL_MM;
+    const ceiling = handySpeedCeiling({ maxSpeedMmS, travelMm: travel });
+    const strokes = Math.round((value / 200) * 10) / 10;
+    if (value > ceiling) {
+        const top = Math.round((ceiling * travel) / 100);
+        return `≈ ${strokes} full strokes/s · The Handy (${Math.round(travel)} mm) tops out at ≈ ${top} mm/s, ${Math.round(ceiling)} %/s, and plays no faster`;
+    }
+    return `≈ ${Math.round((value * travel) / 100)} mm/s on a ${Math.round(travel)} mm Handy · ≈ ${strokes} full strokes/s`;
+}
+
 // The panel's lines about a loaded script: its length, the fastest
-// segment, how much the speed limit will cap, and what the file asked that
-// is not played as written.
-export function describeScriptSummary({ meta = null, stats = null, maxSpeed = 300, span = 100, dropped = '' } = {}) {
+// segment, how much the speed limit will cap on each toy that plays the
+// strokes (describeSpeedCaps), and what the file asked that is not played
+// as written.
+export function describeScriptSummary({ meta = null, stats = null, maxSpeed = 300, span = 100, toys = [], dropped = '' } = {}) {
     if (!meta) return [];
     const lines = [];
     const starts = finite(meta.firstAtMs) && meta.firstAtMs > 0 ? `, first stroke at ${formatMediaTime(meta.firstAtMs)}` : '';
@@ -87,7 +141,7 @@ export function describeScriptSummary({ meta = null, stats = null, maxSpeed = 30
     if (stats && finite(stats.maxSpeed) && stats.maxSpeed > 0) {
         const at = finite(stats.fastestAt) ? ` at ${formatMediaTime(stats.fastestAt)}` : '';
         lines.push(`Fastest segment: ${formatCount(stats.maxSpeed)} %/s${at}.`);
-        lines.push(describeCappedShare(cappedShareFor(stats, maxSpeed, span), maxSpeed));
+        lines.push(...describeSpeedCaps({ stats, maxSpeed, span, toys }));
     }
     if (meta.inverted === true) lines.push('The file is marked inverted, so it plays upside down (Invert on the Script tab flips it back).');
     if (meta.rangeNoted === true) lines.push(`The file names a range of ${meta.range}; it is ignored, as other players do.`);
