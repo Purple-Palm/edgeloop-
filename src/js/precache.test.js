@@ -27,7 +27,17 @@ const SW_URL = new URL('sw.js', SITE).href;
 // the page imports one of them, the walk reaches it and the precache check
 // below fails until sw.js names it.
 const NOT_LOADED_BY_THE_PAGE = [
-    './src/js/hrv.js' // the HRV display (H3) will import it
+    './src/js/hrv.js', // the HRV display (H3) will import it
+    // The player's pure core. The engine's Script mode, the script feed and
+    // the player section import them as they are wired in, and each comes
+    // off this list (and goes into sw.js) with that change.
+    './src/js/player/funscript-parse.js',
+    './src/js/player/script-pairing.js',
+    './src/js/player/script-track.js',
+    './src/js/player/media-clock.js',
+    './src/js/player/script-governor.js',
+    './src/js/player/script-shaper.js',
+    './src/js/player/script-rhythm.js'
 ];
 
 const readRepo = (relative) => readFileSync(new URL(relative, ROOT), 'utf8');
