@@ -20,6 +20,7 @@ import {
     peerCommandAllowed,
     describePeerVersionMismatch
 } from './peer-messages.js';
+import { ENGINE_MODES } from './engine.js';
 
 describe('sanitizeCommand', () => {
     it('accepts the transport, orgasm and mode commands the controller UI exposes', () => {
@@ -313,6 +314,17 @@ describe('the two pages say which version they speak', () => {
         for (const junk of [undefined, null, '', '2', 2.5, 0, -2, NaN, Infinity, 1e9, true, {}, [], [2]]) {
             assert.equal(readPeerProtocol(junk), undefined, `${JSON.stringify(junk)} is not a version`);
         }
+    });
+
+    it('goes up with every mode a host can report: a mode added without a new version fails here', () => {
+        // The modes each version's host can be in (ENGINE_MODES). A page on
+        // an older version cannot read a mode added after it, so a new mode
+        // is a new version, with MODE_CHANGE refused across the two.
+        const V2 = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival', 'edgetrain'];
+        const MODES_BY_VERSION = { 2: V2, 3: [...V2, 'script'] };
+        assert.ok(MODES_BY_VERSION[PEER_PROTOCOL_VERSION], `no mode list for version ${PEER_PROTOCOL_VERSION}`);
+        assert.deepEqual([...ENGINE_MODES], MODES_BY_VERSION[PEER_PROTOCOL_VERSION]);
+        assert.ok(VERSIONED_COMMANDS.includes('MODE_CHANGE'));
     });
 
     it('a message without one is from an older page, never a matching or a newer one', () => {

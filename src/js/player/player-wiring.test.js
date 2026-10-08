@@ -74,6 +74,47 @@ describe('app.js: the video follows the session', () => {
     });
 });
 
+describe('app.js: the Script-mode rules', () => {
+    it('a hidden page with a silent video pauses the session, on the tick and the moment the page hides', () => {
+        assert.match(body('function pauseIfHiddenAndSilent('), /hiddenSilentPause\(\{[\s\S]*\}\);\s*if \(!pause\) return false;\s*triggerDisconnectAlert\(describeHiddenSilent\(\), 'video'\);/);
+        assert.match(body('function masterClockTick('), /if \(document\.visibilityState === 'hidden'\) pauseIfHiddenAndSilent\(\);/);
+        assert.match(APP, /if \(document\.visibilityState === 'hidden'\) \{\s*supervisionClock\.noteHidden\(\);[^}]*pauseIfHiddenAndSilent\(\);\s*return;\s*\}/);
+    });
+
+    it('the video\'s end stops a live session ("Video ended")', () => {
+        const ended = body('onEnded: () => {', '\n            },');
+        assert.match(ended, /if \(sessionIsLive\(\)\) stopSession\('Video ended'\);/);
+    });
+
+    it('the files cannot change under a live Script-mode session', () => {
+        const can = body('canChangeFiles: () =>', '\n            onScript');
+        assert.match(can, /^canChangeFiles: \(\) => \(scriptCoupled\(\) && sessionIsLive\(\)\s*\? 'Press STOP before changing the files/);
+    });
+
+    it('Script mode needs a script loaded here, and takes no game card', () => {
+        const select = body('function applyModeSelection(');
+        assert.match(select, /if \(mode === 'script' && !\(scriptLoaded\(\) && !isRemotePage\)\) return false;/);
+        assert.match(select, /if \(GAME_CARD_MODES\.includes\(mode\) && state\.teaseMode === 'script' && enabled !== false\) \{\s*renderGamesForScript\(\);\s*return false;\s*\}/);
+        assert.match(select, /if \(mode === 'script' && state\.gameMode\) \{\s*state\.gameMode = null;/);
+        // Both refusals come before anything the selection changes.
+        const firstWrite = select.search(/state\.\w+ = /);
+        assert.ok(select.indexOf("mode === 'script' && !(scriptLoaded()") < firstWrite);
+        assert.ok(select.indexOf('renderGamesForScript();') < firstWrite);
+    });
+
+    it('START waits for a valid script and a video that can show a frame', () => {
+        const waiting = body('function transportWaitingReason(');
+        assert.match(waiting, /const scriptReason = currentScriptWaitingReason\(\);\s*if \(scriptReason\) return scriptReason;/);
+        assert.ok(waiting.indexOf('if (scriptReason) return scriptReason;') < waiting.lastIndexOf('return null;'));
+    });
+
+    it('edge action Pause video holds the video while the edge is up', () => {
+        const edge = body('function followEdgeWithVideo(');
+        assert.match(edge, /edgeActionPausesVideo\(advancedSettings\.scriptEdgeAction\)/);
+        assert.match(edge, /if \(holds\) \{\s*if \(player\.isPlaying\(\)\) player\.holdForEdge\(\);\s*\}/);
+    });
+});
+
 describe('app.js: nothing about the files is kept', () => {
     it('History keeps the mode, the hash and the length of a script, and no name', () => {
         const save = body('function saveSessionToHistory(');
@@ -83,6 +124,24 @@ describe('app.js: nothing about the files is kept', () => {
 
     it('only the offsets, keyed by hash, are written for a script', () => {
         assert.match(body('function rememberScriptOffset('), /rememberOffset\(storedScriptOffsets\(\), loadedScript\.hash, ms, Date\.now\(\)\)/);
+    });
+
+    it('writes nothing to storage but the keys it always has, and the player writes nothing at all', () => {
+        // A new key here is a new thing kept on the wearer's disk: check
+        // that it holds no file name, title or script content, then add it.
+        const KEYS = [
+            "'edgeloop_age_verified'", "'edgeloop_wizard_seen'", "'handy_max_cap'", "'handy_role'",
+            'SCRIPT_OFFSETS_STORAGE_KEY', 'BEAT_SYNC_STORAGE_KEY', 'HANDY_APP_ID_STORAGE_KEY', 'BEAT_SYNC_CONSENT_KEY',
+            "'edgeloop_advanced_settings'", "'handy_connection_key'", 'VACUGLIDE_TOKEN_STORAGE_KEY',
+            'INTIFACE_STORAGE_KEY', 'TCODE_STORAGE_KEY'
+        ];
+        const written = [...APP.matchAll(/\bsafeSet\(\s*([^,]+?)\s*,/g)].map((m) => m[1]);
+        assert.ok(written.length > 0);
+        for (const key of written) assert.ok(KEYS.includes(key), `app.js writes ${key}`);
+        assert.ok(!/\blocalStorage\.setItem\(|\bsessionStorage\.setItem\(/.test(APP));
+        assert.ok(!/_picked\(/.test(APP), 'app.js never reads the picked files');
+        const player = readFileSync(new URL('./player.js', import.meta.url), 'utf8');
+        assert.ok(!/safeSet|localStorage|sessionStorage|indexedDB|durable/i.test(player), 'player.js keeps nothing');
     });
 });
 
