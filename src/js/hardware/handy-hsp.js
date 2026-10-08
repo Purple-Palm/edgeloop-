@@ -23,7 +23,8 @@
 //      before deviceNow + lead are re-sent exactly as they were last sent
 //      (planWindow), and the new ones are shaped from where the old plan
 //      is at that moment, under the speed limit (script-shaper.js).
-//   3. Bounded: the device only ever holds points up to about 4 s ahead, so
+//   3. Bounded: the device only ever holds points up to about 4 s ahead
+//      (a rejoin's far join point included: clipPlan), so
 //      a dead page, a frozen tab or lost Wi-Fi ends within that window even
 //      before any stop arrives [device: starving holds the slider still].
 //   4. Under the rate limit: the driver counts its own requests
@@ -72,6 +73,7 @@ import {
     leadFor,
     planPositionAt,
     planWindow,
+    clipPlan,
     chunkPoints,
     quantizeAllowance,
     isUrgentAllowanceChange,
@@ -568,6 +570,9 @@ export function createHandyHsp({
                 join = { t: Math.round(shaped.join.t), x: Math.round(shaped.join.x * 100) };
                 points = points.concat([join]);
             }
+            // A join beyond the window is the target, not a point the
+            // device holds: it gets the way there up to the window's end.
+            points = clipPlan(points, t0 + HSP_WINDOW_AHEAD_MS);
         } else if (startPos !== null) {
             points = toHspPoints(holdPoints(t0, t0 + HSP_WINDOW_AHEAD_MS, startPos, HSP_HOLD_EVERY_MS));
         } else {
@@ -676,7 +681,9 @@ export function createHandyHsp({
                 newPoints = newPoints.concat([join]);
             }
         }
-        const points = planWindow({ lastPlan: play.lastPlan, from, splice, newPoints }).points;
+        // Never a point past the window in the device's buffer: a join
+        // further out is reached across refills (play.join).
+        const points = clipPlan(planWindow({ lastPlan: play.lastPlan, from, splice, newPoints }).points, to);
         if (points.length === 0) return false;
         const previous = play.lastPlan;
         const previousState = { allowance: play.allowance, holding: play.holding, holdX: play.holdX, join: play.join };

@@ -417,6 +417,32 @@ export function planWindow({ lastPlan = null, from, splice: spliceAt, newPoints 
     return { points, prefix: prefix.length, spliceX };
 }
 
+// The points of a plan up to `end` (script ms), and none later: the first
+// point past it is replaced by the point on its line at `end`, so the
+// device moves toward it at the same speed and its buffer runs out at
+// `end`. A rejoin's join point can lie a minute ahead at a low speed limit;
+// it stays the driver's target, never the device's, so a page that dies
+// leaves no more than the window in the buffer. Returns new { t, x } points.
+export function clipPlan(points, end) {
+    const list = Array.isArray(points) ? points : [];
+    const limit = Math.round(end);
+    const out = [];
+    for (const p of list) {
+        if (p.t <= limit) {
+            out.push({ t: p.t, x: p.x });
+            continue;
+        }
+        const prev = out[out.length - 1];
+        if (prev && prev.t < limit) {
+            // Rounded toward the point before it: never faster than the line.
+            const x = prev.x + Math.trunc(((p.x - prev.x) * (limit - prev.t)) / (p.t - prev.t));
+            out.push({ t: limit, x: clampInt(x, 0, 100) });
+        }
+        break;
+    }
+    return out;
+}
+
 // Split points into PUT /hsp/add bodies of at most 100 points. Only the
 // first carries flush; the tail index counts on from `tailIndex` (the last
 // index already used), one per point. Returns { bodies, tailIndex }.

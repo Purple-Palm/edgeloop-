@@ -28,6 +28,7 @@ import {
     leadFor,
     planPositionAt,
     planWindow,
+    clipPlan,
     chunkPoints,
     quantizeAllowance,
     isUrgentAllowanceChange,
@@ -226,6 +227,21 @@ describe('the firmware, the slider and the clock', () => {
 });
 
 describe('the rolling window', () => {
+    it('clips a plan at the window end, on the line toward the first point past it, never faster', () => {
+        const far = [{ t: 5000, x: 0 }, { t: 70050, x: 26 }];
+        assert.deepEqual(clipPlan(far, 9000), [{ t: 5000, x: 0 }, { t: 9000, x: 1 }]);
+        const down = [{ t: 0, x: 90 }, { t: 1000, x: 90 }, { t: 11000, x: 10 }];
+        assert.deepEqual(clipPlan(down, 4000), [{ t: 0, x: 90 }, { t: 1000, x: 90 }, { t: 4000, x: 66 }]);
+        // Inside the window: unchanged, as new objects.
+        const inside = [{ t: 0, x: 10 }, { t: 250, x: 90 }];
+        const same = clipPlan(inside, 4000);
+        assert.deepEqual(same, inside);
+        assert.notEqual(same[0], inside[0]);
+        // A point exactly at the end is kept; nothing before the first point.
+        assert.deepEqual(clipPlan([{ t: 100, x: 5 }, { t: 4000, x: 9 }, { t: 5000, x: 50 }], 4000), [{ t: 100, x: 5 }, { t: 4000, x: 9 }]);
+        assert.deepEqual(clipPlan([{ t: 5000, x: 50 }], 4000), []);
+    });
+
     const lastPlan = [
         { t: 900, x: 10 },
         { t: 1100, x: 90 },

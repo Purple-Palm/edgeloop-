@@ -514,6 +514,32 @@ describe('the play and the rolling window', () => {
         assert.ok(api.of('PUT /hsp/stop').some((c) => c.at === edgeAt), 'a stop at once');
     });
 
+    it('never puts a far join point in the buffer: every send ends inside the window, and refills carry the way there', async () => {
+        // The device's clock agrees with the script's, so nothing re-anchors.
+        const h = setup({ 'GET /hsp/state': (c, d) => ({ status: 200, body: { result: { play_state: d.play, points: 3, max_points: 4000, current_time: c.at + 5000 } } }) });
+        h.feed.real.setSettings({ scriptMaxSpeed: 50 });
+        h.api.device.position = 0;
+        await h.hsp.prepare({ envMin: 0, envMax: 100, endMargin: 5 });
+        h.hsp.dispatch({ allowance: 100, cap: 5 });
+        await h.sched.advance(0);
+        await h.sched.advance(30000);
+        const sends = h.api.calls.filter((c) => c.path === '/hsp/play' || c.path === '/hsp/add');
+        assert.ok(sends.length >= 10, `${sends.length} sends`);
+        let lastX = -1;
+        for (const s of sends) {
+            const pts = (s.body.add || s.body).points;
+            const end = pts[pts.length - 1];
+            assert.ok(end.t <= s.at + 5000 + 4000, `a point ${end.t - s.at - 5000} ms ahead`);
+            for (let i = 1; i < pts.length; i += 1) {
+                const v = (Math.abs(pts[i].x - pts[i - 1].x) / (pts[i].t - pts[i - 1].t)) * 1000;
+                assert.ok(v <= 50 * 0.05 + 1e-9, `${v} %/s`);
+            }
+            assert.ok(end.x >= lastX, 'still on the way to the join');
+            lastX = end.x;
+        }
+        assert.ok(lastX >= 5, `got to ${lastX} after 30 s`);
+    });
+
     it('waits for the cadence with a small change, and plans it in 5-point steps', async () => {
         const { api, sched, hsp } = await playing();
         await sched.advance(300);
