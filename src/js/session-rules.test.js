@@ -4244,7 +4244,9 @@ describe('cool-down after edges', () => {
         assert.ok(COOLDOWN_MINUTES_OPTIONS.includes(DEFAULT_COOLDOWN_MINUTES));
         assert.ok(COOLDOWN_EVERY_OPTIONS.includes(DEFAULT_COOLDOWN_EVERY_EDGES));
         assert.deepEqual(COOLDOWN_EVENTS, ['release', 'edgeResume']);
-        assert.deepEqual(COOLDOWN_MODES, tease);
+        // Script mode eases through cooldownShape on its own rejoin ramp,
+        // and is never eligible for the Guards cool-down (below).
+        assert.deepEqual(COOLDOWN_MODES, [...tease, 'script']);
     });
 
     it('is eligible only in a running tease mode, and never during Force Orgasm', () => {

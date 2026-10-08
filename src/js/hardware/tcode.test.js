@@ -23,6 +23,9 @@ import {
     resetTCodeForTests
 } from './tcode.js';
 import { REST_MOVE_MS, FAST_LEG_MS, legDurationMs } from './stroke-planner.js';
+import { setTCodeScriptFeed, tcodeAxisPlanner } from './tcode.js';
+import { createScriptFeed } from '../player/script-feed.js';
+import { createMediaClock } from '../player/media-clock.js';
 
 const OSR_REPLIES = {
     D0: ['OSR2 Test Rig'],
@@ -921,5 +924,143 @@ describe('planner constants', () => {
     it('rest defaults match the shared planner', () => {
         assert.equal(REST_MOVE_MS, 400);
         assert.equal(FAST_LEG_MS, 180);
+    });
+});
+
+// ---- Script mode -------------------------------------------------------------
+
+function playingFeed(actions, { settings = {} } = {}) {
+    const feed = createScriptFeed({ clock: createMediaClock({ maxExtrapolateMs: Infinity }) });
+    feed.setTrack({
+        at: Int32Array.from(actions.map(([t]) => t)),
+        pos: Uint8Array.from(actions.map(([, p]) => p))
+    });
+    feed.setSettings(settings);
+    feed.setVideoState('playing');
+    feed.sample({ mediaMs: 0, perfMs: performance.now(), source: 'frame' });
+    return feed;
+}
+
+function beat(every, seconds = 30) {
+    const out = [];
+    for (let t = 0, i = 0; t <= seconds * 1000; t += every, i += 1) out.push([t, i % 2 ? 100 : 0]);
+    return out;
+}
+
+// The L0 commands written, as { pos (0-1), ms }.
+function l0() {
+    return lines().filter((l) => /^L0\d+I\d+$/.test(l)).map((l) => {
+        const [, mag, ms] = /^L0(\d+)I(\d+)$/.exec(l);
+        return { pos: Number(mag) / 10000, ms: Number(ms) };
+    });
+}
+
+describe('Script mode: L0 plays the script', () => {
+    afterEach(() => setTCodeScriptFeed(null));
+
+    it('strokes on the script\'s beat inside the envelope; the other axes follow the engine as in every mode', async () => {
+        await connect();
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setTCodeScriptFeed(feed);
+        const before = l0().length;
+        dispatchTCode(100, 60, 20, 80, 20, 80);
+        await flush();
+        assert.equal(tcodeAxisPlanner(0), 'script');
+        assert.equal(tcodeAxisPlanner(1), 'stroke', 'R0 swings with the engine speed');
+        await sleep(2600);
+        const legs = l0().slice(before);
+        assert.ok(legs.length >= 5, `${legs.length}`);
+        assert.ok(legs.every((l) => l.pos >= 0.2 - 1e-9 && l.pos <= 0.8 + 1e-9), legs.map((l) => l.pos).join(' '));
+        const steady = legs.slice(2);
+        assert.ok(steady.every((l) => l.ms >= 340 && l.ms <= 400), steady.map((l) => l.ms).join(' '));
+        assert.ok(steady.every((l) => Math.abs(l.pos - 0.2) < 0.001 || Math.abs(l.pos - 0.8) < 0.001), steady.map((l) => l.pos).join(' '));
+        // V0 takes the secondary (the allowance x 0.6 from the engine).
+        assert.ok(lines().some((l) => /^V0/.test(l)));
+        // STOP rests every axis on one line, L0 at the envelope's bottom.
+        dispatchTCode(0, 0, 0, 100, 20, 80, true);
+        await flush();
+        assert.match(lastLine(), new RegExp(`^L02000I${TCODE_TIMINGS.restMs} `));
+        const after = port.written.length;
+        await sleep(700);
+        assert.equal(port.written.length, after, 'then silence');
+    });
+
+    it('a skip rests L0 at once and the script carries on without it; the allowance back rejoins it', async () => {
+        await connect();
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setTCodeScriptFeed(feed);
+        dispatchTCode(100, 60, 0, 100, 0, 100);
+        await sleep(1200);
+        const at = l0().length;
+        dispatchTCode(0, 0, 0, 100, 0, 100, false, { urgent: true });
+        await flush();
+        assert.deepEqual(l0().slice(at), [{ pos: 0, ms: TCODE_TIMINGS.restMs }]);
+        await sleep(700);
+        assert.equal(l0().length, at + 1);
+        dispatchTCode(50, 30, 0, 100, 0, 100);
+        await sleep(1500);
+        const back = l0().slice(at + 1);
+        assert.ok(back.length >= 2);
+        assert.ok(back[0].pos / back[0].ms <= 300 / 100 / 1000 / 2 + 1e-6, JSON.stringify(back[0]));
+        assert.ok(back.every((l) => l.pos <= 0.5 + 1e-9), back.map((l) => l.pos).join(' '));
+    });
+
+    it('a seek rests L0 at once, not at the end of the leg in flight', async () => {
+        await connect();
+        const feed = playingFeed(beat(1800), { settings: { scriptMaxSpeed: 600 } });
+        feed.setActive(true);
+        setTCodeScriptFeed(feed);
+        dispatchTCode(100, 0, 0, 100, 0, 100);
+        await sleep(2300);
+        const at = l0().length;
+        feed.setVideoState('seeking');
+        await flush();
+        assert.deepEqual(l0().slice(at), [{ pos: 0, ms: TCODE_TIMINGS.restMs }]);
+        feed.setVideoState('playing');
+        feed.sample({ mediaMs: 8000, perfMs: performance.now(), source: 'frame' });
+        await sleep(80);
+        const join = l0().slice(at + 1);
+        assert.equal(join.length, 1);
+        assert.equal(join[0].pos, 0.9999);
+        assert.ok(join[0].ms >= 900 && join[0].ms <= 1000, `${join[0].ms}`);
+    });
+
+    it('writes nothing while the script holds where L0 is', async () => {
+        await connect();
+        // Connected, L0 rests at the bottom; the script holds there for
+        // 2.6 s, then strokes.
+        const feed = playingFeed([[0, 0], [2600, 0], [3000, 100], [3400, 0]]);
+        feed.setActive(true);
+        setTCodeScriptFeed(feed);
+        const before = l0().length;
+        dispatchTCode(100, 0, 0, 100, 0, 100);
+        await sleep(2400);
+        assert.equal(l0().length, before, 'not one L0 command during the hold');
+        await sleep(900);
+        assert.ok(l0().slice(before).some((l) => l.pos === 0.9999), JSON.stringify(l0().slice(before)));
+    });
+
+    it('a secondary-role L0 keeps its stroke planner, and Script mode off hands L0 back after its leg', async () => {
+        await connect();
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setTCodeScriptFeed(feed);
+        setAxisRole(0, 'secondary');
+        dispatchTCode(100, 60, 0, 100, 0, 100);
+        await sleep(TCODE_TIMINGS.restMs + 20);
+        dispatchTCode(100, 60, 0, 100, 0, 100);
+        assert.equal(tcodeAxisPlanner(0), 'stroke');
+        setAxisRole(0, 'primary');
+        await sleep(1200);
+        dispatchTCode(100, 60, 0, 100, 0, 100);
+        assert.equal(tcodeAxisPlanner(0), 'script');
+        feed.setActive(false);
+        dispatchTCode(100, 60, 0, 100, 0, 100);
+        assert.equal(tcodeAxisPlanner(0), 'script', 'the leg in flight runs out first');
+        await sleep(500);
+        assert.equal(tcodeAxisPlanner(0), 'stroke');
+        dispatchTCode(0, 0, 0, 100, 0, 100, true);
     });
 });

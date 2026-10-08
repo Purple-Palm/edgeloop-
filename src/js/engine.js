@@ -10,6 +10,7 @@
 import { normalizeEnvelope } from './hardware/handy-protocol.js';
 import { teaseFrame, warmupShape, combineWake, placeStroke, orgasmFrame, roundSpeed } from './patterns.js';
 import { isConfirmedEdge } from './edge-confirm.js';
+import { scriptAllowance, scriptSecondary, sanitizeScriptSettings, MAX_REJOIN_SECONDS } from './player/script-governor.js';
 
 export const TEASE_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin'];
 export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
@@ -19,7 +20,14 @@ export const GAME_MODES = ['oracle', 'survival', 'edgetrain'];
 // timed lockout of its own, and the games are left out because they run their
 // own speeds against the pulse: a cool-down slowing the Oracle's approach or
 // a Survival floor would change what the game promised.
-export const COOLDOWN_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate'];
+//
+// Script mode is in the list because its rejoin ramp after an edge IS this
+// cool-down, on the Script tab's length in seconds (cooldownShape('script',
+// secondsSinceRelease, rejoinSeconds / 60)); script-governor.js computes the
+// same curve. The Guards tab's minutes-long cool-down is not started in
+// Script mode (session-rules.js cooldownEligible), and the script branch
+// below never reads `cooldownSeconds`.
+export const COOLDOWN_MODES = ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'script'];
 
 export function resolveTeaseMode(strokeMode, activeMode) {
     if (TEASE_MODES.includes(strokeMode)) return strokeMode;
@@ -36,7 +44,11 @@ export const ENGINE_MODES = [
     'ruin',
     'oracle',
     'survival',
-    'edgetrain'
+    'edgetrain',
+    // The wearer's own funscript, played with the pulse as the limiter
+    // (player/script-governor.js): the primary channel is the ALLOWANCE,
+    // how much of the script the toy may play.
+    'script'
 ];
 
 // Hysteresis: once edged, the flag only clears when HR drops MORE than this
@@ -269,7 +281,14 @@ export function calculateEngineOutputs({
     // Seconds into the cool-down that follows an edge (null: none running)
     // and the length the wearer chose (0: Off). See cooldownShape.
     cooldownSeconds = null,
-    cooldownMinutes = 0
+    cooldownMinutes = 0,
+    // Script mode only. The Script tab's settings (script-governor.js
+    // DEFAULT_SCRIPT_SETTINGS keys; each goes through its sanitizer here),
+    // and the session second the edge flag last cleared, or null: the start
+    // of the rejoin ramp. The caller carries it from call to call as this
+    // returns it (`scriptReleasedAt`), the way it carries the edge flag.
+    scriptSettings = null,
+    scriptReleasedAt = null
 }) {
     const mode = resolveEngineMode(activeMode);
     const teaseMode = resolveTeaseMode(strokeMode, mode);
@@ -291,6 +310,8 @@ export function calculateEngineOutputs({
     // and a count still owed with it. Only an edge in progress can be owed
     // a count.
     const heldEdge = { isEdged: Boolean(isEdged), edgePending: Boolean(isEdged) && Boolean(edgePending) };
+    // Script mode's rejoin stamp is state as well, and is held the same way.
+    if (mode === 'script') heldEdge.scriptReleasedAt = Number.isFinite(scriptReleasedAt) ? scriptReleasedAt : null;
 
     // Motors are silent in every other status, but the edge flag is state,
     // not output: clearing it here would re-arm the detector, so the first
@@ -365,6 +386,39 @@ export function calculateEngineOutputs({
     ) {
         newEdgeTriggered = true;
         nextPending = false;
+    }
+
+    // Script mode: everything above - the mark, the pullback, the release
+    // band, the count - is the edge logic every mode shares, untouched. What
+    // follows replaces the tease curve: the primary is the allowance, the
+    // share of the wearer's script the toy may play (script-governor.js), and
+    // the governor already applies the warm-up (its speed factor only), the
+    // stall guard, Global Intensity, Force Orgasm and the Soft Landing on it,
+    // number for number as the code below does for the other modes. None of
+    // that runs again here, or the allowance would be scaled twice.
+    if (mode === 'script') {
+        return scriptOutputs({
+            hr,
+            triggerHr,
+            wasEdged: heldEdge.isEdged,
+            isEdged: nextIsEdged,
+            edgePending: nextPending,
+            pullbackStarted,
+            newEdgeTriggered,
+            sessionStatus,
+            seconds,
+            warmupMinutes,
+            stallGuardEngaged,
+            orgasmMode,
+            orgasmBoost,
+            orgasmFrom,
+            rampLeft,
+            landingFrom,
+            intensityValue: intensitySafe,
+            releasedAt: heldEdge.scriptReleasedAt,
+            settings: scriptSettings,
+            env
+        });
     }
 
     // The tease band runs from the resting rate to the pullback mark, so the
@@ -612,6 +666,71 @@ export function calculateEngineOutputs({
         pullbackStarted,
         newEdgeTriggered,
         resolvedMode: mode
+    };
+}
+
+// The rejoin stamp for this tick: the session second the edge flag cleared,
+// carried from the last tick, restarted when it clears on this one, and
+// dropped once no rejoin ramp can still be running (MAX_REJOIN_SECONDS) or
+// when it lies after the present (a stamp from an earlier session). A seek
+// does not touch it: a scrub is not an edge.
+export function nextScriptRelease(releasedAt, { wasEdged = false, isEdged = false, seconds } = {}) {
+    if (!Number.isFinite(seconds)) return null;
+    let stamp = Number.isFinite(releasedAt) ? releasedAt : null;
+    if (wasEdged && !isEdged) stamp = seconds;
+    if (stamp === null) return null;
+    const since = seconds - stamp;
+    if (since < 0 || since >= MAX_REJOIN_SECONDS) return null;
+    return stamp;
+}
+
+// Script mode's outputs (calculateEngineOutputs' script branch):
+//   primary    the allowance (scriptAllowance), 0-100
+//   secondary  the limiter at 60% (scriptSecondary), or 0 with the second
+//              channel Off
+//   zone       the whole travel envelope: the shaper maps the script into it,
+//              so no tease zone and no warm-up depth apply
+// plus `script`, the governor's answer (phase, approach, rejoin) for the
+// status line, and `scriptReleasedAt` for the caller to carry.
+function scriptOutputs({
+    hr, triggerHr, wasEdged, isEdged, edgePending, pullbackStarted, newEdgeTriggered,
+    sessionStatus, seconds, warmupMinutes, stallGuardEngaged, orgasmMode, orgasmBoost, orgasmFrom,
+    rampLeft, landingFrom, intensityValue, releasedAt, settings, env
+}) {
+    const script = sanitizeScriptSettings(settings);
+    const stamp = nextScriptRelease(releasedAt, { wasEdged, isEdged, seconds });
+    const governed = scriptAllowance({
+        hr,
+        triggerHr,
+        isEdged,
+        sessionStatus,
+        sessionSeconds: seconds,
+        warmupMinutes,
+        // The stall guard only ever holds a RUNNING session's primary, as in
+        // every other mode; a landing runs its own course.
+        stallGuardEngaged: Boolean(stallGuardEngaged) && sessionStatus === 'RUNNING',
+        orgasmMode: Boolean(orgasmMode) && sessionStatus === 'RUNNING',
+        orgasmBoost,
+        orgasmFrom,
+        rampdownSecondsLeft: rampLeft,
+        landingFrom,
+        intensityValue,
+        sinceReleaseSeconds: stamp === null ? null : seconds - stamp,
+        settings: script
+    });
+    const primary = clamp(finiteOr(governed.allowance, 0), 0, 100);
+    return {
+        primaryPercent: primary,
+        secondaryPercent: clamp(finiteOr(scriptSecondary(primary, script.scriptSecondChannel), 0), 0, 100),
+        strokeMinPercent: env.min,
+        strokeMaxPercent: env.max,
+        isEdged,
+        edgePending,
+        pullbackStarted,
+        newEdgeTriggered,
+        resolvedMode: 'script',
+        script: governed,
+        scriptReleasedAt: stamp
     };
 }
 

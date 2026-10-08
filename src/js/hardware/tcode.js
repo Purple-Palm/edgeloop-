@@ -17,6 +17,16 @@
 //      the leg an urgent dispatch (a guard engaging, a cut, Force Orgasm's
 //      landing) re-times - to the position it was sent to, and on L0 only
 //      inside the envelope - and only a stop cuts a leg short.
+//   4. Script mode: a PRIMARY-role L0 plays the wearer's funscript through a
+//      script planner (script-planner.js) instead of its stroke planner,
+//      when app.js has installed a script feed that is driving
+//      (setTCodeScriptFeed). Same interface, same timer chain; the axis
+//      changes hands only while it moves, and only between legs
+//      (syncPlanner). A script leg may be IDLE - the script holds where the
+//      axis is - and an idle leg writes nothing. A stop is the planners'
+//      own rest move, and STOP still rests every axis on one line. Every
+//      other axis follows the engine's channels as in every mode, the
+//      primary being the allowance.
 //
 // Formatting and parsing live in tcode-protocol.js (pure, unit-tested).
 // Roles, caps and the linear invert flag are persisted per device name
@@ -41,6 +51,7 @@ import {
     describeSerialError
 } from './tcode-protocol.js';
 import { createStrokePlanner } from './stroke-planner.js';
+import { createScriptPlanner, liveFeed } from './script-planner.js';
 
 export const TCODE_STORAGE_KEY = 'edgeloop_tcode_devices';
 
@@ -66,6 +77,11 @@ let status = { state: 'offline', text: 'Offline' };
 let lastZone = { min: 0, max: 1 };
 let lastEnvelope = { min: 0, max: 1 };
 let lastSpeeds = { primary: 0, secondary: 0 };
+// The script feed app.js installed (setTCodeScriptFeed) and the unsubscribe
+// for its change listener; script planners ask it through `scriptFeedNow`.
+let scriptFeed = null;
+let unsubscribeScriptFeed = null;
+const scriptFeedNow = liveFeed(() => scriptFeed);
 
 const handlers = {
     onStatus: null,
@@ -358,6 +374,7 @@ function makeAxis(parsedAxis, saved, defaults) {
     const role = savedAxis && isAxisRole(savedAxis.role) ? savedAxis.role : (defaults[id] || 'off');
     const cap = savedAxis ? Number(savedAxis.maxCap) : NaN;
     const usesPlanner = kind === 'linear' || kind === 'rotate';
+    const planner = usesPlanner ? createStrokePlanner({ restMs: TCODE_TIMINGS.restMs }) : null;
     return {
         id,
         kind,
@@ -368,7 +385,12 @@ function makeAxis(parsedAxis, saved, defaults) {
         role,
         maxCap: Number.isFinite(cap) ? Math.max(0, Math.min(100, Math.round(cap))) : 100,
         invert: kind === 'linear' && Boolean(savedAxis && savedAxis.invert),
-        planner: usesPlanner ? createStrokePlanner({ restMs: TCODE_TIMINGS.restMs }) : null,
+        // The planner in use (syncPlanner): the stroke planner of every
+        // mode, or on L0 in Script mode the script planner, made the first
+        // time it is needed.
+        planner,
+        strokePlanner: planner,
+        scriptPlanner: null,
         // The physical positions the leg in flight was sent from and to (the
         // end of the move before it, and its own), for a re-time
         // (pumpPlanner); null while unknown.
@@ -602,19 +624,120 @@ function travelCovered(axis) {
 // sized it for when the mapping changed just before it was planned.
 function pumpPlanner(axis, now = Date.now(), { retime = false } = {}) {
     if (!axis.planner || !isTCodeConnected() || !device.axes.includes(axis)) return;
+    syncPlanner(axis, now);
     const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
     const leg = retimed || axis.planner.next(now);
     if (!leg) return;
+    if (leg.kind === 'idle') {
+        // The script holds where the axis is: nothing is written, the
+        // timer only asks again at the end of the pause.
+        armLegTimer(axis, leg.durationMs);
+        return;
+    }
     if (!retimed) {
         axis.legFrom = axis.legTarget;
         axis.legTarget = physicalPosition(axis, leg.position);
     }
     writeCommands([formatAxisCommand(axis.id, axis.legTarget, { intervalMs: leg.durationMs })]);
+    armLegTimer(axis, leg.durationMs);
+}
+
+function armLegTimer(axis, durationMs) {
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
         axis.timer = null;
-        pumpPlanner(axis, Math.max(Date.now(), axis.planner.legEndsAt()));
-    }, leg.durationMs);
+        try {
+            pumpPlanner(axis, Math.max(Date.now(), axis.planner.legEndsAt()));
+        } catch (e) {
+            // A driver bug must never escape a timer.
+        }
+    }, durationMs);
+}
+
+// ---- Script mode (script-planner.js) ---------------------------------------
+
+// Whether this axis plays the script: the stroke axis (L0, a linear axis
+// that is not centred) in the primary role, while the installed feed says
+// Script mode is driving. A feed that throws is not.
+function wantsScript(axis) {
+    if (axis.kind !== 'linear' || axis.centred || axis.role !== 'primary' || !scriptFeed) return false;
+    try {
+        return Boolean(scriptFeed.isActive());
+    } catch (e) {
+        return false;
+    }
+}
+
+function scriptPlannerOf(axis) {
+    if (!axis.scriptPlanner) {
+        axis.scriptPlanner = createScriptPlanner({ feed: scriptFeedNow, restMs: TCODE_TIMINGS.restMs, profile: 'tcode' });
+    }
+    return axis.scriptPlanner;
+}
+
+function plannerMoves(planner) {
+    const input = planner.getInput();
+    return input.enabled && input.effectiveSpeed > 0;
+}
+
+// Hand the axis to the planner it should be using now: only while it moves
+// (a stop is the same in both, and the one in use gives it) and only between
+// legs, so the new planner starts from where the axis really is.
+function syncPlanner(axis, now) {
+    if (!axis.strokePlanner || axis.kind !== 'linear' || axis.centred) return;
+    const want = wantsScript(axis) ? scriptPlannerOf(axis) : axis.strokePlanner;
+    const current = axis.planner;
+    if (want === current) return;
+    if (!plannerMoves(current) || current.isInFlight(now) || axis.testTimer) return;
+    const at = current.lastPosition();
+    want.reset();
+    want.place(at);
+    axis.planner = want;
+}
+
+// Install the script feed (player/script-feed.js), or null to remove it. Its
+// changes reach every axis at once: a clock that stopped (a seek, a pause)
+// interrupts a script leg in flight like any stop. Never throws.
+export function setTCodeScriptFeed(feed) {
+    try {
+        if (unsubscribeScriptFeed) {
+            try { unsubscribeScriptFeed(); } catch (e) {}
+            unsubscribeScriptFeed = null;
+        }
+        scriptFeed = feed && typeof feed === 'object' ? feed : null;
+        if (scriptFeed && typeof scriptFeed.subscribe === 'function') {
+            unsubscribeScriptFeed = scriptFeed.subscribe(onScriptFeedChange);
+        }
+        onScriptFeedChange();
+    } catch (e) {
+        // A driver bug must never take the page down with it.
+    }
+}
+
+// A change the feed announced reaches the axis playing the script at once:
+// a clock that stopped cuts the leg in flight (the planner's rest move goes
+// out), one that started again sends the rejoin. An axis on its stroke
+// planner is left to the next dispatch. Never throws.
+function onScriptFeedChange() {
+    try {
+        if (!isTCodeConnected()) return;
+        const now = Date.now();
+        device.axes.forEach((axis) => {
+            if (!axis.scriptPlanner || axis.planner !== axis.scriptPlanner) return;
+            axis.scriptPlanner.poke();
+            pumpPlanner(axis, now);
+        });
+    } catch (e) {
+        // A driver bug must never take the page down with it.
+    }
+}
+
+// Which planner an axis is using: 'script', 'stroke', or null for an axis
+// with none (the modal's per-toy note, and the tests).
+export function tcodeAxisPlanner(axisIdx) {
+    const axis = device && device.axes[axisIdx];
+    if (!axis || !axis.planner) return null;
+    return axis.planner === axis.scriptPlanner ? 'script' : 'stroke';
 }
 
 function sendScalar(axis, level) {
@@ -634,7 +757,12 @@ function applyAxis(axis, primary, secondary, zone, now, urgent = false) {
     const speed = speedForRole(axis.role, primary, secondary);
     const enabled = axis.role !== 'off';
     if (axis.kind === 'linear' && !axis.centred) {
-        axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled });
+        axis.strokePlanner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled });
+        // The script is mapped into the whole travel envelope (the engine's
+        // zone in Script mode), and a stop rests at its bottom.
+        if (axis.scriptPlanner || wantsScript(axis)) {
+            scriptPlannerOf(axis).setInput({ speed, cap: axis.maxCap, zoneMin: lastEnvelope.min, zoneMax: lastEnvelope.max, enabled });
+        }
         pumpPlanner(axis, now, { retime: urgent });
     } else if (axis.planner) {
         // Rotation and surge / sway: swing around the centre; amplitude 0
@@ -831,5 +959,10 @@ export function resetTCodeForTests() {
     lastZone = { min: 0, max: 1 };
     lastEnvelope = { min: 0, max: 1 };
     lastSpeeds = { primary: 0, secondary: 0 };
+    if (unsubscribeScriptFeed) {
+        try { unsubscribeScriptFeed(); } catch (e) {}
+        unsubscribeScriptFeed = null;
+    }
+    scriptFeed = null;
     Object.keys(handlers).forEach((k) => { handlers[k] = null; });
 }

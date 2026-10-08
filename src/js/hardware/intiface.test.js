@@ -29,6 +29,9 @@ import {
 import { REST_MOVE_MS, legDurationMs } from './stroke-planner.js';
 import { OSCILLATE_TEST_LEVEL, TEST_LEVEL, HELD_SEGMENT_MS } from './intiface.js';
 import { capStepPercent } from './buttplug-protocol.js';
+import { setIntifaceScriptFeed, intifaceAxisPlanner } from './intiface.js';
+import { createScriptFeed } from '../player/script-feed.js';
+import { createMediaClock } from '../player/media-clock.js';
 
 const sockets = [];
 
@@ -1428,5 +1431,232 @@ describe('nothing a Test or a yielded twin still had due goes out after a stop',
             assert.equal(Math.round(last * 15), k, `cap ${capStepPercent(k, 15)}% gave step ${Math.round(last * 15)}`);
         }
         dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+});
+
+// ---- Script mode -------------------------------------------------------------
+
+// A script feed playing `actions` from now: media time 0 is the moment it is
+// made, and the clock runs on the page's own performance.now().
+function playingFeed(actions, { settings = {} } = {}) {
+    const feed = createScriptFeed({ clock: createMediaClock({ maxExtrapolateMs: Infinity }) });
+    feed.setTrack({
+        at: Int32Array.from(actions.map(([t]) => t)),
+        pos: Uint8Array.from(actions.map(([, p]) => p))
+    });
+    feed.setSettings(settings);
+    feed.setVideoState('playing');
+    feed.sample({ mediaMs: 0, perfMs: performance.now(), source: 'frame' });
+    return feed;
+}
+
+// 0 and 100 in turn every `every` ms for `seconds`.
+function beat(every, seconds = 30) {
+    const out = [];
+    for (let t = 0, i = 0; t <= seconds * 1000; t += every, i += 1) out.push([t, i % 2 ? 100 : 0]);
+    return out;
+}
+
+function linearTo(ws, deviceIndex) {
+    const out = [];
+    ws.sent.forEach((frame, i) => frame.forEach((m) => {
+        if (m.LinearCmd && m.LinearCmd.DeviceIndex === deviceIndex) {
+            m.LinearCmd.Vectors.forEach((v) => out.push({ index: v.Index, pos: v.Position, ms: v.Duration, at: ws.at[i] }));
+        }
+    }));
+    return out;
+}
+
+describe('Script mode: a primary linear axis plays the script', () => {
+    afterEach(() => setIntifaceScriptFeed(null));
+
+    it('strokes on the script\'s beat inside the travel envelope, through the script planner', async () => {
+        const ws = connectWith([OSR2]);
+        const feed = playingFeed(beat(400));
+        setIntifaceScriptFeed(feed);
+        // Loaded but not driving: the stroke planner, as in every mode.
+        dispatchIntiface(100, 60, 20, 80, 20, 80);
+        assert.equal(intifaceAxisPlanner(1, 0), 'stroke');
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        await sleep(450);
+        const before = linearTo(ws, 1).length;
+        feed.setActive(true);
+        dispatchIntiface(100, 60, 20, 80, 20, 80);
+        assert.equal(intifaceAxisPlanner(1, 0), 'script');
+        await sleep(2600);
+        const legs = linearTo(ws, 1).slice(before);
+        assert.ok(legs.length >= 5, `${legs.length} legs`);
+        assert.ok(legs.every((l) => l.pos >= 0.2 - 1e-9 && l.pos <= 0.8 + 1e-9), legs.map((l) => l.pos).join(' '));
+        // After the join, every leg runs to the next beat: about 400 ms, and
+        // the turns land at the envelope's ends.
+        const steady = legs.slice(2);
+        assert.ok(steady.every((l) => l.ms >= 340 && l.ms <= 400), steady.map((l) => l.ms).join(' '));
+        assert.ok(steady.every((l) => Math.abs(l.pos - 0.2) < 0.002 || Math.abs(l.pos - 0.8) < 0.002), steady.map((l) => l.pos).join(' '));
+        // STOP: StopAllDevices and the usual rest move to the envelope's bottom.
+        const stopAt = linearTo(ws, 1).length;
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        assert.equal(ws.messages('StopAllDevices').length, 2);
+        const rest = linearTo(ws, 1).slice(stopAt);
+        assert.deepEqual(rest.map((l) => [l.pos, l.ms]), [[0.2, REST_MOVE_MS]]);
+        await sleep(900);
+        assert.equal(linearTo(ws, 1).length, stopAt + 1, 'then silence');
+    });
+
+    it('skips at the edge (allowance 0) with the rest move, and rejoins when the allowance comes back', async () => {
+        const ws = connectWith([OSR2]);
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(100, 60, 0, 100, 0, 100);
+        await sleep(1200);
+        const at = linearTo(ws, 1).length;
+        dispatchIntiface(0, 0, 0, 100, 0, 100, false, { urgent: true });
+        const cut = linearTo(ws, 1).slice(at);
+        assert.deepEqual(cut.map((l) => [l.pos, l.ms]), [[0, REST_MOVE_MS]], 'the rest move goes out with the cut');
+        assert.equal(ws.messages('StopAllDevices').length, 0, 'a skip is not STOP');
+        await sleep(800);
+        assert.equal(linearTo(ws, 1).length, at + 1, 'nothing while skipping; the video plays on');
+        assert.equal(feed.hasTime(), true);
+        dispatchIntiface(40, 24, 0, 100, 0, 100);
+        await sleep(1500);
+        const back = linearTo(ws, 1).slice(at + 1);
+        assert.ok(back.length >= 2, 'strokes again');
+        // From the rest at 0, the join comes at no more than half the limit.
+        assert.ok(back[0].pos / back[0].ms <= 300 / 100 / 1000 / 2 + 1e-9, JSON.stringify(back[0]));
+        // The allowance at 40%: every stroke is shortened to 40% of the travel.
+        assert.ok(back.every((l) => l.pos <= 0.4 + 1e-9), back.map((l) => l.pos).join(' '));
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a seek interrupts the leg in flight at once, and the axis rejoins once the video plays', async () => {
+        const ws = connectWith([OSR2]);
+        // Slow strokes: a leg lasts most of two seconds.
+        const feed = playingFeed(beat(1800), { settings: { scriptMaxSpeed: 600 } });
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(100, 0, 0, 100, 0, 100);
+        await sleep(2300);
+        const at = linearTo(ws, 1).length;
+        feed.setVideoState('seeking');
+        const cut = linearTo(ws, 1).slice(at);
+        assert.deepEqual(cut.map((l) => [l.pos, l.ms]), [[0, REST_MOVE_MS]], 'rests now, not at the leg\'s end');
+        await sleep(600);
+        assert.equal(linearTo(ws, 1).length, at + 1);
+        // Scrubbed to 8 s, where the script climbs from the bottom (7.2 s)
+        // to the top (9 s): the axis, resting at the bottom, joins it there.
+        feed.setVideoState('playing');
+        feed.sample({ mediaMs: 8000, perfMs: performance.now(), source: 'frame' });
+        await sleep(100);
+        const join = linearTo(ws, 1).slice(at + 1);
+        assert.equal(join.length, 1, 'playing again');
+        assert.equal(join[0].pos, 1);
+        assert.ok(join[0].ms >= 900 && join[0].ms <= 1000, `${join[0].ms}`);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('sends nothing while the script holds where the axis is (idle legs)', async () => {
+        const ws = connectWith([OSR2]);
+        // To the top, held there from 0.6 s to 3 s, then down.
+        const feed = playingFeed([[0, 0], [600, 100], [3000, 100], [3400, 0], [3800, 100]]);
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(100, 0, 0, 100, 0, 100);
+        await sleep(1400);
+        const during = linearTo(ws, 1).length;
+        await sleep(1300);
+        assert.equal(linearTo(ws, 1).length, during, 'not one command during the hold');
+        await sleep(900);
+        const after = linearTo(ws, 1).slice(during);
+        assert.ok(after.some((l) => l.pos === 0), 'and the stroke after it goes out');
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('only the primary role plays the script; the secondary keeps its stroke planner, and Script mode off hands the axis back', async () => {
+        const ws = connectWith([SR6]);
+        setAxisRole(3, 0, 'primary');
+        setAxisRole(3, 1, 'secondary');
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(100, 60, 0, 100, 0, 100);
+        // The role change rested the axis (setAxisRole); it changes hands
+        // when that rest move ends.
+        await sleep(REST_MOVE_MS + 50);
+        assert.equal(intifaceAxisPlanner(3, 0), 'script');
+        assert.equal(intifaceAxisPlanner(3, 1), 'stroke');
+        await sleep(450);
+        feed.setActive(false);
+        // The leg in flight runs out; the axis changes hands at its end.
+        assert.equal(intifaceAxisPlanner(3, 0), 'script');
+        await sleep(700);
+        assert.equal(intifaceAxisPlanner(3, 0), 'stroke');
+        const l0 = linearTo(ws, 3).filter((l) => l.index === 0);
+        assert.ok(l0.length >= 3);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('with no feed, or a feed that is not driving, nothing changes', () => {
+        const ws = connectWith([OSR2]);
+        dispatchIntiface(100, 0, 20, 80);
+        assert.equal(intifaceAxisPlanner(1, 0), 'stroke');
+        assert.equal(ws.messages('LinearCmd')[0].Vectors[0].Position, 0.8);
+        setIntifaceScriptFeed(playingFeed(beat(400)));
+        dispatchIntiface(100, 0, 20, 80);
+        assert.equal(intifaceAxisPlanner(1, 0), 'stroke');
+        assert.equal(intifaceAxisPlanner(1, 7), null);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+
+    it('a vibrator follows the allowance as a level', () => {
+        const ws = connectWith([EDGE]);
+        setAxisRole(0, 0, 'primary');
+        const feed = playingFeed(beat(400));
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(65, 40, 0, 100, 0, 100);
+        const levels = ws.messages('ScalarCmd').flatMap((c) => c.Scalars.map((x) => x.Scalar));
+        assert.ok(levels.includes(0.65), levels.join(' '));
+        assert.equal(intifaceAxisPlanner(0, 0), null);
+        dispatchIntiface(0, 0, 0, 100, 0, 100, true);
+    });
+});
+
+describe('Script mode on an OSSM: it holds where it stops', () => {
+    afterEach(() => setIntifaceScriptFeed(null));
+
+    it('plays the script as one-way segments of at most 200 ms, never the same step twice, and holds on a skip', async () => {
+        const ws = connectWith([OSSM]);
+        const feed = playingFeed(beat(700), { settings: { scriptMaxSpeed: 200 } });
+        feed.setActive(true);
+        setIntifaceScriptFeed(feed);
+        dispatchIntiface(100, 0, 20, 80, 20, 80);
+        assert.equal(intifaceAxisPlanner(4, 1), 'script');
+        await sleep(3000);
+        const legs = ossmLegs(ws);
+        assert.ok(legs.length >= 8, `${legs.length}`);
+        const later = legs.slice(1);
+        assert.ok(later.every((l) => l.ms <= HELD_SEGMENT_MS), later.map((l) => l.ms).join(' '));
+        legs.forEach((l, i) => { if (i) assert.notEqual(l.step, legs[i - 1].step, `repeat at ${i}`); });
+        assert.ok(legs.every((l) => l.step >= 20 && l.step <= 80));
+        // One way between turns, and only at the envelope's ends does it turn.
+        for (let i = 1; i < later.length - 1; i++) {
+            const turn = Math.sign(later[i].step - later[i - 1].step) !== Math.sign(later[i + 1].step - later[i].step);
+            if (turn) assert.ok([20, 80].includes(later[i].step), `turned at ${later[i].step}: ${later.map((l) => l.step).join(' ')}`);
+        }
+        // A skip: nothing more, no rest move.
+        dispatchIntiface(0, 0, 20, 80, 20, 80, false, { urgent: true });
+        const held = ossmLegs(ws).length;
+        await sleep(900);
+        assert.equal(ossmLegs(ws).length, held, 'held where it is');
+        // Back from the hold: from where it stopped, never its last step again.
+        dispatchIntiface(100, 0, 20, 80, 20, 80);
+        await sleep(1200);
+        const again = ossmLegs(ws);
+        assert.ok(again.length > held);
+        again.forEach((l, i) => { if (i) assert.notEqual(l.step, again[i - 1].step, `repeat at ${i}`); });
+        dispatchIntiface(0, 0, 0, 100, 20, 80, true);
+        const stopped = ossmLegs(ws).length;
+        await sleep(600);
+        assert.equal(ossmLegs(ws).length, stopped, 'STOP: no rest move either');
     });
 });

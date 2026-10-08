@@ -28,6 +28,7 @@ const PRECACHE = [
     './src/js/app.js',
     './src/js/state.js',
     './src/js/engine.js',
+    './src/js/player/script-governor.js',
     './src/js/edge-confirm.js',
     './src/js/patterns.js',
     './src/js/session-rules.js',
@@ -64,6 +65,7 @@ const PRECACHE = [
     './src/js/hardware/intiface.js',
     './src/js/hardware/buttplug-protocol.js',
     './src/js/hardware/stroke-planner.js',
+    './src/js/hardware/script-planner.js',
     './src/js/hardware/vibe-pulse.js',
     './src/js/hardware/tcode.js',
     './src/js/hardware/tcode-protocol.js'

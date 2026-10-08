@@ -29,6 +29,16 @@
 //      end of the segments (pumpHeld). Its Oscillate twin runs the machine's
 //      own full-rail stroke, so it runs only while the travel envelope is
 //      the whole travel (fullRail).
+//   6. Script mode: a PRIMARY-role linear axis plays the wearer's funscript
+//      through a script planner (script-planner.js) instead of its stroke
+//      planner, when app.js has installed a script feed that is driving
+//      (setIntifaceScriptFeed). The two planners share one interface and
+//      one timer chain; the axis changes hands only while it moves, and
+//      only between legs (syncPlanner). A script leg may be IDLE - the
+//      script holds where the axis is - and an idle leg sends nothing at
+//      all. Every stop is the planners' own: the rest move, or an OSSM's
+//      hold (rule 5). Vibrators, rotators and secondary-role axes follow the
+//      engine's channels as in every mode, the primary being the allowance.
 //
 // Message construction and parsing live in buttplug-protocol.js (pure,
 // unit-tested). Roles, caps, linear invert and the rotation settings are
@@ -64,6 +74,7 @@ import {
     capSteps
 } from './buttplug-protocol.js';
 import { createStrokePlanner } from './stroke-planner.js';
+import { createScriptPlanner, liveFeed } from './script-planner.js';
 import { readVibeMode, readPulsePeriod, pulsePhase, pulseLevel, DEFAULT_VIBE_MODE, DEFAULT_PULSE_PERIOD_MS } from './vibe-pulse.js';
 
 export const INTIFACE_STORAGE_KEY = 'edgeloop_intiface_devices';
@@ -111,6 +122,12 @@ let status = { state: 'offline', text: 'Offline' };
 let lastZone = { min: 0.2, max: 0.8 };
 let lastEnvelope = { min: 0, max: 1 };
 let lastSpeeds = { primary: 0, secondary: 0 };
+// The script feed app.js installed (setIntifaceScriptFeed), and the
+// unsubscribe for its change listener. Every script planner asks it through
+// `scriptFeedNow`, so it can be installed after the planners exist.
+let scriptFeed = null;
+let unsubscribeScriptFeed = null;
+const scriptFeedNow = liveFeed(() => scriptFeed);
 
 const handlers = {
     onStatus: null,
@@ -538,6 +555,11 @@ function makeAxis(kind, attr, position, parsed, saved) {
         sentPos: null,
         sentStep: null,
         planner: kind === 'linear' ? createStrokePlanner() : null,
+        // The axis's two planners: the stroke planner of every mode, and the
+        // script planner of Script mode, made the first time it is needed.
+        // `planner` is the one in use (syncPlanner).
+        strokePlanner: null,
+        scriptPlanner: null,
         // The physical positions the leg in flight was sent from and to (the
         // end of the leg before it, and its own), for a re-time (pumpLinear);
         // null while unknown.
@@ -549,6 +571,7 @@ function makeAxis(kind, attr, position, parsed, saved) {
         failures: 0,
         failing: false
     };
+    axis.strokePlanner = axis.planner;
     return axis;
 }
 
@@ -582,6 +605,7 @@ function addDiscoveredDevice(raw) {
         if (osc.role !== 'off' && lin.role !== 'off') osc.role = 'off';
         lin.holds = true;
         lin.planner = createStrokePlanner({ hold: true });
+        lin.strokePlanner = lin.planner;
     });
     // A rotator listed twice is driven through RotateCmd only.
     rotateDuplicates(parsed).forEach((pos) => {
@@ -848,6 +872,7 @@ function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
         cancelSegments(axis);
         return;
     }
+    syncPlanner(axis, now);
     if (axis.holds) {
         pumpHeld(dev, axis, now);
         return;
@@ -855,16 +880,118 @@ function pumpLinear(dev, axis, now = Date.now(), { retime = false } = {}) {
     const retimed = retime && mayRetime(axis) ? axis.planner.retime(now, { travel: travelCovered(axis) }) : null;
     const leg = retimed || axis.planner.next(now);
     if (!leg) return;
+    if (leg.kind === 'idle') {
+        armLegTimer(dev, axis, leg.durationMs);
+        return;
+    }
     if (!retimed) {
         axis.legFrom = axis.legTarget;
         axis.legTarget = physicalPosition(axis, leg.position);
     }
     sendLinear(dev, axis, axis.legTarget, leg.durationMs);
+    armLegTimer(dev, axis, leg.durationMs);
+}
+
+// The timer at the end of a leg - a stroke, a rest move, a held axis's
+// segments, or an idle leg of the script, which sent nothing - that asks for
+// the next one.
+function armLegTimer(dev, axis, durationMs) {
     if (axis.timer) clearTimeout(axis.timer);
     axis.timer = setTimeout(() => {
         axis.timer = null;
         pumpLinear(dev, axis, Math.max(Date.now(), axis.planner.legEndsAt()));
-    }, leg.durationMs);
+    }, durationMs);
+}
+
+// ---- Script mode (script-planner.js) ---------------------------------------
+
+// Whether this axis plays the script: a primary-role linear axis while the
+// installed feed says Script mode is driving. A feed that throws is not.
+function wantsScript(axis) {
+    if (axis.kind !== 'linear' || axis.role !== 'primary' || !scriptFeed) return false;
+    try {
+        return Boolean(scriptFeed.isActive());
+    } catch (e) {
+        return false;
+    }
+}
+
+function scriptPlannerOf(axis) {
+    if (!axis.scriptPlanner) {
+        axis.scriptPlanner = createScriptPlanner({
+            feed: scriptFeedNow,
+            hold: axis.holds,
+            // An OSSM's ceiling where it holds (position mode), Intiface's
+            // linear ceiling otherwise (script-shaper.js DEVICE_CEILINGS).
+            profile: axis.holds ? 'ossm' : 'intiface'
+        });
+    }
+    return axis.scriptPlanner;
+}
+
+function plannerMoves(planner) {
+    const input = planner.getInput();
+    return input.enabled && input.effectiveSpeed > 0;
+}
+
+// Hand the axis to the planner it should be using now. Only a moving axis
+// changes hands - a stop is the same in both planners, and the one in use
+// gives it - and only between legs: the leg in flight runs out first (a
+// stroke leg at most SLOW_LEG_MS, a script leg about SCRIPT_WINDOW_MS), so
+// the new planner starts from where the axis really is. A held axis starts
+// from the last segment it was sent.
+function syncPlanner(axis, now) {
+    if (axis.kind !== 'linear' || !axis.strokePlanner) return;
+    const want = wantsScript(axis) ? scriptPlannerOf(axis) : axis.strokePlanner;
+    const current = axis.planner;
+    if (want === current) return;
+    if (!plannerMoves(current) || current.isInFlight(now) || axis.testTimer) return;
+    const at = axis.holds
+        ? (axis.sentPos === null ? null : physicalPosition(axis, axis.sentPos))
+        : current.lastPosition();
+    want.reset();
+    want.place(at);
+    axis.planner = want;
+}
+
+// Install the script feed (player/script-feed.js), or null to remove it.
+// Its changes - the clock starting or stopping, Script mode on or off, a new
+// track - reach every axis at once: a clock that stopped (a seek, a pause)
+// interrupts a script leg in flight like any stop.
+export function setIntifaceScriptFeed(feed) {
+    if (unsubscribeScriptFeed) {
+        try { unsubscribeScriptFeed(); } catch (e) {}
+        unsubscribeScriptFeed = null;
+    }
+    scriptFeed = feed && typeof feed === 'object' ? feed : null;
+    if (scriptFeed && typeof scriptFeed.subscribe === 'function') {
+        try { unsubscribeScriptFeed = scriptFeed.subscribe(onScriptFeedChange); } catch (e) {}
+    }
+    onScriptFeedChange();
+}
+
+// A change the feed announced reaches the axes playing the script at once:
+// a clock that stopped cuts the leg in flight (the planner's stop goes out),
+// one that started again sends the rejoin. Axes on their stroke planner are
+// left to the next dispatch, which hands them over between legs; nothing
+// that no dispatch has moved yet is sent anything from here.
+function onScriptFeedChange() {
+    if (!isIntifaceConnected()) return;
+    const now = Date.now();
+    intifaceDevices.forEach((dev) => dev.axes.forEach((axis) => {
+        if (!axis.scriptPlanner || axis.planner !== axis.scriptPlanner) return;
+        axis.scriptPlanner.poke();
+        pumpLinear(dev, axis, now);
+    }));
+}
+
+// Which planner an axis is using, for the modal's per-toy note and the
+// tests: 'script', 'stroke', or null for an axis with none.
+export function intifaceAxisPlanner(devIdx, axisIdx) {
+    const dev = intifaceDevices.get(devIdx);
+    const axis = dev && dev.axes[axisIdx];
+    if (!axis || !axis.planner) return null;
+    return axis.planner === axis.scriptPlanner ? 'script' : 'stroke';
 }
 
 // One LinearCmd, on the axis's step grid and inside the travel envelope
@@ -945,15 +1072,15 @@ function pumpHeld(dev, axis, now) {
         holdAxis(axis);
         return;
     }
+    if (leg.kind === 'idle') {
+        armLegTimer(dev, axis, leg.durationMs);
+        return;
+    }
     const to = physicalPosition(axis, leg.position);
     axis.legFrom = axis.sentPos;
     axis.legTarget = to;
     streamLeg(dev, axis, axis.sentPos, to, leg.durationMs);
-    if (axis.timer) clearTimeout(axis.timer);
-    axis.timer = setTimeout(() => {
-        axis.timer = null;
-        pumpLinear(dev, axis, Math.max(Date.now(), axis.planner.legEndsAt()));
-    }, leg.durationMs);
+    armLegTimer(dev, axis, leg.durationMs);
 }
 
 // One leg as segments from `from` to `to` over `durationMs`; a segment that
@@ -1020,7 +1147,13 @@ function maybeAlternate(dev, now, active) {
 function applyAxis(dev, axis, primary, secondary, zone, now, urgent = false) {
     const speed = axis.role === 'primary' ? primary : (axis.role === 'secondary' ? secondary : 0);
     if (axis.kind === 'linear') {
-        axis.planner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled: axis.role !== 'off' });
+        const enabled = axis.role !== 'off';
+        axis.strokePlanner.setInput({ speed, cap: axis.maxCap, zoneMin: zone.min, zoneMax: zone.max, enabled });
+        // The script is mapped into the whole travel envelope (the engine's
+        // zone in Script mode), and a stop rests at its bottom.
+        if (axis.scriptPlanner || wantsScript(axis)) {
+            scriptPlannerOf(axis).setInput({ speed, cap: axis.maxCap, zoneMin: lastEnvelope.min, zoneMax: lastEnvelope.max, enabled });
+        }
         pumpLinear(dev, axis, now, { retime: urgent });
     } else if (axis.kind === 'rotate') {
         const value = scalarFor(axis, speed);
@@ -1113,8 +1246,12 @@ function yieldTwin(axis) {
     cancelSegments(axis);
     cutPulse(axis);
     if (axis.planner) {
-        axis.planner.reset();
-        axis.planner.setInput({ enabled: false });
+        for (const planner of [axis.strokePlanner, axis.scriptPlanner]) {
+            if (!planner) continue;
+            planner.reset();
+            planner.setInput({ enabled: false });
+        }
+        axis.planner = axis.strokePlanner;
         axis.legFrom = null;
         axis.legTarget = null;
         axis.sentPos = null;
@@ -1298,5 +1435,10 @@ export function resetIntifaceForTests() {
     lastZone = { min: 0.2, max: 0.8 };
     lastEnvelope = { min: 0, max: 1 };
     lastSpeeds = { primary: 0, secondary: 0 };
+    if (unsubscribeScriptFeed) {
+        try { unsubscribeScriptFeed(); } catch (e) {}
+        unsubscribeScriptFeed = null;
+    }
+    scriptFeed = null;
     Object.keys(handlers).forEach((k) => { handlers[k] = null; });
 }

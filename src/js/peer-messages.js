@@ -33,7 +33,12 @@ import {
 // "game off" restarted the game from zero on a 1.0.0 host. Neither build
 // sent a version at all, so a message without one is from before this
 // number existed, and counts as older.
-export const PEER_PROTOCOL_VERSION = 2;
+//
+// Version 3 added Script mode to ENGINE_MODES. A host in it reports an
+// activeMode a version 2 page cannot read, and that page's mode cards then
+// toggle against a mode it has never heard of, so MODE_CHANGE is refused
+// across the two again (VERSIONED_COMMANDS).
+export const PEER_PROTOCOL_VERSION = 3;
 
 // Anything past this is not a version but junk in the field.
 const MAX_PEER_PROTOCOL = 1000;
@@ -108,6 +113,11 @@ export function describePeerVersionMismatch(role, peerProtocol) {
 
 export const PEER_ROLES = ['controller', 'viewer'];
 
+// The modes a partner may select. Script mode plays the wearer's own video
+// and funscript, which exist only on the wearer's device, so a partner can
+// see it (telemetry carries it) and PAUSE or STOP it, but never select it.
+export const PARTNER_MODES = Object.freeze(ENGINE_MODES.filter((mode) => mode !== 'script'));
+
 // Statuses a controller may ASK for. RAMPDOWN is host-internal.
 export const COMMAND_STATUSES = ['IDLE', 'RUNNING', 'PAUSED'];
 
@@ -171,7 +181,7 @@ function readCommand(raw, role) {
         case 'ORGASM_TOGGLE':
             return { type: 'ORGASM_TOGGLE' };
         case 'MODE_CHANGE': {
-            const mode = oneOf(raw.mode, ENGINE_MODES);
+            const mode = oneOf(raw.mode, PARTNER_MODES);
             if (!mode) return null;
             const command = { type: 'MODE_CHANGE', mode };
             // Present only when the sender said so. A game click carries

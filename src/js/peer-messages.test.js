@@ -9,6 +9,7 @@ import {
     HISTORY_LENGTH,
     REMOTE_STATUSES,
     PEER_PROTOCOL_VERSION,
+    PARTNER_MODES,
     VERSIONED_COMMANDS,
     readPeerProtocol,
     peerProtocolMatches,
@@ -42,6 +43,10 @@ describe('sanitizeCommand', () => {
         assert.equal(sanitizeCommand({ type: 'SESSION_STATE', status: 'RAMPDOWN' }), null);
         assert.equal(sanitizeCommand({ type: 'SESSION_STATE' }), null);
         assert.equal(sanitizeCommand({ type: 'MODE_CHANGE', mode: '<script>' }), null);
+        // Script mode plays files only the wearer's device has: a partner can
+        // never select it, whatever else the message says.
+        assert.equal(sanitizeCommand({ type: 'MODE_CHANGE', mode: 'script' }), null);
+        assert.equal(sanitizeCommand({ type: 'MODE_CHANGE', mode: 'script', enabled: true, protocol: PEER_PROTOCOL_VERSION }), null);
         assert.equal(sanitizeCommand({ type: 42 }), null);
         assert.equal(sanitizeCommand('SESSION_RESET'), null);
         assert.equal(sanitizeCommand(null), null);
@@ -189,6 +194,10 @@ describe('sanitizeTelemetry', () => {
         });
         assert.equal(t.sessionStatus, 'RAMPDOWN');
         assert.equal(t.activeMode, 'oracle');
+        // A host in Script mode says so: the partner sees the mode it cannot select.
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', activeMode: 'script' }).activeMode, 'script');
+        assert.ok(!PARTNER_MODES.includes('script'));
+        assert.equal(PARTNER_MODES.length, 9);
         assert.equal(t.teaseMode, 'shortener');
         assert.equal(t.gameMode, 'off');
         assert.equal(t.orgasmMode, true);

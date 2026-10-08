@@ -1975,8 +1975,11 @@ function cooldownLength(minutes) {
 // engine eases (COOLDOWN_MODES), never during Force Orgasm - the wearer asked
 // for full speed - and never in a soft landing or a pause, where the toys are
 // already teasing down or stopped and a cool-down clock would run unseen.
+// Nor in Script mode: there the Script tab's rejoin ramp is the cool-down,
+// seconds long and started by the edge itself (engine.js), and this
+// minutes-long one would only be a second clock nothing reads.
 export function cooldownEligible({ activeMode, orgasmMode = false, sessionStatus } = {}) {
-    return sessionStatus === 'RUNNING' && !orgasmMode && COOLDOWN_MODES.includes(activeMode);
+    return sessionStatus === 'RUNNING' && !orgasmMode && activeMode !== 'script' && COOLDOWN_MODES.includes(activeMode);
 }
 
 // One event of the cool-down counter, called on every edge release, on every

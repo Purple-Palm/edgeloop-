@@ -22,8 +22,15 @@ import {
     TEASE_MODES,
     COOLDOWN_MODES,
     GAME_MODES,
-    cooldownShape
+    cooldownShape,
+    nextScriptRelease
 } from './engine.js';
+import {
+    scriptAllowance,
+    rejoinFactor,
+    DEFAULT_SCRIPT_SETTINGS,
+    MAX_REJOIN_SECONDS
+} from './player/script-governor.js';
 import { MIN_MOVING_PERCENT, warmupShape, roundSpeed, ORGASM_RAMP_SECONDS } from './patterns.js';
 import { rememberEdgeReading } from './edge-confirm.js';
 
@@ -75,7 +82,7 @@ const running = {
 describe('engine modes', () => {
     it('lists every cockpit mode', () => {
         assert.deepEqual(ENGINE_MODES, [
-            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival', 'edgetrain'
+            'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin', 'oracle', 'survival', 'edgetrain', 'script'
         ]);
     });
 
@@ -2435,6 +2442,16 @@ describe('0% reaches the motors only as a stop the engine decided on', () => {
 });
 
 describe('cool-down after edges', () => {
+    // The modes the Guards cool-down eases through the engine's wake-up.
+    // Script mode is in COOLDOWN_MODES for its rejoin ramp, which is the same
+    // curve on the governor's own clock; its branch never reads
+    // cooldownSeconds (see 'script mode').
+    const TEASE_COOLDOWN_MODES = COOLDOWN_MODES.filter((mode) => mode !== 'script');
+    // The modes the seeded sweeps draw from: every mode there was when their
+    // digests were recorded. Script mode is left out so the digests still pin
+    // every other mode to the last digit - adding a mode to the list would
+    // only reshuffle the draws - and has its own sweep ('script mode').
+    const SWEPT_MODES = ENGINE_MODES.filter((mode) => mode !== 'script');
     // A small seeded generator, so a failing case can be re-run by number.
     function mulberry32(seed) {
         let a = seed >>> 0;
@@ -2466,7 +2483,7 @@ describe('cool-down after edges', () => {
             edgeHr: rnd() < 0.2 ? undefined : (rnd() < 0.05 ? NaN : hr + between(rnd, -25, 5)),
             minHr: rnd() < 0.02 ? NaN : minHr,
             maxHr: rnd() < 0.02 ? NaN : maxHr,
-            activeMode: rnd() < 0.03 ? 'ghost' : pick(rnd, ENGINE_MODES),
+            activeMode: rnd() < 0.03 ? 'ghost' : pick(rnd, SWEPT_MODES),
             strokeMode: pick(rnd, [undefined, undefined, 'classic', 'milker', 'shortener', 'headplay', 'ultimate', 'ruin']),
             sessionStatus: pick(rnd, ['RUNNING', 'RUNNING', 'RUNNING', 'RUNNING', 'RAMPDOWN', 'PAUSED', 'IDLE']),
             rampdownSecondsLeft: between(rnd, 0, 45),
@@ -2562,8 +2579,8 @@ describe('cool-down after edges', () => {
         resolvedMode: r.resolvedMode
     });
 
-    it('runs only in the five tease modes: not in Ruin & Leak, not in a game', () => {
-        assert.deepEqual(COOLDOWN_MODES, ['classic', 'milker', 'shortener', 'headplay', 'ultimate']);
+    it('runs only in the five tease modes and Script mode: not in Ruin & Leak, not in a game', () => {
+        assert.deepEqual(COOLDOWN_MODES, ['classic', 'milker', 'shortener', 'headplay', 'ultimate', 'script']);
         for (const mode of COOLDOWN_MODES) {
             assert.ok(ENGINE_MODES.includes(mode) && !GAME_MODES.includes(mode) && mode !== 'ruin', mode);
         }
@@ -2642,7 +2659,7 @@ describe('cool-down after edges', () => {
             resolvedMode: 'classic'
         });
         // A cool-down's first second IS a warm-up's first second, bit for bit.
-        for (const mode of COOLDOWN_MODES) {
+        for (const mode of TEASE_COOLDOWN_MODES) {
             for (const hr of [75, 100, 130]) {
                 const base = { ...running, activeMode: mode, hr, sessionSeconds: 0 };
                 assert.deepEqual(
@@ -2655,7 +2672,7 @@ describe('cool-down after edges', () => {
     });
 
     it('eases every tease mode from its first second and lets go exactly at its length', () => {
-        for (const mode of COOLDOWN_MODES) {
+        for (const mode of TEASE_COOLDOWN_MODES) {
             for (const minutes of LENGTHS) {
                 const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 45 };
                 const open = calculateEngineOutputs(base);
@@ -2677,7 +2694,7 @@ describe('cool-down after edges', () => {
     });
 
     it('with the warm-up still running, the smaller factor of the two wins', () => {
-        for (const mode of COOLDOWN_MODES) {
+        for (const mode of TEASE_COOLDOWN_MODES) {
             const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 60 };
             // A cool-down at its start under a warm-up a fifth of the way
             // in: the cool-down is slower, and the result is the cool-down
@@ -2752,7 +2769,7 @@ describe('cool-down after edges', () => {
         }
         // Junk in either field is no cool-down, in the very state where a
         // real one would bite hardest.
-        for (const mode of COOLDOWN_MODES) {
+        for (const mode of TEASE_COOLDOWN_MODES) {
             const base = { ...running, activeMode: mode, hr: 100, sessionSeconds: 20 };
             const plain = calculateEngineOutputs(base);
             assert.notDeepEqual(calculateEngineOutputs({ ...base, cooldownSeconds: 0, cooldownMinutes: 2 }), plain, `${mode}: the control case must move`);
@@ -2895,7 +2912,7 @@ describe('cool-down after edges', () => {
         const rnd = mulberry32(20260927);
         const seen = new Set();
         for (let i = 0; i < 20000; i += 1) seen.add(resolveEngineMode(seededInput(rnd).activeMode));
-        assert.deepEqual([...seen].sort(), [...ENGINE_MODES].sort());
+        assert.deepEqual([...seen].sort(), [...SWEPT_MODES].sort());
     });
 
     it('golden, readable: the 1.1.2 numbers for every mode through the warm-up, cool-down Off', () => {
@@ -2934,7 +2951,8 @@ describe('cool-down after edges', () => {
             ['edgetrain', 120, 13, 10, 0, 26, false, false],
             ['edgetrain', 140, 2, 7, 0, 29, true, false]
         ];
-        assert.deepEqual([...new Set(GOLDEN_ROWS.map(([mode]) => mode))], ENGINE_MODES, 'every mode has its rows');
+        // Every mode 1.1.2 had (Script mode came after it: 'script mode').
+        assert.deepEqual([...new Set(GOLDEN_ROWS.map(([mode]) => mode))], SWEPT_MODES, 'every mode has its rows');
         for (const [mode, hr, primary, secondary, strokeMin, strokeMax, isEdged, newEdgeTriggered] of GOLDEN_ROWS) {
             const input = { ...running, activeMode: mode, hr, isEdged: hr >= 140, warmupMinutes: 5, sessionSeconds: 20, ceilingBehaviour: 'crawl' };
             const expected = {
@@ -2949,6 +2967,240 @@ describe('cool-down after edges', () => {
             assert.deepEqual(documented(calculateEngineOutputs(input)), expected, `${mode} hr ${hr}: no cool-down fields`);
             assert.deepEqual(documented(calculateEngineOutputs({ ...input, cooldownSeconds: null, cooldownMinutes: 5 })), expected, `${mode} hr ${hr}: cooldownSeconds null`);
             assert.deepEqual(documented(calculateEngineOutputs({ ...input, cooldownSeconds: 12, cooldownMinutes: 0 })), expected, `${mode} hr ${hr}: cooldownMinutes 0`);
+        }
+    });
+});
+
+describe('script mode', () => {
+    const script = { ...running, activeMode: 'script', minHr: 70, maxHr: 140, handyHwMin: 0, handyHwMax: 100, intensityValue: 50 };
+    // The mark of the fixture: 100% of 140.
+    const MARK = 140;
+
+    function mulberry32(seed) {
+        let a = seed >>> 0;
+        return () => {
+            a = (a + 0x6D2B79F5) >>> 0;
+            let t = a;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+    const between = (rnd, lo, hi) => Math.round(lo + rnd() * (hi - lo));
+    const pick = (rnd, list) => list[Math.floor(rnd() * list.length)];
+
+    it('is an engine mode, eased by its own rejoin ramp through cooldownShape', () => {
+        assert.ok(ENGINE_MODES.includes('script'));
+        assert.equal(resolveEngineMode('script'), 'script');
+        assert.ok(COOLDOWN_MODES.includes('script'));
+        // rejoinShape: the cool-down machinery with the length in seconds is
+        // exactly the governor's rejoin factor.
+        for (const length of [1, 5, 8, 20, 60]) {
+            for (const t of [0, 0.5, 1, 2, 3.7, length / 2, length - 1, length, length + 3]) {
+                assert.equal(cooldownShape('script', t, length / 60).speed, rejoinFactor(t, length), `${t}s of ${length}s`);
+            }
+        }
+        assert.equal(cooldownShape('script', null, 8 / 60).speed, rejoinFactor(null, 8));
+    });
+
+    it('the primary is the allowance, the zone the whole envelope, the secondary the allowance x 0.6', () => {
+        for (const [lo, hi] of [[0, 100], [15, 80], [90, 10], [30, 63]]) {
+            for (const hr of [72, 100, 128, 131, 135, 139]) {
+                const out = calculateEngineOutputs({ ...script, hr, handyHwMin: lo, handyHwMax: hi });
+                const expected = scriptAllowance({ hr, triggerHr: MARK, sessionStatus: 'RUNNING', sessionSeconds: 20, settings: DEFAULT_SCRIPT_SETTINGS });
+                assert.equal(out.primaryPercent, expected.allowance, `hr ${hr}`);
+                assert.equal(out.secondaryPercent, roundSpeed(expected.allowance * 0.6), `hr ${hr}`);
+                assert.equal(out.strokeMinPercent, Math.min(lo, hi), `${lo}-${hi}`);
+                assert.equal(out.strokeMaxPercent, Math.max(lo, hi), `${lo}-${hi}`);
+                assert.equal(out.resolvedMode, 'script');
+                assert.equal(out.script.allowance, out.primaryPercent);
+            }
+        }
+        // Below the band the whole script; inside it the allowance falls to
+        // the floor (30%) at the mark.
+        assert.equal(calculateEngineOutputs({ ...script, hr: 100 }).primaryPercent, 100);
+        assert.equal(calculateEngineOutputs({ ...script, hr: 135 }).primaryPercent, 65);
+        assert.equal(calculateEngineOutputs({ ...script, hr: 139 }).primaryPercent, 37);
+        // The second channel Off is 0.
+        const off = calculateEngineOutputs({ ...script, hr: 100, scriptSettings: { scriptSecondChannel: 'off' } });
+        assert.equal(off.primaryPercent, 100);
+        assert.equal(off.secondaryPercent, 0);
+    });
+
+    it('skips from the first reading at the mark, in that same tick', () => {
+        const out = calculateEngineOutputs({ ...script, hr: MARK, edgeHr: MARK, isEdged: false });
+        assert.equal(out.pullbackStarted, true);
+        assert.equal(out.isEdged, true);
+        assert.equal(out.primaryPercent, 0);
+        assert.equal(out.secondaryPercent, 0);
+        assert.equal(out.script.phase, 'skipping');
+        // Held there, and inside the release band, it stays a skip.
+        const held = calculateEngineOutputs({ ...script, hr: MARK - 3, edgeHr: MARK - 3, isEdged: true });
+        assert.equal(held.isEdged, true);
+        assert.equal(held.primaryPercent, 0);
+    });
+
+    it('decides the edge exactly as Classic does, over 50 000 seeded inputs', () => {
+        // The edge logic is shared and untouched: the flag, the pullback, the
+        // count and a count still owed are the same in Script mode as in
+        // Classic for any input, junk included.
+        const rnd = mulberry32(93);
+        for (let i = 0; i < 50000; i += 1) {
+            const minHr = between(rnd, 40, 110);
+            const maxHr = rnd() < 0.05 ? between(rnd, 30, minHr) : between(rnd, minHr + 1, 200);
+            const hr = rnd() < 0.03 ? NaN : between(rnd, minHr - 10, maxHr + 15);
+            const pulse = rnd() < 0.2 ? hr : hr + between(rnd, -25, 5);
+            const isEdged = rnd() < 0.35;
+            const input = {
+                hr,
+                edgeHr: pulse,
+                minHr: rnd() < 0.02 ? NaN : minHr,
+                maxHr,
+                sessionStatus: pick(rnd, ['RUNNING', 'RUNNING', 'RUNNING', 'RAMPDOWN', 'PAUSED', 'IDLE']),
+                rampdownSecondsLeft: between(rnd, 0, 45),
+                isEdged,
+                edgePending: isEdged && rnd() < 0.5,
+                recentReadings: rnd() < 0.5 ? readingsOf(pulse, pulse) : [],
+                orgasmMode: rnd() < 0.15,
+                orgasmBoost: between(rnd, 0, 40),
+                intensityValue: between(rnd, 0, 100),
+                sessionSeconds: between(rnd, 0, 900),
+                warmupMinutes: pick(rnd, [0, 1, 5]),
+                stallGuardEngaged: rnd() < 0.2,
+                edgeHoldPercent: pick(rnd, [90, 95, 100]),
+                handyHwMin: pick(rnd, [0, 15, 40]),
+                handyHwMax: pick(rnd, [100, 80, 60]),
+                scriptReleasedAt: rnd() < 0.3 ? between(rnd, 0, 900) : null
+            };
+            const classic = calculateEngineOutputs({ ...input, activeMode: 'classic' });
+            const out = calculateEngineOutputs({ ...input, activeMode: 'script' });
+            for (const key of ['isEdged', 'edgePending', 'pullbackStarted', 'newEdgeTriggered']) {
+                if (out[key] !== classic[key]) assert.fail(`${key}: case ${i} ${JSON.stringify(input)}`);
+            }
+            if (!(out.primaryPercent >= 0 && out.primaryPercent <= 100)) assert.fail(`primary ${out.primaryPercent}: case ${i}`);
+            if (!(out.secondaryPercent >= 0 && out.secondaryPercent <= out.primaryPercent)) assert.fail(`secondary: case ${i}`);
+            if (out.isEdged && input.sessionStatus === 'RUNNING' && !input.orgasmMode && out.primaryPercent !== 0) {
+                assert.fail(`edged and moving: case ${i} ${JSON.stringify(input)}`);
+            }
+        }
+    });
+
+    it('applies only the warm-up speed factor: the zone stays the whole envelope', () => {
+        for (const sessionSeconds of [0, 20, 60, 150, 299, 300]) {
+            const out = calculateEngineOutputs({ ...script, hr: 90, warmupMinutes: 5, sessionSeconds });
+            assert.equal(out.primaryPercent, Math.min(100, roundSpeed(100 * warmupShape(sessionSeconds, 5).speed)), `${sessionSeconds}s`);
+            assert.equal(out.strokeMinPercent, 0);
+            assert.equal(out.strokeMaxPercent, 100);
+        }
+        // Global Intensity: above 50% it cannot push past the script, below
+        // it calms the whole script.
+        assert.equal(calculateEngineOutputs({ ...script, hr: 90, intensityValue: 100 }).primaryPercent, 100);
+        assert.equal(calculateEngineOutputs({ ...script, hr: 90, intensityValue: 0 }).primaryPercent, 50);
+    });
+
+    it('the mic boost can only bring the reaction forward; the edge reads the measured pulse', () => {
+        const plain = calculateEngineOutputs({ ...script, hr: 130, edgeHr: 130 });
+        const boosted = calculateEngineOutputs({ ...script, hr: 136, edgeHr: 130 });
+        assert.ok(boosted.primaryPercent < plain.primaryPercent);
+        const atMark = calculateEngineOutputs({ ...script, hr: 145, edgeHr: 130 });
+        assert.equal(atMark.isEdged, false, 'a boost never raises the edge flag');
+    });
+
+    it('the rejoin ramp starts when the edge flag clears and runs over the Script tab length', () => {
+        const base = { ...script, hr: 100, edgeHr: 100 };
+        // Released this tick: stamped, and the ramp is at its slowest.
+        const released = calculateEngineOutputs({ ...base, isEdged: true, sessionSeconds: 200 });
+        assert.equal(released.isEdged, false);
+        assert.equal(released.scriptReleasedAt, 200);
+        assert.equal(released.primaryPercent, roundSpeed(100 * rejoinFactor(0, 8)));
+        assert.equal(released.script.phase, 'rejoining');
+        let last = released.primaryPercent;
+        for (let t = 1; t <= 9; t += 1) {
+            const out = calculateEngineOutputs({ ...base, sessionSeconds: 200 + t, scriptReleasedAt: 200 });
+            assert.equal(out.primaryPercent, Math.min(100, roundSpeed(100 * rejoinFactor(t, 8))), `${t}s`);
+            assert.ok(out.primaryPercent >= last, `${t}s never falls`);
+            last = out.primaryPercent;
+        }
+        assert.equal(last, 100);
+        // Its length is the Script tab's, 0 to 60 s.
+        const long = calculateEngineOutputs({ ...base, sessionSeconds: 230, scriptReleasedAt: 200, scriptSettings: { scriptRejoinSeconds: 60 } });
+        assert.equal(long.primaryPercent, roundSpeed(100 * rejoinFactor(30, 60)));
+        const none = calculateEngineOutputs({ ...base, isEdged: true, sessionSeconds: 200, scriptSettings: { scriptRejoinSeconds: 0 } });
+        assert.equal(none.primaryPercent, 100);
+        // A new pullback during the ramp skips at once.
+        const again = calculateEngineOutputs({ ...base, hr: MARK, edgeHr: MARK, sessionSeconds: 203, scriptReleasedAt: 200 });
+        assert.equal(again.primaryPercent, 0);
+        // The approach band and the ramp: the smaller wins.
+        const both = calculateEngineOutputs({ ...base, hr: 138, edgeHr: 120, sessionSeconds: 207, scriptReleasedAt: 200 });
+        assert.equal(both.primaryPercent, Math.min(
+            roundSpeed(100 * rejoinFactor(7, 8)),
+            scriptAllowance({ hr: 138, triggerHr: MARK, sessionStatus: 'RUNNING', settings: DEFAULT_SCRIPT_SETTINGS }).allowance
+        ));
+    });
+
+    it('holds the rejoin stamp through a pause, and drops it once no ramp can be running', () => {
+        const paused = calculateEngineOutputs({ ...script, sessionStatus: 'PAUSED', isEdged: true, scriptReleasedAt: 50 });
+        assert.equal(paused.primaryPercent, 0);
+        assert.equal(paused.scriptReleasedAt, 50);
+        assert.equal(paused.isEdged, true);
+        const junk = calculateEngineOutputs({ ...script, hr: NaN, scriptReleasedAt: 50 });
+        assert.equal(junk.primaryPercent, 0);
+        assert.equal(junk.scriptReleasedAt, 50);
+        // Not carried into other modes.
+        assert.equal('scriptReleasedAt' in calculateEngineOutputs({ ...running, activeMode: 'classic' }), false);
+
+        assert.equal(nextScriptRelease(null, { wasEdged: true, isEdged: false, seconds: 12 }), 12);
+        assert.equal(nextScriptRelease(12, { wasEdged: false, isEdged: false, seconds: 30 }), 12);
+        assert.equal(nextScriptRelease(12, { wasEdged: true, isEdged: true, seconds: 30 }), 12);
+        assert.equal(nextScriptRelease(12, { wasEdged: false, isEdged: false, seconds: 12 + MAX_REJOIN_SECONDS }), null);
+        assert.equal(nextScriptRelease(400, { seconds: 30 }), null, 'a stamp from an earlier session');
+        assert.equal(nextScriptRelease(12, { seconds: NaN }), null);
+        assert.equal(nextScriptRelease('12', { seconds: 20 }), null);
+    });
+
+    it('ignores the Guards cool-down: the rejoin ramp is the only cool-down in Script mode', () => {
+        for (const hr of [90, 132, 141]) {
+            for (const isEdged of [false, true]) {
+                const base = { ...script, hr, edgeHr: hr, isEdged, sessionSeconds: 120 };
+                assert.deepEqual(
+                    calculateEngineOutputs({ ...base, cooldownSeconds: 0, cooldownMinutes: 2 }),
+                    calculateEngineOutputs(base),
+                    `hr ${hr} edged ${isEdged}`
+                );
+            }
+        }
+    });
+
+    it('the stall guard, Force Orgasm and the Soft Landing act on the allowance as the governor says', () => {
+        const stalled = calculateEngineOutputs({ ...script, hr: 100, stallGuardEngaged: true });
+        assert.equal(stalled.primaryPercent, 0);
+        assert.equal(stalled.script.phase, 'stall');
+        // The guard holds a RUNNING session only.
+        const landing = calculateEngineOutputs({ ...script, hr: 100, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 45, stallGuardEngaged: true });
+        assert.equal(landing.primaryPercent, 50);
+        assert.equal(landing.script.phase, 'landing');
+        assert.equal(calculateEngineOutputs({ ...script, hr: 100, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 0 }).primaryPercent, 0);
+        // A landing never raises a channel past what was sent.
+        const fromSent = calculateEngineOutputs({ ...script, hr: 100, sessionStatus: 'RAMPDOWN', rampdownSecondsLeft: 45, landingFrom: { primary: 20, secondary: 12 } });
+        assert.ok(fromSent.primaryPercent <= 20);
+        // Force Orgasm ramps from what was sent, over the edge and the guard.
+        const first = calculateEngineOutputs({ ...script, hr: MARK, edgeHr: MARK, isEdged: true, orgasmMode: true, orgasmBoost: 0, orgasmFrom: { primary: 0 } });
+        assert.equal(first.primaryPercent, 0);
+        assert.equal(first.script.phase, 'orgasm');
+        const top = calculateEngineOutputs({ ...script, hr: MARK, edgeHr: MARK, isEdged: true, orgasmMode: true, orgasmBoost: ORGASM_RAMP_SECONDS, orgasmFrom: { primary: 0 } });
+        assert.ok(top.primaryPercent >= 70, `${top.primaryPercent}`);
+        assert.equal(top.isEdged, true, 'Force Orgasm freezes the flag');
+    });
+
+    it('is silent when the session is not running, and never NaN', () => {
+        for (const sessionStatus of ['IDLE', 'PAUSED', 'STOPPED', undefined]) {
+            const out = calculateEngineOutputs({ ...script, hr: 100, sessionStatus });
+            assert.equal(out.primaryPercent, 0);
+            assert.equal(out.secondaryPercent, 0);
+        }
+        for (const junk of [{ hr: NaN }, { minHr: NaN }, { maxHr: Infinity }, { intensityValue: NaN }, { sessionSeconds: NaN }, { scriptSettings: 'junk' }]) {
+            const out = calculateEngineOutputs({ ...script, ...junk });
+            assert.ok(Number.isFinite(out.primaryPercent) && Number.isFinite(out.secondaryPercent), JSON.stringify(junk));
         }
     });
 });
