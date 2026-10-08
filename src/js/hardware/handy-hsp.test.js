@@ -540,6 +540,45 @@ describe('the play and the rolling window', () => {
         assert.ok(lastX >= 5, `got to ${lastX} after 30 s`);
     });
 
+    it('plans from script time 0 when a negative offset puts the present before it: the way from the slider stays in the buffer, under the limit', async () => {
+        // Script time = media time + offset (down to -2000 ms), so the first
+        // seconds of a video can be at a negative script time; HSP point
+        // times start at 0. The slider is at the top of the window.
+        const speeds = (pts) => pts.slice(1).map((p, i) => (Math.abs(p.x - pts[i].x) * 0.9 * 1000) / (p.t - pts[i].t));
+        for (const { scriptNow, maxSpeed, cap } of [
+            { scriptNow: -1900, maxSpeed: 100, cap: 10 },
+            { scriptNow: -1000, maxSpeed: 300, cap: 100 }
+        ]) {
+            const label = `script time ${scriptNow}, Max ${maxSpeed}, cap ${cap}`;
+            const limit = (maxSpeed * cap) / 100;
+            const h = setup();
+            h.feed.real.setSettings({ scriptMaxSpeed: maxSpeed });
+            h.api.device.position = 0.97;
+            h.feed.origin = h.sched.t - scriptNow;
+            await h.hsp.prepare({ envMin: 0, envMax: 100, endMargin: 5 });
+            h.hsp.dispatch({ allowance: 100, cap });
+            await h.sched.advance(0);
+            const [play] = h.api.of('PUT /hsp/play');
+            assert.equal(play.body.start_time, scriptNow, label);
+            const pts = play.body.add.points;
+            // The buffer starts where the slider is: nothing left to the firmware.
+            assert.deepEqual(pts[0], { t: 0, x: 100 }, label);
+            // The way to the script at the join speed (half the limit), the rest under the limit.
+            assert.ok(speeds(pts)[0] <= limit / 2 + 1e-9, `${label}: join leg ${speeds(pts)[0]} %/s`);
+            for (const v of speeds(pts)) assert.ok(v <= limit + 1e-9, `${label}: ${v} %/s`);
+            // A replan still before 0 splices at 0, from where the plan is then.
+            await h.sched.advance(50);
+            const n = h.api.of('PUT /hsp/add').length;
+            h.hsp.dispatch({ allowance: 60, cap });
+            await h.sched.advance(10);
+            const add = h.api.of('PUT /hsp/add')[n];
+            assert.ok(add, `${label}: a replan`);
+            assert.deepEqual(add.body.points[0], { t: 0, x: 100 }, label);
+            for (const v of speeds(add.body.points)) assert.ok(v <= limit + 1e-9, `${label}: replan ${v} %/s`);
+            await h.hsp.release();
+        }
+    });
+
     it('waits for the cadence with a small change, and plans it in 5-point steps', async () => {
         const { api, sched, hsp } = await playing();
         await sched.advance(300);

@@ -86,11 +86,29 @@ describe('points and bodies', () => {
             { t: 20, x: NaN },
             { t: 30, x: 0.333 }
         ]);
-        assert.deepEqual(out, [{ t: 0, x: 50 }, { t: 10, x: 0 }, { t: 30, x: 33 }]);
+        // -5 ms at 50 to 10.4 ms at 100: at 0 the line is at 88.96, rounded toward 100.
+        assert.deepEqual(out, [{ t: 0, x: 89 }, { t: 10, x: 0 }, { t: 30, x: 33 }]);
         for (const p of out) {
             assert.ok(Number.isInteger(p.t) && p.t >= 0);
             assert.ok(Number.isInteger(p.x) && p.x >= 0 && p.x <= 100);
         }
+    });
+
+    it('puts a plan that starts before 0 in the buffer from 0, where the plan is then, never faster than the plan', () => {
+        // A long, slow move from -1900 ms: the part from 0 on keeps its speed,
+        // where clamping its start to 0 would squeeze all of it into 250 ms.
+        const plan = [{ t: -1900, x: 1 }, { t: 250, x: 0.9 }, { t: 500, x: 0.87 }];
+        const out = toHspPoints(plan);
+        // At 0 the line is at 91.16, rounded toward 90.
+        assert.deepEqual(out, [{ t: 0, x: 91 }, { t: 250, x: 90 }, { t: 500, x: 87 }]);
+        assert.ok((out[0].x - out[1].x) / 250 <= 10 / 2150);
+        // A point at 0 after one before it is the plan's own point at 0, kept.
+        assert.deepEqual(toHspPoints([{ t: -1000, x: 1 }, { t: 0, x: 0.1 }, { t: 250, x: 0.9 }]), [{ t: 0, x: 10 }, { t: 250, x: 90 }]);
+        // Rounded toward the next point (1.5 and 48.5): up when it is higher, down when lower.
+        assert.deepEqual(toHspPoints([{ t: -100, x: 0 }, { t: 100, x: 0.03 }]), [{ t: 0, x: 2 }, { t: 100, x: 3 }]);
+        assert.deepEqual(toHspPoints([{ t: -100, x: 0.5 }, { t: 100, x: 0.47 }]), [{ t: 0, x: 48 }, { t: 100, x: 47 }]);
+        // Only points before 0: where the plan ends, held at 0.
+        assert.deepEqual(toHspPoints([{ t: -300, x: 0.2 }, { t: -100, x: 0.4 }]), [{ t: 0, x: 40 }]);
     });
 
     it('builds play with its add embedded, flush on, pause_on_starving off', () => {

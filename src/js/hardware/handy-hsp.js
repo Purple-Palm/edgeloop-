@@ -552,6 +552,16 @@ export function createHandyHsp({
         if (play.holdTimer && play.holding && pendingSends === 0) replan({ urgent: true });
     }
 
+    // The device's buffer starts at script time 0 (HSP point times are
+    // whole ms >= 0), but with a negative script offset the first seconds of
+    // a video are at a negative script time. A plan that started there
+    // would have its first move, the way from where the slider is, squeezed
+    // into the time up to its next point or lost (toHspPoints): every plan
+    // starts at 0 at the earliest, from where the device is then.
+    function planStart(t) {
+        return t < 0 ? 0 : t;
+    }
+
     async function doAnchor() {
         const my = epoch;
         const startPos = await readStartPosition();
@@ -560,10 +570,14 @@ export function createHandyHsp({
         if (t0 === null) return false;
         const lead = sync ? sync.lead : 1000;
         const allowance = quantizeAllowance(wanted.allowance);
+        // The plan starts at script time 0 at the earliest (planStart): the
+        // slider stays where it is until then, and the lead still counts
+        // from now.
+        const from = planStart(t0);
         let points = [];
         let join = null;
         if (allowance > 0) {
-            const shaped = shape({ from: t0, to: t0 + HSP_WINDOW_AHEAD_MS, allowance, startPos, rejoin: true, lead });
+            const shaped = shape({ from, to: t0 + HSP_WINDOW_AHEAD_MS, allowance, startPos, rejoin: true, lead: Math.max(0, t0 + lead - from) });
             if (!shaped) return false;
             points = toHspPoints(shaped.points);
             if (shaped.join && shaped.join.t > t0 + HSP_WINDOW_AHEAD_MS) {
@@ -574,7 +588,7 @@ export function createHandyHsp({
             // device holds: it gets the way there up to the window's end.
             points = clipPlan(points, t0 + HSP_WINDOW_AHEAD_MS);
         } else if (startPos !== null) {
-            points = toHspPoints(holdPoints(t0, t0 + HSP_WINDOW_AHEAD_MS, startPos, HSP_HOLD_EVERY_MS));
+            points = toHspPoints(holdPoints(from, t0 + HSP_WINDOW_AHEAD_MS, startPos, HSP_HOLD_EVERY_MS));
         } else {
             return false;
         }
@@ -652,7 +666,8 @@ export function createHandyHsp({
         if (t === null || !play) return false;
         const lead = sync ? sync.lead : 1000;
         const from = t - HSP_WINDOW_BEHIND_MS;
-        const splice = Math.round(t + lead);
+        // Never before script time 0, where the device's buffer starts.
+        const splice = Math.round(planStart(t + lead));
         const to = t + HSP_WINDOW_AHEAD_MS;
         const allowance = quantizeAllowance(wanted.allowance);
         const wasHolding = play.holding;

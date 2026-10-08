@@ -152,13 +152,29 @@ export function setupBody(streamId) {
 
 // Device points as HSP takes them: t whole ms >= 0, x whole 0-100 of the
 // stroke window, times strictly increasing (the later of two at the same
-// ms wins). `points` are the shaper's { t, x 0-1 }.
+// ms wins). `points` are the shaper's { t, x 0-1 }. A move before t 0
+// cannot go in the buffer: the plan's points before 0 become one point at
+// 0 where the plan is then, rounded toward the next point, so no segment
+// that goes out is faster than the plan (the planners start at 0 or later:
+// handy-hsp.js planStart).
 export function toHspPoints(points) {
     const out = [];
+    let before = null;
     for (const p of Array.isArray(points) ? points : []) {
         if (!p || !finite(p.t) || !finite(p.x)) continue;
-        const t = Math.max(0, Math.round(p.t));
+        if (p.t < 0) {
+            if (out.length === 0) before = p;
+            continue;
+        }
+        const t = Math.round(p.t);
         const x = clampInt(p.x * 100, 0, 100);
+        if (before) {
+            if (t > 0) {
+                const at = before.x * 100 + ((p.x - before.x) * 100 * (0 - before.t)) / (p.t - before.t);
+                out.push({ t: 0, x: clampInt(x >= at ? Math.ceil(at) : Math.floor(at), 0, 100) });
+            }
+            before = null;
+        }
         const last = out[out.length - 1];
         if (last && t < last.t) continue;
         if (last && t === last.t) {
@@ -167,6 +183,7 @@ export function toHspPoints(points) {
         }
         out.push({ t, x });
     }
+    if (before) out.push({ t: 0, x: clampInt(before.x * 100, 0, 100) });
     return out;
 }
 
