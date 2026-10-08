@@ -15,7 +15,8 @@
 //      within the seconds still in its buffer, and stops keep being sent in
 //      the background until one is confirmed. A play that may have landed
 //      after a stop is stopped again. A skip (allowance 0 at an edge) is a
-//      hold replan; one not confirmed within 1 s becomes a stop. A device
+//      hold replan that goes out at once, whatever else is on its way, and
+//      one not confirmed within 1 s of the edge becomes a stop. A device
 //      that starves (hsp_starving) was not meant to: it is re-anchored, and
 //      a second time within a minute pauses the session.
 //   2. The device never sees a change it cannot reach smoothly: the points
@@ -206,6 +207,10 @@ export function createHandyHsp({
     let stateTimer = null;
     let resyncTimer = null;
     let inFlight = null;
+    // Window sends (a play, an add) whose answer has not come back, and the
+    // count of plans made: a newer plan supersedes an older one on its way.
+    let pendingSends = 0;
+    let planSeq = 0;
     let slowWarned = false;
     let unsubscribeFeed = null;
     // The stroke window on its way to the device (setWindow), and whether a
@@ -491,6 +496,17 @@ export function createHandyHsp({
     // landed.
     async function sendBuffer(points, { anchorAt = null, kind = 'routine' } = {}) {
         const { bodies, tailIndex } = chunkPoints(points, { flush: true, tailIndex: play ? play.tailIndex : 0 });
+        // Taken now: a hold may go out while this send is still on its way.
+        if (play) play.tailIndex = tailIndex;
+        pendingSends += 1;
+        try {
+            return await sendBodies(bodies, { anchorAt, kind, tailIndex });
+        } finally {
+            pendingSends -= 1;
+        }
+    }
+
+    async function sendBodies(bodies, { anchorAt, kind, tailIndex }) {
         let first;
         if (anchorAt !== null) {
             const body = playBody({ startTime: anchorAt.scriptMs, serverTime: anchorAt.serverMs, add: bodies[0] });
@@ -519,12 +535,19 @@ export function createHandyHsp({
     }
 
     // One window request at a time: what was asked for meanwhile goes next.
+    // A hold is the exception (replan): it goes out at once, and one that
+    // went out while an older send was still on its way vouches for nothing,
+    // since that send may have landed after it. Once nothing is on its way,
+    // the hold goes again, and that one's answer confirms it.
     function afterJob(job) {
         if (inFlight === job) inFlight = null;
-        if (play && play.urgent && !inFlight) {
+        if (!play || inFlight) return;
+        if (play.urgent) {
             play.urgent = false;
             replan({ urgent: true });
+            return;
         }
+        if (play.holdTimer && play.holding && pendingSends === 0) replan({ urgent: true });
     }
 
     async function doAnchor() {
@@ -581,7 +604,6 @@ export function createHandyHsp({
             return false;
         }
         if (!play) return false;
-        play.tailIndex = sent.tailIndex;
         if (!sent.ok) {
             failedAnchors += 1;
             if (!sent.verdict.notConnected) stop({ reason: 'anchor' });
@@ -598,14 +620,19 @@ export function createHandyHsp({
 
     // Replan the buffer: the old plan up to deviceNow + lead, the new one
     // after it.
+    // An edge (a skip to 0) never waits behind a window request on its way:
+    // the 1 s escalation to a stop is armed the moment the hold is decided,
+    // and the hold goes out at once, superseding the older request.
     async function replan({ urgent = false } = {}) {
         if (!session || !play || offline) return false;
-        if (inFlight) {
+        const hold = quantizeAllowance(wanted.allowance) === 0 && !play.holding;
+        if (hold) armHoldEscalation();
+        if (inFlight && !hold) {
             play.dirty = true;
             if (urgent) play.urgent = true;
             return inFlight;
         }
-        const job = doReplan(urgent);
+        const job = doReplan(urgent || hold);
         inFlight = job;
         try {
             return await job;
@@ -649,11 +676,11 @@ export function createHandyHsp({
                 newPoints = newPoints.concat([join]);
             }
         }
-        const planned = planWindow({ lastPlan: play.lastPlan, from, splice, newPoints });
-        if (planned.points.length === 0) return false;
+        const points = planWindow({ lastPlan: play.lastPlan, from, splice, newPoints }).points;
+        if (points.length === 0) return false;
         const previous = play.lastPlan;
         const previousState = { allowance: play.allowance, holding: play.holding, holdX: play.holdX, join: play.join };
-        play.lastPlan = planned.points;
+        play.lastPlan = points;
         play.allowance = allowance;
         play.cap = wanted.cap;
         play.holding = allowance === 0;
@@ -661,17 +688,22 @@ export function createHandyHsp({
         play.join = join;
         play.lastSentAt = now();
         play.dirty = false;
-        const holdSent = allowance === 0 && !wasHolding;
-        if (holdSent) armHoldEscalation();
-        const sent = await sendBuffer(planned.points, { kind: urgent ? 'urgent' : 'routine' });
+        planSeq += 1;
+        const mine = planSeq;
+        play.planSeq = mine;
+        // Nothing else on its way: this send cannot be overtaken by an older one.
+        const clean = pendingSends === 0;
+        const sent = await sendBuffer(points, { kind: urgent ? 'urgent' : 'routine' });
         if (my !== epoch || !play) return false;
-        play.tailIndex = sent.tailIndex;
+        // A newer plan (a hold) went out while this one was on its way: its
+        // answer says nothing about what the device has now.
+        if (play.planSeq !== mine) return false;
         if (sent.verdict && sent.verdict.budget) {
             // Not sent at all: the device still has the previous plan.
             play.lastPlan = previous;
             Object.assign(play, previousState);
             play.dirty = true;
-            if (holdSent) {
+            if (play.holdTimer) {
                 // A skip that cannot go out as a hold goes out as a stop.
                 stop({ reason: 'hold' });
             }
@@ -685,10 +717,12 @@ export function createHandyHsp({
                 Object.assign(play, previousState);
                 play.dirty = true;
             }
-            if (holdSent) stop({ reason: 'hold' });
+            if (play.holdTimer) stop({ reason: 'hold' });
             return false;
         }
-        if (holdSent) disarmHoldEscalation();
+        // The device has this plan, and nothing sent before it can land
+        // after it: a hold it carries is confirmed.
+        if (clean) disarmHoldEscalation();
         if (finite(sent.rtd) && sent.rtd > lead) {
             play.misses += 1;
             if (play.misses >= T.missedLeadsToPause) {
@@ -703,8 +737,7 @@ export function createHandyHsp({
     // A skip's hold must be confirmed within holdEscalateMs, or it becomes
     // a stop.
     function armHoldEscalation() {
-        if (!play) return;
-        play.holdTimer = clear(play.holdTimer);
+        if (!play || play.holdTimer) return;
         const my = epoch;
         play.holdTimer = setTimer(() => {
             if (my !== epoch || !play) return;
@@ -812,6 +845,11 @@ export function createHandyHsp({
     // way has been answered: its flush must not land after the play's.
     function reanchor() {
         if (!session || offline) return;
+        // A hold not yet confirmed is not given up for a new play: a stop.
+        if (play && play.holdTimer) {
+            stop({ reason: 'hold' });
+            return;
+        }
         stopLoops();
         play = null;
         const go = () => {
@@ -943,6 +981,10 @@ export function createHandyHsp({
         if (!session || offline) return Promise.resolve(false);
         if (!play) {
             if (wanted.allowance > 0 && scriptNow() !== null) return anchor();
+            // An edge while no plan is in hand (a new play still being
+            // prepared, the old buffer still playing): nothing can be held,
+            // so the device is stopped.
+            if (wanted.allowance === 0 && before > 0 && motion !== 'stopped') return stop({ reason: 'hold' });
             return Promise.resolve(false);
         }
         const q = quantizeAllowance(wanted.allowance);

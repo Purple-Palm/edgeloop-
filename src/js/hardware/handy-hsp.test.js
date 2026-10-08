@@ -159,6 +159,7 @@ function createFakeFeed(sched) {
     real.setTrack(strokeTrack(), { inverted: false });
     const listeners = new Set();
     const f = {
+        real,
         running: true,
         origin: -5000,
         gen: 1,
@@ -400,6 +401,117 @@ describe('the play and the rolling window', () => {
         await sched.advance(200);
         assert.equal(api.of('PUT /hsp/stop').length, 1, 'escalated after 1 s');
         assert.equal(hsp.isPlaying(), false);
+    });
+
+    for (const slow of [4000, 6000]) {
+        it(`skips at once while a refill is still on its way (adds answered after ${slow / 1000} s), and stops within a second when the hold is not confirmed`, async () => {
+            let slowOn = false;
+            const { api, sched, hsp } = await playing({
+                'PUT /hsp/add': (c, d) => {
+                    const answer = () => {
+                        d.points = (c.body.flush ? 0 : d.points) + c.body.points.length;
+                        return { status: 200, body: { result: { play_state: d.play, points: d.points, max_points: 4000 } } };
+                    };
+                    return slowOn ? { delay: slow, then: answer } : answer();
+                }
+            });
+            slowOn = true;
+            let refill = null;
+            for (let i = 0; i < 40 && !refill; i += 1) {
+                await sched.advance(100);
+                refill = api.of('PUT /hsp/add')[0];
+            }
+            assert.ok(refill, 'a refill is on its way');
+            await sched.advance(100);
+            const edge = sched.t;
+            hsp.dispatch({ allowance: 0, cap: 100 });
+            await sched.advance(0);
+            const hold = api.of('PUT /hsp/add').find((c) => c.at >= edge);
+            assert.ok(hold, 'the hold did not wait for the refill');
+            assert.equal(hold.at, edge);
+            const held = hold.body.points.filter((p) => p.t > edge + 5000 + 1000);
+            assert.ok(held.length >= 2);
+            assert.equal(new Set(held.map((p) => p.x)).size, 1, 'one position held');
+            assert.ok(hold.body.tail_point_stream_index > refill.body.tail_point_stream_index, 'tail indexes still only grow');
+            await sched.advance(900);
+            assert.equal(api.of('PUT /hsp/stop').length, 0);
+            await sched.advance(200);
+            const [stop] = api.of('PUT /hsp/stop');
+            assert.ok(stop, 'the hold nobody confirmed became a stop');
+            assert.ok(stop.at - edge <= 1000, `stop ${stop.at - edge} ms after the edge`);
+            assert.equal(hsp.isPlaying(), false);
+            // The slow answers that come back later set nothing going again.
+            await sched.advance(slow + 1000);
+            assert.equal(api.calls.filter((c) => (c.path === '/hsp/add' || c.path === '/hsp/play') && c.at >= edge).length, 1);
+        });
+    }
+
+    it('confirms a hold sent past an older refill only with a hold sent after that refill was answered', async () => {
+        let slowOn = false;
+        const { api, sched, hsp } = await playing({
+            'PUT /hsp/add': (c, d) => {
+                const answer = () => ({ status: 200, body: { result: { play_state: d.play, points: c.body.points.length, max_points: 4000 } } });
+                return slowOn ? { delay: 300, then: answer } : answer();
+            }
+        });
+        slowOn = true;
+        let refill = null;
+        for (let i = 0; i < 100 && !refill; i += 1) {
+            await sched.advance(50);
+            refill = api.of('PUT /hsp/add')[0];
+        }
+        assert.ok(refill, 'a refill is on its way');
+        const edge = sched.t;
+        hsp.dispatch({ allowance: 0, cap: 100 });
+        await sched.advance(0);
+        const sinceEdge = () => api.of('PUT /hsp/add').filter((c) => c !== refill && c.at >= edge);
+        assert.equal(sinceEdge().length, 1, 'the hold went out at once');
+        // The refill was answered after the hold went out: it may have landed
+        // after it, so the hold goes again once nothing else is on its way.
+        await sched.advance(700);
+        const holds = sinceEdge();
+        assert.equal(holds.length, 2, 'a second hold');
+        assert.ok(holds[1].at >= refill.at + 300);
+        await sched.advance(3000);
+        assert.equal(api.of('PUT /hsp/stop').length, 0, 'the second hold was confirmed in time');
+        assert.equal(hsp.status().holding, true);
+    });
+
+    it('stops at an edge that comes while a new play is still being prepared', async () => {
+        let slowState = false;
+        const { api, sched, hsp, sse } = await playing({
+            'GET /slider/state': () => (slowState ? { delay: 4000, then: { status: 200, body: { result: { position: 0.5 } } } } : { status: 200, body: { result: { position: 0.5 } } })
+        });
+        await sched.advance(500);
+        slowState = true;
+        // The device starves once: a new play is prepared from where the
+        // slider is, which takes 4 s to read on this link.
+        sse().emit('hsp_starving', { connection_key: KEY, data: { play_state: 4 } });
+        await sched.advance(100);
+        assert.equal(hsp.isPlaying(), false);
+        const edge = sched.t;
+        hsp.dispatch({ allowance: 0, cap: 100 });
+        await sched.advance(0);
+        const stop = api.of('PUT /hsp/stop').find((c) => c.at >= edge);
+        assert.ok(stop && stop.at === edge, 'a stop at once, with no plan to hold');
+        await sched.advance(5000);
+        assert.equal(api.of('PUT /hsp/play').length, 1, 'the play being prepared was dropped');
+    });
+
+    it('does not trade a hold still waiting for its answer for a new play: it stops', async () => {
+        let holdNow = false;
+        const { api, sched, hsp, sse } = await playing({
+            'PUT /hsp/add': (c, d) => (holdNow ? { delay: 5000, then: { status: 200, body: { result: { play_state: 1, points: 3 } } } } : { status: 200, body: { result: { play_state: d.play, points: c.body.points.length } } })
+        });
+        await sched.advance(500);
+        holdNow = true;
+        hsp.dispatch({ allowance: 0 });
+        await sched.advance(300);
+        const edgeAt = sched.t;
+        sse().emit('hsp_starving', { connection_key: KEY, data: { play_state: 4 } });
+        await sched.advance(0);
+        assert.equal(api.of('PUT /hsp/play').length, 1, 'no new play');
+        assert.ok(api.of('PUT /hsp/stop').some((c) => c.at === edgeAt), 'a stop at once');
     });
 
     it('waits for the cadence with a small change, and plans it in 5-point steps', async () => {
