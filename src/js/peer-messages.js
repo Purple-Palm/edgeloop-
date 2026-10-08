@@ -245,6 +245,15 @@ export function hostTransportAction(command, hostStatus) {
     }
 }
 
+// Script mode's phase as the host's status line reads it ("FREE", "EASING
+// 64%", "SKIPPING: EDGE", "REJOINING 5 s (VIDEO HELD)"), or '' outside
+// Script mode. Short plain words only: a partner's page prints it.
+export const SCRIPT_PHASE_MAX_LENGTH = 48;
+export function readScriptPhase(value) {
+    if (typeof value !== 'string' || value.length > SCRIPT_PHASE_MAX_LENGTH) return undefined;
+    return /^[A-Za-z0-9 :%().-]*$/.test(value) ? value : undefined;
+}
+
 // Host -> controller / viewer. Returns an object holding only the fields
 // that were present AND valid (absent fields stay undefined so the remote
 // page keeps its previous value), or null when it is not telemetry at all.
@@ -284,6 +293,8 @@ export function sanitizeTelemetry(raw) {
     out.orgasmSecondsLeft = clampNumber(raw.orgasmSecondsLeft, 0, MAX_FORCE_ORGASM_SECONDS, true);
     out.orgasmRefusal = oneOf(raw.orgasmRefusal, FORCE_ORGASM_REFUSALS);
     out.ready = typeof raw.ready === 'boolean' ? raw.ready : undefined;
+    // What the script is doing, so a partner sees the skip at an edge.
+    out.scriptPhase = readScriptPhase(raw.scriptPhase);
 
     if (Array.isArray(raw.history)) {
         const cleaned = [];

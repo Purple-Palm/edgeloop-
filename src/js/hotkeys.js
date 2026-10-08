@@ -17,6 +17,9 @@
  *    button the page had just rebuilt away under the focus.
  *  - Escape closes the open modal exactly as its X does, discarding whatever
  *    the X discards.
+ *  - [ and ] move the script offset 50 ms earlier or later while a script
+ *    is loaded in the player (positive plays the strokes later). They move
+ *    nothing but the offset, start nothing and resume nothing.
  *
  * What makes this more than a lookup table is what a key already means
  * before the layer sees it, each measured in Chromium:
@@ -74,7 +77,9 @@
 // line here and one planner there, behind the same guards.
 export const HOTKEYS = Object.freeze({
     Space: 'pause',
-    Escape: 'closeModal'
+    Escape: 'closeModal',
+    '[': 'offsetEarlier',
+    ']': 'offsetLater'
 });
 
 const LIVE_STATUSES = ['RUNNING', 'RAMPDOWN'];
@@ -89,6 +94,15 @@ const IGNORE = Object.freeze({ action: null, consume: false });
 const SWALLOW = Object.freeze({ action: null, consume: true });
 const PAUSE = Object.freeze({ action: 'pause', consume: true });
 const CLOSE_MODAL = Object.freeze({ action: 'closeModal', consume: true });
+const OFFSET_EARLIER = Object.freeze({ action: 'offsetEarlier', consume: true });
+const OFFSET_LATER = Object.freeze({ action: 'offsetLater', consume: true });
+
+// The offset keys work where the page is the wearer's and nothing is open
+// over the player: not behind the age gate or the wizard, not under a
+// modal, and only while a script is loaded (`offsetAvailable`).
+function offsetPlanner(plan) {
+    return (c, target, plain) => (plain && c.offsetAvailable === true && !c.modalOpen && !c.overlay ? plan : IGNORE);
+}
 
 function boundAction(key) {
     return Object.prototype.hasOwnProperty.call(HOTKEYS, key) ? HOTKEYS[key] : null;
@@ -151,7 +165,9 @@ const PLANNERS = {
     },
     closeModal(c, target, plain) {
         return plain && c.modalOpen && !c.overlay ? CLOSE_MODAL : IGNORE;
-    }
+    },
+    offsetEarlier: offsetPlanner(OFFSET_EARLIER),
+    offsetLater: offsetPlanner(OFFSET_LATER)
 };
 
 // What one press should do.
@@ -159,8 +175,10 @@ const PLANNERS = {
 //   ctx:   { target: classifyKeyTarget() of its target, sessionStatus,
 //            transportEnabled: the play / pause button is live on this page,
 //            modalOpen, overlay: 'ageGate' or 'wizard' while one is up (the
-//            age gate when both are), else null }
-// Returns { action, consume }. `action` is null, 'pause' or 'closeModal'.
+//            age gate when both are), else null, offsetAvailable: a script
+//            is loaded in the player }
+// Returns { action, consume }. `action` is null, 'pause', 'closeModal',
+// 'offsetEarlier' or 'offsetLater'.
 // `consume` means the caller must cancel the event, so that nothing else -
 // above all the focused button's own activation - acts on it.
 export function planHotkey(press, ctx = {}) {

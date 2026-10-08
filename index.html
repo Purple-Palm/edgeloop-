@@ -31,6 +31,19 @@
     @media (hover: none), (max-width: 399px) {
       #playPauseKeyHint { display: none; }
     }
+    /* The player (player.js). Theater is the whole viewport in CSS, above
+       the phone's transport bar (z-40) and under the modals (z-50); the HUD
+       carries its own PAUSE and STOP there. Fullscreen puts the stage, not
+       the <video>, on screen, so the HUD stays on top of the picture. */
+    #playerStage[data-theater="on"] { position: fixed; inset: 0; z-index: 45; border-radius: 0; border: 0; }
+    #playerStage[data-immersive="on"] { background: #000; }
+    #playerStage[data-immersive="on"] video { max-height: none; height: 100%; width: 100%; object-fit: contain; }
+    #playerStage:fullscreen { background: #000; }
+    #playerHud .hud-info { transition: opacity 0.3s; }
+    #playerHud[data-idle="on"] .hud-info { opacity: 0; }
+    #playerHud .hud-btn { transition: opacity 0.3s; }
+    #playerHud[data-idle="on"] .hud-btn { opacity: 0.45; }
+    #playerDrop[data-over="on"] { border-color: rgb(168 85 247); background: rgb(59 7 100 / 0.3); }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen p-2.5 sm:p-5 pb-24 sm:pb-24 lg:pb-5 font-sans antialiased select-none flex flex-col justify-between">
@@ -76,6 +89,12 @@
           <span class="hidden sm:inline">History</span>
         </button>
 
+        <!-- The player section (your own video and .funscript) -->
+        <button id="playerHeaderBtn" type="button" aria-label="Player" aria-controls="playerSection" aria-expanded="false" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-sky-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
+          <svg class="w-3.5 h-3.5 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+          <span class="hidden sm:inline">Player</span>
+        </button>
+
         <!-- Session Setup Action -->
         <button id="sessionParamsHeaderBtn" aria-label="Session Setup" class="bg-slate-900 hover:bg-slate-800 border border-slate-800 px-2.5 py-1.5 rounded-xl text-purple-300 transition flex items-center gap-1 text-xs font-semibold cursor-pointer">
           <svg class="w-3.5 h-3.5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
@@ -98,6 +117,107 @@
         </div>
       </div>
     </header>
+
+    <!-- The player (player/player.js): the wearer's own video and .funscript,
+         played with the pulse as the limiter in Script mode. A section, not
+         a modal, so the cockpit stays in view under it; closed, it is one
+         line. Nothing here is uploaded or stored. -->
+    <section id="playerSection" aria-label="Player" class="bg-slate-900 border border-slate-800 rounded-2xl p-2.5 sm:p-3 space-y-2.5">
+      <div class="flex items-center justify-between gap-2 min-w-0">
+        <button id="playerToggleBtn" type="button" aria-controls="playerBody" aria-expanded="false" class="flex items-center gap-1.5 min-w-0 text-left cursor-pointer min-h-[2.25rem]">
+          <svg class="w-3.5 h-3.5 text-sky-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+          <span id="playerStrip" class="text-[11px] font-semibold text-slate-300 truncate">Player: your own video and .funscript, played with your pulse as the limiter</span>
+        </button>
+        <span id="playerStripPhase" class="hidden shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded bg-sky-950/80 border border-sky-700 text-sky-300 font-mono"></span>
+      </div>
+
+      <div id="playerBody" class="hidden grid grid-cols-1 lg:grid-cols-12 gap-3">
+        <div class="lg:col-span-7 space-y-1.5 min-w-0">
+          <div id="playerStage" data-theater="off" data-immersive="off" class="relative bg-black rounded-xl border border-slate-800 overflow-hidden flex items-center justify-center">
+            <video id="playerVideo" playsinline preload="auto" class="block w-full max-h-[40vh] bg-black"></video>
+            <!-- The HUD: only in theater and fullscreen. Its readouts hide
+                 after 4 s and come back on a tap or a mouse move; PAUSE and
+                 STOP only fade, and take a press at any time. -->
+            <div id="playerHud" data-idle="off" class="hidden absolute inset-0 pointer-events-none">
+              <div class="hud-info absolute top-0 inset-x-0 p-3 flex justify-between items-start gap-3 bg-gradient-to-b from-black/70 to-transparent text-white">
+                <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  <span class="text-3xl font-black font-mono text-rose-400"><span id="hudHr">--</span><span class="text-xs text-slate-300 ml-1">BPM</span></span>
+                  <span class="text-[11px] font-mono text-purple-200">mark <span id="hudMark">--</span></span>
+                  <span id="hudPhase" class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-sky-950/90 border border-sky-700 text-sky-200 font-mono"></span>
+                </div>
+                <div class="text-right font-mono">
+                  <div class="text-xl font-bold" id="hudTimer">00:00</div>
+                  <div class="text-[11px] text-amber-300">edges <span id="hudEdges">0</span></div>
+                </div>
+              </div>
+              <p id="hudNotice" class="hud-info hidden absolute top-20 inset-x-3 text-center text-[11px] font-bold text-rose-100 bg-rose-950/90 border border-rose-700 rounded-lg px-2 py-1"></p>
+              <div class="hud-info absolute bottom-10 left-[28%] right-[28%] h-1.5 rounded-full bg-white/20 overflow-hidden" aria-hidden="true">
+                <div id="hudBar" class="h-full bg-gradient-to-r from-teal-400 to-rose-500" style="width: 0%"></div>
+              </div>
+              <button id="hudPauseBtn" type="button" class="hud-btn pointer-events-auto absolute left-3 bottom-3 min-w-[64px] min-h-[64px] px-4 rounded-2xl bg-amber-600/90 hover:bg-amber-500 text-white font-black text-sm cursor-pointer shadow-xl">PAUSE</button>
+              <button id="hudStopBtn" type="button" class="hud-btn pointer-events-auto absolute right-3 bottom-3 min-w-[64px] min-h-[64px] px-4 rounded-2xl bg-rose-700/90 hover:bg-rose-600 text-white font-black text-sm cursor-pointer shadow-xl">STOP</button>
+            </div>
+          </div>
+
+          <!-- EdgeLoop's own control strip: native controls are off, so a
+               key or a click on the picture can never resume it behind the
+               wearer's back. Play / Pause goes through the session transport
+               in Script mode. -->
+          <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
+            <button id="playerPlayBtn" type="button" class="min-h-[2.75rem] min-w-[3.5rem] px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 font-bold cursor-pointer">Play</button>
+            <input id="playerSeek" type="range" min="0" max="0" step="0.1" value="0" disabled aria-label="Seek" class="flex-1 min-w-[6rem] accent-sky-500 h-1.5 cursor-pointer">
+            <span id="playerTime" class="font-mono text-slate-400 shrink-0">0:00 / 0:00</span>
+            <button id="playerMuteBtn" type="button" class="min-h-[2.75rem] px-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold cursor-pointer">Mute</button>
+          </div>
+          <div class="flex flex-wrap items-center gap-1.5 text-[10px]">
+            <span class="text-slate-400 font-semibold">Offset</span>
+            <button id="playerOffsetMinus" type="button" aria-label="Strokes 50 ms earlier" class="min-h-[2.75rem] min-w-[2.75rem] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold cursor-pointer">−50</button>
+            <span id="playerOffsetValue" class="font-mono text-sky-300 font-bold w-16 text-center">0 ms</span>
+            <button id="playerOffsetPlus" type="button" aria-label="Strokes 50 ms later" class="min-h-[2.75rem] min-w-[2.75rem] rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold cursor-pointer">+50</button>
+            <span class="text-slate-500 hidden sm:inline">keys [ ]</span>
+            <span class="flex-1"></span>
+            <button id="playerTheaterBtn" type="button" class="min-h-[2.75rem] px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold cursor-pointer">Theater</button>
+            <button id="playerFullscreenBtn" type="button" class="min-h-[2.75rem] px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold cursor-pointer">Fullscreen</button>
+          </div>
+          <p id="playerNotice" role="status" aria-live="polite" class="hidden text-[10px] text-amber-300 leading-snug"></p>
+        </div>
+
+        <div class="lg:col-span-5 space-y-2 min-w-0">
+          <div id="playerDrop" data-over="off" class="p-2.5 rounded-xl border border-dashed border-slate-700 bg-slate-950 space-y-1.5">
+            <div class="flex flex-wrap items-center gap-2">
+              <button id="playerChooseBtn" type="button" class="min-h-[2.75rem] px-3 rounded-lg bg-sky-700 hover:bg-sky-600 text-white text-xs font-bold cursor-pointer">Choose files</button>
+              <button id="playerClearBtn" type="button" class="min-h-[2.75rem] px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold cursor-pointer">Clear</button>
+              <span class="text-[10px] text-slate-400">or drop them here</span>
+              <input id="playerFileInput" type="file" multiple accept=".funscript,video/*,.mp4,.m4v,.webm,.mkv,.mov,.ogv" class="hidden">
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">A video and its script, named alike: <span class="font-mono">Movie.mp4</span> + <span class="font-mono">Movie.funscript</span>. On a phone, pick them one after the other.</p>
+            <div id="playerPackRow" class="hidden flex items-center gap-2 text-[10px]">
+              <label for="playerPackSelect" class="text-slate-400 font-semibold">Script</label>
+              <select id="playerPackSelect" class="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-slate-200"></select>
+            </div>
+            <ul id="playerPairList" class="text-[10px] text-slate-300 leading-snug space-y-0.5 break-words"></ul>
+            <p id="playerError" role="alert" class="hidden text-[10px] font-semibold text-rose-300 leading-snug"></p>
+            <ul id="playerSummary" class="text-[10px] text-slate-400 leading-snug space-y-0.5"></ul>
+          </div>
+
+          <div class="p-2.5 rounded-xl border border-slate-800 bg-slate-950 space-y-1.5">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] font-bold uppercase tracking-wider text-slate-300">Status</span>
+              <span id="playerPhase" class="text-[10px] font-bold font-mono text-sky-300">IDLE</span>
+            </div>
+            <ul id="playerToyNotes" class="text-[10px] text-slate-400 leading-snug space-y-0.5"></ul>
+            <label class="flex items-start gap-2 pt-1.5 border-t border-slate-900 cursor-pointer">
+              <input id="beatSyncToggle" type="checkbox" class="mt-0.5 accent-sky-500 cursor-pointer">
+              <span class="text-[10px] text-slate-300 leading-snug"><strong>Beat sync on The Handy</strong> (firmware 4): stroke for stroke over Handy's cloud. Off: The Handy plays the script's rhythm only. Asks once before it first goes on.</span>
+            </label>
+            <p id="beatSyncRoute" class="text-[10px] text-slate-400 leading-snug"></p>
+          </div>
+
+          <p id="playerPrivacy" class="text-[9px] text-slate-400 leading-snug">Your video and script stay on this device. EdgeLoop uploads neither. With Beat sync on The Handy switched on, The Handy is sent the next few seconds of stroke positions through Handy's cloud as it plays. Your heart rate, file names and video never leave this device.</p>
+          <p class="text-[9px] text-slate-500 leading-snug">In a headset: run EdgeLoop on a PC, tablet or phone that reads your pulse. Inside the headset this page can play the video, but it cannot read a heart-rate monitor.</p>
+        </div>
+      </div>
+    </section>
 
     <!-- Two-Column Responsive Cockpit Grid (Desktop & Landscape Tablet) -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
@@ -433,7 +553,22 @@
                 Rides the edge, then stops dead.
               </p>
             </button>
+
+            <!-- Enabled while a valid script is loaded in the Player. -->
+            <button id="scriptModeCard" type="button" data-mode="script" disabled class="mode-card sm:col-span-2 text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between opacity-50">
+              <div class="font-bold text-[11px] text-slate-200 flex justify-between items-center gap-1">
+                <span>Script <span class="text-[9px] font-semibold text-sky-300">· your video</span></span>
+                <span class="flex items-center gap-1">
+                  <span class="mode-check hidden text-rose-500">●</span>
+                </span>
+              </div>
+              <p id="scriptCardLine" class="text-[9px] text-slate-400 mt-0.5 leading-snug">
+                Load a video and its .funscript in the Player first.
+              </p>
+            </button>
           </div>
+
+          <p id="gamesDisabledNote" class="hidden text-[10px] font-semibold text-amber-300 leading-snug">Games run their own speeds; they cannot be combined with a script yet.</p>
 
           <!-- Game Modes Grid -->
           <div id="gameModesGrid" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-1.5">
@@ -654,6 +789,20 @@
           </div>
         </div>
 
+        <!-- Beat sync (HSP, API v3) in Script mode. The Application ID is
+             not a secret (Handy documents it as meant for client code); the
+             override is for a copy of EdgeLoop hosted elsewhere, and rides
+             in a Backup only with the device keys. -->
+        <details class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-[10px] text-slate-400">
+          <summary class="cursor-pointer text-xs font-bold text-slate-300">Beat sync (advanced)</summary>
+          <div class="space-y-1.5 pt-2">
+            <p class="leading-snug">The Handy takes commands from one place at a time: while EdgeLoop drives it, close ScriptPlayer, Handyverse or any other app that could, or the session pauses when one takes it over.</p>
+            <label for="handyAppIdInput" class="block text-[10px] text-slate-300 font-semibold uppercase tracking-wider">Handy Application ID</label>
+            <input id="handyAppIdInput" type="text" autocomplete="off" spellcheck="false" placeholder="Empty: EdgeLoop's own" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 font-mono text-xs outline-none focus:border-sky-500 text-slate-200">
+            <p id="handyAppIdMsg" class="leading-snug">Empty uses EdgeLoop's own ID. Only needed for a copy of EdgeLoop hosted somewhere else: register your own at user.handyfeeling.com.</p>
+          </div>
+        </details>
+
         <div class="flex gap-2 pt-1">
           <button id="modalHandyConnectBtn" class="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold py-2 px-3 rounded-lg text-xs transition cursor-pointer">
             Connect Handy
@@ -862,11 +1011,12 @@
         </div>
       </div>
 
-      <!-- 5. UNIFIED SESSION SETUP MODAL (4 Sub-Tabs: Duration, Guards, Audio & Mic, Backup) -->
+      <!-- 5. UNIFIED SESSION SETUP MODAL (5 Sub-Tabs: Duration, Guards, Script, Audio & Mic, Backup) -->
       <div id="modalBodyParams" class="space-y-3 hidden">
         <div class="flex bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-[10px] font-bold">
           <button id="paramsTabDurationBtn" class="flex-1 py-1.5 rounded-md bg-purple-600 text-white transition cursor-pointer">Duration</button>
           <button id="paramsTabGuardsBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Guards</button>
+          <button id="paramsTabScriptBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Script</button>
           <button id="paramsTabAudioBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Audio & Mic</button>
           <button id="paramsTabBackupBtn" class="flex-1 py-1.5 rounded-md text-slate-400 hover:text-white transition cursor-pointer">Backup</button>
         </div>
@@ -947,6 +1097,7 @@
 
         <!-- TAB 2: Guards -->
         <div id="paramsGuardsSection" class="space-y-2.5 hidden">
+          <p id="guardsScriptNote" class="hidden p-2 rounded-lg bg-sky-950/40 border border-sky-800 text-[10px] text-sky-200 leading-snug">Script mode is selected: <strong>At the ceiling</strong> does not apply to it. The Script tab's <strong>At the edge</strong> decides what the toy does at the mark, and the stall guard is not armed by a script.</p>
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
             <div class="flex justify-between items-center gap-2">
               <label for="ceilingBehaviourSelect" class="text-xs font-bold text-slate-200">At the ceiling</label>
@@ -1089,6 +1240,96 @@
           </div>
         </div>
 
+        <!-- TAB: Script (player/script-governor.js). How the pulse limits the
+             wearer's own funscript in Script mode. Every value goes through
+             its sanitizer in settings-schema.js and rides in the Backup. -->
+        <div id="paramsScriptSection" class="space-y-2.5 hidden">
+          <p class="text-[9px] text-slate-400 leading-snug">In Script mode the script sets the shape of every stroke and your pulse limits how much of it the toy may play. Near the edge the toy <strong>skips</strong> strokes while the video plays on, and rejoins the script on the beat when your pulse comes back down. Where the edge is still comes from your Resting / Climax HR and the Guards tab.</p>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptReactBpmInput" class="text-xs font-bold text-slate-200">Start reacting</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="scriptReactBpmInput" type="number" min="0" max="40" value="10" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-sky-300 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">BPM below the mark</span>
+              </div>
+            </div>
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptApproachSelect" class="text-[10px] font-bold text-slate-300">Approach reaction</label>
+              <select id="scriptApproachSelect" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-sky-300 font-bold outline-none">
+                <option value="shorten">Shorten</option>
+                <option value="slow">Slow</option>
+                <option value="both">Shorten &amp; slow</option>
+                <option value="none">None</option>
+              </select>
+            </div>
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptFloorInput" class="text-[10px] font-bold text-slate-300">Approach floor</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="scriptFloorInput" type="number" min="0" max="100" value="30" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-sky-300 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">%</span>
+              </div>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">Inside that band the toy backs off smoothly, down to the floor just below the mark. <strong>Shorten</strong> keeps every stroke on its beat at a smaller amplitude, anchored at the base; <strong>Slow</strong> lowers the speed limit so fast strokes reach less far; <strong>None</strong> plays the full script until the mark. Nothing is ever time-stretched, so the toy never drifts from the video. 0 BPM reacts only at the mark.</p>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptEdgeActionSelect" class="text-xs font-bold text-slate-200">At the edge</label>
+              <select id="scriptEdgeActionSelect" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-sky-300 font-bold outline-none">
+                <option value="skip">Skip strokes</option>
+                <option value="pause-video">Pause video</option>
+              </select>
+            </div>
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptRejoinInput" class="text-[10px] font-bold text-slate-300">Rejoin ramp</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="scriptRejoinInput" type="number" min="0" max="60" value="8" class="w-14 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-sky-300 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">sec</span>
+              </div>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug"><strong>Skip strokes</strong> stops the toy where its stop leaves it while the video and the script keep running; <strong>Pause video</strong> also holds the video until the edge releases (the session keeps running and every guard with it). On release the toy joins the script at the first turning point it can reach at half the speed limit, then the allowance ramps back over the rejoin ramp. A new pullback during the ramp skips again at once. PAUSE always pauses the video.</p>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptMaxSpeedInput" class="text-xs font-bold text-slate-200">Max speed</label>
+              <div class="flex items-center gap-1 font-mono">
+                <input id="scriptMaxSpeedInput" type="number" min="50" max="600" step="10" value="300" class="w-16 bg-slate-900 border border-slate-700 rounded-lg py-0.5 text-xs text-center text-sky-300 font-bold outline-none">
+                <span class="text-slate-500 text-[10px]">% of travel / s</span>
+              </div>
+            </div>
+            <p id="scriptMaxSpeedHint" class="text-[10px] font-mono text-sky-300">≈ 330 mm/s on a 110 mm Handy · ≈ 1.5 full strokes/s</p>
+            <p class="text-[9px] text-slate-400 leading-snug">A stroke faster than this is cut short (it reaches as far as it can in its time); its timing never changes. Each toy's speed cap scales it, and it never goes above what the toy can do (The Handy: its own top speed; T-Code and OSSM 600 %/s; Intiface linear toys 500 %/s).</p>
+            <div class="flex items-center justify-between gap-2 pt-1 border-t border-slate-900">
+              <label for="scriptInvertToggle" class="text-[10px] font-bold text-slate-300">Invert script</label>
+              <input id="scriptInvertToggle" type="checkbox" class="accent-sky-500 cursor-pointer">
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] font-bold text-slate-300">Smoothing</span>
+              <span class="text-[10px] font-mono text-slate-400">Light (drops jitter under 3% and points under 60 ms apart)</span>
+            </div>
+          </div>
+
+          <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-1.5">
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptSecondChannelSelect" class="text-xs font-bold text-slate-200">Second channel</label>
+              <select id="scriptSecondChannelSelect" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-sky-300 font-bold outline-none">
+                <option value="hr">Heart rate (the limiter at 60%)</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div class="flex justify-between items-center gap-2">
+              <label for="scriptVideoEndSelect" class="text-xs font-bold text-slate-200">When the video ends</label>
+              <select id="scriptVideoEndSelect" class="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-[10px] text-sky-300 font-bold outline-none">
+                <option value="stop">Stop the session</option>
+                <option value="loop">Loop</option>
+              </select>
+            </div>
+            <p class="text-[9px] text-slate-400 leading-snug">Vibrators, rotators and the VacuGlide cannot play strokes: they follow the limiter as a level. Games are off in Script mode. The script offset is set in the Player, per script.</p>
+          </div>
+        </div>
+
         <!-- TAB 3: Audio & Mic -->
         <div id="paramsAudioSection" class="space-y-2.5 hidden">
           <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
@@ -1182,7 +1423,7 @@
             <p class="text-[9px] text-slate-400 leading-snug">Exports every Session Setup value (voice-phrase lists included), your Handy channel role and speed cap, your VacuGlide channel role, speed cap and valve pulse, your saved Intiface and T-Code device maps, and the age / wizard flags. Import restores them and tells you what it put back. Session history is never included. Phrase files can also be exported on their own from the Audio &amp; Mic tab.</p>
             <label class="flex items-start gap-1.5 pt-0.5 cursor-pointer">
               <input id="exportIncludeKey" type="checkbox" class="mt-0.5 accent-rose-600 cursor-pointer">
-              <span class="text-[9px] text-slate-400 leading-snug">Include my device keys - the Handy connection key and the VacuGlide device token <span class="text-rose-400">- anyone who has the file can then control those toys</span>. Off by default; the file itself says which kind it is, and the download is named differently when a key is in it.</span>
+              <span class="text-[9px] text-slate-400 leading-snug">Include my device keys - the Handy connection key and the VacuGlide device token, and your own Handy Application ID if you set one <span class="text-rose-400">- anyone who has the file can then control those toys</span>. Off by default; the file itself says which kind it is, and the download is named differently when a key is in it.</span>
             </label>
             <p id="exportKeyNotice" role="status" aria-live="polite" class="text-[9px] leading-snug text-slate-400"></p>
             <div class="flex gap-2 pt-1">

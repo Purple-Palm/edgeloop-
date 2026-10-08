@@ -6,7 +6,7 @@
 // offline once it has been visited. Bump CACHE_VERSION when the precache list
 // changes; old caches are removed on activate.
 
-const CACHE_VERSION = 'edgeloop-v7';
+const CACHE_VERSION = 'edgeloop-v8';
 
 // Every module the page imports, directly or through another module, belongs
 // here. One import that fails fails the whole module graph, so a module
@@ -34,6 +34,10 @@ const PRECACHE = [
     './src/js/player/script-shaper.js',
     './src/js/player/script-track.js',
     './src/js/player/script-rhythm.js',
+    './src/js/player/player.js',
+    './src/js/player/player-rules.js',
+    './src/js/player/funscript-parse.js',
+    './src/js/player/script-pairing.js',
     './src/js/edge-confirm.js',
     './src/js/patterns.js',
     './src/js/session-rules.js',

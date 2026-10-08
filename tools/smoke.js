@@ -4,9 +4,11 @@
 // python http.server, walks the age gate, the setup wizard, every device modal,
 // Session Setup, Guide / History / Share, the simulator HR sweep, a full
 // session on a mocked Handy API (START / PAUSE / RESUME / STOP / Reset, with
-// the API calls asserted), the History entry it leaves and the remote viewer /
-// controller pages, and fails on any page error, console.error, failed request
-// or broken assertion. Screenshots and a JSON report land in the output
+// the API calls asserted), the History entry it leaves, the player (a 3 s
+// silent WebM and its script from tools/fixtures, in Script mode, with beat
+// sync on a mocked Handy API v3), and the remote viewer / controller pages,
+// and fails on any page error, console.error, failed request or broken
+// assertion. Screenshots and a JSON report land in the output
 // directory.
 //
 // It is the twin of the script used while developing the app, so a contributor
@@ -104,6 +106,40 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     if (p === '/connected') body = { connected: true };
     else if (p === '/info') body = { fwVersion: '3.2.3', model: 'Handy 1.1' };
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
+
+  // The Handy API v3 (beat sync over HSP) is mocked the same way, answering
+  // as the live API was seen to: results wrapped in `result`, /servertime
+  // unwrapped, the event stream with named events. CORS is answered too,
+  // since the page calls handyfeeling.com from another origin.
+  const v3Calls = [];
+  await page.route('https://www.handyfeeling.com/api/handy-rest/v3/**', async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    const p = url.pathname.replace('/api/handy-rest/v3', '');
+    const cors = {
+      'access-control-allow-origin': `http://127.0.0.1:${PORT}`,
+      'access-control-allow-credentials': 'true',
+      'access-control-allow-headers': 'x-api-key,x-connection-key,content-type',
+      'access-control-allow-methods': 'GET,PUT'
+    };
+    if (req.method() === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
+    let body = null;
+    try { body = req.postData() ? JSON.parse(req.postData()) : null; } catch (e) { body = null; }
+    const h = req.headers();
+    v3Calls.push({ at: Date.now(), method: req.method(), path: p, body, apiKey: h['x-api-key'] || url.searchParams.get('apikey') || '', key: h['x-connection-key'] || url.searchParams.get('ck') || '' });
+    const json = (b) => route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'application/json' }, body: JSON.stringify(b) });
+    if (p === '/sse') return route.fulfill({ status: 200, headers: { ...cors, 'content-type': 'text/event-stream' }, body: 'retry: 5000\nevent: device_status\ndata: {"data":{"connected":true}}\n\n' });
+    if (p === '/servertime') return json({ server_time: Date.now() });
+    if (p === '/connected') return json({ result: { connected: true } });
+    if (p === '/info') return json({ result: { fw_status: 0, fw_version: '4.0.16' } });
+    if (p === '/capabilities') return json({ result: { slider: 1 } });
+    if (p === '/settings/slider') return json({ result: { x_limit_start: 0, x_limit_stop: 110, x_max_speed: 400 } });
+    if (p === '/mode2') return json({ result: { mode: 4, mode_session_id: 1 } });
+    if (p === '/slider/state') return json({ result: { position: 0.5 } });
+    if (p === '/hsp/stop' || p === '/hsp/flush') return json({ result: { play_state: 2, points: 0, max_points: 4000 } });
+    if (p === '/hsp/pause') return json({ result: { play_state: 3, points: 0, max_points: 4000 } });
+    return json({ result: { play_state: 1, points: 10, max_points: 4000, current_time: 0 } });
   });
 
   const steps = [];
@@ -360,6 +396,97 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
       const badge = (await page.locator('#badgeHandyText').textContent() || '').trim();
       if (!/disconnected/i.test(badge)) throw new Error('expected Disconnected badge, got: ' + badge);
     } finally { await closeModal(); }
+  });
+  // The player: the fixture clip and its script (tools/fixtures), Script mode,
+  // and The Handy over a mocked API v3 with beat sync on.
+  const FIXTURE = path.join(REPO, 'tools', 'fixtures');
+  const media = () => page.evaluate(() => { const v = document.getElementById('playerVideo'); return { paused: v.paused, t: v.currentTime }; });
+  const text = async (sel) => ((await page.locator(sel).textContent()) || '').trim();
+  await step('player: the clip pairs with its script and Script mode can be selected', async () => {
+    if (!(await page.locator('[data-mode="script"]').isDisabled())) throw new Error('the Script card is enabled with no script loaded');
+    await page.locator('#playerHeaderBtn').click(); await sleep(200);
+    await page.locator('#playerFileInput').setInputFiles([path.join(FIXTURE, 'smoke-clip.webm'), path.join(FIXTURE, 'smoke-clip.funscript')]);
+    await sleep(1200);
+    const strip = await text('#playerStrip');
+    if (!/^Script loaded: 0:03, 13 actions$/.test(strip)) throw new Error('strip: ' + strip);
+    const summary = await page.locator('#playerSummary').textContent();
+    if (!/% of strokes are faster than your 300 %\/s limit/.test(summary || '')) throw new Error('no speed-limit line: ' + summary);
+    // A 3 s clip: it loops, and the warm-up is off, so the session plays the script at once.
+    await page.locator('#sessionParamsHeaderBtn').click(); await sleep(200);
+    await setRange('#warmupInput', '0');
+    await page.locator('#paramsTabScriptBtn').click(); await sleep(100);
+    await page.locator('#scriptVideoEndSelect').selectOption('loop');
+    await page.locator('#applyParamsBtn').click(); await sleep(300);
+    await page.locator('#expTabBioBtn').click(); await sleep(150);
+    await page.locator('[data-mode="script"]').click(); await sleep(300);
+    if (await page.locator('[data-mode="script"] .mode-check').isHidden()) throw new Error('Script mode did not light its card');
+    if (await page.locator('#gamesDisabledNote').isHidden()) throw new Error('the games are not marked off in Script mode');
+    await shot('13-player-loaded');
+  });
+  await step('player: beat sync over API v3 - START plays the video with a flushed add, an edge holds while the video plays, PAUSE and STOP stop', async () => {
+    const onDialog = (d) => d.accept().catch(() => {});
+    page.on('dialog', onDialog);
+    try {
+      await page.locator('#cardHandy').click(); await sleep(200);
+      await page.locator('#modalHandyInput').fill('SMOKE-KEY-0001');
+      await page.locator('#modalHandyConnectBtn').click(); await sleep(800);
+      await closeModal();
+      await page.locator('#beatSyncToggle').check(); await sleep(1500);
+      const route = await text('#beatSyncRoute');
+      if (!/^Beat sync \(HSP\)/.test(route)) throw new Error('beat sync not verified: ' + route);
+      await setRange('#modalSimHrSlider', '100'); await sleep(300);
+      v3Calls.length = 0;
+      handyCalls.length = 0;
+      await page.locator('#sessionPlayPauseBtn').click();
+      for (let i = 0; i < 40 && !((await media()).t > 0.2); i += 1) await sleep(100);
+      const playing = await media();
+      if (playing.paused || !(playing.t > 0)) throw new Error('START did not play the video: ' + JSON.stringify(playing));
+      const seq = v3Calls.map(c => c.method + ' ' + c.path);
+      for (const want of ['PUT /mode2', 'PUT /hsp/setup', 'PUT /slider/stroke', 'PUT /hsp/play']) if (!seq.includes(want)) throw new Error('START did not send ' + want + ': ' + JSON.stringify(seq));
+      const play = v3Calls.find(c => c.path === '/hsp/play');
+      if (!(play.body && play.body.add && play.body.add.flush === true && play.body.add.points.length > 0)) throw new Error('the play carries no flushed add: ' + JSON.stringify(play.body));
+      if (!v3Calls.every(c => c.path === '/servertime' || (c.apiKey && c.key === 'SMOKE-KEY-0001'))) throw new Error('a v3 call went out without both headers');
+      if (handyCalls.some(c => c.path === '/hamp/start')) throw new Error('HAMP was started under beat sync');
+      // The edge: well above the 140 BPM mark. The toy skips, the video plays on.
+      const edgeAt = Date.now();
+      await setRange('#modalSimHrSlider', '150');
+      await sleep(700);
+      const hold = v3Calls.find(c => c.at >= edgeAt && c.path === '/hsp/add' && c.body && c.body.flush === true);
+      if (!hold) throw new Error('no hold replan at the edge: ' + JSON.stringify(v3Calls.filter(c => c.at >= edgeAt).map(c => c.path)));
+      const later = hold.body.points.filter(pt => pt.t > hold.body.points[0].t + 1200).map(pt => pt.x);
+      if (later.length && new Set(later).size !== 1) throw new Error('the edge replan still strokes: ' + JSON.stringify(hold.body.points));
+      if (v3Calls.some(c => c.at >= edgeAt && c.path === '/hsp/stop')) throw new Error('a skip was sent as a stop');
+      const a = await media(); await sleep(400); const b = await media();
+      if (b.paused || a.t === b.t) throw new Error('the video did not play through the edge: ' + JSON.stringify([a, b]));
+      if (!/SKIPPING: EDGE/.test(await text('#playerPhase'))) throw new Error('phase at the edge: ' + await text('#playerPhase'));
+      await shot('14-player-edge');
+      // PAUSE: the video pauses and The Handy gets its HSP stop.
+      await setRange('#modalSimHrSlider', '100'); await sleep(300);
+      const pauseAt = Date.now();
+      await page.locator('#sessionPlayPauseBtn').click(); await sleep(800);
+      if ((await text('#playPauseText')) !== 'RESUME') throw new Error('expected RESUME after PAUSE');
+      if (!(await media()).paused) throw new Error('PAUSE left the video playing');
+      if (!v3Calls.some(c => c.at >= pauseAt && c.method === 'PUT' && c.path === '/hsp/stop')) throw new Error('PAUSE sent no PUT /hsp/stop');
+      // STOP: the video stays paused where it stands, HSP stopped again.
+      await sleep(600);
+      await page.locator('#sessionPlayPauseBtn').click(); await sleep(1200);
+      if ((await media()).paused) throw new Error('RESUME did not play the video');
+      const stopAt = Date.now();
+      await page.locator('#sessionStopBtn').click(); await sleep(800);
+      if (!/START SESSION/i.test(await text('#playPauseText'))) throw new Error('expected START SESSION after STOP');
+      if (!(await media()).paused) throw new Error('STOP left the video playing');
+      if (!v3Calls.some(c => c.at >= stopAt && c.path === '/hsp/stop')) throw new Error('STOP sent no PUT /hsp/stop');
+      await shot('15-player-stopped');
+    } finally {
+      page.off('dialog', onDialog);
+      await page.locator('#beatSyncToggle').uncheck().catch(() => {});
+      await page.getByText(/classic tease/i).first().click().catch(() => {});
+      // Disconnected before the pages below are opened, so no stop is
+      // left in flight when this page goes.
+      await page.locator('#cardHandy').click().catch(() => {}); await sleep(200);
+      await page.locator('#modalHandyDisconnectBtn').click().catch(() => {}); await sleep(800);
+      await closeModal();
+    }
   });
   await step('viewer page (?group_sub=) locks every control', async () => {
     await page.goto(`http://127.0.0.1:${PORT}/?group_sub=smokeroom`, { waitUntil: 'load', timeout: 60000 });

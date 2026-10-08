@@ -286,3 +286,65 @@ describe('the enum settings are the owner\'s own lists', () => {
         assert.ok(!/\['orgasm', 'denial'/.test(src), 'no hand-copied endgame list may remain');
     });
 });
+
+describe('the Script tab', () => {
+    const SCRIPT_FIELDS = ['scriptReactBpm', 'scriptFloorPercent', 'scriptApproach', 'scriptEdgeAction', 'scriptRejoinSeconds',
+        'scriptMaxSpeed', 'scriptInvert', 'scriptSmoothing', 'scriptSecondChannel', 'scriptVideoEnd'];
+
+    it('every Script setting is a setting with its factory default, and rides in the Backup', () => {
+        assert.deepEqual(SCRIPT_FIELDS.filter((name) => !SETTING_KEYS.includes(name)), []);
+        assert.equal(SETTING_DEFAULTS.scriptReactBpm, 10);
+        assert.equal(SETTING_DEFAULTS.scriptFloorPercent, 30);
+        assert.equal(SETTING_DEFAULTS.scriptApproach, 'shorten');
+        assert.equal(SETTING_DEFAULTS.scriptEdgeAction, 'skip');
+        assert.equal(SETTING_DEFAULTS.scriptRejoinSeconds, 8);
+        assert.equal(SETTING_DEFAULTS.scriptMaxSpeed, 300);
+        assert.equal(SETTING_DEFAULTS.scriptInvert, false);
+        assert.equal(SETTING_DEFAULTS.scriptSmoothing, 'light');
+        assert.equal(SETTING_DEFAULTS.scriptSecondChannel, 'hr');
+        assert.equal(SETTING_DEFAULTS.scriptVideoEnd, 'stop');
+    });
+
+    it('the number inputs carry the bounds their sanitizers enforce', () => {
+        const bounds = {
+            scriptReactBpmInput: ['scriptReactBpm', 0, 40],
+            scriptFloorInput: ['scriptFloorPercent', 0, 100],
+            scriptRejoinInput: ['scriptRejoinSeconds', 0, 60],
+            scriptMaxSpeedInput: ['scriptMaxSpeed', 50, 600]
+        };
+        for (const [id, [name, min, max]] of Object.entries(bounds)) {
+            const at = INDEX.indexOf(`id="${id}"`);
+            assert.ok(at >= 0, `${id} is missing`);
+            const tag = INDEX.slice(at, INDEX.indexOf('>', at));
+            assert.match(tag, new RegExp(`min="${min}"`), `${id} should carry min="${min}"`);
+            assert.match(tag, new RegExp(`max="${max}"`), `${id} should carry max="${max}"`);
+            assert.equal(sanitizeSetting(name, min), min);
+            assert.equal(sanitizeSetting(name, max), max);
+            assert.equal(sanitizeSetting(name, max + 1000), max);
+            assert.equal(sanitizeSetting(name, min - 1000), min);
+        }
+    });
+
+    it('every select offers exactly the values its sanitizer keeps', () => {
+        const selects = {
+            scriptApproachSelect: ['scriptApproach', ['shorten', 'slow', 'both', 'none']],
+            scriptEdgeActionSelect: ['scriptEdgeAction', ['skip', 'pause-video']],
+            scriptSecondChannelSelect: ['scriptSecondChannel', ['hr', 'off']],
+            scriptVideoEndSelect: ['scriptVideoEnd', ['stop', 'loop']]
+        };
+        for (const [id, [name, values]] of Object.entries(selects)) {
+            const at = INDEX.indexOf(`id="${id}"`);
+            assert.ok(at >= 0, `${id} is missing`);
+            const select = INDEX.slice(at, INDEX.indexOf('</select>', at));
+            const offered = [...select.matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]);
+            assert.deepEqual(offered, values, `${id} offers ${offered}`);
+            for (const v of values) assert.equal(sanitizeSetting(name, v), v);
+        }
+        // Crawl at the edge is not in this version: it is Skip, never a crawl.
+        assert.equal(sanitizeSetting('scriptEdgeAction', 'crawl'), 'skip');
+        // Smoothing has one option and no control.
+        assert.equal(sanitizeSetting('scriptSmoothing', 'strong'), 'light');
+        assert.equal(sanitizeSetting('scriptInvert', 'true'), true);
+        assert.equal(sanitizeSetting('scriptInvert', 'yes'), false);
+    });
+});

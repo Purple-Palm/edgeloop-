@@ -27,6 +27,18 @@ import { clampEndMargin } from './hardware/handy-protocol.js';
 import { sanitizeVacuglideRole, clampSpeedCap, clampValvePulseMs } from './hardware/vacuglide-protocol.js';
 import { clampMicGate, clampMicBoostBpm } from './voice.js';
 import { clampEncourageSeconds, mergeVoiceCues } from './voice-cues.js';
+import {
+    clampReactBpm,
+    clampFloor,
+    resolveApproach,
+    resolveEdgeAction,
+    clampRejoinSeconds,
+    clampMaxSpeed,
+    resolveInvert,
+    resolveSmoothing,
+    resolveSecondChannel,
+    resolveVideoEnd
+} from './player/script-governor.js';
 
 // Re-exported so a caller has one place to ask about setting bounds; the
 // window itself belongs to the parser that refuses a length outside it.
@@ -201,6 +213,22 @@ export const SETTING_SANITIZERS = {
     micEnabled: boolean('micEnabled'),
     micSensitivityThreshold: (value) => clampMicGate(value),
     micBoostMaxBpm: (value) => clampMicBoostBpm(value),
+
+    // The Script tab: each through the governor's own sanitizer, so the
+    // tab, the store, a file and the engine bound a value the same way.
+    // Smoothing has one option in this version (Light), so its sanitizer
+    // keeps nothing else; the edge action knows Skip strokes and Pause
+    // video, and anything else (Crawl among them) is Skip.
+    scriptReactBpm: (value) => clampReactBpm(value),
+    scriptFloorPercent: (value) => clampFloor(value),
+    scriptApproach: (value) => resolveApproach(value),
+    scriptEdgeAction: (value) => resolveEdgeAction(value),
+    scriptRejoinSeconds: (value) => clampRejoinSeconds(value),
+    scriptMaxSpeed: (value) => clampMaxSpeed(value),
+    scriptInvert: (value) => resolveInvert(value),
+    scriptSmoothing: (value) => resolveSmoothing(value),
+    scriptSecondChannel: (value) => resolveSecondChannel(value),
+    scriptVideoEnd: (value) => resolveVideoEnd(value),
 
     learningProfile: sanitizeLearningProfile
 };

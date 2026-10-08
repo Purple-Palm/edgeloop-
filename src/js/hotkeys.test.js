@@ -67,8 +67,8 @@ function* everyContext() {
 }
 
 describe('the key map', () => {
-    it('knows two keys, and what each asks for', () => {
-        assert.deepEqual(HOTKEYS, { Space: 'pause', Escape: 'closeModal' });
+    it('knows four keys, and what each asks for', () => {
+        assert.deepEqual(HOTKEYS, { Space: 'pause', Escape: 'closeModal', '[': 'offsetEarlier', ']': 'offsetLater' });
         assert.ok(Object.isFrozen(HOTKEYS));
     });
 
@@ -598,5 +598,42 @@ describe('the page', () => {
         const autoResume = bodyFrom('function resumeAfterSignalReturn(');
         assert.match(autoResume, /startOrResumeWhenReady\(\)/);
         assert.ok(!autoResume.includes('playPauseBtn'));
+    });
+});
+
+describe('[ and ] move the script offset, and nothing else', () => {
+    const KEY = (key, extra = {}) => ({ key, repeat: false, ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, ...extra });
+    const base = { target: 'other', sessionStatus: 'RUNNING', transportEnabled: true, modalOpen: false, overlay: null, offsetAvailable: true };
+
+    it('nudges earlier and later while a script is loaded, in any session state', () => {
+        for (const sessionStatus of ['IDLE', 'RUNNING', 'PAUSED', 'RAMPDOWN']) {
+            assert.deepEqual(planHotkey(readKeyEvent(KEY('[')), { ...base, sessionStatus }), { action: 'offsetEarlier', consume: true });
+            assert.deepEqual(planHotkey(readKeyEvent(KEY(']')), { ...base, sessionStatus }), { action: 'offsetLater', consume: true });
+        }
+    });
+
+    it('does nothing without a script, in a text field, under a modal or an overlay, or with a modifier', () => {
+        const none = { action: null, consume: false };
+        assert.deepEqual(planHotkey(readKeyEvent(KEY('[')), { ...base, offsetAvailable: false }), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY('[')), { ...base, target: 'text' }), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY(']')), { ...base, modalOpen: true }), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY(']')), { ...base, overlay: 'ageGate' }), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY(']')), { ...base, overlay: 'wizard' }), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY('[', { ctrlKey: true })), base), none);
+        assert.deepEqual(planHotkey(readKeyEvent(KEY('[', { repeat: true })), base), none);
+    });
+
+    it('never pauses, starts or resumes anything', () => {
+        for (const key of ['[', ']']) {
+            for (const sessionStatus of ['IDLE', 'RUNNING', 'PAUSED']) {
+                const plan = planHotkey(readKeyEvent(KEY(key)), { ...base, sessionStatus });
+                assert.notEqual(plan.action, 'pause');
+            }
+        }
+    });
+
+    it('Space still only pauses', () => {
+        assert.deepEqual(planHotkey(readKeyEvent(KEY(' ')), { ...base, sessionStatus: 'PAUSED' }), { action: null, consume: false });
+        assert.deepEqual(planHotkey(readKeyEvent(KEY(' ')), { ...base, sessionStatus: 'RUNNING' }), { action: 'pause', consume: true });
     });
 });

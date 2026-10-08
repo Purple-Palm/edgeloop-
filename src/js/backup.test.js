@@ -1548,3 +1548,50 @@ describe('app.js keeps the token where the key is kept', () => {
         assert.ok(RESTORE_PARTS.token, 'the refused part has a name the message can use');
     });
 });
+
+// The Handy Application ID override (Handy panel, advanced) is not a bearer
+// credential the way the connection key is, but usage is attributed to the
+// account that owns it: it rides with the device keys, only when the box is
+// ticked, and is never a setting.
+describe('the Handy Application ID override rides with the device keys', () => {
+    const APP_ID = 'MyOwnFork_AppId-1234~x';
+    const WITH_APP_ID = { ...STORES, handyApplicationId: APP_ID };
+
+    it('is left out unless the box is ticked', () => {
+        const plain = buildBackup(WITH_APP_ID, { now: NOW });
+        assert.equal(plain.handyApplicationIdIncluded, false);
+        assert.equal(plain.handyApplicationId, null);
+        assert.ok(!JSON.stringify(plain).includes(APP_ID), 'the default file must not contain the ID anywhere');
+        const ticked = buildBackup(WITH_APP_ID, { includeKey: true, now: NOW });
+        assert.equal(ticked.handyApplicationIdIncluded, true);
+        assert.equal(ticked.handyApplicationId, APP_ID);
+    });
+
+    it('carries only a usable ID, and none when the built-in one is in use', () => {
+        assert.equal(buildBackup({ ...STORES, handyApplicationId: 'has a space in it' }, { includeKey: true, now: NOW }).handyApplicationId, null);
+        assert.equal(buildBackup({ ...STORES, handyApplicationId: '' }, { includeKey: true, now: NOW }).handyApplicationIdIncluded, false);
+        assert.equal(buildBackup(STORES, { includeKey: true, now: NOW }).handyApplicationIdIncluded, false);
+    });
+
+    it('is read back, junk refused, and never merged into the settings', () => {
+        const read = readBackup(buildBackup(WITH_APP_ID, { includeKey: true, now: NOW }));
+        assert.equal(read.ok, true);
+        assert.equal(read.appIdPresent, true);
+        assert.equal(read.handyApplicationId, APP_ID);
+        assert.ok(!('handyApplicationId' in read.settings));
+        assert.equal(readBackup({ minHr: 70, handyApplicationId: 'a\nb' }).appIdPresent, false);
+        assert.ok(RESERVED_SETTING_KEYS.includes('handyApplicationId'));
+        assert.ok(RESERVED_SETTING_KEYS.includes('handyApplicationIdIncluded'));
+        const store = { minHr: 70, handyApplicationId: APP_ID };
+        pruneReservedKeys(store);
+        assert.equal('handyApplicationId' in store, false);
+    });
+
+    it('a file that carries only the ID is a backup, and the import says it was restored', () => {
+        const read = readBackup({ format: BACKUP_FORMAT, version: BACKUP_VERSION, settings: {}, handyApplicationId: APP_ID });
+        assert.equal(read.ok, true);
+        assert.match(describeBackupImport(read), /Handy Application ID was restored/);
+        assert.match(describeBackupImport(read, { unsaved: ['appId'] }), /Handy Application ID in this file is in use right now but was not saved/);
+        assert.doesNotMatch(describeBackupImport(readBackup({ minHr: 70 })), /Application ID/);
+    });
+});

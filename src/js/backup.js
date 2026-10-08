@@ -62,7 +62,13 @@ import {
     VALVE_PULSE_STEP_MS,
     formatPulseSeconds
 } from './hardware/vacuglide-protocol.js';
-export { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM, sanitizeDeviceToken };
+// The Handy Application ID override (Handy panel, advanced) is held to the
+// rule the HSP driver sends it by. It is not a secret the way a connection
+// key is - Handy documents an Application ID as meant for client code - but
+// usage is attributed to the account that owns it, so it is handled like
+// the device keys: carried only when the box asks for them.
+import { sanitizeApplicationId } from './hardware/handy-hsp-protocol.js';
+export { sanitizeLearningProfile, MAX_LEARNED_OFFSET_BPM, sanitizeDeviceToken, sanitizeApplicationId };
 
 export const BACKUP_FORMAT = 'edgeloop-backup';
 
@@ -148,7 +154,9 @@ export const RESERVED_SETTING_KEYS = [
     'handyConnectionKey',
     'handyConnectionKeyIncluded',
     'vacuglideDeviceToken',
-    'vacuglideDeviceTokenIncluded'
+    'vacuglideDeviceTokenIncluded',
+    'handyApplicationId',
+    'handyApplicationIdIncluded'
 ];
 
 function isPlainObject(value) {
@@ -385,6 +393,9 @@ export function buildBackup(stores = {}, options = {}) {
     const carriesKey = includeKey && key !== null;
     const token = sanitizeDeviceToken(stores.vacuglideDeviceToken);
     const carriesToken = includeKey && token !== null;
+    // The Application ID override rides with the keys, never on its own.
+    const appId = sanitizeApplicationId(stores.handyApplicationId);
+    const carriesAppId = includeKey && appId !== null;
     // Write the fields this version has and nothing else. That covers the
     // file's own field names (a build that merged a stray handyConnectionKey
     // into the settings store would otherwise export that copy of the
@@ -410,6 +421,8 @@ export function buildBackup(stores = {}, options = {}) {
         handyConnectionKey: carriesKey ? key : null,
         vacuglideDeviceTokenIncluded: carriesToken,
         vacuglideDeviceToken: carriesToken ? token : null,
+        handyApplicationIdIncluded: carriesAppId,
+        handyApplicationId: carriesAppId ? appId : null,
         settings,
         handy,
         devices: {
@@ -571,6 +584,8 @@ export function readBackup(parsed, options = {}) {
     const tokenBlank = rawToken === undefined || rawToken === null
         || (typeof rawToken === 'string' && rawToken.trim() === '');
     const tokenRejected = !tokenBlank && vacuglideDeviceToken === null;
+    // The Application ID override: only a usable one is taken.
+    const handyApplicationId = sanitizeApplicationId(parsed.handyApplicationId);
 
     // No gate: `handy`, `devices` and `flags` are never setting names, so a
     // file that carries one means it, whatever shape the rest of it is in.
@@ -601,7 +616,8 @@ export function readBackup(parsed, options = {}) {
         || flags.ageVerified
         || flags.wizardSeen
         || handyConnectionKey !== null
-        || vacuglideDeviceToken !== null;
+        || vacuglideDeviceToken !== null
+        || handyApplicationId !== null;
     if (!carriesSomething) {
         return {
             ok: false,
@@ -633,7 +649,9 @@ export function readBackup(parsed, options = {}) {
         vacuglideDeviceToken,
         tokenPresent: vacuglideDeviceToken !== null,
         tokenRejected,
-        tokenDeclaredAbsent: parsed.vacuglideDeviceTokenIncluded === false
+        tokenDeclaredAbsent: parsed.vacuglideDeviceTokenIncluded === false,
+        handyApplicationId,
+        appIdPresent: handyApplicationId !== null
     };
 }
 
@@ -645,6 +663,7 @@ export const RESTORE_PARTS = {
     settings: 'your Session Setup values',
     key: 'your Handy connection key',
     token: 'your VacuGlide device token',
+    appId: 'your Handy Application ID',
     role: 'the Handy channel role',
     cap: 'the Handy speed cap',
     intiface: 'your Intiface device maps',
@@ -880,6 +899,13 @@ export function describeBackupImport(result, context = {}) {
         lines.push(result.tokenDeclaredAbsent
             ? 'This file was exported without a VacuGlide device token, so the one saved in this browser was kept.'
             : 'This file contained no VacuGlide device token, so the one saved in this browser was kept.');
+    }
+
+    // The Application ID override, only when the file carried one.
+    if (result.appIdPresent && refused.has('appId')) {
+        lines.push('The Handy Application ID in this file is in use right now but was not saved, so this browser goes back to the one it had (or to EdgeLoop\'s own) when you reload.');
+    } else if (result.appIdPresent) {
+        lines.push('Your own Handy Application ID was restored; beat sync on The Handy uses it instead of EdgeLoop\'s.');
     }
 
     if (result.settingsUnreadable) {

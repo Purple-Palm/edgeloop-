@@ -107,10 +107,39 @@ import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, de
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
 import { createHandyHsp } from './hardware/handy-hsp.js';
-import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, describeHspStartRefusal, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
+import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, sanitizeApplicationId, describeHspStartRefusal, describeHandyRoute, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
 import { createScriptFeed } from './player/script-feed.js';
 import { rhythmAt, hampTarget } from './player/script-rhythm.js';
-import { effectiveInvert } from './player/script-shaper.js';
+import { effectiveInvert, percentToMmPerSecond, HANDY_DEFAULT_TRAVEL_MM } from './player/script-shaper.js';
+import {
+    DEFAULT_SCRIPT_SETTINGS,
+    sanitizeScriptSettings,
+    scriptCeilingBehaviour,
+    edgeActionPausesVideo,
+    describeScriptPhase,
+    clampScriptOffset
+} from './player/script-governor.js';
+import { createPlayer } from './player/player.js';
+import {
+    SCRIPT_OFFSETS_STORAGE_KEY,
+    BEAT_SYNC_CONSENT_KEY,
+    BEAT_SYNC_STORAGE_KEY,
+    OFFSET_NUDGE_MS,
+    BEAT_SYNC_CONSENT_TEXT,
+    GAMES_DISABLED_LINE,
+    describePlayerStrip,
+    describeScriptSummary,
+    scriptWaitingReason,
+    videoCoupled,
+    hiddenSilentPause,
+    describeHiddenSilent,
+    describeVideoStall,
+    describeVideoPlayRefused,
+    describeToyNotes,
+    readOffsets,
+    offsetFor,
+    rememberOffset
+} from './player/player-rules.js';
 import { createStartGate } from './start-gate.js';
 import {
     connectVacuglide,
@@ -520,6 +549,20 @@ let lastDispatched = { primary: 0, secondary: 0, strokeMin: 0, strokeMax: 100 };
 // 'idle'), shown under the button for as long as that reason holds.
 let orgasmRefusalShown = '';
 
+// The player (player/player.js, wired further down). Declared here because
+// the banner, the transport and the readiness check, which run from the
+// start, all ask it; `playerWired` stays false until it exists.
+let player = null;
+let playerWired = false;
+// The script the player loaded ({ track, meta, hash, stats, dropped }), or
+// null. Nothing of it is stored but the hash (offsets, History).
+let loadedScript = null;
+let scriptRefusal = '';
+let lastScriptPhase = '';
+let playerNoticeTimer = null;
+// What the last beat sync check of The Handy found (handy-hsp.js verify).
+let beatSyncCheck = { state: 'idle', reason: '', rtdP95: null };
+
 // Age Verification Handlers
 const ageOverlay = document.getElementById('ageOverlay');
 if (safeGet('edgeloop_age_verified') === 'true' && ageOverlay) {
@@ -621,6 +664,8 @@ function renderAlertBanner() {
     if (!banner) return;
     if (bannerState.visible) banner.classList.remove('hidden');
     else banner.classList.add('hidden');
+    // The HUD carries the banner's words over a theater or fullscreen video.
+    renderPlayerLive();
 }
 
 // `motorsPaused` ends the report with "Motors paused for safety." until the
@@ -736,6 +781,7 @@ function renderTransport(status) {
         playPauseBtn.className = "flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-3 rounded-xl text-xs sm:text-sm transition tracking-wide flex justify-center items-center gap-1.5 shadow-lg shadow-emerald-950/40 cursor-pointer";
     }
     renderTransportKeyHint(status);
+    renderPlayerControls();
 }
 
 // Grey out the transport with a reason while the hardware is not ready.
@@ -872,12 +918,16 @@ function transportWaitingReason(now = Date.now()) {
     if (!hrReady && !toyReady) return "WAITING FOR HR SENSOR & TOY";
     if (!hrReady) return "WAITING FOR HR SENSOR";
     if (!toyReady) return "WAITING FOR TOY CONNECTION";
+    // Script mode: a valid script and a video that can show a frame.
+    const scriptReason = currentScriptWaitingReason();
+    if (scriptReason) return scriptReason;
     if (state.sessionStatus === 'PAUSED' && state.hrSignalPaused) return "WAITING FOR PULSE";
     if (!pulseIsFresh(now)) return "WAITING FOR PULSE";
     return null;
 }
 
 function checkReadiness() {
+    renderPlayerControls();
     if (!playPauseBtn) return;
 
     const active = state.sessionStatus === 'RUNNING' || state.sessionStatus === 'PAUSED' || state.sessionStatus === 'RAMPDOWN';
@@ -1304,8 +1354,13 @@ function updateEngine() {
         ruinSpent: state.ruinSpent,
         oracleState: state.oracleState,
         survivalSpeedFloor: state.survivalSpeedFloor,
-        trainingState: state.trainState
+        trainingState: state.trainState,
+        // Script mode: the Script tab, and the second the edge flag last
+        // cleared (the rejoin ramp), carried here like the edge flag.
+        scriptSettings: scriptSettingsNow(),
+        scriptReleasedAt: state.scriptReleasedAt
     });
+    if (Object.prototype.hasOwnProperty.call(result, 'scriptReleasedAt')) state.scriptReleasedAt = result.scriptReleasedAt;
 
     // A new edge, and only a new edge, earns Ruin & Leak another ride. The
     // ride is part of the pullback, so it starts with the flag, on the first
@@ -1402,6 +1457,13 @@ function updateEngine() {
     updateWarmupBadge();
     updateGameNotice(ceiling);
     renderForceOrgasmButton();
+
+    // The allowance, for the drivers that do not take it through dispatch,
+    // and the video held or let go at an edge (edge action Pause video).
+    scriptFeed?.setAllowance(result.primaryPercent);
+    followEdgeWithVideo(result);
+    renderPlayerLive(result);
+    renderPlayerControls();
 
     dispatchHardware(result.primaryPercent, result.secondaryPercent, result.strokeMinPercent, result.strokeMaxPercent);
 }
@@ -1506,6 +1568,570 @@ function handyRhythmTarget(primarySpeed, range) {
     });
 }
 
+// ---- The player (player/player.js) -----------------------------------------
+//
+// The wearer's own video and .funscript. The player section holds the files
+// and the video; this page holds the session. In Script mode with a script
+// loaded the video follows the transport (player-rules.videoCoupled): START
+// and RESUME play it, PAUSE, STOP and Reset pause it where it stands, and
+// whatever the video does by its own controls - a media key, iOS's native
+// fullscreen, a headset browser's bar - is a request to the transport: a
+// pause is always taken, a play goes through the START / RESUME gate. In any
+// other mode it is a plain player and the script drives nothing.
+
+// The Script tab's settings as the engine and the feed take them.
+function scriptSettingsNow() {
+    return sanitizeScriptSettings(advancedSettings);
+}
+
+function scriptLoaded() {
+    return Boolean(scriptFeed && scriptFeed.hasTrack());
+}
+
+// The video follows the session transport: Script mode, a script loaded.
+function scriptCoupled() {
+    return playerWired && Boolean(player) && videoCoupled({ activeMode: state.activeMode, hasTrack: scriptLoaded() });
+}
+
+// Why START / RESUME waits in Script mode (a valid script, a video that can
+// show a frame), or null.
+function currentScriptWaitingReason() {
+    if (isRemotePage || !playerWired || !player) return null;
+    return scriptWaitingReason({
+        activeMode: state.activeMode,
+        hasTrack: scriptLoaded(),
+        hasVideo: player.hasVideo(),
+        videoReady: player.videoReady(),
+        videoError: Boolean(player.videoError())
+    });
+}
+
+// "At the ceiling" as the stall guard reads it: in Script mode the Script
+// tab's edge action replaces it (Skip and Pause video are both a stop at
+// the mark, so a script never arms the guard in this version).
+function effectiveCeilingBehaviour() {
+    return state.activeMode === 'script'
+        ? scriptCeilingBehaviour(advancedSettings.scriptEdgeAction)
+        : advancedSettings.ceilingBehaviour;
+}
+
+// The feed drives while Script mode is selected and a script is loaded -
+// tied to the mode and the track only, never to the session state: the
+// allowance the engine dispatches is what stops and starts the toys.
+function syncScriptMode() {
+    if (!scriptFeed) return;
+    scriptFeed.setSettings(scriptSettingsNow());
+    scriptFeed.setActive(state.activeMode === 'script' && scriptFeed.hasTrack());
+    player?.setLoop(advancedSettings.scriptVideoEnd === 'loop');
+}
+
+// Play the video for a session that runs. A video that will not start
+// leaves nothing for the script to follow, and a session running on no
+// clock is a session nobody can see: it is paused, and says why.
+function playVideoForSession() {
+    if (!player) return;
+    player.play().then((result) => {
+        if (result.ok) return;
+        if (!scriptCoupled() || !sessionDriving() || player.isPlaying()) return;
+        triggerDisconnectAlert(describeVideoPlayRefused(result.reason), 'video');
+    });
+}
+
+// The video where the session wants it: playing while it drives, paused
+// otherwise (a pause the governor holds for an edge stays held). Only in
+// Script mode; anywhere else the video is the wearer's to play.
+function syncVideoToSession() {
+    if (!scriptCoupled()) return;
+    if (sessionDriving()) {
+        if (!player.isPlaying() && !player.edgeHeld()) playVideoForSession();
+    } else {
+        player.pause();
+    }
+}
+
+// A forced stop pauses the video once the session no longer drives; a
+// forced stop the session sends before it changes its state (the watchdog)
+// leaves the video to the pause that follows. It never starts it.
+function pauseVideoWithToys() {
+    if (scriptCoupled() && !sessionDriving()) player.pause();
+}
+
+// Edge action Pause video: the governor holds the video while the edge is
+// up and lets it go at the release. The session stays RUNNING and every
+// guard keeps running. Force Orgasm and the Soft Landing play through it.
+function followEdgeWithVideo(result) {
+    if (!player || !scriptCoupled()) return;
+    const holds = state.sessionStatus === 'RUNNING'
+        && edgeActionPausesVideo(advancedSettings.scriptEdgeAction)
+        && result.isEdged === true
+        && !state.orgasmMode;
+    if (holds) {
+        if (player.isPlaying()) player.holdForEdge();
+    } else if (player.edgeHeld() && sessionDriving()) {
+        player.releaseEdge().then((r) => {
+            if (!r.ok && sessionDriving() && scriptCoupled() && !player.isPlaying()) {
+                triggerDisconnectAlert(describeVideoPlayRefused(r.reason), 'video');
+            }
+        });
+    }
+}
+
+// The per-script offsets (player-rules.js): this browser only, keyed by the
+// script's hash, never in the Backup.
+function storedScriptOffsets() {
+    return readOffsets(safeParse(SCRIPT_OFFSETS_STORAGE_KEY, {}), { clamp: clampScriptOffset });
+}
+
+function rememberScriptOffset(ms) {
+    if (!loadedScript || !loadedScript.hash) return;
+    safeSet(SCRIPT_OFFSETS_STORAGE_KEY, rememberOffset(storedScriptOffsets(), loadedScript.hash, ms, Date.now()));
+}
+
+// A START or RESUME asked for by the video's own controls (the player has
+// already paused it again). It presses the transport's own button, so it
+// goes through every lock and gate a press there does - the hold on a
+// RESUME that has only just appeared among them - and a greyed-out button
+// says why instead.
+function startFromVideo() {
+    if (isRemotePage || !playPauseBtn) return;
+    const reason = transportWaitingReason();
+    if (reason || playPauseBtn.disabled) {
+        withdrawStartRefusal();
+        showAlertBanner(`The video was not started: ${String(reason || playPauseBtn.textContent || '').trim().toLowerCase()}.`, { severity: 'advisory', source: 'handyCheck' });
+        checkReadiness();
+        return;
+    }
+    if (state.sessionStatus === 'IDLE' || state.sessionStatus === 'PAUSED') playPauseBtn.click();
+}
+
+function pauseFromVideo() {
+    if (pauseSession('Paused.')) {
+        checkReadiness();
+        syncTelemetry();
+        updateEngine();
+    }
+}
+
+if (!isRemotePage && scriptFeed) {
+    // A driver that threw while following the script has stopped its axis;
+    // the session pauses with the reason, like any device's safety report.
+    scriptFeed.onError((error, source) => {
+        console.error(`Script feed error (${source})`, error);
+        triggerDisconnectAlert('A toy that follows the script stopped with an error, so every toy was stopped and the session paused. Press RESUME to carry on.', 'scriptFeed');
+    });
+    const byId = (id) => document.getElementById(id);
+    player = createPlayer({
+        feed: scriptFeed,
+        els: {
+            video: byId('playerVideo'),
+            stage: byId('playerStage'),
+            hud: byId('playerHud'),
+            hudHr: byId('hudHr'),
+            hudMark: byId('hudMark'),
+            hudPhase: byId('hudPhase'),
+            hudEdges: byId('hudEdges'),
+            hudTimer: byId('hudTimer'),
+            hudNotice: byId('hudNotice'),
+            hudBar: byId('hudBar'),
+            hudPause: byId('hudPauseBtn'),
+            hudStop: byId('hudStopBtn'),
+            fileInput: byId('playerFileInput'),
+            chooseBtn: byId('playerChooseBtn'),
+            clearBtn: byId('playerClearBtn'),
+            dropZone: byId('playerDrop'),
+            packRow: byId('playerPackRow'),
+            packSelect: byId('playerPackSelect'),
+            pairList: byId('playerPairList'),
+            error: byId('playerError'),
+            playBtn: byId('playerPlayBtn'),
+            muteBtn: byId('playerMuteBtn'),
+            seek: byId('playerSeek'),
+            time: byId('playerTime'),
+            offsetMinus: byId('playerOffsetMinus'),
+            offsetPlus: byId('playerOffsetPlus'),
+            offsetValue: byId('playerOffsetValue'),
+            theaterBtn: byId('playerTheaterBtn'),
+            fullscreenBtn: byId('playerFullscreenBtn')
+        },
+        handlers: {
+            transport: () => ({ coupled: scriptCoupled(), sessionStatus: state.sessionStatus }),
+            // The files are what a Script-mode session plays: they change
+            // only while it is stopped.
+            canChangeFiles: () => (scriptCoupled() && sessionIsLive()
+                ? 'Press STOP before changing the files: the session in Script mode plays these.'
+                : null),
+            onScript: (script) => {
+                loadedScript = script;
+                scriptRefusal = '';
+                scriptFeed.setTrack(script.track, script.meta);
+                player?.setOffset(offsetFor(storedScriptOffsets(), script.hash));
+                syncScriptMode();
+                renderPlayerPanel();
+                checkReadiness();
+            },
+            onScriptCleared: ({ refused = '' } = {}) => {
+                loadedScript = null;
+                scriptRefusal = refused || '';
+                scriptFeed.setTrack(null);
+                player?.setOffset(0);
+                syncScriptMode();
+                renderPlayerPanel();
+                checkReadiness();
+            },
+            onVideo: () => {
+                renderPlayerPanel();
+                checkReadiness();
+            },
+            onReadiness: () => {
+                renderScriptCard();
+                checkReadiness();
+            },
+            onPanel: () => renderPlayerPanel(),
+            onPlayRequest: startFromVideo,
+            onPauseRequest: pauseFromVideo,
+            onEnded: () => {
+                // The video's own end: the session ends with it (the Script
+                // tab's "When the video ends: Loop" never gets here).
+                if (sessionIsLive()) stopSession('Video ended');
+            },
+            onStall: (seconds) => {
+                if (scriptCoupled() && sessionDriving()) triggerDisconnectAlert(describeVideoStall(seconds), 'video');
+            },
+            onMediaError: (message) => {
+                if (scriptCoupled() && sessionIsLive()) triggerDisconnectAlert(`${message} Every toy was stopped and the session paused.`, 'video');
+                else showAlertBanner(message, { severity: 'advisory', source: 'video' });
+                checkReadiness();
+            },
+            onOffset: (ms) => rememberScriptOffset(ms),
+            onHudPause: () => {
+                if (sessionDriving()) playPauseBtn?.click();
+            },
+            onHudStop: () => stopBtn?.click(),
+            onPlayButton: ({ playing }) => {
+                if (scriptCoupled()) {
+                    // The transport's own button, with every lock it has.
+                    if (playPauseBtn && playPauseBtn.disabled) {
+                        setPlayerNotice(`Not started: ${String(playPauseBtn.textContent || '').trim().toLowerCase()}.`);
+                        return;
+                    }
+                    playPauseBtn?.click();
+                } else if (playing) {
+                    player.pause();
+                } else {
+                    player.play();
+                }
+            },
+            onNotice: (text) => setPlayerNotice(text)
+        }
+    });
+}
+
+function setPlayerNotice(text) {
+    const el = document.getElementById('playerNotice');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
+    clearTimeout(playerNoticeTimer);
+    if (text) playerNoticeTimer = setTimeout(() => setPlayerNotice(''), 6000);
+}
+
+// The section opens and closes from the header's Player button and its own
+// strip; closed it is one line.
+function setPlayerOpen(open) {
+    const body = document.getElementById('playerBody');
+    if (!body) return;
+    body.classList.toggle('hidden', !open);
+    document.getElementById('playerToggleBtn')?.setAttribute('aria-expanded', open ? 'true' : 'false');
+    document.getElementById('playerHeaderBtn')?.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function togglePlayer() {
+    const body = document.getElementById('playerBody');
+    const open = Boolean(body && body.classList.contains('hidden'));
+    setPlayerOpen(open);
+    if (open) document.getElementById('playerSection')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+playerWired = true;
+
+if (isRemotePage) {
+    // The files and the video exist only on the wearer's device.
+    document.getElementById('playerSection')?.classList.add('hidden');
+    document.getElementById('playerHeaderBtn')?.classList.add('hidden');
+} else {
+    document.getElementById('playerHeaderBtn')?.addEventListener('click', togglePlayer);
+    document.getElementById('playerToggleBtn')?.addEventListener('click', togglePlayer);
+}
+
+// The Script card is enabled while a valid script is loaded, and never on a
+// remote page: the files are on the wearer's device.
+function renderScriptCard() {
+    if (!playerWired) return;
+    const card = document.getElementById('scriptModeCard');
+    if (!card) return;
+    const usable = !isRemotePage && scriptLoaded();
+    card.disabled = !usable;
+    card.classList.toggle('opacity-50', !usable);
+    card.classList.toggle('cursor-not-allowed', !usable);
+    const line = document.getElementById('scriptCardLine');
+    if (line) {
+        line.textContent = isRemotePage
+            ? 'Plays the wearer\'s own video and script. Only the wearer can select it.'
+            : usable
+                ? 'Your script is the stroke shape, your pulse the limiter: near the edge it skips strokes while the video plays on.'
+                : 'Load a video and its .funscript in the Player first.';
+    }
+}
+
+// Games run their own speeds: off while Script mode is the active mode.
+function renderGamesForScript() {
+    const scriptOn = state.activeMode === 'script';
+    const note = document.getElementById('gamesDisabledNote');
+    if (note) {
+        note.textContent = GAMES_DISABLED_LINE;
+        note.classList.toggle('hidden', !scriptOn);
+    }
+    document.getElementById('guardsScriptNote')?.classList.toggle('hidden', !scriptOn);
+}
+
+// The beat sync switch: off by default; asks once per browser before it
+// first goes on (BEAT_SYNC_CONSENT_TEXT says what leaves the device). The
+// route line says what The Handy really does.
+function verifyBeatSync() {
+    if (!handyHsp || !handyHsp.beatSync() || !handyConnected) {
+        beatSyncCheck = { state: 'idle', reason: '', rtdP95: null };
+        renderPlayerControls();
+        return;
+    }
+    beatSyncCheck = { state: 'checking', reason: '', rtdP95: null };
+    renderPlayerControls();
+    handyHsp.verify().then((v) => {
+        beatSyncCheck = v.ok
+            ? { state: 'ok', reason: '', rtdP95: v.rtdP95 }
+            : { state: 'refused', reason: v.reason || 'it could not be checked', rtdP95: null };
+    }, () => {
+        beatSyncCheck = { state: 'refused', reason: 'it could not be checked', rtdP95: null };
+    }).finally(renderPlayerControls);
+}
+
+function setBeatSync(on) {
+    if (!handyHsp) return;
+    handyHsp.setBeatSync(on);
+    safeSet(BEAT_SYNC_STORAGE_KEY, on ? 'on' : 'off');
+    const toggle = document.getElementById('beatSyncToggle');
+    if (toggle) toggle.checked = Boolean(on);
+    if (on) verifyBeatSync();
+    else {
+        beatSyncCheck = { state: 'idle', reason: '', rtdP95: null };
+        // Beat sync hands The Handy back to HAMP once nothing runs on it;
+        // a running session keeps its route until it is paused or stopped.
+        if (!sessionDriving() && (handyHsp.owns() || handyHspReleasing)) releaseHandyHsp();
+    }
+    renderPlayerControls();
+}
+
+function handyRouteLine() {
+    if (!handyHsp) return '';
+    if (!handyConnected) return handyHsp.beatSync() ? 'Connect The Handy to check beat sync.' : '';
+    if (state.handyRole !== 'primary') return 'The Handy is not on the primary channel: it follows the limiter as a level.';
+    const status = handyHsp.status();
+    if (handyHsp.owns() || status.playing) return describeHandyRoute({ route: 'hsp', rtdP95: status.rtdP95 });
+    if (!handyHsp.beatSync()) return describeHandyRoute({ route: 'rhythm', reason: 'Beat sync is off' });
+    if (beatSyncCheck.state === 'checking') return 'Checking beat sync on The Handy...';
+    if (beatSyncCheck.state === 'refused') return describeHandyRoute({ route: 'rhythm', reason: beatSyncCheck.reason });
+    if (beatSyncCheck.state === 'ok') return describeHandyRoute({ route: 'hsp', rtdP95: beatSyncCheck.rtdP95 });
+    return describeHandyRoute({ route: 'rhythm', reason: 'beat sync is checked when The Handy connects' });
+}
+
+// The parts of the panel that follow the session and the toys: the beat
+// sync switch (changed only while nothing runs), the route line, the notes
+// on what each toy does, the Script card.
+function renderPlayerControls() {
+    if (isRemotePage || !playerWired) return;
+    const toggle = document.getElementById('beatSyncToggle');
+    if (toggle && handyHsp) {
+        toggle.checked = handyHsp.beatSync();
+        toggle.disabled = sessionDriving();
+        toggle.title = sessionDriving() ? 'Pause or stop the session to switch beat sync.' : '';
+    }
+    const route = handyRouteLine();
+    const routeEl = document.getElementById('beatSyncRoute');
+    if (routeEl && routeEl.textContent !== route) routeEl.textContent = route;
+    const intifaceAxes = Array.from(intifaceDevices.values()).flatMap((d) => d.axes || []);
+    const notes = describeToyNotes({
+        handy: handyConnected,
+        handyRole: state.handyRole,
+        handyRoute: state.handyRole === 'primary' ? route : '',
+        intifaceLinear: isIntifaceConnected() ? intifaceAxes.filter((a) => a.kind === 'linear' && a.role === 'primary').length : 0,
+        intifaceOther: isIntifaceConnected() ? intifaceAxes.filter((a) => !(a.kind === 'linear' && a.role === 'primary') && a.role !== 'off').length : 0,
+        tcode: isTCodeConnected() && tcodeHasRole('primary'),
+        vacuglide: isVacuglideConnected()
+    });
+    const list = document.getElementById('playerToyNotes');
+    if (list) {
+        const text = notes.join('\n');
+        if (list.dataset.text !== text) {
+            list.dataset.text = text;
+            list.replaceChildren(...notes.map((line) => {
+                const li = document.createElement('li');
+                li.textContent = line;
+                return li;
+            }));
+        }
+    }
+    renderScriptCard();
+}
+
+// The script's own lines: the strip, the summary, what the speed limit caps.
+function renderPlayerPanel() {
+    if (isRemotePage || !playerWired || !player) return;
+    const meta = loadedScript ? loadedScript.meta : null;
+    const strip = document.getElementById('playerStrip');
+    if (strip) strip.textContent = describePlayerStrip({ meta, hasVideo: player.hasVideo(), refused: Boolean(scriptRefusal) });
+    const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+    const lines = loadedScript
+        ? describeScriptSummary({
+            meta,
+            stats: loadedScript.stats,
+            maxSpeed: scriptSettingsNow().scriptMaxSpeed,
+            span: env.max - env.min,
+            dropped: loadedScript.dropped
+        })
+        : [];
+    const list = document.getElementById('playerSummary');
+    if (list) {
+        list.replaceChildren(...lines.map((line) => {
+            const li = document.createElement('li');
+            li.textContent = line;
+            return li;
+        }));
+    }
+    renderPlayerControls();
+}
+
+// The live readouts: the phase on the strip and in the panel, and the HUD.
+function scriptPhaseText(result) {
+    if (state.activeMode !== 'script') return '';
+    if (state.sessionStatus === 'PAUSED') return 'PAUSED';
+    if (state.sessionStatus === 'IDLE') return 'IDLE';
+    const text = describeScriptPhase(result && result.script);
+    return player && player.edgeHeld() ? `${text} (VIDEO HELD)` : text;
+}
+
+function renderPlayerLive(result = null) {
+    if (isRemotePage || !playerWired || !player) return;
+    if (result) lastScriptPhase = scriptPhaseText(result);
+    else if (state.activeMode !== 'script') lastScriptPhase = '';
+    const phase = lastScriptPhase;
+    const phaseEl = document.getElementById('playerPhase');
+    if (phaseEl && phaseEl.textContent !== (phase || 'NOT IN SCRIPT MODE')) phaseEl.textContent = phase || 'NOT IN SCRIPT MODE';
+    const chip = document.getElementById('playerStripPhase');
+    if (chip) {
+        if (chip.textContent !== phase) chip.textContent = phase;
+        chip.classList.toggle('hidden', !phase);
+    }
+    player.renderHud({
+        hr: Number.isFinite(state.sensorHr) ? String(Math.round(state.sensorHr)) : '--',
+        mark: Number.isFinite(state.edgeTriggerHr) ? String(state.edgeTriggerHr) : '--',
+        phase: phase || state.sessionStatus,
+        edges: String(state.edges || 0),
+        timer: document.getElementById('sessionTimer')?.textContent || '00:00',
+        allowance: state.activeMode === 'script' ? state.strokerSpeed : 0,
+        notice: bannerState.visible ? bannerState.text : ''
+    });
+}
+
+// The hidden-and-silent rule (spec 5.2): a hidden page keeps full-rate
+// timers only while it is heard, so a Script-mode session on a hidden page
+// with a silent video is paused rather than left to a throttled clock.
+function pauseIfHiddenAndSilent() {
+    if (isRemotePage || !playerWired || !player) return false;
+    const pause = hiddenSilentPause({
+        hidden: document.visibilityState === 'hidden',
+        coupled: scriptCoupled(),
+        sessionStatus: state.sessionStatus,
+        audible: player.audible()
+    });
+    if (!pause) return false;
+    triggerDisconnectAlert(describeHiddenSilent(), 'video');
+    return true;
+}
+
+// The Handy Application ID override (Handy panel, advanced). Empty is
+// EdgeLoop's own; a usable one is kept under its own key, which a Backup
+// carries only with the device keys. It cannot change while beat sync owns
+// the device: that session was set up under the ID it has.
+function paintHandyAppId(message = '') {
+    const input = document.getElementById('handyAppIdInput');
+    const saved = sanitizeApplicationId(safeGet(HANDY_APP_ID_STORAGE_KEY, '') || '') || '';
+    if (input && document.activeElement !== input) input.value = saved;
+    const msg = document.getElementById('handyAppIdMsg');
+    if (msg) {
+        msg.textContent = message || (saved
+            ? 'Beat sync uses your own Application ID. Empty the field to use EdgeLoop\'s again.'
+            : 'Empty uses EdgeLoop\'s own ID. Only needed for a copy of EdgeLoop hosted somewhere else: register your own at user.handyfeeling.com.');
+    }
+}
+
+function applyHandyAppIdInput() {
+    const input = document.getElementById('handyAppIdInput');
+    if (!input) return;
+    const typed = input.value.trim();
+    const saved = sanitizeApplicationId(safeGet(HANDY_APP_ID_STORAGE_KEY, '') || '') || '';
+    if (typed === saved) {
+        paintHandyAppId();
+        return;
+    }
+    if (handyHsp && (handyHsp.owns() || handyHspReleasing)) {
+        input.value = saved;
+        paintHandyAppId('Stop the session first: beat sync is using the ID it was set up with.');
+        return;
+    }
+    if (!typed) {
+        safeRemove(HANDY_APP_ID_STORAGE_KEY);
+    } else {
+        const id = sanitizeApplicationId(typed);
+        if (!id) {
+            paintHandyAppId('That is not an Application ID (8-128 letters, digits, and . _ ~ -). Nothing was saved.');
+            return;
+        }
+        safeSet(HANDY_APP_ID_STORAGE_KEY, id);
+    }
+    paintHandyAppId();
+    verifyBeatSync();
+}
+
+function initPlayerSettings() {
+    if (isRemotePage) {
+        renderScriptCard();
+        return;
+    }
+    const appId = document.getElementById('handyAppIdInput');
+    appId?.addEventListener('change', applyHandyAppIdInput);
+    appId?.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyHandyAppIdInput(); });
+    paintHandyAppId();
+    const toggle = document.getElementById('beatSyncToggle');
+    toggle?.addEventListener('change', () => {
+        if (!handyHsp) return;
+        if (toggle.checked && safeGet(BEAT_SYNC_CONSENT_KEY, '') !== 'yes') {
+            // The one-time question: what leaves the device, and to whom.
+            if (!window.confirm(BEAT_SYNC_CONSENT_TEXT)) {
+                toggle.checked = false;
+                return;
+            }
+            safeSet(BEAT_SYNC_CONSENT_KEY, 'yes');
+        }
+        setBeatSync(toggle.checked);
+    });
+    // Beat sync stays as the wearer left it in this browser, once they
+    // have agreed to it here.
+    if (handyHsp && safeGet(BEAT_SYNC_CONSENT_KEY, '') === 'yes' && safeGet(BEAT_SYNC_STORAGE_KEY, '') === 'on') handyHsp.setBeatSync(true);
+    syncScriptMode();
+    renderPlayerPanel();
+    renderGamesForScript();
+    setPlayerOpen(false);
+}
+
 // What a live session is driving right now, for its crash-recovery marker.
 // Called before every dispatch, and whenever a toy joins mid-session: a role
 // change or a Test press can move an Intiface or T-Code axis before the
@@ -1568,6 +2194,11 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // moving primary to 0, or a guard or Force Orgasm's time limit made it:
     // every toy takes it now - The Handy past its velocity throttle, a
     // stroker on the leg in flight - whichever channel it follows.
+    // A forced stop (PAUSE, STOP, Reset, the watchdog, a guard, the page
+    // going away) stops the video too, whoever asked for it, and even when
+    // the tick already sent its stop: in Script mode nothing may play on
+    // once the toys have been told to stop. It never plays it.
+    if (force) pauseVideoWithToys();
     const release = tickDispatch.admit([primarySpeed, secondarySpeed, strokeMin, strokeMax], { force, urgent });
     if (!release) return;
     // And not before the marker naming the toy is on disk. localStorage
@@ -1883,6 +2514,7 @@ function resetSessionCounters() {
     state.rampdownSecondsLeft = 45;
     state.landingAfterForceOrgasm = false;
     state.landingFrom = null;
+    state.scriptReleasedAt = null;
     state.resumeStatus = null;
     state.durationFallback = false;
     state.endgameFired = false;
@@ -1984,7 +2616,9 @@ function tickSessionGuardsAndGames() {
             isEdged: state.isEdged,
             orgasmMode: state.orgasmMode,
             stallGuard: Boolean(advancedSettings.stallGuard),
-            ceilingBehaviour: advancedSettings.ceilingBehaviour,
+            // In Script mode the Script tab's edge action stands in for
+            // "At the ceiling".
+            ceilingBehaviour: effectiveCeilingBehaviour(),
             holdTimeoutSeconds: advancedSettings.stallGuardSeconds,
             pauseTimeoutSeconds: advancedSettings.stallPauseSeconds
         }
@@ -2420,6 +3054,8 @@ function masterClockTick() {
     // the last one pauses the session instead of counting a second.
     const now = Date.now();
     haltIfUnsupervised(now);
+    // A video that fell silent on a hidden page (it paused, or was muted).
+    if (document.visibilityState === 'hidden') pauseIfHiddenAndSilent();
     supervisionClock.beat(now, { hidden: document.visibilityState === 'hidden' });
 
     // The simulator's slider IS the pulse for as long as it is engaged, and a
@@ -2613,8 +3249,12 @@ function startOrResumeSession() {
     hideAlertBanner('supervision');
     hideAlertBanner('vacuglidePaused');
     // What beat sync paused for (the device's button, another app, heat, a
-    // starving buffer) is over once the wearer carries on.
+    // starving buffer) is over once the wearer carries on, and so is what
+    // the video or a script toy paused for: the gate has just checked that
+    // the video can play.
     hideAlertBanner('handyHsp');
+    hideAlertBanner('video');
+    hideAlertBanner('scriptFeed');
     // And no report may go on saying "Motors paused for safety." over motors
     // that run. The rest of a report can still be true: an Intiface or
     // T-Code device that was lost, or a Handy lost while reconnecting, is
@@ -2657,6 +3297,9 @@ function startOrResumeSession() {
         // Handy moving, and the wearer carries on here next to it: the pass
         // a session start runs (crash-recovery.js).
         crashRecovery?.sessionResumed();
+        // Script mode rejoins after a pause through the rejoin ramp, as
+        // after an edge (spec 1.5, "ramp included").
+        if (state.activeMode === 'script') state.scriptReleasedAt = state.sessionSeconds;
     }
     // The wearer carries on: a Came Early or Finished me press the Handy
     // turned away is not what the next press is about any more.
@@ -2679,6 +3322,8 @@ function startOrResumeSession() {
     renderTransport(state.sessionStatus);
     syncScreenWakeLock();
     renderForceOrgasmButton();
+    // In Script mode the video plays from where it stands.
+    syncVideoToSession();
     return true;
 }
 
@@ -3393,7 +4038,8 @@ const MODE_DETAILS = {
     ruin: 'The stroker keeps moving through the edge, once. After about 12 seconds on the mark it stops dead and the other toy drops low, so it can leak without a full orgasm. The stop lasts at least 18 seconds, and until the edge releases 5 BPM below the mark; only the next edge rides again. "At the ceiling" does not govern the ride or that stop.',
     oracle: 'Pulls you up and holds the edge, then decides how the session ends. Climax and denial wait for your Mystery minimum. The stroke range is the tease mode you selected.',
     survival: 'Each edge raises your max by 1 BPM and the speed a little. The climb takes about half an hour to get hard, and "At the ceiling" does not stop the toys or end the run. Check Calibration when this run should set your Climax HR, then tap Finished me when you come: it stops the toys, then offers the highest heart rate your monitor held on two readings in a row. The stroke range is the tease mode you selected.',
-    edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.'
+    edgetrain: 'Hold the edge for the time you set. Drop early and it does not count. After the set number of holds it offers to finish you. The stroke range is the tease mode you selected.',
+    script: 'Your own video and .funscript from the Player: the script sets the shape of every stroke and your pulse limits how much of it the toy may play. Near the edge it skips strokes while the video plays on, then rejoins on the beat. The Script tab in Session Setup sets how. Games are off while it is selected.'
 };
 
 // The paragraph above the cards follows the card you are looking at.
@@ -3401,31 +4047,58 @@ const MODE_DETAILS = {
 function renderModeDetail() {
     const el = document.getElementById('modeDetail');
     if (!el) return;
+    if (state.activeMode === 'script') {
+        // A partner's page also says what the script is doing right now.
+        const phase = isRemotePage && state.remoteScriptPhase ? ` Now: ${state.remoteScriptPhase}.` : '';
+        el.textContent = `${MODE_DETAILS.script}${phase}`;
+        return;
+    }
     const gamesVisible = gameModesGrid && !gameModesGrid.classList.contains('hidden');
     const mode = (gamesVisible && state.gameMode) ? state.gameMode : state.teaseMode;
     el.textContent = MODE_DETAILS[mode] || '';
 }
 
 function highlightModeCard() {
+    // Script mode is a mode of its own: while it is active no other card is
+    // lit (a remote page learns it from activeMode, as its tease mode is
+    // not one a partner's page keeps).
+    const scriptOn = state.activeMode === 'script';
     modeCards.forEach(c => {
         const mode = c.getAttribute('data-mode');
-        const on = mode === state.teaseMode || mode === state.gameMode;
+        const on = scriptOn ? mode === 'script' : (mode === state.teaseMode || mode === state.gameMode);
         const check = c.querySelector('.mode-check');
         const title = c.querySelector('.font-bold');
+        // The Script card spans the row; a game card is off while a script
+        // plays, and the Script card while no script is loaded.
+        const span = mode === 'script' ? ' sm:col-span-2' : '';
+        const off = (mode === 'script' && c.disabled) || (scriptOn && GAME_CARD_MODES.includes(mode)) ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer';
         if (on) {
-            c.className = "mode-card text-left p-2 rounded-xl bg-purple-950/20 border border-purple-800 hover:border-purple-600 transition cursor-pointer flex flex-col justify-between";
+            c.className = `mode-card${span} text-left p-2 rounded-xl bg-purple-950/20 border border-purple-800 hover:border-purple-600 transition${off} flex flex-col justify-between`;
             if (title) title.className = "font-bold text-[11px] text-purple-300 flex justify-between items-center";
             check?.classList.remove('hidden');
         } else {
-            c.className = "mode-card text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between";
+            c.className = `mode-card${span} text-left p-2 rounded-xl bg-slate-950 border border-slate-800 hover:border-slate-700 transition${off} flex flex-col justify-between`;
             if (title) title.className = "font-bold text-[11px] text-slate-200 flex justify-between items-center";
             check?.classList.add('hidden');
         }
     });
+    renderGamesForScript();
 }
 
 function applyModeSelection(mode, enabled) {
     const wasSurvival = state.activeMode === 'survival';
+    // Script mode needs a valid script loaded here (a partner can never
+    // select it: peer-messages.PARTNER_MODES), and games run their own
+    // speeds, so none is combined with a script.
+    if (mode === 'script' && !(scriptLoaded() && !isRemotePage)) return false;
+    if (GAME_CARD_MODES.includes(mode) && state.teaseMode === 'script' && enabled !== false) {
+        renderGamesForScript();
+        return false;
+    }
+    if (mode === 'script' && state.gameMode) {
+        state.gameMode = null;
+        resetGameState();
+    }
     if (GAME_CARD_MODES.includes(mode)) {
         const turnOn = enabled !== undefined ? enabled : state.gameMode !== mode;
         if (!turnOn) {
@@ -3452,9 +4125,16 @@ function applyModeSelection(mode, enabled) {
     // The button now means the other thing, and a press it turned away as
     // Came Early is no Finished me - nor a Finished me of a record just gone.
     if (wasSurvival !== (state.activeMode === 'survival')) heldPress = null;
+    // The script drives while Script mode is selected, and the video joins
+    // the transport (or leaves it, and plays on as a plain video). The
+    // player opens, so the video that now follows the session is in view.
+    syncScriptMode();
+    syncVideoToSession();
+    if (mode === 'script' && !isRemotePage) setPlayerOpen(true);
     highlightModeCard();
     renderModeDetail();
     updateEngine();
+    return true;
 }
 
 document.getElementById('wizardCalibrateBtn')?.addEventListener('click', () => {
@@ -3473,6 +4153,12 @@ modeCards.forEach(card => {
         if (isRemoteViewer) return;
         const mode = card.getAttribute('data-mode');
         const enabled = GAME_CARD_MODES.includes(mode) ? state.gameMode !== mode : true;
+        // Games are off while a script plays: the card says so and does
+        // nothing, here and on a partner's page alike.
+        if (GAME_CARD_MODES.includes(mode) && enabled && state.activeMode === 'script') {
+            renderGamesForScript();
+            return;
+        }
         const command = { type: 'MODE_CHANGE', mode, enabled };
         // A host on another version can read this message as something
         // else - a 1.0.0 host restarts the very game that "game off" means
@@ -3735,7 +4421,9 @@ document.addEventListener('keydown', (e) => {
         transportEnabled: Boolean(playPauseBtn) && !playPauseBtn.disabled && !isRemoteViewer,
         modalOpen: overlayUp(overlay),
         // The age gate sits above the wizard, so it names the pair.
-        overlay: overlayUp(ageOverlay) ? 'ageGate' : (overlayUp(wizardOverlay) ? 'wizard' : null)
+        overlay: overlayUp(ageOverlay) ? 'ageGate' : (overlayUp(wizardOverlay) ? 'wizard' : null),
+        // [ and ] move the script offset while a script is loaded.
+        offsetAvailable: !isRemotePage && Boolean(player) && scriptLoaded()
     });
     if (plan.consume) {
         e.preventDefault();
@@ -3749,6 +4437,8 @@ document.addEventListener('keydown', (e) => {
     } else if (plan.action === 'closeModal') {
         document.getElementById('modalCloseBtn')?.click();
         raisePressSheet();
+    } else if (plan.action === 'offsetEarlier' || plan.action === 'offsetLater') {
+        player?.nudgeOffset(plan.action === 'offsetEarlier' ? -OFFSET_NUDGE_MS : OFFSET_NUDGE_MS);
     }
 }, true);
 document.addEventListener('keyup', (e) => {
@@ -3777,10 +4467,11 @@ bleTabSimBtn?.addEventListener('click', () => {
     bleRealSection?.classList.add('hidden');
 });
 
-// Session Setup Sub-Tabs (4 Tabs: duration, guards, audio, backup)
+// Session Setup Sub-Tabs (5 Tabs: duration, guards, script, audio, backup)
 const paramsTabMap = {
     duration: { btn: document.getElementById('paramsTabDurationBtn'), sec: document.getElementById('paramsDurationSection') },
     guards: { btn: document.getElementById('paramsTabGuardsBtn'), sec: document.getElementById('paramsGuardsSection') },
+    script: { btn: document.getElementById('paramsTabScriptBtn'), sec: document.getElementById('paramsScriptSection') },
     audio: { btn: document.getElementById('paramsTabAudioBtn'), sec: document.getElementById('paramsAudioSection') },
     backup: { btn: document.getElementById('paramsTabBackupBtn'), sec: document.getElementById('paramsBackupSection') }
 };
@@ -3800,6 +4491,7 @@ function setParamsTab(activeKey) {
 
 paramsTabMap.duration.btn?.addEventListener('click', () => setParamsTab('duration'));
 paramsTabMap.guards.btn?.addEventListener('click', () => setParamsTab('guards'));
+paramsTabMap.script.btn?.addEventListener('click', () => setParamsTab('script'));
 paramsTabMap.audio.btn?.addEventListener('click', () => setParamsTab('audio'));
 paramsTabMap.backup.btn?.addEventListener('click', () => setParamsTab('backup'));
 
@@ -3931,6 +4623,9 @@ function syncParamsUI() {
     if (staleInput) staleInput.value = clampStaleSeconds(advancedSettings.hrStaleSeconds);
     if (autoResumeToggle) autoResumeToggle.checked = advancedSettings.hrAutoResume !== false;
 
+    paintScriptTab(sanitizeScriptSettings(advancedSettings));
+    renderGamesForScript();
+
     if (warmup) warmup.value = advancedSettings.warmupMinutes ?? 5;
     if (warmupDisp) warmupDisp.textContent = (advancedSettings.warmupMinutes === 0) ? "0 min (Instant)" : `${advancedSettings.warmupMinutes ?? 5} Minutes`;
 
@@ -3953,6 +4648,56 @@ function syncParamsUI() {
     renderVoiceCueEditor();
     paintIdlePrompt();
 }
+
+// The Script tab (player/script-governor.js). Painted from the settings
+// (or, on a remote page, left at the factory values: the host's are its
+// own), read back on Apply through the same sanitizers.
+const SCRIPT_TAB_FIELDS = {
+    scriptReactBpm: 'scriptReactBpmInput',
+    scriptFloorPercent: 'scriptFloorInput',
+    scriptApproach: 'scriptApproachSelect',
+    scriptEdgeAction: 'scriptEdgeActionSelect',
+    scriptRejoinSeconds: 'scriptRejoinInput',
+    scriptMaxSpeed: 'scriptMaxSpeedInput',
+    scriptSecondChannel: 'scriptSecondChannelSelect',
+    scriptVideoEnd: 'scriptVideoEndSelect'
+};
+
+function paintScriptTab(settings) {
+    const values = isRemotePage ? DEFAULT_SCRIPT_SETTINGS : settings;
+    for (const [name, id] of Object.entries(SCRIPT_TAB_FIELDS)) {
+        const el = document.getElementById(id);
+        if (el) el.value = String(values[name]);
+    }
+    const invert = document.getElementById('scriptInvertToggle');
+    if (invert) invert.checked = Boolean(values.scriptInvert);
+    paintMaxSpeedHint();
+}
+
+function readScriptTab() {
+    const raw = {};
+    for (const [name, id] of Object.entries(SCRIPT_TAB_FIELDS)) {
+        const el = document.getElementById(id);
+        if (el) raw[name] = el.value;
+    }
+    raw.scriptInvert = document.getElementById('scriptInvertToggle')?.checked === true;
+    raw.scriptSmoothing = advancedSettings.scriptSmoothing;
+    return sanitizeScriptSettings(raw);
+}
+
+// "≈ 330 mm/s on a 110 mm Handy · ≈ 1.5 full strokes/s": a full stroke is
+// there and back, twice the travel.
+function paintMaxSpeedHint() {
+    const el = document.getElementById('scriptMaxSpeedHint');
+    if (!el) return;
+    const value = sanitizeScriptSettings({ scriptMaxSpeed: document.getElementById('scriptMaxSpeedInput')?.value }).scriptMaxSpeed;
+    const limits = handyHsp ? handyHsp.deviceLimits() : {};
+    const travel = Number.isFinite(limits.travelMm) && limits.travelMm > 0 ? limits.travelMm : HANDY_DEFAULT_TRAVEL_MM;
+    const mm = Math.round(percentToMmPerSecond(value, travel));
+    const strokes = Math.round((value / 200) * 10) / 10;
+    el.textContent = `≈ ${mm} mm/s on a ${Math.round(travel)} mm Handy · ≈ ${strokes} full strokes/s`;
+}
+document.getElementById('scriptMaxSpeedInput')?.addEventListener('input', paintMaxSpeedHint);
 
 // What the wearer is told about the voice itself. Speech errors used to be
 // swallowed, so a voice that never worked looked exactly like one that did.
@@ -4532,6 +5277,9 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     syncWatchdogSettings();
     const warmupParsed = parseInt(document.getElementById('warmupInput')?.value, 10);
     advancedSettings.warmupMinutes = Number.isFinite(warmupParsed) ? warmupParsed : 5;
+    // The Script tab, through its sanitizers; a running session takes the
+    // new values on its next tick.
+    Object.assign(advancedSettings, readScriptTab());
     // Already live from the switch itself; Apply commits the same value
     // through the same rule (silence at once when it is off).
     setVoiceEnabled(document.getElementById('paramVoiceToggle')?.checked ?? false);
@@ -4558,6 +5306,8 @@ document.getElementById('applyParamsBtn')?.addEventListener('click', async () =>
     paintIdlePrompt();
 
     persistSettings();
+    syncScriptMode();
+    renderPlayerPanel();
     closeModal();
     updateEngine();
     syncTelemetry();
@@ -4598,6 +5348,8 @@ document.getElementById('exportSettingsBtn')?.addEventListener('click', () => {
         handyMaxCap: state.handyMaxCap,
         handyConnectionKey: savedKey,
         vacuglideDeviceToken: savedToken,
+        // Carried only with the device keys (backup.js).
+        handyApplicationId: safeGet(HANDY_APP_ID_STORAGE_KEY, '') || '',
         intifaceDevices: safeParse(INTIFACE_STORAGE_KEY, {}),
         tcodeDevices: safeParse(TCODE_STORAGE_KEY, {}),
         ageVerified: safeGet('edgeloop_age_verified') === 'true',
@@ -4647,6 +5399,10 @@ function applyImportedBackup(result) {
         if (!safeSet(VACUGLIDE_TOKEN_STORAGE_KEY, result.vacuglideDeviceToken)) unsaved.push('token');
         const input = document.getElementById('modalVacuglideInput');
         if (input) input.value = result.vacuglideDeviceToken;
+    }
+    if (result.appIdPresent) {
+        if (!safeSet(HANDY_APP_ID_STORAGE_KEY, result.handyApplicationId)) unsaved.push('appId');
+        paintHandyAppId();
     }
     if (result.handy.role) {
         // The role buttons own the badge and the button painting, so the
@@ -4784,6 +5540,7 @@ document.getElementById('importConfigFile')?.addEventListener('change', (e) => {
             syncHwEnvelopeInputs();
             syncWatchdogSettings();
             syncGuardSettings();
+            syncScriptMode();
             // Counted after the clamps, before the write, so the number the
             // user reads is the number that is actually in the store.
             // One comparison: what the file ASKED for against what the
@@ -5189,6 +5946,8 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
         setHandyStatus(handyConnectedLabel, 'ok');
         setBadgeState('Handy', 'connected', 'The Handy', handyBatteryLabel());
         withdrawStartRefusal();
+        // Beat sync is checked now, not at START, so START stays quick.
+        verifyBeatSync();
         document.getElementById('modalHandyDisconnectBtn')?.classList.remove('hidden');
         // Connected: whatever said the link was gone is over. A stop this
         // key owed was settled already, by the stop that verified it
@@ -6236,6 +6995,9 @@ document.addEventListener('visibilitychange', () => {
     if (isRemotePage) return;
     if (document.visibilityState === 'hidden') {
         supervisionClock.noteHidden();
+        // A Script-mode session goes on behind a hidden page only while
+        // its video is heard.
+        pauseIfHiddenAndSilent();
         return;
     }
     haltIfUnsupervised();
@@ -6257,6 +7019,11 @@ function saveSessionToHistory(outcome) {
         pauses: state.pauses,
         peakHr: state.peakHr,
         outcome,
+        // A Script-mode session records that it was one, the script's
+        // length and its hash: never a file name, never the script.
+        ...(state.activeMode === 'script' && loadedScript
+            ? { mode: 'Script', script: { hash: loadedScript.hash || null, lengthMs: loadedScript.meta.durationMs } }
+            : {}),
         // Raw 4 Hz timeline; both funscripts are built from it on download.
         samples: [...funscriptSamples]
     });
@@ -6318,7 +7085,7 @@ function renderHistory() {
         item.innerHTML = `
         <div>
         <div class="font-bold text-slate-200">#${idx + 1} — ${s.date}</div>
-        <div class="text-[10px] text-slate-400 mt-0.5">⏱ ${mins}m ${secs}s &bull; ⚡ ${s.edges} Edges &bull; 🔥 ${s.peakHr} BPM &bull; <span class="text-purple-300 font-semibold">${s.outcome}</span></div>
+        <div class="text-[10px] text-slate-400 mt-0.5">⏱ ${mins}m ${secs}s &bull; ⚡ ${s.edges} Edges &bull; 🔥 ${s.peakHr} BPM &bull; <span class="text-purple-300 font-semibold">${escapeHtml(String(s.outcome ?? ''))}</span>${s.mode === 'Script' ? ' &bull; <span class="text-sky-300 font-semibold">Script</span>' : ''}</div>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
         <button onclick="downloadFunscript(${s.id}, 'primary')" class="px-2 py-1 bg-purple-950 hover:bg-purple-800 border border-purple-700 text-purple-200 rounded text-[10px] font-mono transition cursor-pointer flex items-center gap-1" title="Download Primary Stroker Funscript">
@@ -6518,8 +7285,9 @@ const CONTROLLER_LOCKED_IDS = [
     'cameEarlyBtn', 'intensitySlider', 'openParamsBtn', 'sessionParamsHeaderBtn',
     'partnerShareBtn', 'cardBle', 'cardHandy', 'cardVacuglide', 'cardIntiface', 'cardTCode',
     // The mode cards stay live (MODE_CHANGE is a legal command), but the two
-    // Edge Training numbers inside one of them are host-only settings.
-    'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle'
+    // Edge Training numbers inside one of them are host-only settings, and
+    // Script mode plays files only the wearer's device has.
+    'trainHoldSecondsInput', 'trainEdgesInput', 'survivalCalibrateToggle', 'scriptModeCard'
 ];
 function lockControllerControls() {
     CONTROLLER_LOCKED_IDS.forEach((id) => lockElement(document.getElementById(id)));
@@ -6613,7 +7381,8 @@ function applyRemoteTelemetry(data) {
     if (data.gameMode === 'off') state.gameMode = null;
     else if (data.gameMode !== undefined) state.gameMode = data.gameMode;
     if (data.activeMode !== undefined) state.activeMode = data.activeMode;
-    if (data.teaseMode !== undefined || data.gameMode !== undefined || data.activeMode !== undefined) {
+    if (data.scriptPhase !== undefined) state.remoteScriptPhase = data.scriptPhase;
+    if (data.teaseMode !== undefined || data.gameMode !== undefined || data.activeMode !== undefined || data.scriptPhase !== undefined) {
         highlightModeCard();
         renderModeDetail();
     }
@@ -6702,7 +7471,9 @@ function syncTelemetry() {
         // reads what the wearer's does.
         orgasmSecondsLeft: forceOrgasmSecondsLeftNow(),
         orgasmRefusal: forceOrgasmRefusalNow(),
-        ready: readiness.hrReady && readiness.toyReady,
+        ready: readiness.hrReady && readiness.toyReady && !currentScriptWaitingReason(),
+        // Script mode's phase (the skip at an edge), '' in any other mode.
+        scriptPhase: state.activeMode === 'script' ? (lastScriptPhase || state.sessionStatus) : '',
         hrSignal: {
             status: state.hrSignalState,
             noContact: state.hrNoContact,
@@ -6762,6 +7533,7 @@ document.getElementById('copyGroupUrlBtn')?.addEventListener('click', () => {
 // Boot Initialization
 initHandyRoleUI();
 initVacuglidePanel();
+initPlayerSettings();
 renderLearningStatus();
 syncParamsUI();
 // A persisted mic setting waits for a tap (browser gesture rule).

@@ -9,6 +9,8 @@ import {
     HISTORY_LENGTH,
     REMOTE_STATUSES,
     PEER_PROTOCOL_VERSION,
+    SCRIPT_PHASE_MAX_LENGTH,
+    readScriptPhase,
     PARTNER_MODES,
     VERSIONED_COMMANDS,
     readPeerProtocol,
@@ -551,5 +553,18 @@ describe('a controller RESUME never becomes a START', () => {
             if (shown === 'PAUSED') assert.equal(onPaused, 'resume', 'a page showing RESUME may resume');
             else assert.equal(onPaused, null, `a page showing ${String(shown)} must not resume the host`);
         }
+    });
+});
+
+describe('the Script phase in telemetry', () => {
+    it('carries the host\'s status words and nothing else', () => {
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: 'SKIPPING: EDGE' }).scriptPhase, 'SKIPPING: EDGE');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: 'EASING 64%' }).scriptPhase, 'EASING 64%');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: 'REJOINING 5 s (VIDEO HELD)' }).scriptPhase, 'REJOINING 5 s (VIDEO HELD)');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: '' }).scriptPhase, '');
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: '<img src=x>' }).scriptPhase, undefined);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: 'A'.repeat(SCRIPT_PHASE_MAX_LENGTH + 1) }).scriptPhase, undefined);
+        assert.equal(sanitizeTelemetry({ type: 'TELEMETRY', scriptPhase: 42 }).scriptPhase, undefined);
+        assert.equal(readScriptPhase('a\nb'), undefined);
     });
 });

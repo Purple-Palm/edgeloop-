@@ -27,15 +27,7 @@ const SW_URL = new URL('sw.js', SITE).href;
 // the page imports one of them, the walk reaches it and the precache check
 // below fails until sw.js names it.
 const NOT_LOADED_BY_THE_PAGE = [
-    './src/js/hrv.js', // the HRV display (H3) will import it
-    // The player's file loading. The player section imports them when it
-    // is wired in, and each comes off this list (and goes into sw.js) with
-    // that change. app.js already loads the script feed and, through it,
-    // the clock, the track and the shaper, and the rhythm fallback; the
-    // engine's Script mode loads script-governor.js, and the Intiface and
-    // T-Code drivers hardware/script-planner.js.
-    './src/js/player/funscript-parse.js',
-    './src/js/player/script-pairing.js'
+    './src/js/hrv.js' // the HRV display (H3) will import it
 ];
 
 const readRepo = (relative) => readFileSync(new URL(relative, ROOT), 'utf8');

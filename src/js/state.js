@@ -5,6 +5,7 @@ import { safeGet } from './storage.js';
 import { HANDY_DEFAULT_END_MARGIN } from './hardware/handy-protocol.js';
 import { DEFAULT_FORCE_ORGASM_MAX_SECONDS } from './session-rules.js';
 import { VACUGLIDE_DEFAULT_ROLE, VALVE_PULSE_DEFAULT_MS } from './hardware/vacuglide-protocol.js';
+import { DEFAULT_SCRIPT_SETTINGS } from './player/script-governor.js';
 
 export const state = {
     sessionStatus: 'IDLE',
@@ -166,7 +167,13 @@ export const state = {
     // The pullback mark. Null until the engine computes it (host) or
     // telemetry carries it (remote page): a default would draw a chart
     // line for a threshold nobody set.
-    edgeTriggerHr: null
+    edgeTriggerHr: null,
+    // Script mode's rejoin ramp: the session second the edge flag last
+    // cleared (engine.js nextScriptRelease carries it), or the second of a
+    // RESUME, which restarts the ramp. Null at START: the warm-up covers it.
+    scriptReleasedAt: null,
+    // Remote page only: the host's Script phase from telemetry.
+    remoteScriptPhase: ''
 };
 
 export const advancedSettings = {
@@ -241,6 +248,12 @@ export const advancedSettings = {
     micEnabled: false,
     micSensitivityThreshold: 40,
     micBoostMaxBpm: 8,
+    // The Script tab (player/script-governor.js): how the wearer's own
+    // funscript is limited by the pulse in Script mode. Each has its own
+    // sanitizer in settings-schema.js and rides in the Backup like every
+    // other Session Setup value. The per-script offset is NOT here: it is
+    // kept per script hash in this browser only (player-rules.js).
+    ...DEFAULT_SCRIPT_SETTINGS,
     learningProfile: {
         breakthroughEvents: 0,
         suggestedMaxHrOffset: 0,
