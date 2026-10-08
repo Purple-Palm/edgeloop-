@@ -99,6 +99,9 @@ export const ALTERNATE_SECONDS_MAX = 60;
 
 export const FILENAME_PLAIN = 'edgeloop_settings.json';
 export const FILENAME_WITH_KEY = 'edgeloop_settings_with_key.json';
+// A file that carries the Application ID override and no device key: not a
+// credential that controls a toy, but not the plain file either.
+export const FILENAME_WITH_APP_ID = 'edgeloop_settings_with_app_id.json';
 
 // The first thing a human sees on opening the file.
 export const NOTE_WITH_KEY = 'WARNING: this file contains your Handy connection key. Anyone who has this file can control your Handy from anywhere, without any password. Do not mail it, upload it or post it.';
@@ -119,6 +122,8 @@ export const NOTE_TOKEN_UNUSABLE = 'This file does NOT contain your VacuGlide de
 // the file carries one and not the other, and says why.
 const KEY_LEFT_OUT = 'Your Handy connection key is NOT in it: what is saved in this browser is not a usable key. Re-enter it in the Handy panel and export again.';
 const TOKEN_LEFT_OUT = 'Your VacuGlide device token is NOT in it: what is saved in this browser is not a usable token. Re-enter it in the VacuGlide panel and export again.';
+// The Application ID override, when the box carried it.
+export const APP_ID_CARRIED = 'It also carries your own Handy Application ID; that ID is not secret, and nobody can control a toy with it.';
 
 // Top-level field names the file itself uses. They are never settings, so
 // they are stripped from the settings object both on the way out and on the
@@ -413,7 +418,7 @@ export function buildBackup(stores = {}, options = {}) {
     // answers "is my key in this?" on line 2 without scrolling or knowing
     // the format. The reader does not care about key order.
     return {
-        note: backupNote(carriesKey, includeKey, stores.handyConnectionKey, { carries: carriesToken, saved: stores.vacuglideDeviceToken }),
+        note: backupNote(carriesKey, includeKey, stores.handyConnectionKey, { carries: carriesToken, saved: stores.vacuglideDeviceToken }, { carriesAppId }),
         format: BACKUP_FORMAT,
         version: BACKUP_VERSION,
         exportedAt: new Date(now).toISOString(),
@@ -442,8 +447,14 @@ export function buildBackup(stores = {}, options = {}) {
 // to tick the box. `token` is the VacuGlide half: { carries, saved }. A
 // credential that is not saved here at all is only mentioned when nothing
 // at all went in - a file is incomplete when it lacks something this
-// browser HAS, and a Handy user with no VacuGlide lacks nothing.
-export function backupNote(carriesKey, requestedKey, savedKey, token = {}) {
+// browser HAS, and a Handy user with no VacuGlide lacks nothing. A carried
+// Application ID override is said after it (APP_ID_CARRIED).
+export function backupNote(carriesKey, requestedKey, savedKey, token = {}, { carriesAppId = false } = {}) {
+    const note = keyNote(carriesKey, requestedKey, savedKey, token);
+    return carriesAppId === true ? `${note} ${APP_ID_CARRIED}` : note;
+}
+
+function keyNote(carriesKey, requestedKey, savedKey, token) {
     const carriesToken = token && token.carries === true;
     const rawKey = typeof savedKey === 'string' ? savedKey.trim() : '';
     const rawToken = token && typeof token.saved === 'string' ? token.saved.trim() : '';
@@ -460,10 +471,13 @@ export function backupNote(carriesKey, requestedKey, savedKey, token = {}) {
 }
 
 // The filename carries the warning into the mail client, for either
-// credential.
+// credential; a file with only the Application ID override in it is named
+// for that, as the box's label says ("named differently when any of them is
+// in it").
 export function backupFilename(file) {
     const carries = Boolean(file) && (file.handyConnectionKeyIncluded === true || file.vacuglideDeviceTokenIncluded === true);
-    return carries ? FILENAME_WITH_KEY : FILENAME_PLAIN;
+    if (carries) return FILENAME_WITH_KEY;
+    return file && file.handyApplicationIdIncluded === true ? FILENAME_WITH_APP_ID : FILENAME_PLAIN;
 }
 
 // What the panel says the moment the file is written, so the answer to "is my
@@ -473,6 +487,8 @@ export function backupFilename(file) {
 export function describeBackupExport(file, context = {}) {
     const carriesKey = Boolean(file && file.handyConnectionKeyIncluded === true);
     const carriesToken = Boolean(file && file.vacuglideDeviceTokenIncluded === true);
+    const carriesAppId = Boolean(file && file.handyApplicationIdIncluded === true);
+    const appIdLine = carriesAppId ? ` ${APP_ID_CARRIED}` : '';
     const filename = backupFilename(file);
     const requested = context.requestedKey === true;
     // Asked for, saved, and still not carried: what is saved is unusable.
@@ -491,7 +507,7 @@ export function describeBackupExport(file, context = {}) {
             carriesKey,
             carriesToken,
             tone: 'warn',
-            message: `Exported ${filename}. This file CONTAINS ${what}: anyone who has the file can control ${who}. Keep it off shared drives and out of forum posts.${leftOut ? ` ${leftOut}` : ''}`
+            message: `Exported ${filename}. This file CONTAINS ${what}: anyone who has the file can control ${who}. Keep it off shared drives and out of forum posts.${appIdLine}${leftOut ? ` ${leftOut}` : ''}`
         };
     }
     if (requested) {
@@ -506,8 +522,10 @@ export function describeBackupExport(file, context = {}) {
             carriesToken: false,
             tone: reasons ? 'warn' : 'info',
             message: reasons
-                ? `Exported ${filename}. ${reasons}`
-                : `Exported ${filename}. No Handy connection key is saved in this browser, and no VacuGlide device token either, so there was nothing to include.`
+                ? `Exported ${filename}. ${reasons}${appIdLine}`
+                : carriesAppId
+                    ? `Exported ${filename}. No Handy connection key is saved in this browser, and no VacuGlide device token either, so neither is in it.${appIdLine}`
+                    : `Exported ${filename}. No Handy connection key is saved in this browser, and no VacuGlide device token either, so there was nothing to include.`
         };
     }
     return {

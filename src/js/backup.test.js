@@ -40,7 +40,9 @@ import {
     NOTE_WITHOUT_KEYS,
     NOTE_TOKEN_UNUSABLE,
     sanitizeDeviceToken,
-    VACUGLIDE_SETTING_NAMES
+    VACUGLIDE_SETTING_NAMES,
+    FILENAME_WITH_APP_ID,
+    APP_ID_CARRIED
 } from './backup.js';
 import { advancedSettings, SETTING_KEYS, SETTING_DEFAULTS } from './state.js';
 import { sanitizeSetting, SETTING_SANITIZERS } from './settings-schema.js';
@@ -1585,6 +1587,24 @@ describe('the Handy Application ID override rides with the device keys', () => {
         const store = { minHr: 70, handyApplicationId: APP_ID };
         pruneReservedKeys(store);
         assert.equal('handyApplicationId' in store, false);
+    });
+
+    it('a file whose only carried item is the ID says so, in the panel, the file and its name', () => {
+        const file = buildBackup({ ...WITH_APP_ID, handyConnectionKey: '', vacuglideDeviceToken: '' }, { includeKey: true, now: NOW });
+        assert.equal(file.handyApplicationId, APP_ID);
+        assert.equal(backupFilename(file), FILENAME_WITH_APP_ID);
+        assert.match(file.note, /It also carries your own Handy Application ID; that ID is not secret, and nobody can control a toy with it\.$/);
+        const notice = describeBackupExport(file, { requestedKey: true, hasSavedKey: false, hasSavedToken: false });
+        assert.doesNotMatch(notice.message, /nothing to include/);
+        assert.equal(notice.message, `Exported ${FILENAME_WITH_APP_ID}. No Handy connection key is saved in this browser, and no VacuGlide device token either, so neither is in it. ${APP_ID_CARRIED}`);
+        assert.equal(notice.carriesKey, false);
+        // With the key too: the key's name and warning, and the ID named.
+        const both = buildBackup(WITH_APP_ID, { includeKey: true, now: NOW });
+        assert.equal(backupFilename(both), FILENAME_WITH_KEY);
+        assert.match(describeBackupExport(both, { requestedKey: true, hasSavedKey: true }).message, /CONTAINS your Handy connection key[^]*It also carries your own Handy Application ID/);
+        assert.equal(both.note, `${NOTE_WITH_KEY} ${APP_ID_CARRIED}`);
+        // Unticked: nothing of it, the plain name.
+        assert.equal(backupFilename(buildBackup(WITH_APP_ID, { now: NOW })), FILENAME_PLAIN);
     });
 
     it('a file that carries only the ID is a backup, and the import says it was restored', () => {
