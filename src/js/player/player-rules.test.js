@@ -22,6 +22,7 @@ import {
     formatOffset,
     describeToyNotes,
     describeVideoPlayRefused,
+    scriptPhaseLabel,
     PRIVACY_LINE,
     BEAT_SYNC_CONSENT_TEXT,
     MAX_REMEMBERED_OFFSETS
@@ -305,10 +306,33 @@ describe('describeToyNotes', () => {
     });
 });
 
+describe('scriptPhaseLabel', () => {
+    const live = { activeMode: 'script', sessionStatus: 'RUNNING', phase: 'FREE', videoState: 'playing' };
+    it('names the governor\'s phase while the video plays', () => {
+        assert.equal(scriptPhaseLabel(live), 'FREE');
+        assert.equal(scriptPhaseLabel({ ...live, sessionStatus: 'RAMPDOWN', phase: 'LANDING' }), 'LANDING');
+        assert.equal(scriptPhaseLabel({ ...live, phase: 'SKIPPING: EDGE', videoState: 'paused', edgeHeld: true }), 'SKIPPING: EDGE (VIDEO HELD)');
+    });
+
+    it('never reads FREE while the video buffers or seeks: the toys hold', () => {
+        assert.equal(scriptPhaseLabel({ ...live, videoState: 'waiting' }), 'BUFFERING: TOYS HELD');
+        assert.equal(scriptPhaseLabel({ ...live, videoState: 'seeking' }), 'SEEKING: TOYS HELD');
+    });
+
+    it('says PAUSED, IDLE, or nothing outside Script mode', () => {
+        assert.equal(scriptPhaseLabel({ ...live, sessionStatus: 'PAUSED', videoState: 'waiting' }), 'PAUSED');
+        assert.equal(scriptPhaseLabel({ ...live, sessionStatus: 'IDLE' }), 'IDLE');
+        assert.equal(scriptPhaseLabel({ ...live, activeMode: 'classic' }), '');
+    });
+});
+
 describe('the words', () => {
     it('promise what leaves the machine and nothing more', () => {
         assert.match(PRIVACY_LINE, /stay on this device/);
         assert.match(PRIVACY_LINE, /never leave this device/);
+        // A partner linked with Share Control is sent the heart rate.
+        assert.doesNotMatch(PRIVACY_LINE, /heart rate[^.;]*never leave/i);
+        assert.match(PRIVACY_LINE, /your heart rate goes only to a partner you link with Share Control\.$/);
         assert.match(BEAT_SYNC_CONSENT_TEXT, /firmware 4/);
         assert.match(BEAT_SYNC_CONSENT_TEXT, /Application ID/);
         assert.match(describeVideoPlayRefused('NotAllowedError'), /\(NotAllowedError\)/);

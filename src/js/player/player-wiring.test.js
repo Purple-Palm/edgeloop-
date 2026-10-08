@@ -5,9 +5,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { PRIVACY_LINE } from './player-rules.js';
 
 const APP = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
 const INDEX = readFileSync(new URL('../../../index.html', import.meta.url), 'utf8');
+const README = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
+const PLAYER = readFileSync(new URL('./player.js', import.meta.url), 'utf8');
 
 function body(anchor, end = '\n}') {
     const at = APP.indexOf(anchor);
@@ -29,6 +32,32 @@ describe('app.js: the video follows the session', () => {
         assert.match(body('function pauseSession('), /state\.sessionStatus = 'PAUSED';[\s\S]*dispatchHardware\(0, 0, 0, 100, true\);/);
         assert.match(body('function stopSession('), /state\.sessionStatus = 'IDLE';[\s\S]*dispatchHardware\(0, 0, 0, 100, true\);/);
         assert.match(body("resetBtn?.addEventListener('click'", '\n});'), /state\.sessionStatus = 'IDLE';[\s\S]*dispatchHardware\(0, 0, 0, 100, true\);/);
+    });
+
+    it('PAUSE, STOP and Reset pause a video playing in the player in any mode, Script mode left mid-session included', () => {
+        assert.match(body('function pauseVideoWithSession('), /if \(player && player\.isPlaying\(\)\) player\.pause\(\);/);
+        assert.match(body('function pauseSession('), /dispatchHardware\(0, 0, 0, 100, true\);\s*pauseVideoWithSession\(\);/);
+        assert.match(body('function stopSession('), /\} finally \{\s*resetSessionCounters\(\);\s*pauseVideoWithSession\(\);/);
+        assert.match(body("resetBtn?.addEventListener('click'", '\n});'), /dispatchHardware\(0, 0, 0, 100, true\);\s*pauseVideoWithSession\(\);/);
+    });
+
+    it('the video\'s own pause, a long buffering stall and a media error each pause the session', () => {
+        // (a) A pause by the video's own controls (a media key, iOS's
+        // native fullscreen, a headset's bar) is a session PAUSE.
+        assert.match(APP, /\n {12}onPauseRequest: pauseFromVideo,\n/);
+        assert.match(body('function pauseFromVideo('), /if \(pauseSession\('Paused\.'\)\) \{/);
+        assert.match(PLAYER, /if \(video\.paused && decide\('pause'\) === 'pause-session'\) call\(handlers, 'onPauseRequest'\);/);
+        // (b) A buffering stall over 30 s, while the session drives.
+        assert.match(body('onStall: (seconds) => {', '\n            },'), /if \(scriptCoupled\(\) && sessionDriving\(\)\) triggerDisconnectAlert\(describeVideoStall\(seconds\), 'video'\);/);
+        // (c) A media error under a live session.
+        assert.match(body('onMediaError: (message) => {', '\n            },'), /if \(scriptCoupled\(\) && sessionIsLive\(\)\) triggerDisconnectAlert\(`\$\{message\} Every toy was stopped and the session paused\.`, 'video'\);/);
+        // The alert is the pause.
+        assert.match(body('function triggerDisconnectAlert('), /if \(pauseSession\(null\)\) syncTelemetry\(\);/);
+    });
+
+    it('the phase reads what the toys do while the video buffers, not FREE', () => {
+        assert.match(body('function scriptPhaseText('), /videoState: scriptFeed \? scriptFeed\.videoState\(\) : '',/);
+        assert.match(body('function scriptPhaseText('), /return scriptPhaseLabel\(\{/);
     });
 
     it('START and RESUME play it only once the session runs', () => {
@@ -186,7 +215,37 @@ describe('index.html: the player', () => {
         assert.match(body('function setPlayerOpen('), /document\.documentElement\.dataset\.playerOpen = open \? 'on' : 'off';/);
     });
 
-    it('says what stays on the device', () => {
+    it('says what stays on the device, and not that the heart rate never leaves it', () => {
         assert.match(INDEX, /Your video and script stay on this device\. EdgeLoop uploads neither\./);
+        const at = INDEX.indexOf('<p id="playerPrivacy"');
+        const text = INDEX.slice(INDEX.indexOf('>', at) + 1, INDEX.indexOf('</p>', at));
+        assert.equal(text, PRIVACY_LINE);
+        assert.doesNotMatch(README, /the video, the script and your heart rate stay on this device/);
+    });
+
+    it('the new controls are at least 44 px to touch', () => {
+        const tag = (id) => {
+            const at = INDEX.indexOf(`id="${id}"`);
+            assert.ok(at >= 0, id);
+            return INDEX.slice(INDEX.lastIndexOf('<', at), INDEX.indexOf('>', at));
+        };
+        assert.match(tag('playerHeaderBtn'), /min-h-\[44px\] min-w-\[44px\]/);
+        // The header buttons beside it are as tall, so the row stays even.
+        for (const id of ['guideBtn', 'historyBtn', 'sessionParamsHeaderBtn', 'partnerShareBtn']) {
+            assert.match(tag(id), /min-h-\[44px\]/, id);
+        }
+        assert.match(tag('playerToggleBtn'), /min-h-\[44px\]/);
+        assert.match(tag('playerSeek'), /\bh-11\b/);
+        assert.match(tag('playerPackSelect'), /min-h-\[44px\]/);
+        assert.match(INDEX, /<label for="beatSyncToggle" class="[^"]*min-h-\[44px\]/);
+        for (const id of ['playerPlayBtn', 'playerMuteBtn', 'playerOffsetMinus', 'playerOffsetPlus', 'playerTheaterBtn', 'playerFullscreenBtn', 'playerChooseBtn', 'playerClearBtn']) {
+            assert.match(tag(id), /min-h-\[2\.75rem\]/, id);
+        }
+    });
+
+    it('the README says what an iPhone shows: no Fullscreen button, Theater instead', () => {
+        assert.match(PLAYER, /if \(els\.fullscreenBtn && !canFullscreen\(\)\) els\.fullscreenBtn\.classList\?\.add\('hidden'\);/);
+        assert.doesNotMatch(README, /Fullscreen opens Theater instead/);
+        assert.match(README, /On an iPhone, where only the video itself can go fullscreen, there is no Fullscreen button: use Theater, which fills the screen with the same HUD\./);
     });
 });

@@ -48,6 +48,8 @@ describe('script feed: time', () => {
             feed.setVideoState(state);
             assert.equal(feed.scriptNow(), null, state);
             assert.equal(feed.hasTime(), false, state);
+            // The status line reads it (player-rules scriptPhaseLabel).
+            assert.equal(feed.videoState(), state === 'nonsense' ? 'idle' : state);
         }
         const clock = createMediaClock();
         const feed = createScriptFeed({ clock, perfNow: () => 0 });

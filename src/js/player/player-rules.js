@@ -308,7 +308,23 @@ export function describeToyNotes({
 }
 
 // The privacy line, always visible in the panel (§1.2).
-export const PRIVACY_LINE = 'Your video and script stay on this device. EdgeLoop uploads neither. With Beat sync on The Handy switched on, The Handy is sent the next few seconds of stroke positions through Handy\'s cloud as it plays. Your heart rate, file names and video never leave this device.';
+// The heart rate is not promised to stay here: a partner linked with Share
+// Control is sent it, as it always has been.
+export const PRIVACY_LINE = 'Your video and script stay on this device. EdgeLoop uploads neither. With Beat sync on The Handy switched on, The Handy is sent the next few seconds of stroke positions through Handy\'s cloud as it plays. File names and the video never leave this device; your heart rate goes only to a partner you link with Share Control.';
+
+// The phase the status line, the strip and the HUD show in Script mode.
+// `phase` is the governor's (script-governor describeScriptPhase); a video
+// that waits for data or seeks stops the clock and every toy holds, so the
+// line says that rather than a phase that is not playing; a video the edge
+// action holds says so after the phase.
+export function scriptPhaseLabel({ activeMode, sessionStatus, phase = '', videoState = '', edgeHeld = false } = {}) {
+    if (activeMode !== 'script') return '';
+    if (sessionStatus === 'PAUSED') return 'PAUSED';
+    if (!LIVE.includes(sessionStatus)) return 'IDLE';
+    if (videoState === 'waiting') return 'BUFFERING: TOYS HELD';
+    if (videoState === 'seeking') return 'SEEKING: TOYS HELD';
+    return edgeHeld ? `${phase} (VIDEO HELD)` : phase;
+}
 
 // The one-time question before beat sync is first switched on (§1.3).
 export const BEAT_SYNC_CONSENT_TEXT = 'Beat sync plays the script on The Handy stroke for stroke.\n\nWhile it is on, the next few seconds of stroke positions and their times are sent ahead, a few seconds at a time, to Handy\'s servers (handyfeeling.com), under EdgeLoop\'s Application ID, as the video plays. Nothing else is sent: not the video, not the script file, not its name, not your heart rate.\n\nIt needs a Handy on firmware 4 or later. Without it, The Handy plays the script\'s rhythm only.\n\nSwitch beat sync on?';

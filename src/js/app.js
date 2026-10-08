@@ -130,6 +130,7 @@ import {
     describePlayerStrip,
     describeScriptSummary,
     describeMaxSpeedHint,
+    scriptPhaseLabel,
     scriptWaitingReason,
     videoCoupled,
     hiddenSilentPause,
@@ -752,6 +753,7 @@ function pauseSession(voiceText = 'Paused.') {
     renderTransport('PAUSED');
     clearMicBoost(state);
     dispatchHardware(0, 0, 0, 100, true);
+    pauseVideoWithSession();
     syncScreenWakeLock();
     if (voiceText) cueVoice('paused');
     renderForceOrgasmButton();
@@ -1675,6 +1677,13 @@ function pauseVideoWithToys() {
     if (scriptCoupled() && !sessionDriving()) player.pause();
 }
 
+// PAUSE, STOP and Reset pause the video whenever it is playing in the
+// player, in any mode: Script mode left mid-session lets it play on as a
+// plain video, and the session's PAUSE and STOP still stop it.
+function pauseVideoWithSession() {
+    if (player && player.isPlaying()) player.pause();
+}
+
 // Edge action Pause video: the governor holds the video while the edge is
 // up and lets it go at the release. The session stays RUNNING and every
 // guard keeps running. Force Orgasm and the Soft Landing play through it.
@@ -2069,11 +2078,13 @@ function renderPlayerPanel() {
 
 // The live readouts: the phase on the strip and in the panel, and the HUD.
 function scriptPhaseText(result) {
-    if (state.activeMode !== 'script') return '';
-    if (state.sessionStatus === 'PAUSED') return 'PAUSED';
-    if (state.sessionStatus === 'IDLE') return 'IDLE';
-    const text = describeScriptPhase(result && result.script);
-    return player && player.edgeHeld() ? `${text} (VIDEO HELD)` : text;
+    return scriptPhaseLabel({
+        activeMode: state.activeMode,
+        sessionStatus: state.sessionStatus,
+        phase: describeScriptPhase(result && result.script),
+        videoState: scriptFeed ? scriptFeed.videoState() : '',
+        edgeHeld: Boolean(player && player.edgeHeld())
+    });
 }
 
 function renderPlayerLive(result = null) {
@@ -3552,6 +3563,7 @@ function stopSession(outcome = "Stopped", voiceText = null, voiceVars = null) {
         console.warn('Session history could not be saved', e);
     } finally {
         resetSessionCounters();
+        pauseVideoWithSession();
         resetGameState();
         updateWarmupBadge();
         showIdleTransport();
@@ -3577,6 +3589,7 @@ resetBtn?.addEventListener('click', () => {
     state.sessionStatus = 'IDLE';
     state.resumeStatus = null;
     dispatchHardware(0, 0, 0, 100, true);
+    pauseVideoWithSession();
     syncScreenWakeLock();
     crashRecovery?.clear();
     setOrgasmMode(false);

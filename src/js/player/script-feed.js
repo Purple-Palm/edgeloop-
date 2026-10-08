@@ -162,6 +162,12 @@ export function createScriptFeed({ clock = createMediaClock(), perfNow = default
             if (clock.generation() !== before) notify('clock');
             return clock.state();
         },
+        // The video's state as last set ('playing', 'waiting', ...): the
+        // status line says BUFFERING, not the governor's phase, while the
+        // clock waits for data.
+        videoState() {
+            return clock.state();
+        },
         // One observation of the video (media-clock.js sample). The first
         // one after a seek or a pause gives the script its time back, and a
         // re-anchor moves the timeline: both are told to the listeners.
