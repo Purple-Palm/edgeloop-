@@ -234,3 +234,31 @@ describe('the banner says a Handy may still be moving exactly until it is accoun
         assert.equal(flow.text, `${HR_ALERT} Also: ${ONE(ERR_503)}`);
     });
 });
+
+describe('a stop owed by a Handy on beat sync (HSP)', () => {
+    it('says the device runs out of script, and within how long', () => {
+        const report = createHandyStopReport();
+        report.unconfirmed(A, 'Stop not confirmed: Request timed out (/hsp/stop)', { runsOutSeconds: 3.4 });
+        assert.equal(report.sentence(), 'The Handy did not confirm its stop. It runs out of script within 4 s; check the device. (Stop not confirmed: Request timed out (/hsp/stop))');
+        assert.equal(report.confirmed(A), true);
+        assert.equal(report.sentence(), null);
+    });
+
+    it('a later HAMP report for the same key takes the HAMP words back', () => {
+        const report = createHandyStopReport();
+        report.unconfirmed(A, 'Stop not confirmed: x', { runsOutSeconds: 2 });
+        report.unconfirmed(A, ERR_503);
+        assert.equal(report.sentence(), ONE(ERR_503));
+    });
+
+    it('counts it with the others and says how soon the one on beat sync runs out', () => {
+        const report = createHandyStopReport();
+        report.unconfirmed(A, ERR_503);
+        report.unconfirmed(B, 'Stop not confirmed: HTTP 502 (/hsp/flush)', { runsOutSeconds: 1.2 });
+        assert.equal(report.sentence(), 'Two Handys did not confirm a stop and may still be moving: check both devices. The one on beat sync runs out of script within 2 s. (Stop not confirmed: HTTP 502 (/hsp/flush))');
+    });
+
+    it('still reads a map of bare errors, as describeOwedStops always took', () => {
+        assert.equal(describeOwedStops(new Map([[A, ERR_503]])), ONE(ERR_503));
+    });
+});

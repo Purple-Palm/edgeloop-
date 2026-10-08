@@ -36,6 +36,13 @@
 // confirmation then took the banner down while the first had never
 // confirmed anything.
 
+// A Handy driven over HSP (beat sync) only ever holds a few seconds of
+// script, so a stop it did not confirm is bounded: the report says within
+// how long it runs out (handy-hsp.js gives the seconds left in its buffer
+// when the stop was given up on).
+
+import { describeHspOwedStop } from './handy-hsp-protocol.js';
+
 // The roles in which the session drives the Handy. On Off it gets no motion,
 // so a session running does not account for it.
 export const HANDY_DRIVEN_ROLES = Object.freeze(['primary', 'secondary']);
@@ -51,20 +58,38 @@ function detailOf(message) {
     return typeof message === 'string' ? message.trim() : '';
 }
 
+// One entry as kept: { detail, runsOutSeconds } (runsOutSeconds null for a
+// HAMP stop), or the bare error string an older caller hands over.
+function entryOf(value) {
+    if (value && typeof value === 'object') {
+        const n = Number(value.runsOutSeconds);
+        return { detail: detailOf(value.detail), runsOutSeconds: value.runsOutSeconds === null || value.runsOutSeconds === undefined || !Number.isFinite(n) ? null : n };
+    }
+    return { detail: detailOf(value), runsOutSeconds: null };
+}
+
 // What the banner says about the stops in `owed` (key -> the error of its
 // last unconfirmed stop, oldest first), or null when none is owed. Two
 // devices are counted rather than folded into one "check the device": the
 // wearer has to find and check each of them. The error in brackets is the
-// newest one.
+// newest one. A Handy on beat sync is told by how soon its buffer runs out.
 export function describeOwedStops(owed) {
-    const entries = owed instanceof Map ? [...owed.values()] : [];
+    const entries = owed instanceof Map ? [...owed.values()].map(entryOf) : [];
     if (entries.length === 0) return null;
-    const newest = detailOf(entries[entries.length - 1]);
-    const lead = entries.length === 1
-        ? ONE_OWED
-        : entries.length === 2
+    const newest = entries[entries.length - 1].detail;
+    const hsp = entries.filter((e) => e.runsOutSeconds !== null);
+    let lead;
+    if (entries.length === 1) {
+        lead = hsp.length === 1 ? describeHspOwedStop(hsp[0].runsOutSeconds) : ONE_OWED;
+    } else {
+        lead = entries.length === 2
             ? 'Two Handys did not confirm a stop and may still be moving: check both devices.'
             : `${entries.length} Handys did not confirm a stop and may still be moving: check each device.`;
+        if (hsp.length > 0) {
+            const longest = Math.max(...hsp.map((e) => e.runsOutSeconds));
+            lead += ` ${hsp.length === 1 ? 'The one on beat sync runs' : 'Those on beat sync run'} out of script within ${Math.max(0, Math.ceil(longest))} s.`;
+        }
+    }
     return newest ? `${lead} (${newest})` : lead;
 }
 
@@ -72,11 +97,13 @@ export function createHandyStopReport() {
     const owed = new Map();
     return {
         // The API did not confirm a stop sent to `key`. The newest error is
-        // kept, and the key counts as reported last.
-        unconfirmed(key, message) {
+        // kept, and the key counts as reported last. `runsOutSeconds`: the
+        // stop was an HSP stop, and the device's buffer runs out within
+        // that many seconds.
+        unconfirmed(key, message, { runsOutSeconds = null } = {}) {
             const k = keyOf(key);
             owed.delete(k);
-            owed.set(k, detailOf(message));
+            owed.set(k, { detail: detailOf(message), runsOutSeconds });
         },
         // The API confirmed a stop sent to `key`. True when that settled a
         // stop the key owed; a key that owed none changes nothing.

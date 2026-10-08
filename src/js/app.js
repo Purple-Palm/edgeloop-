@@ -106,6 +106,11 @@ import { openDurableStore } from './durable-store.js';
 import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, describeStartRefusal } from './hardware/handy-protocol.js';
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
+import { createHandyHsp } from './hardware/handy-hsp.js';
+import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, describeHspStartRefusal, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
+import { createScriptFeed } from './player/script-feed.js';
+import { rhythmAt, hampTarget } from './player/script-rhythm.js';
+import { effectiveInvert } from './player/script-shaper.js';
 import { createStartGate } from './start-gate.js';
 import {
     connectVacuglide,
@@ -141,6 +146,7 @@ import {
     disconnectIntiface,
     rescanIntiface,
     dispatchIntiface,
+    setIntifaceScriptFeed,
     stopAllIntiface,
     setAxisRole,
     setAxisMaxCap,
@@ -166,6 +172,7 @@ import {
     connectTCode,
     disconnectTCode,
     dispatchTCode,
+    setTCodeScriptFeed,
     stopTCode,
     setTCodeHandlers,
     setAxisRole as setTCodeAxisRole,
@@ -1412,6 +1419,93 @@ function effectiveStrokeRange(strokeMin, strokeMax) {
 // was decided, and never first the speed it overrules.
 const tickDispatch = createTickDispatch();
 
+// The Application ID sent with every API v3 request: the fork's own,
+// embedded (handy-hsp-protocol.js; Handy documents it as not secret), or the
+// override saved under its own key from the Handy panel. That key is not in
+// the Backup's allow-list, so it never leaves with a Backup by itself.
+function handyApplicationId() {
+    return resolveApplicationId(safeGet(HANDY_APP_ID_STORAGE_KEY, '') || '');
+}
+
+// The script feed (player/script-feed.js): the one object every script
+// driver asks where the toy should be. Nothing is loaded into it yet and it
+// is not active, so no driver plays a script until the player section loads
+// one and Script mode is selected.
+const scriptFeed = isRemotePage ? null : createScriptFeed();
+if (scriptFeed) {
+    setIntifaceScriptFeed(scriptFeed);
+    setTCodeScriptFeed(scriptFeed);
+}
+
+// The Handy over HSP (beat sync, hardware/handy-hsp.js). It owns the device
+// only between prepare() at START or RESUME and release() at the end of the
+// session, only in Script mode with Beat sync on, and while it does, the v2
+// HAMP driver is sent nothing for it (dispatchHardware). Every way it asks
+// for a pause goes through the same path as any other device's safety
+// report: the session pauses and every toy is stopped.
+const handyHsp = isRemotePage ? null : createHandyHsp({
+    feed: scriptFeed,
+    getKey: () => (handyConnected ? getHandyKey() : ''),
+    getAppId: handyApplicationId,
+    handlers: {
+        onPause: (reason) => triggerDisconnectAlert(reason, 'handyHsp'),
+        onOffline: (reason) => triggerDisconnectAlert(reason || 'The Handy went offline.', 'handyLink', { motorsPaused: !reason }),
+        onStopUnconfirmed: (message, key, info = {}) => {
+            setHandyStatus(message, 'error');
+            handyStopReport.unconfirmed(key, message, { runsOutSeconds: info.runsOutSeconds ?? null });
+            reportOwedHandyStops({ fresh: true });
+        },
+        onStopConfirmed: (key) => {
+            if (handyStopReport.confirmed(key)) reportOwedHandyStops();
+        },
+        onNotice: (message) => {
+            if (handyConnected && message) setHandyStatus(message, 'busy');
+        },
+        onLog: (type, data) => console.info(`The Handy (HSP): ${type}`, data)
+    }
+});
+
+// Whether a START or RESUME now sets The Handy up for beat sync: Script
+// mode with a script loaded, The Handy connected and following the primary
+// channel, and Beat sync switched on (after the wearer's consent).
+function handyBeatSyncWanted() {
+    return Boolean(handyHsp && scriptFeed && scriptFeed.hasTrack())
+        && state.activeMode === 'script'
+        && handyConnected
+        && state.handyRole === 'primary'
+        && handyHsp.beatSync();
+}
+
+// The end of a session, or Script mode left while beat sync owned The
+// Handy: a confirmed HSP stop, then HAMP mode again for the v2 driver.
+// Until that is done the v2 driver is sent nothing (dispatchHardware).
+let handyHspReleasing = null;
+function releaseHandyHsp() {
+    if (!handyHsp || handyHspReleasing) return handyHspReleasing || Promise.resolve(true);
+    handyHspReleasing = handyHsp.release().catch(() => false).finally(() => { handyHspReleasing = null; });
+    return handyHspReleasing;
+}
+
+// What The Handy is sent in Script mode when beat sync does not own it:
+// rhythm mode (script-rhythm.js). Its speed and stroke range follow the
+// script's next three seconds, scaled by the allowance; the cap, the HAMP
+// floor and the end margin are applied by the usual path. A primary role
+// only: a Handy on the secondary channel follows that channel as a level.
+function handyRhythmTarget(primarySpeed, range) {
+    const settings = scriptFeed.settings();
+    const t = scriptFeed.scriptNow();
+    const rhythm = rhythmAt(scriptFeed.track(), t === null ? NaN : t, { invert: effectiveInvert(scriptFeed.meta(), settings) });
+    const limits = handyHsp ? handyHsp.deviceLimits() : {};
+    return hampTarget(rhythm, primarySpeed, {
+        envMin: range.env.min,
+        envMax: range.env.max,
+        travelMm: limits.travelMm,
+        maxSpeedMmS: limits.maxSpeedMmS,
+        maxSpeed: settings.scriptMaxSpeed,
+        approach: settings.scriptApproach
+    });
+}
+
 // What a live session is driving right now, for its crash-recovery marker.
 // Called before every dispatch, and whenever a toy joins mid-session: a role
 // change or a Test press can move an Intiface or T-Code axis before the
@@ -1432,9 +1526,11 @@ let pageFrozen = false;
 function noteLiveHardware() {
     if (!crashRecovery || state.sessionStatus === 'IDLE') return;
     const handyKey = handyConnected ? getHandyKey() : '';
+    const overHsp = Boolean(handyHsp && handyKey && (handyHsp.owns(handyKey) || handyHsp.mayBeMoving()));
     const current = crashRecovery.note({
         handyKey,
-        driving: drivesHandyNow({ sessionStatus: state.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving(), frozen: pageFrozen }),
+        handyProtocol: overHsp ? 'hsp' : 'hamp',
+        driving: drivesHandyNow({ sessionStatus: state.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving() || Boolean(handyHsp && handyHsp.mayBeMoving()), frozen: pageFrozen }),
         intiface: isIntifaceConnected() && intifaceDevices.size > 0,
         tcode: isTCodeConnected(),
         // A VacuGlide joins the marker with the cluster it is reached
@@ -1507,7 +1603,10 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // driver and the funscript export still records what the engine asked
     // for. A T-Code or Intiface linear axis takes a wider zone as a longer,
     // slower stroke rather than a faster one, so they keep the envelope as is.
-    if (!held.handy) dispatchHandy(targetHandySpeed, range.min, range.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
+    // In Script mode The Handy may be beat sync's (HSP), which takes the
+    // dispatch itself, or play the script's rhythm (routeTheHandy).
+    const handyPlan = held.handy ? null : routeTheHandy(primarySpeed, targetHandySpeed, range, force, release.urgent);
+    if (!held.handy && handyPlan) dispatchHandy(handyPlan.speed, handyPlan.min, handyPlan.max, force, range.env.min, range.env.max, advancedSettings.handyEndMargin, { urgent: release.urgent });
     // The VacuGlide takes one speed and nothing else: the channel its role
     // names, under its cap. It has no stroke range to follow and no second
     // motor for the other channel, and its valves are the wearer's alone -
@@ -1526,6 +1625,38 @@ function dispatchHardware(primarySpeed, secondarySpeed, strokeMin, strokeMax, fo
     // And once more after it: every other page learns of a start this
     // dispatch just sent before it can take The Handy for one nobody drives.
     noteLiveHardware();
+}
+
+// What the v2 driver sends The Handy for a dispatch: { speed, min, max }, or
+// null when it is sent nothing. Outside Script mode, and in Script mode on
+// the secondary channel, exactly what it always was. In Script mode on the
+// primary channel: beat sync when it owns the device (it is dispatched here,
+// and the v2 driver gets nothing), else rhythm mode. Beat sync owning a
+// device whose session ended (STOP and Reset dispatch their forced zero
+// once IDLE) or left Script mode hands it back to HAMP after a confirmed
+// stop; until then the v2 driver is sent nothing.
+function routeTheHandy(primarySpeed, targetHandySpeed, range, force, urgent) {
+    const route = handyScriptRoute({
+        scriptDrives: Boolean(scriptFeed && scriptFeed.isActive()),
+        hspOwns: Boolean(handyHsp && handyHsp.owns()),
+        releasing: Boolean(handyHspReleasing),
+        role: state.handyRole
+    });
+    if (route === 'hsp' && !(force && state.sessionStatus === 'IDLE')) {
+        const allowance = state.handyRole === 'primary' ? primarySpeed : 0;
+        handyHsp.dispatch({ allowance, cap: state.handyMaxCap, force, urgent });
+        return null;
+    }
+    if (route === 'hsp' || route === 'release') {
+        if (force) handyHsp.dispatch({ allowance: 0, force: true });
+        if (!handyHspReleasing) releaseHandyHsp();
+        return null;
+    }
+    if (route === 'rhythm') {
+        const target = handyRhythmTarget(primarySpeed, range);
+        return { speed: handyTargetSpeed('primary', target.speed, 0, state.handyMaxCap), min: target.strokeMin, max: target.strokeMax };
+    }
+    return { speed: targetHandySpeed, min: range.min, max: range.max };
 }
 
 // A change of the crash-recovery records has reached the disk, failed or
@@ -2481,6 +2612,9 @@ function startOrResumeSession() {
     hideAlertBanner('hrSignal');
     hideAlertBanner('supervision');
     hideAlertBanner('vacuglidePaused');
+    // What beat sync paused for (the device's button, another app, heat, a
+    // starving buffer) is over once the wearer carries on.
+    hideAlertBanner('handyHsp');
     // And no report may go on saying "Motors paused for safety." over motors
     // that run. The rest of a report can still be true: an Intiface or
     // T-Code device that was lost, or a Handy lost while reconnecting, is
@@ -2591,8 +2725,17 @@ function startOrResumeWhenReady(tappedAt) {
     }
     const resuming = state.sessionStatus === 'PAUSED';
     const started = startGate.run({
+        // With beat sync wanted, The Handy is set up for it before anything
+        // moves (handy-hsp.js prepare); a setup that fails refuses the start
+        // and says so, and the route is never switched to rhythm silently.
         ask: handyConnected
-            ? () => pollHandyConnected().then((answer) => ({ ok: answer.state === 'online', answer }))
+            ? () => pollHandyConnected().then(async (answer) => {
+                if (answer.state !== 'online') return { ok: false, answer };
+                if (!handyBeatSyncWanted()) return { ok: true, answer };
+                const env = normalizeEnvelope(advancedSettings.handyHwMin, advancedSettings.handyHwMax);
+                const ready = await handyHsp.prepare({ envMin: env.min, envMax: env.max, endMargin: advancedSettings.handyEndMargin });
+                return ready.ok ? { ok: true, answer } : { ok: false, answer, hsp: ready };
+            })
             : null,
         start: startOrResumeSession,
         // An advisory: a start that did not happen moves nothing, and a
@@ -2602,7 +2745,10 @@ function startOrResumeWhenReady(tappedAt) {
         // latest press is news.
         refuse: (verdict) => {
             withdrawStartRefusal();
-            showAlertBanner(describeStartRefusal(verdict && verdict.answer, resuming), {
+            const text = verdict && verdict.hsp
+                ? describeHspStartRefusal(verdict.hsp, resuming)
+                : describeStartRefusal(verdict && verdict.answer, resuming);
+            showAlertBanner(text, {
                 severity: 'advisory',
                 source: 'handyCheck'
             });
@@ -4954,6 +5100,15 @@ function settleDrivenHandyStop() {
 
 setHandyHandlers({
     isSessionActive: () => state.sessionStatus === 'RUNNING' || state.sessionStatus === 'RAMPDOWN',
+    // A page that died drove the Handy linked here over HSP: the v2 driver
+    // stops it on its next zero, and beat sync sends the HSP stop now
+    // unless this page's own session is playing on it.
+    onLinkedCrash: (key, protocol) => {
+        if (protocol === 'hsp' && handyHsp) handyHsp.stopForeign(key).catch(() => {});
+    },
+    // A Handy a dead session drove over HSP is sent the HSP stop with the
+    // Application ID this page uses.
+    applicationId: () => handyApplicationId(),
     onError: (message) => {
         if (!handyConnected) return;
         if (message) {
@@ -5019,6 +5174,10 @@ document.getElementById('modalHandyConnectBtn')?.addEventListener('click', async
     setBadgeState('Handy', 'connecting', wasConnected ? 'Reconnecting...' : 'Connecting...');
 
     try {
+        // Beat sync hands its device back first (a confirmed HSP stop, then
+        // HAMP mode): Connect switches the device to HAMP mode itself, and an
+        // HSP play under way must not outlive the link it belonged to.
+        if (handyHsp && (handyHsp.owns() || handyHspReleasing)) await releaseHandyHsp();
         const result = await connectHandy(key);
         // Connecting sent this very device a stop and the API confirmed it:
         // whatever a crashed session left it doing is over, so no
@@ -5067,6 +5226,9 @@ document.getElementById('modalHandyDisconnectBtn')?.addEventListener('click', as
     // modal can say whether the device confirmed it. The banner hears from
     // the driver either way: a stop that fails is reported for this key, and
     // one that is confirmed settles whatever this key still owed.
+    // Beat sync, if it owns the device, stops it over HSP as well; its own
+    // stop is reported by its driver when it is not confirmed.
+    if (handyHsp && (handyHsp.owns() || handyHsp.mayBeMoving())) releaseHandyHsp();
     const stopped = disconnectHandy();
     state.handyBattery = null;
     setHandyStatus('Stopping the device...', 'busy');
@@ -6011,6 +6173,7 @@ const pageAway = createPageAwayTracker();
 function stopEveryToyOnPageAway() {
     // One at a time, so a driver that throws cannot keep the stop from the others.
     try { stopHandyOnUnload(); } catch (e) {}
+    try { handyHsp?.stopOnUnload(); } catch (e) {}
     try { stopAllIntiface(); } catch (e) {}
     try { stopTCode(); } catch (e) {}
 }
@@ -6078,6 +6241,8 @@ document.addEventListener('visibilitychange', () => {
     haltIfUnsupervised();
     screenWakeLock.visibilityChanged();
     syncScreenWakeLock();
+    // Beat sync's clock estimate is renewed after the page was away.
+    if (handyHsp?.owns()) handyHsp.resync().catch(() => {});
 });
 
 // Session History & Funscript Downloader Hook

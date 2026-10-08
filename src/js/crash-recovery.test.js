@@ -32,6 +32,7 @@ import {
     isOwnerAlive,
     openPages,
     readPendingCrashStops,
+    readPendingHspCrashStops,
     readPendingCrashStopPromises,
     addPendingCrashStops,
     clearPendingCrashStop,
@@ -4375,7 +4376,8 @@ describe('app.js puts the crash recovery in the page', () => {
 
     it('tells other pages whether this session drives its Handy right now: after every dispatch, and when the page is frozen', () => {
         const note = functionBody('function noteLiveHardware(');
-        assert.match(note, /driving: drivesHandyNow\(\{ sessionStatus: state\.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving\(\), frozen: pageFrozen \}\)/);
+        // Beat sync's own motion counts too (handy-hsp.js mayBeMoving).
+        assert.match(note, /driving: drivesHandyNow\(\{ sessionStatus: state\.sessionStatus, handyKey, mayBeMoving: handyMayBeMoving\(\)(?: \|\| Boolean\(handyHsp && handyHsp\.mayBeMoving\(\)\))?, frozen: pageFrozen \}\)/);
         const dispatch = functionBody('function dispatchHardware(');
         const again = dispatch.lastIndexOf('noteLiveHardware();');
         for (const send of ['dispatchHandy(', 'dispatchIntiface(', 'dispatchTCode(']) {
@@ -4422,7 +4424,10 @@ describe('app.js puts the crash recovery in the page', () => {
         const held = dispatch.indexOf('const held = force || !crashRecovery ? NOTHING_HELD : crashRecovery.waitingForDisk();');
         assert.ok(held > dispatch.indexOf('noteLiveHardware();'), 'asked once the marker is noted');
         for (const [kind, send] of [['handy', 'dispatchHandy('], ['vacuglide', 'dispatchVacuglide('], ['intiface', 'dispatchIntiface('], ['tcode', 'dispatchTCode(']]) {
-            const at = dispatch.indexOf(`if (!held.${kind}) ${send}`);
+            // The Handy may be sent nothing at all in Script mode, when beat
+            // sync takes the dispatch (routeTheHandy).
+            const m = new RegExp(`if \\(!held\\.${kind}(?: && handyPlan)?\\) ${send.replace('(', '\\(')}`).exec(dispatch);
+            const at = m ? m.index : -1;
             assert.ok(at > held, `${send} only for a toy the disk names`);
         }
         assert.match(dispatch, /heldDispatch = held\.handy \|\| held\.intiface \|\| held\.tcode \|\| held\.vacuglide;/);
@@ -4430,5 +4435,103 @@ describe('app.js puts the crash recovery in the page', () => {
         assert.match(resume, /if \(!heldDispatch\) return;/);
         assert.match(resume, /if \(state\.sessionStatus !== 'RUNNING' && state\.sessionStatus !== 'RAMPDOWN'\) return;/);
         assert.match(resume, /updateEngine\(\);/);
+    });
+});
+
+describe('a Handy driven over HSP', () => {
+    const KH = 'KEY-HSP-0001';
+
+    it('is named in a list of its own beside the keys, which an older page still reads as keys', () => {
+        const storage = fakeStorage();
+        const tracker = createLiveSessionTracker({ owner: 'page-a', storage });
+        tracker.note({ handyKey: KH });
+        const plain = storage.getItem(liveSessionKey('page-a'));
+        assert.equal(JSON.parse(plain).handyHsp, undefined, 'a HAMP session writes the marker it always did');
+        assert.deepEqual(Object.keys(JSON.parse(plain)), ['handy', 'intiface', 'tcode', 'gen']);
+        tracker.note({ handyKey: KH, handyProtocol: 'hsp' });
+        const parsed = JSON.parse(storage.getItem(liveSessionKey('page-a')));
+        assert.deepEqual(parsed.handy, [KH], 'the key is still a plain string in `handy`');
+        assert.deepEqual(parsed.handyHsp, [KH]);
+        assert.ok(parsed.gen > JSON.parse(plain).gen, 'a new generation: the marker names more than before');
+        // Sticky for the session: back on HAMP, a crash may still have left
+        // it playing its buffer.
+        tracker.note({ handyKey: KH, handyProtocol: 'hamp' });
+        assert.deepEqual(readLiveSession(storage, 'page-a').hspKeys, [KH]);
+    });
+
+    it('reads the { key, protocol } form as well', () => {
+        const storage = fakeStorage();
+        storage.setItem(liveSessionKey('page-z'), JSON.stringify({ handy: [{ key: KH, protocol: 'hsp' }, 'KEY-PLAIN-2'], intiface: false, tcode: false, gen: 3 }));
+        const marker = readLiveSession(storage, 'page-z');
+        assert.deepEqual(marker.handyKeys, [KH, 'KEY-PLAIN-2']);
+        assert.deepEqual(marker.hspKeys, [KH]);
+    });
+
+    it('plans the HSP stop for it, and only for it', () => {
+        const plan = planCrashRecovery({
+            markers: [{ readable: true, handyKeys: [KH, 'KEY-PLAIN-2'], hspKeys: [KH], intiface: false, tcode: false, vacuglides: [] }],
+            savedHandyKey: KH
+        });
+        assert.deepEqual(plan.handy, [
+            { key: KH, saved: true, driven: true, protocol: 'hsp' },
+            { key: 'KEY-PLAIN-2', saved: false, driven: true }
+        ]);
+        const owed = planCrashRecovery({ pending: [KH, 'KEY-PLAIN-2'], pendingHsp: [KH], savedHandyKey: '' });
+        assert.deepEqual(owed.earlier, [
+            { key: KH, saved: false, driven: true, protocol: 'hsp' },
+            { key: 'KEY-PLAIN-2', saved: false, driven: true }
+        ]);
+    });
+
+    it('sends the stop with its protocol, and owes the next page the HSP stop when it does not get through', async () => {
+        const { storage, locks } = crashedPage({ handyKey: KH, handyProtocol: 'hsp' });
+        const asked = [];
+        const stopHandy = (key, { onUpdate, protocol } = {}) => {
+            asked.push({ key, protocol });
+            const update = { outcome: 'offline', detail: 'Device not connected', final: true };
+            if (onUpdate) onUpdate(update);
+            return Promise.resolve(update);
+        };
+        await runCrashRecovery({ storage, locks, savedHandyKey: '', stopHandy, onReport: () => {} });
+        assert.deepEqual(asked, [{ key: KH, protocol: 'hsp' }]);
+        assert.deepEqual(readPendingCrashStops(storage), [KH]);
+        assert.deepEqual(readPendingHspCrashStops(storage), [KH]);
+        // The next page sends it the HSP stop again.
+        const again = [];
+        const next = (key, { onUpdate, protocol } = {}) => {
+            again.push({ key, protocol });
+            const update = { outcome: 'stopped', detail: '', final: true };
+            if (onUpdate) onUpdate(update);
+            return Promise.resolve(update);
+        };
+        await runCrashRecovery({ storage, locks: fakeLocks(), savedHandyKey: '', stopHandy: next, onReport: () => {} });
+        assert.deepEqual(again, [{ key: KH, protocol: 'hsp' }]);
+        assert.deepEqual(readPendingCrashStops(storage), []);
+    });
+
+    it('a record of HAMP stops alone is written as it always was', () => {
+        const storage = fakeStorage();
+        addPendingCrashStops(['KEY-PLAIN-2'], storage);
+        assert.deepEqual(JSON.parse(storage.getItem(PENDING_CRASH_STOPS_KEY)).handy, [{ key: 'KEY-PLAIN-2', promised: '' }]);
+        addPendingCrashStops([KH], storage, { hspKeys: [KH] });
+        assert.deepEqual(JSON.parse(storage.getItem(PENDING_CRASH_STOPS_KEY)).handy[1], { key: KH, promised: '', hsp: true });
+        // Owed again by a HAMP crash, it keeps the HSP stop it was owed.
+        addPendingCrashStops([KH], storage);
+        assert.deepEqual(readPendingHspCrashStops(storage), [KH]);
+    });
+
+    it('holds the first HSP command until the marker on disk names the key as HSP', () => {
+        const states = new Map();
+        const storage = fakeStorage();
+        storage.state = (key) => states.get(key) || null;
+        const tracker = createLiveSessionTracker({ owner: 'page-a', storage });
+        tracker.note({ handyKey: KH });
+        const key = liveSessionKey('page-a');
+        states.set(key, { status: 'pending', settled: JSON.stringify({ handy: [KH], intiface: false, tcode: false, gen: 1 }) });
+        assert.equal(tracker.waitingForDisk().handy, false, 'HAMP: the key is on disk');
+        tracker.note({ handyKey: KH, handyProtocol: 'hsp' });
+        assert.equal(tracker.waitingForDisk().handy, true, 'HSP: not until the disk says so');
+        states.set(key, { status: 'pending', settled: JSON.stringify({ handy: [KH], handyHsp: [KH], intiface: false, tcode: false, gen: 2 }) });
+        assert.equal(tracker.waitingForDisk().handy, false);
     });
 });

@@ -68,6 +68,13 @@ import {
     parseBatteryLevel,
     describeHandyInfo
 } from './handy-protocol.js';
+import {
+    HANDY_V3_BASE,
+    HANDY_APP_ID,
+    v3Headers,
+    classifyHspReply,
+    classifyHspRecoveryStop
+} from './handy-hsp-protocol.js';
 
 export let handyConnected = false;
 
@@ -232,7 +239,9 @@ const handlers = {
     onStopUnconfirmed: null,
     onStopConfirmed: null,
     onNotice: null,
-    isSessionActive: null
+    isSessionActive: null,
+    onLinkedCrash: null,
+    applicationId: null
 };
 
 // app.js installs UI callbacks here:
@@ -264,7 +273,9 @@ const handlers = {
 // to that device that left after it confirmed. A stop that fails after a
 // later one was confirmed used to be reported all the same, and the page
 // then said "may still be moving" over a device the record knew at rest.
-export function setHandyHandlers({ onError, onOffline, onStopUnconfirmed, onStopConfirmed, onNotice, isSessionActive } = {}) {
+export function setHandyHandlers({ onError, onOffline, onStopUnconfirmed, onStopConfirmed, onNotice, isSessionActive, onLinkedCrash, applicationId } = {}) {
+    if (onLinkedCrash !== undefined) handlers.onLinkedCrash = onLinkedCrash;
+    if (applicationId !== undefined) handlers.applicationId = applicationId;
     if (onError !== undefined) handlers.onError = onError;
     if (onOffline !== undefined) handlers.onOffline = onOffline;
     if (onStopUnconfirmed !== undefined) handlers.onStopUnconfirmed = onStopUnconfirmed;
@@ -573,6 +584,29 @@ async function exchange(path, { method = 'GET', body = undefined, key }) {
         err.undelivered = false;
         err.timedOut = timedOut;
         throw err;
+    } finally {
+        if (abortTimer !== null) clearTimeout(abortTimer);
+    }
+}
+
+// One HTTP exchange with API v3, for the crash stop of a Handy driven over
+// HSP: the Application ID goes with the connection key. Never throws:
+// resolves { httpOk, status, body } or { noReply, timedOut }.
+async function exchangeV3(path, { method = 'PUT', key, apiKey }) {
+    const init = { method, headers: v3Headers(apiKey || HANDY_APP_ID, key) };
+    let abortTimer = null;
+    if (typeof AbortController === 'function') {
+        const controller = new AbortController();
+        init.signal = controller.signal;
+        abortTimer = setTimeout(() => controller.abort(), HANDY_TIMINGS.requestTimeoutMs);
+    }
+    try {
+        const res = await fetch(`${HANDY_V3_BASE}${path}`, init);
+        let data = null;
+        try { data = await res.json(); } catch (e) { data = null; }
+        return { httpOk: res.ok, status: res.status, body: data };
+    } catch (e) {
+        return { noReply: true, timedOut: Boolean(e && e.name === 'AbortError') };
     } finally {
         if (abortTimer !== null) clearTimeout(abortTimer);
     }
@@ -1397,7 +1431,8 @@ export function stopHandyOnUnload() {
 // (classifyRecoveryStop): no connect or mode call is needed first.
 //
 // Rules:
-//   * Nothing but PUT /hamp/stop is ever sent, and nothing is reported
+//   * Nothing but PUT /hamp/stop is ever sent - and, to a Handy the dead
+//     session drove over HSP, v3 PUT /hsp/stop beside it - and nothing is reported
 //     through the live link: no error, no offline link and no unconfirmed
 //     stop is reported, and no failure is counted. A stop the API confirms
 //     (result 0 or 1) is still entered against the device like any other
@@ -1449,8 +1484,8 @@ export function stopHandyOnUnload() {
 //     (crash-recovery.js) - so hearing a second one would renew a promise
 //     that the page sending this stop may be the try of.
 //
-// Jobs by key: { key, active, held, rounds, startedAt, timer, inFlight,
-// last, listeners, settleListeners, resolve, done }.
+// Jobs by key: { key, protocol, apiKey, active, held, rounds, startedAt,
+// timer, inFlight, last, listeners, settleListeners, resolve, done }.
 const crashStops = new Map();
 // Jobs that gave up, by key, until a Connect with that key succeeds.
 const givenUpCrashStops = new Map();
@@ -1496,10 +1531,18 @@ function sendCrashStop(job) {
     const key = job.key;
     const sentAs = ++stopsSent;
     motionRecord(key).roundsOut += 1;
-    const pending = exchange('/hamp/stop', { method: 'PUT', key }).then(
+    const hamp = exchange('/hamp/stop', { method: 'PUT', key }).then(
         (reply) => classifyRecoveryStop(reply),
         (e) => classifyRecoveryStop({ noReply: true, timedOut: Boolean(e && e.timedOut) })
-    ).then((verdict) => {
+    );
+    // A Handy the dead session drove over HSP is sent the v3 stop as well,
+    // and only that stop's confirmation, or HAMP's own, settles it: its v2
+    // "not in HAMP mode" is no answer for a device in HSP mode.
+    const both = job.protocol === 'hsp'
+        ? Promise.all([hamp, exchangeV3('/hsp/stop', { method: 'PUT', key, apiKey: job.apiKey }).then((reply) => classifyHspReply(reply, '/hsp/stop'))])
+            .then(([hampVerdict, hspVerdict]) => classifyHspRecoveryStop({ hsp: hspVerdict, hamp: hampVerdict }))
+        : hamp;
+    const pending = both.then((verdict) => {
         if (verdict.outcome === RECOVERY_STOP.STOPPED || verdict.outcome === RECOVERY_STOP.ALREADY_STOPPED) {
             noteStopConfirmed(key, sentAs);
         }
@@ -1570,7 +1613,22 @@ function settledCrashStop(update, onUpdate) {
     return Promise.resolve(update);
 }
 
-// Send the crash-recovery stop for `key`. `onUpdate({ outcome, detail,
+// The Application ID the page sends (app.js installs it with the
+// handlers), or the built-in one.
+function pageApplicationId() {
+    try {
+        const id = typeof handlers.applicationId === 'function' ? handlers.applicationId() : '';
+        return typeof id === 'string' && id ? id : HANDY_APP_ID;
+    } catch (e) {
+        return HANDY_APP_ID;
+    }
+}
+
+// Send the crash-recovery stop for `key`. `protocol` is 'hsp' for a Handy the
+// dead session drove over HSP (beat sync): each attempt then sends v3 PUT
+// /hsp/stop with `apiKey` (the Application ID) next to v2 PUT /hamp/stop, and
+// v2's "not in HAMP mode" no longer settles it (classifyHspRecoveryStop).
+// `onUpdate({ outcome, detail,
 // final })` is called whenever what the wearer should be told changes: after
 // the first round, when a later round gets a different answer, and once at
 // the end. Resolves with the final update. Outcomes are RECOVERY_STOP's; a
@@ -1580,7 +1638,8 @@ function settledCrashStop(update, onUpdate) {
 // once, and sends nothing. A second call for a key already being stopped
 // joins that job: it is told the latest answer at once, then every later
 // one, and shares its result. Never throws.
-export function stopHandyAfterCrash(key, { onUpdate } = {}) {
+export function stopHandyAfterCrash(key, { onUpdate, protocol = 'hamp', apiKey = pageApplicationId() } = {}) {
+    const overHsp = protocol === 'hsp';
     const trimmed = typeof key === 'string' ? key.trim() : '';
     if (!trimmed) {
         return settledCrashStop({ outcome: RECOVERY_STOP.FAILED, detail: 'no connection key', final: true }, onUpdate);
@@ -1594,10 +1653,19 @@ export function stopHandyAfterCrash(key, { onUpdate } = {}) {
     if (handyConnected && handyKey === trimmed) {
         handyMotionUnknown = true;
         noteMayHaveStarted(trimmed);
+        // The page's HSP driver, if it has one, is told too: a dead page's
+        // HSP play is its to stop (app.js).
+        callHandler('onLinkedCrash', trimmed, overHsp ? 'hsp' : 'hamp');
         return settledCrashStop({ outcome: RECOVERY_STOP.LINKED, detail: '', final: true }, onUpdate);
     }
     const existing = crashStops.get(trimmed);
     if (existing) {
+        // Asked again for a key the dead session drove over HSP: from the
+        // next attempt on, the job sends the HSP stop too.
+        if (overHsp) {
+            existing.protocol = 'hsp';
+            existing.apiKey = apiKey || HANDY_APP_ID;
+        }
         if (typeof onUpdate === 'function') {
             existing.listeners.push(onUpdate);
             if (existing.last) {
@@ -1610,6 +1678,8 @@ export function stopHandyAfterCrash(key, { onUpdate } = {}) {
     const done = new Promise((r) => { resolve = r; });
     const job = {
         key: trimmed,
+        protocol: overHsp ? 'hsp' : 'hamp',
+        apiKey: apiKey || HANDY_APP_ID,
         active: true,
         // A Connect already verifying this key owns the device until it is
         // over: the job waits for it rather than racing its first start.

@@ -36,7 +36,10 @@
 // Rules:
 //   * Nothing is started, connected or changed: the one command ever sent is
 //     PUT /hamp/stop (handy.js, stopHandyAfterCrash), and to a VacuGlide its
-//     whole stop.
+//     whole stop. A Handy the session drove over HSP (beat sync, API v3) is
+//     named as such in the marker (`handyHsp`) and in the stops still owed
+//     (`hsp`), and is sent the v3 PUT /hsp/stop as well; for it the v2
+//     answer "not in HAMP mode" settles nothing, since HSP is not HAMP.
 //   * A remote controller or viewer page neither writes nor reads the marker
 //     or the stops still owed (app.js never calls this module there).
 //   * Every page keeps a marker of its own, under a key named after its id
@@ -349,16 +352,42 @@ function sameVacuglides(a, b) {
     return x.length === y.length && x.every((entry, i) => entry.token === y[i].token && entry.cluster === y[i].cluster);
 }
 
+// The Handy keys a marker names. An entry is a key, as every marker has
+// always written it, or { key, protocol } (the spec's form for a protocol
+// per key, read here so either form a page writes is understood).
 function cleanHandyKeys(value, cap = MAX_MARKER_HANDY_KEYS) {
     const keys = [];
     if (!Array.isArray(value)) return keys;
     for (const item of value) {
-        const key = sanitizeConnectionKey(item);
+        const key = sanitizeConnectionKey(item && typeof item === 'object' ? item.key : item);
         if (key && !keys.includes(key)) keys.push(key);
         if (keys.length >= cap) break;
     }
     return keys;
 }
+
+// The keys of a marker that the session drove over HSP (beat sync, API v3):
+// its `handyHsp` list, and any { key, protocol: 'hsp' } entry of `handy`.
+// A key named only as a plain string was driven over HAMP, as every marker
+// written before there was HSP. They are written as a list of their own,
+// next to `handy` and not inside it, so that a page of an older version
+// still reads every key and still sends each one its HAMP stop.
+function cleanHspKeys(parsed, keys) {
+    const out = [];
+    const add = (value) => {
+        const key = sanitizeConnectionKey(value);
+        if (key && keys.includes(key) && !out.includes(key)) out.push(key);
+    };
+    if (Array.isArray(parsed.handyHsp)) for (const item of parsed.handyHsp) add(item);
+    if (Array.isArray(parsed.handy)) {
+        for (const item of parsed.handy) {
+            if (item && typeof item === 'object' && item.protocol === 'hsp') add(item.key);
+        }
+    }
+    return out;
+}
+
+export const HANDY_PROTOCOLS = Object.freeze(['hamp', 'hsp']);
 
 // The storage a host page keeps its crash-recovery records in: localStorage,
 // with every change of a record committed to the durable store as well
@@ -632,14 +661,16 @@ function parseLiveSession(key, text, { raw = text } = {}) {
         parsed = null;
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        return { key, owner, raw, handyKeys: [], intiface: false, tcode: false, vacuglides: [], gen: null, readable: false };
+        return { key, owner, raw, handyKeys: [], hspKeys: [], intiface: false, tcode: false, vacuglides: [], gen: null, readable: false };
     }
     if (Object.prototype.hasOwnProperty.call(parsed, 'ended')) return null;
+    const handyKeys = cleanHandyKeys(parsed.handy);
     return {
         key,
         owner,
         raw,
-        handyKeys: cleanHandyKeys(parsed.handy),
+        handyKeys,
+        hspKeys: cleanHspKeys(parsed, handyKeys),
         intiface: parsed.intiface === true,
         tcode: parsed.tcode === true,
         vacuglides: cleanVacuglides(parsed.vacuglide),
@@ -670,16 +701,20 @@ export function drivesHandyNow({ sessionStatus, handyKey, mayBeMoving, frozen = 
         && frozen !== true;
 }
 
-const NOTHING_CONNECTED = Object.freeze({ handyKey: '', intiface: false, tcode: false, vacuglideToken: '' });
+const NOTHING_CONNECTED = Object.freeze({ handyKey: '', handyHsp: false, intiface: false, tcode: false, vacuglideToken: '' });
 
 // The marker a host page keeps while its session may drive hardware.
-//   note({ handyKey, driving, intiface, tcode, vacuglide })
+//   note({ handyKey, handyProtocol, driving, intiface, tcode, vacuglide })
 //                                        what is connected right now, and
 //                                        whether the session drives that
 //                                        Handy right now (drivesHandyNow);
 //                                        `vacuglide` is { token, cluster } of
 //                                        the VacuGlide connected now, or
-//                                        null; called around every dispatch
+//                                        null; `handyProtocol` is 'hsp'
+//                                        while the session drives that
+//                                        Handy over HSP (beat sync), so the
+//                                        recovery sends it the HSP stop as
+//                                        well; called around every dispatch
 //                                        of a live session
 //   clear()                              the session ended cleanly
 // Hardware only ever joins a session's marker: a Handy that dropped offline
@@ -824,6 +859,11 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
             keys.push(handyKey);
             if (keys.length > MAX_MARKER_HANDY_KEYS) keys.shift();
         }
+        // A key once driven over HSP stays so for the session: a crash at
+        // any point after that may have left it playing its buffer.
+        const hspKeys = (live ? live.hspKeys : []).filter((k) => keys.includes(k));
+        const overHsp = Boolean(handyKey) && hardware.handyProtocol === 'hsp';
+        if (overHsp && !hspKeys.includes(handyKey)) hspKeys.push(handyKey);
         // A VacuGlide joins like a Handy key, with the cluster it is reached
         // through: the stop a recovery sends it goes there when Autoblow's
         // router cannot be asked. One that has moved cluster since is named
@@ -841,6 +881,7 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
         }
         const next = {
             handyKeys: keys,
+            hspKeys,
             intiface: Boolean(live && live.intiface) || hardware.intiface === true,
             tcode: Boolean(live && live.tcode) || hardware.tcode === true,
             vacuglides
@@ -854,20 +895,25 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
             || next.tcode !== live.tcode
             || next.handyKeys.length !== live.handyKeys.length
             || next.handyKeys.some((k, i) => live.handyKeys[i] !== k)
+            || next.hspKeys.length !== live.hspKeys.length
             || !sameVacuglides(next.vacuglides, live.vacuglides);
         const found = safeGet(key, null, storage);
         const displaced = stored !== null && found !== stored;
         if (joined || displaced) generation += 1;
         live = next;
-        connected = { handyKey, intiface: hardware.intiface === true, tcode: hardware.tcode === true, vacuglideToken: vacuglide ? vacuglide.token : '' };
+        connected = { handyKey, handyHsp: overHsp, intiface: hardware.intiface === true, tcode: hardware.tcode === true, vacuglideToken: vacuglide ? vacuglide.token : '' };
         // The lock is asked for before the marker exists, so no page can find
         // this marker while its owner looks closed.
         holdLock();
-        // A session that never drove a VacuGlide writes the marker it always
-        // has, byte for byte.
-        const text = live.vacuglides.length > 0
-            ? JSON.stringify({ handy: live.handyKeys, intiface: live.intiface, tcode: live.tcode, vacuglide: live.vacuglides, gen: generation })
-            : JSON.stringify({ handy: live.handyKeys, intiface: live.intiface, tcode: live.tcode, gen: generation });
+        // A session that never drove a VacuGlide, nor a Handy over HSP,
+        // writes the marker it always has, byte for byte.
+        const record = { handy: live.handyKeys };
+        if (live.hspKeys.length > 0) record.handyHsp = live.hspKeys;
+        record.intiface = live.intiface;
+        record.tcode = live.tcode;
+        if (live.vacuglides.length > 0) record.vacuglide = live.vacuglides;
+        record.gen = generation;
+        const text = JSON.stringify(record);
         const current = found === text || safeSet(key, text, storage);
         stored = current ? text : null;
         // On its way to disk now, not once the dispatch that noted it is
@@ -914,7 +960,8 @@ export function createLiveSessionTracker({ owner, storage, locks, onSessionStart
         const disk = typeof record.settled === 'string' ? parseLiveSession(key, record.settled) : null;
         const named = disk && disk.readable ? disk : null;
         return {
-            handy: Boolean(connected.handyKey) && !(named && named.handyKeys.includes(connected.handyKey)),
+            handy: Boolean(connected.handyKey) && !(named && named.handyKeys.includes(connected.handyKey)
+                && (!connected.handyHsp || named.hspKeys.includes(connected.handyKey))),
             intiface: connected.intiface && !(named && named.intiface),
             tcode: connected.tcode && !(named && named.tcode),
             vacuglide: Boolean(connected.vacuglideToken) && !(named && named.vacuglides.some((entry) => entry.token === connected.vacuglideToken))
@@ -1117,7 +1164,10 @@ function parsePending(raw) {
     for (const item of parsed.handy) {
         const key = sanitizeConnectionKey(item && typeof item === 'object' ? item.key : null);
         if (!key || handy.some((entry) => entry.key === key)) continue;
-        handy.push({ key, promised: cleanPromise(item.promised) });
+        // `hsp`: the session that owes it drove it over HSP, so its stop is
+        // the HSP stop as well. Written only when true: a record of HAMP
+        // stops alone is what it always was.
+        handy.push(item.hsp === true ? { key, promised: cleanPromise(item.promised), hsp: true } : { key, promised: cleanPromise(item.promised) });
         if (handy.length >= MAX_PENDING_CRASH_STOPS) break;
     }
     // A token the Connect field would refuse is none, and a cluster it would
@@ -1194,6 +1244,11 @@ export function readPendingCrashStops(storage) {
     return readPendingEntries(storage).map((entry) => entry.key);
 }
 
+// Those of them a session drove over HSP.
+export function readPendingHspCrashStops(storage) {
+    return readPendingEntries(storage).filter((entry) => entry.hsp === true).map((entry) => entry.key);
+}
+
 // The promise each owed key carries, by key ('' for none yet): what a page
 // finds before it sends anything, and hands back to
 // notePendingCrashStopGaveUp as `seen` if its own stop gives up.
@@ -1206,13 +1261,17 @@ export function readPendingCrashStopPromises(storage) {
 // recovering from it owes the next page to open a try of its own. Returns
 // the keys owed afterwards, as stored: a key the browser refused to store is
 // not among them.
-export function addPendingCrashStops(keys, storage) {
+// `hspKeys` are those of them the session drove over HSP; a key owed already
+// keeps an HSP stop it was owed.
+export function addPendingCrashStops(keys, storage, { hspKeys = [] } = {}) {
     const adding = cleanHandyKeys(keys, MAX_PENDING_CRASH_STOPS);
     const current = readPendingEntries(storage);
     if (adding.length === 0) return current.map((entry) => entry.key);
+    const overHsp = new Set(cleanHandyKeys(hspKeys, 64));
+    for (const entry of current) if (entry.hsp === true) overHsp.add(entry.key);
     const next = current
         .filter((entry) => !adding.includes(entry.key))
-        .concat(adding.map((key) => ({ key, promised: '' })))
+        .concat(adding.map((key) => (overHsp.has(key) ? { key, promised: '', hsp: true } : { key, promised: '' })))
         .slice(-MAX_PENDING_CRASH_STOPS);
     return (writePendingEntries(next, storage) ? next : current).map((entry) => entry.key);
 }
@@ -1324,9 +1383,13 @@ export function planCrashRecovery({
     otherPage = false,
     savedVacuglideToken = '',
     vacuglideInUse = [],
-    pendingVacuglide = []
+    pendingVacuglide = [],
+    pendingHsp = []
 } = {}) {
     const busy = new Set(cleanHandyKeys(inUse, 64));
+    // The keys a dead session, or an earlier one that still owes the stop,
+    // drove over HSP: their stop is the HSP stop as well (handy.js).
+    const overHsp = new Set(cleanHandyKeys(pendingHsp, 64));
     const linkedElsewhere = new Set((Array.isArray(vacuglideInUse) ? vacuglideInUse : []).map((token) => sanitizeDeviceToken(token)).filter(Boolean));
     const saved = sanitizeConnectionKey(savedHandyKey);
     const owed = cleanHandyKeys(pending, MAX_PENDING_CRASH_STOPS).filter((key) => !busy.has(key));
@@ -1365,6 +1428,7 @@ export function planCrashRecovery({
                 continue;
             }
             for (const key of m.handyKeys) if (!busy.has(key) && !driven.includes(key)) driven.push(key);
+            for (const key of Array.isArray(m.hspKeys) ? m.hspKeys : []) overHsp.add(key);
             if (m.intiface === true) intiface = true;
             if (m.tcode === true) tcode = true;
             for (const entry of vacuglides) addVacuglide(entry.token, entry.cluster, true);
@@ -1385,9 +1449,13 @@ export function planCrashRecovery({
             tcode = true;
         }
     }
+    // An entry names its protocol only when it is HSP; one without is HAMP,
+    // as every entry was before there was HSP.
+    const withProtocol = (entry) => (overHsp.has(entry.key) ? { ...entry, protocol: 'hsp' } : entry);
+    handy = handy.map(withProtocol);
     const inLastSession = handy.map((entry) => entry.key);
     const earlier = withEarlier
-        ? owed.filter((key) => !inLastSession.includes(key)).map((key) => ({ key, saved: key === saved, driven: true }))
+        ? owed.filter((key) => !inLastSession.includes(key)).map((key) => withProtocol({ key, saved: key === saved, driven: true }))
         : [];
     const earlierVacuglide = [];
     for (const item of withEarlier && Array.isArray(pendingVacuglide) ? pendingVacuglide : []) {
@@ -1587,8 +1655,9 @@ export function whenActivated(doc, start) {
 // every Handy key the stop and reports again whenever an answer changes;
 // drops each key from the stops still owed as soon as its stop is settled;
 // and when a stop gives up, notes the promise of another try or, when this
-// page was that try, drops the key. `stopHandy(key, { onUpdate })` is
-// handy.js's stopHandyAfterCrash; an answer it gives after the stop is over
+// page was that try, drops the key. `stopHandy(key, { onUpdate, protocol })`
+// is handy.js's stopHandyAfterCrash, `protocol` 'hsp' for a key a session
+// drove over HSP and 'hamp' otherwise; an answer it gives after the stop is over
 // (Connect confirming a stop for that Handy) is reported like any other.
 //   owner         this page's id: its own marker is never recovered here
 //   claimed       the storage keys of markers this page's passes have taken
@@ -1731,7 +1800,8 @@ export async function runCrashRecovery({
         otherPage,
         savedVacuglideToken: savedToken && savedToken !== liveToken ? savedToken : '',
         vacuglideInUse,
-        pendingVacuglide: readPendingVacuglideStops(storage)
+        pendingVacuglide: readPendingVacuglideStops(storage),
+        pendingHsp: readPendingHspCrashStops(storage)
     });
     // A stop still owed that another pass of this page is sending is left to
     // it: the boot pass and the one a late durable read brings both send them.
@@ -1766,7 +1836,7 @@ export async function runCrashRecovery({
     // record, the markers stay until the stops they ask for are settled, as
     // they did before there was one.
     const drivenKeys = plan.handy.filter((entry) => entry.driven).map((entry) => entry.key);
-    const owedNow = addPendingCrashStops(drivenKeys, storage);
+    const owedNow = addPendingCrashStops(drivenKeys, storage, { hspKeys: plan.handy.filter((entry) => entry.protocol === 'hsp').map((entry) => entry.key) });
     const drivenVacuglides = plan.vacuglide.filter((entry) => entry.driven);
     const owedVacuglidesNow = addPendingVacuglideStops(drivenVacuglides, storage);
     const handedOver = drivenKeys.every((key) => owedNow.includes(key))
@@ -1818,7 +1888,7 @@ export async function runCrashRecovery({
     };
     report(true);
 
-    const stops = entries.map(({ key }) => {
+    const stops = entries.map(({ key, protocol = 'hamp' }) => {
         const onUpdate = (update) => {
             // A settled stop is owed no longer, whoever it was owed to. One
             // that gave up is the promise of another try, or the end of it.
@@ -1829,7 +1899,7 @@ export async function runCrashRecovery({
         };
         return Promise.resolve()
             .then(() => (typeof stopHandy === 'function'
-                ? stopHandy(key, { onUpdate })
+                ? stopHandy(key, { onUpdate, protocol })
                 : { outcome: RECOVERY_STOP.FAILED, detail: 'no stop available', final: true }))
             .catch((e) => ({ outcome: RECOVERY_STOP.FAILED, detail: e && e.message ? e.message : 'unknown error', final: true }))
             .then((update) => {
