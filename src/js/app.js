@@ -107,7 +107,7 @@ import { normalizeEnvelope, applyEndMargin, clampEndMargin, handyTargetSpeed, de
 import { bindEnvelopeField, bindEndMarginField, settleFocusedField } from './hardware/handy-fields.js';
 import { createHandyStopReport } from './hardware/handy-stop-report.js';
 import { createHandyHsp } from './hardware/handy-hsp.js';
-import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, sanitizeApplicationId, describeHspStartRefusal, describeHandyRoute, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
+import { HANDY_APP_ID_STORAGE_KEY, resolveApplicationId, sanitizeApplicationId, describeHspStartRefusal, describeHandyRoute, describeBeatSyncCheckFailed, handyScriptRoute } from './hardware/handy-hsp-protocol.js';
 import { createScriptFeed } from './player/script-feed.js';
 import { rhythmAt, hampTarget } from './player/script-rhythm.js';
 import { effectiveInvert, percentToMmPerSecond, HANDY_DEFAULT_TRAVEL_MM } from './player/script-shaper.js';
@@ -1537,7 +1537,8 @@ function handyBeatSyncWanted() {
         && state.activeMode === 'script'
         && handyConnected
         && state.handyRole === 'primary'
-        && handyHsp.beatSync();
+        && handyHsp.beatSync()
+        && !handyHsp.unavailable();
 }
 
 // Beat sync's stroke window: the Travel Envelope with the end margin. It is
@@ -1954,8 +1955,12 @@ function handyRouteLine() {
     const status = handyHsp.status();
     if (handyHsp.owns() || status.playing) return describeHandyRoute({ route: 'hsp', rtdP95: status.rtdP95 });
     if (!handyHsp.beatSync()) return describeHandyRoute({ route: 'rhythm', reason: 'Beat sync is off' });
+    // Not possible on this Handy (firmware, slider, Application ID): START
+    // plays the rhythm (handyBeatSyncWanted), and the line says why.
+    const impossible = handyHsp.unavailable();
+    if (impossible) return describeHandyRoute({ route: 'rhythm', reason: impossible.reason });
     if (beatSyncCheck.state === 'checking') return 'Checking beat sync on The Handy...';
-    if (beatSyncCheck.state === 'refused') return describeHandyRoute({ route: 'rhythm', reason: beatSyncCheck.reason });
+    if (beatSyncCheck.state === 'refused') return describeBeatSyncCheckFailed(beatSyncCheck.reason);
     if (beatSyncCheck.state === 'ok') return describeHandyRoute({ route: 'hsp', rtdP95: beatSyncCheck.rtdP95 });
     return describeHandyRoute({ route: 'rhythm', reason: 'beat sync is checked when The Handy connects' });
 }
@@ -3414,6 +3419,9 @@ function startOrResumeWhenReady(tappedAt) {
                 severity: 'advisory',
                 source: 'handyCheck'
             });
+            // A check at START that found beat sync not possible turns the
+            // route line to rhythm mode, which the next press plays.
+            if (verdict && verdict.hsp) renderPlayerControls();
         }
     });
     // Paints CHECKING THE HANDY while the question is out.

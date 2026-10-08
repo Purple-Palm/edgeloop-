@@ -594,13 +594,37 @@ export function handyScriptRoute({ scriptDrives = false, hspOwns = false, releas
     return 'level';
 }
 
+// The refusals that say beat sync is not possible on this Handy with this
+// Application ID (spec §3.9): firmware below 4, no slider, the ID refused.
+// The Handy then plays the script's rhythm and the route line says why
+// before START. Every other refusal (the link, the clock, a slow cloud, the
+// setup) is a failure at START (§3.2): the session does not start, and the
+// route is not switched silently.
+export const HSP_NOT_POSSIBLE_CODES = Object.freeze(['firmware', 'capabilities', 'auth']);
+
+export function hspNotPossible(code) {
+    return HSP_NOT_POSSIBLE_CODES.includes(code);
+}
+
+// The route line while beat sync is wanted but its last check failed for a
+// reason that may pass: START checks again, and does not start without it.
+export function describeBeatSyncCheckFailed(reason = '') {
+    const why = typeof reason === 'string' && reason.trim() ? reason.trim() : 'it could not be checked';
+    return `Beat sync could not be checked (${why}). START checks again and does not start without it; switch Beat sync off to play the script in rhythm mode.`;
+}
+
 // The banner line for a START or RESUME refused because beat sync could not
 // be set up (handy-hsp.js prepare). The route is never switched behind the
-// wearer's back: the line says what to do to get rhythm mode instead.
+// wearer's back: the line says what to do to get rhythm mode instead. When
+// START itself found beat sync not possible, the route line now says rhythm
+// mode, and the next press plays it.
 export function describeHspStartRefusal(refusal, resuming = false) {
     const what = resuming ? 'resumed' : 'started';
     const press = resuming ? 'RESUME' : 'START';
     const reason = refusal && typeof refusal.reason === 'string' && refusal.reason.trim() ? refusal.reason.trim() : 'it could not be set up';
+    if (refusal && hspNotPossible(refusal.code)) {
+        return `The session was not ${what}: The Handy cannot beat sync (${reason}). It plays the script in rhythm mode: press ${press} again.`;
+    }
     return `The session was not ${what}: beat sync on The Handy could not start (${reason}). Switch Beat sync off to play the script in rhythm mode, or press ${press} again.`;
 }
 

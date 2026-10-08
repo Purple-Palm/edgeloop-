@@ -37,6 +37,8 @@ import {
     describeHspOwedStop,
     describeHandyRoute,
     describeHspStartRefusal,
+    describeBeatSyncCheckFailed,
+    hspNotPossible,
     handyScriptRoute,
     classifyHspRecoveryStop
 } from './handy-hsp-protocol.js';
@@ -394,5 +396,17 @@ describe('which way a dispatch reaches The Handy', () => {
     it('refuses a start in words that name the way to rhythm mode', () => {
         assert.equal(describeHspStartRefusal({ reason: 'firmware 3.2.0: update The Handy' }), 'The session was not started: beat sync on The Handy could not start (firmware 3.2.0: update The Handy). Switch Beat sync off to play the script in rhythm mode, or press START again.');
         assert.match(describeHspStartRefusal(null, true), /^The session was not resumed: .*press RESUME again\.$/);
+    });
+
+    it('tells beat sync that is not possible (firmware, slider, Application ID) from a check that may pass next time', () => {
+        for (const code of ['firmware', 'capabilities', 'auth']) assert.equal(hspNotPossible(code), true, code);
+        for (const code of ['network', 'offline', 'sync', 'slow', 'mode', 'setup', 'buffer', 'stroke', 'consent', 'no-key', 'stale', '', undefined]) assert.equal(hspNotPossible(code), false, String(code));
+        assert.equal(
+            describeHspStartRefusal({ code: 'firmware', reason: 'firmware 3.2.3: update The Handy to firmware 4 at handyverse.com to get beat sync' }),
+            'The session was not started: The Handy cannot beat sync (firmware 3.2.3: update The Handy to firmware 4 at handyverse.com to get beat sync). It plays the script in rhythm mode: press START again.'
+        );
+        assert.match(describeHspStartRefusal({ code: 'network', reason: 'x' }), /Switch Beat sync off to play the script in rhythm mode, or press START again\.$/);
+        assert.equal(describeBeatSyncCheckFailed('the Handy API could not be asked (HTTP 502)'), 'Beat sync could not be checked (the Handy API could not be asked (HTTP 502)). START checks again and does not start without it; switch Beat sync off to play the script in rhythm mode.');
+        assert.match(describeBeatSyncCheckFailed(), /^Beat sync could not be checked \(it could not be checked\)\./);
     });
 });

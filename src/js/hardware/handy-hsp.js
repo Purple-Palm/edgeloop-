@@ -64,6 +64,7 @@ import {
     isHspStopConfirmed,
     isHspFlushConfirmed,
     fwSupportsHsp,
+    hspNotPossible,
     capabilitiesAllowHsp,
     sliderLimits,
     estimateServerOffset,
@@ -165,6 +166,9 @@ export function createHandyHsp({
     let beatSync = false;
     // GET /connected, /info, /capabilities and /settings/slider, for one key.
     let verified = null;
+    // The last check's word that beat sync is not possible on this device
+    // with this Application ID ({ key, appId, code, reason }), or null.
+    let notPossible = null;
     // The server-time estimate: { offset, rtdP95, rtdMedian, lead, at }.
     let sync = null;
     // From PUT /hsp/setup until release(): { key, appId, streamId,
@@ -342,6 +346,13 @@ export function createHandyHsp({
     async function verify() {
         const key = getKey();
         const appId = getAppId();
+        const v = await checkDevice(key, appId);
+        if (v.ok) notPossible = null;
+        else if (hspNotPossible(v.code)) notPossible = { key, appId, code: v.code, reason: v.reason };
+        return v;
+    }
+
+    async function checkDevice(key, appId) {
         if (!key) return refuse('no-key', 'no Handy is connected');
         const opts = { key, appId, count: false };
         const conn = await request('/connected', opts);
@@ -1318,6 +1329,14 @@ export function createHandyHsp({
             return beatSync;
         },
         verify,
+        // The last check's word that beat sync is not possible on the Handy
+        // connected now with the Application ID in use ({ code, reason }:
+        // firmware below 4, no slider, the ID refused), or null. While it
+        // stands, The Handy plays the script's rhythm (app.js).
+        unavailable() {
+            if (!notPossible || notPossible.key !== getKey() || notPossible.appId !== getAppId()) return null;
+            return { code: notPossible.code, reason: notPossible.reason };
+        },
         prepare,
         setWindow,
         dispatch,

@@ -249,6 +249,30 @@ describe('connect and verify', () => {
         assert.match(v.reason, /^firmware 3\.2\.3: update The Handy to firmware 4 at handyverse\.com/);
     });
 
+    it('remembers that beat sync is not possible on a firmware 3 Handy, for that key only, until a check passes', async () => {
+        let key = KEY;
+        const h = setup();
+        const hsp = createHandyHsp({ fetch: h.api.fetch, EventSource: FakeEventSource, now: h.sched.now, perfNow: h.sched.perf, setTimer: (fn, ms) => h.sched.setTimer(fn, ms), clearTimer: (x) => h.sched.clearTimer(x), feed: h.feed, getKey: () => key });
+        hsp.setBeatSync(true);
+        assert.equal(hsp.unavailable(), null);
+        h.api.device.fw = '3.2.3';
+        await hsp.verify();
+        assert.equal(hsp.unavailable().code, 'firmware');
+        assert.match(hsp.unavailable().reason, /^firmware 3\.2\.3: update The Handy to firmware 4/);
+        key = 'OtherKey02';
+        assert.equal(hsp.unavailable(), null, 'another Handy is checked afresh');
+        key = KEY;
+        h.api.device.fw = '4.0.16';
+        assert.equal((await hsp.verify()).ok, true);
+        assert.equal(hsp.unavailable(), null);
+    });
+
+    it('does not take a failed link for beat sync being impossible', async () => {
+        const { hsp } = setup({ 'GET /connected': () => 'network' });
+        assert.equal((await hsp.verify()).code, 'network');
+        assert.equal(hsp.unavailable(), null);
+    });
+
     it('names a refused Application ID and an offline device', async () => {
         const refused = setup({ 'GET /connected': () => ({ status: 401, body: { error: { name: '', message: 'Unauthenticated' } } }) });
         assert.equal((await refused.hsp.verify()).code, 'auth');

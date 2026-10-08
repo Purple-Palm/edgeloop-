@@ -61,6 +61,14 @@ describe('app.js: the video follows the session', () => {
         assert.match(body('function startOrResumeWhenReady('), /handyHsp\.prepare\(handyHspWindow\(\)\)/);
     });
 
+    it('a Handy that cannot beat sync plays the rhythm its route line promises', () => {
+        assert.match(body('function handyBeatSyncWanted('), /&& handyHsp\.beatSync\(\)\s*&& !handyHsp\.unavailable\(\);/);
+        const line = body('function handyRouteLine(');
+        assert.ok(line.indexOf('handyHsp.unavailable()') >= 0 && line.indexOf('handyHsp.unavailable()') < line.indexOf("beatSyncCheck.state === 'ok'"));
+        assert.match(line, /if \(impossible\) return describeHandyRoute\(\{ route: 'rhythm', reason: impossible\.reason \}\);/);
+        assert.match(line, /if \(beatSyncCheck\.state === 'refused'\) return describeBeatSyncCheckFailed\(/);
+    });
+
     it('the page-away stop includes beat sync', () => {
         assert.match(body('function stopEveryToyOnPageAway('), /handyHsp\?\.stopOnUnload\(\)/);
     });
