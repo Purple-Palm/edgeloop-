@@ -181,6 +181,10 @@ export function createHandyHsp({
     // Bumped by every stop, pause, release and offline: an answer to a
     // request sent before it acts on nothing.
     let epoch = 0;
+    // Bumped whenever something is set going on the device (a play sent, a
+    // play that may have landed after a stop, a play another page left): a
+    // stop vouches only for what was set going before it began.
+    let motionSeq = 0;
     // The allowance and cap the engine asked for last.
     let wanted = { allowance: 0, cap: 100 };
     let failures = 0;
@@ -551,6 +555,7 @@ export function createHandyHsp({
             holdTimer: null
         };
         motion = 'unknown';
+        motionSeq += 1;
         const sent = await sendBuffer(points, { anchorAt: { scriptMs: tSend, serverMs: serverNow() }, kind: 'urgent' });
         if (my !== epoch) {
             // A stop went out while this play was on its way: it may land
@@ -890,38 +895,53 @@ export function createHandyHsp({
         return Math.max(0, (end - t) / 1000);
     }
 
-    // The verified stop. Shared while one is on its way. Resolves whether
-    // the device confirmed it is not playing (a stop, or failing that a
-    // flush that emptied its buffer).
+    // The verified stop. Shared while one is on its way, as long as nothing
+    // was set going since it began. Every call ends the play at once (the
+    // window loop, the refills); a play anchored after the running stop
+    // began (an edge released while a slow stop was out, a RESUME) gets a
+    // stop of its own, sent now, and the older one hands its answer over to
+    // it: its confirmation may describe the device before that play.
+    // Resolves whether the device confirmed it is not playing (a stop, or
+    // failing that a flush that emptied its buffer).
     function stop({ reason = 'stop', key: forKey = null } = {}) {
-        if (stopJob) return stopJob;
         const key = forKey || (session ? session.key : getKey());
         const appId = session ? session.appId : getAppId();
         const lastPlan = play ? play.lastPlan : null;
         epoch += 1;
         stopLoops();
         play = null;
+        const running = stopJob;
+        if (running && running.seq === motionSeq && running.key === key) return running.promise;
         if (!key) return Promise.resolve(true);
         if (motion === 'stopped' && !chase && !inFlight) return Promise.resolve(true);
         const owedSeconds = runsOutSeconds(lastPlan);
-        const job = (async () => {
+        const job = { seq: motionSeq, key, superseded: false, next: null, promise: null };
+        if (running) {
+            running.superseded = true;
+            running.next = job;
+        }
+        const handOver = () => job.next.promise;
+        job.promise = (async () => {
             const opts = { method: 'PUT', kind: 'stop', key, appId };
             const delays = [0].concat(T.stopRetryDelaysMs);
             let last = null;
             for (let i = 0; i < delays.length; i += 1) {
                 if (delays[i] > 0) await sleep(delays[i]);
+                if (job.superseded) return handOver();
                 const { verdict } = await request('/hsp/stop', opts);
+                if (job.superseded) return handOver();
                 last = verdict;
                 if (isHspStopConfirmed(verdict)) {
-                    settled(key);
+                    settled(key, job.seq);
                     return true;
                 }
                 if (verdict.notConnected) break;
             }
             for (let i = 0; i < T.flushAttempts; i += 1) {
                 const { verdict } = await request('/hsp/flush', opts);
+                if (job.superseded) return handOver();
                 if (isHspFlushConfirmed(verdict)) {
-                    settled(key);
+                    settled(key, job.seq);
                     return true;
                 }
                 last = verdict;
@@ -931,30 +951,33 @@ export function createHandyHsp({
             const message = `Stop not confirmed: ${last ? last.message : 'no answer'}`;
             reportedUnconfirmed.add(key);
             call('onStopUnconfirmed', message, key, { runsOutSeconds: owedSeconds, reason });
-            beginChase(key, appId);
+            beginChase(key, appId, job.seq);
             return false;
         })();
         stopJob = job;
-        job.finally(() => { if (stopJob === job) stopJob = null; });
-        return job;
+        job.promise.finally(() => { if (stopJob === job) stopJob = null; });
+        return job.promise;
     }
 
-    function settled(key) {
-        motion = 'stopped';
+    // A confirmed stop. It says the device is still only when nothing was
+    // set going after that stop began.
+    function settled(key, seq) {
+        if (seq === motionSeq) motion = 'stopped';
         endChase();
         if (reportedUnconfirmed.delete(key)) call('onStopConfirmed', key);
     }
 
-    // A play that may have reached the device after a stop: stopped again.
+    // A play that may have reached the device after a stop: stopped again,
+    // now.
     function restop() {
         motion = 'unknown';
-        const pending = stopJob || Promise.resolve();
-        pending.catch(() => {}).then(() => stop({ reason: 'restop' }));
+        motionSeq += 1;
+        stop({ reason: 'restop' });
     }
 
-    function beginChase(key, appId) {
+    function beginChase(key, appId, seq = motionSeq) {
         endChase();
-        const job = { key, appId, timer: null, startedAt: now(), active: true };
+        const job = { key, appId, seq, timer: null, startedAt: now(), active: true };
         chase = job;
         const round = async () => {
             job.timer = null;
@@ -962,7 +985,7 @@ export function createHandyHsp({
             const { verdict } = await request('/hsp/stop', { method: 'PUT', kind: 'stop', key, appId, count: false });
             if (!job.active) return;
             if (isHspStopConfirmed(verdict)) {
-                settled(key);
+                settled(key, job.seq);
                 return;
             }
             if (now() - job.startedAt + T.chaseMs > T.chaseWindowMs) {
@@ -1242,6 +1265,7 @@ export function createHandyHsp({
                 return Promise.resolve(false);
             }
             motion = 'unknown';
+            motionSeq += 1;
             return stop({ reason: 'crash', key });
         },
         stopOnUnload,

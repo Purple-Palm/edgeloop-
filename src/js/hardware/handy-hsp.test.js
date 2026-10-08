@@ -503,6 +503,83 @@ describe('stops', () => {
         assert.equal(hsp.mayBeMoving(), false);
     });
 
+    it('a forced stop while an older, slow stop is out ends a play anchored after it, and is not taken in by the old answer', async () => {
+        // A slow cloud: the edge's hold is not answered within 1 s and
+        // escalates to a stop whose answer is slow too. The edge releases
+        // meanwhile and a new play goes out; then the wearer presses PAUSE.
+        const flags = { slowAdd: false, slowStop: false };
+        const st = (play, device) => ({ play_state: play, points: device.points, max_points: 4000, current_time: 0 });
+        const { api, sched, hsp, events } = await playing({
+            'PUT /hsp/add': (c, d) => {
+                d.points = (c.body.flush ? 0 : d.points) + c.body.points.length;
+                const answer = { status: 200, body: { result: st(d.play, d) } };
+                return flags.slowAdd ? { delay: 1500, then: answer } : answer;
+            },
+            'PUT /hsp/stop': (c, d) => {
+                // The server acts when the request arrives.
+                d.play = HSP_PLAY_STATE.STOPPED;
+                const answer = { status: 200, body: { result: st(HSP_PLAY_STATE.STOPPED, d) } };
+                return flags.slowStop ? { delay: 3000, then: answer } : answer;
+            }
+        });
+        await sched.advance(500);
+        flags.slowAdd = true;
+        flags.slowStop = true;
+        hsp.dispatch({ allowance: 0 });
+        await sched.advance(1100);
+        assert.equal(api.of('PUT /hsp/stop').length, 1, 'the hold escalated to a stop');
+        flags.slowAdd = false;
+        hsp.dispatch({ allowance: 60 });
+        await sched.advance(600);
+        hsp.dispatch({ allowance: 65 });
+        await sched.advance(300);
+        assert.equal(api.of('PUT /hsp/play').length, 2, 'the release anchored a new play');
+        assert.equal(api.device.play, HSP_PLAY_STATE.PLAYING);
+        assert.equal(hsp.isPlaying(), true);
+        const stops = api.of('PUT /hsp/stop').length;
+        const pausedAt = sched.t;
+        const done = hsp.dispatch({ allowance: 0, force: true });
+        await sched.advance(0);
+        assert.equal(hsp.isPlaying(), false, 'the play ends with the PAUSE');
+        assert.equal(api.of('PUT /hsp/stop').length, stops + 1, 'a stop of its own goes out at once');
+        await sched.advance(8000);
+        assert.equal(await done, true);
+        assert.equal(api.calls.filter((c) => c.at > pausedAt && (c.path === '/hsp/add' || c.path === '/hsp/play')).length, 0, 'nothing refills after the PAUSE');
+        assert.equal(api.device.play, HSP_PLAY_STATE.STOPPED);
+        assert.equal(hsp.status().motion, 'stopped');
+        assert.equal(events.unconfirmed.length, 0);
+    });
+
+    it('an old stop\'s confirmation does not say the device is still when a play went out after that stop began', async () => {
+        let slow = false;
+        const { api, sched, hsp } = await playing({
+            'PUT /hsp/stop': (c, d) => {
+                const answer = { status: 200, body: { result: { play_state: HSP_PLAY_STATE.STOPPED, points: 0 } } };
+                if (!slow) {
+                    d.play = HSP_PLAY_STATE.STOPPED;
+                    return answer;
+                }
+                // Received before the play below; answered after it.
+                d.play = HSP_PLAY_STATE.STOPPED;
+                return { delay: 3000, then: answer };
+            }
+        });
+        await sched.advance(500);
+        slow = true;
+        hsp.stop({ reason: 'hold' });
+        await sched.advance(100);
+        hsp.dispatch({ allowance: 80 });
+        await sched.advance(100);
+        assert.equal(api.device.play, HSP_PLAY_STATE.PLAYING);
+        await sched.advance(3000);
+        assert.notEqual(hsp.status().motion, 'stopped', 'the play after the stop is still going');
+        slow = false;
+        const stops = api.of('PUT /hsp/stop').length;
+        assert.equal(await hsp.dispatch({ allowance: 0, force: true }), true);
+        assert.equal(api.of('PUT /hsp/stop').length, stops + 1, 'STOP sends a stop');
+        assert.equal(api.device.play, HSP_PLAY_STATE.STOPPED);
+    });
+
     it('sends a keepalive stop with both headers when the page goes away', async () => {
         const { api, hsp } = await playing();
         assert.equal(hsp.stopOnUnload(), true);
